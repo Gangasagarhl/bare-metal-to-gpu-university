@@ -1,0 +1,347 @@
+<!--meta
+id: F1-52
+title: NICs and descriptor rings
+course: HW205
+level: L3
+prereqs: F1-51; F1-50 (queues in memory, doorbells, phase); HW204 (F1-45 PCIe, BARs); F0 ring buffers as in F1-50
+time: 5–8 hours including the lab
+hardware: none for the lab (g++, QEMU 8.2.2 and tshark 4.2.2 were used). Optional: a Linux computer with a physical NIC, to read its counters with ethtool.
+maps: Curriculum catalog (section 6) "Ethernet MAC and PHY" and "PCIe" rows (DMA into memory); C9 (e1000 driver in QEMU: descriptor rings); HW205 forensic "rx stall"
+analogy: F1 — the restaurant building and its kitchen
+-->
+
+<h2 id="F1-52-hook">Story hook</h2>
+<p>Parcels arrive at the restaurant's back door all day, often while every cook is busy. Lena, who runs the stores, solves this with a round rack of eight numbered shelves by the door, each with an empty crate on it. The courier has one rule: put each parcel into the crate on the next shelf, flip the shelf's little flag to "full", and ring the kitchen bell — but never touch a shelf past the red marker. When Lena has a free minute she empties the full crates, puts fresh empty ones on the shelves, and moves the red marker forward. Nobody waits for anyone: the courier and Lena work at their own speed, and the marker tells each of them where their part of the rack ends.</p>
+<p>One week Lena's new assistant forgets the last step. He empties the crates perfectly — but never moves the red marker. On Monday morning seven parcels arrive and are stored. Then the courier reaches the marker. From then on every parcel is sent back, although the rack is full of empty crates. The rack is a NIC <b>descriptor ring</b>, the courier is the NIC's DMA engine, the red marker is the <b>tail register</b>, and "the network dies after a few seconds" is this chapter's forensic lab.</p>
+
+<h2 id="F1-52-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> how a NIC moves frames to and from memory without the CPU copying them: descriptor rings, DMA, head and tail, interrupts.</li>
+<li><b>Trace</b> who owns each ring slot (driver or NIC) through a sequence of receives and refills, and predict when packets are dropped.</li>
+<li><b>Read</b> a real QEMU e1000e trace: ring set-up writes, tail-register writes, descriptor fetches and interrupts, and correlate it with tshark's view of the same frames.</li>
+<li><b>Compare</b> the e1000-family ring design with NVMe queues (F1-50) and name what a virtio-net device does differently.</li>
+<li><b>Diagnose</b> a receive stall from counters and a register dump.</li>
+</ul>
+
+<div class="co jargon" id="F1-52-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>NIC (network interface controller)</dt><dd><b>Simple words:</b> the network card or chip of a computer. <b>Analogy:</b> the back door with its courier and parcel rack. <b>Precise:</b> a device, on PCs attached over PCIe, containing at least a MAC (often also a PHY), packet buffers, DMA engines, descriptor rings and interrupt logic; the driver controls it through registers in a BAR. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> <sup class="src"><a href="#F1-52-src-R2">R2</a></sup></dd>
+<dt>Descriptor</dt><dd><b>Simple words:</b> a small record in memory that tells the NIC where a packet buffer is and, after use, what happened to it. <b>Analogy:</b> one shelf with its crate and flag. <b>Precise:</b> a fixed-size structure (16 bytes for the e1000e descriptors in this chapter's trace) holding a buffer's physical address, a length and command/status bits; the NIC reads it by DMA and writes status back. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></dd>
+<dt>Descriptor ring</dt><dd><b>Simple words:</b> a circular list of descriptors shared by the driver and the NIC. <b>Analogy:</b> the round rack of shelves. <b>Precise:</b> a contiguous array of descriptors in host memory whose base address and length are written to NIC registers; the NIC and driver advance around it, wrapping at the end; separate rings exist for transmit and receive. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> <sup class="src"><a href="#F1-52-src-D4">D4</a></sup></dd>
+<dt>Head and tail (of a NIC ring)</dt><dd><b>Simple words:</b> two slot numbers that split the ring into "NIC's part" and "driver's part". <b>Analogy:</b> the courier's position and the red marker. <b>Precise:</b> the head is advanced by the NIC as it consumes descriptors; the tail is written by the driver to hand descriptors to the NIC; the NIC uses the slots from head up to, not including, tail. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> <sup class="src"><a href="#F1-52-src-R1">R1</a></sup></dd>
+<dt>DMA (direct memory access)</dt><dd><b>Simple words:</b> a device reading or writing the computer's memory by itself, without the CPU copying each byte. <b>Analogy:</b> the courier walking to the shelf himself. <b>Precise:</b> bus-master transactions (on PCIe: memory read and write requests from the device) addressed with physical or I/O-virtual addresses that the driver provided. <sup class="src"><a href="#F1-52-src-D4">D4</a></sup> <sup class="src"><a href="#F1-52-src-D6">D6</a></sup></dd>
+<dt>Interrupt (from a NIC)</dt><dd><b>Simple words:</b> the NIC's signal to the CPU that something happened, for example a packet arrived. <b>Analogy:</b> the kitchen bell. <b>Precise:</b> a legacy pin interrupt, MSI or MSI-X message raised when an enabled cause bit is set in the NIC's interrupt cause register; the driver reads the causes and handles the rings. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> <sup class="src"><a href="#F1-52-src-D4">D4</a></sup> <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></dd>
+<dt>Missed packet (no descriptor)</dt><dd><b>Simple words:</b> a packet the NIC had to throw away because the driver had given it no free buffer. <b>Analogy:</b> a parcel sent back at the red marker. <b>Precise:</b> a receive drop counted by the NIC when head reaches tail; the frame never reaches memory or the operating system. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> <sup class="src"><a href="#F1-52-src-R1">R1</a></sup></dd>
+<dt>virtqueue</dt><dd><b>Simple words:</b> the queue format of virtio devices, the "paravirtual" devices made for virtual machines. <b>Analogy:</b> a rack designed for couriers who are part of the same company. <b>Precise:</b> a ring structure defined by the VIRTIO specification, shared between a guest driver and a host device, with buffers described in a descriptor table and an "available" and a "used" ring; QEMU's virtio-net NIC uses it. <sup class="src"><a href="#F1-52-src-D3">D3</a></sup> <sup class="src"><a href="#F1-52-src-R2">R2</a></sup></dd>
+</dl></div>
+
+<h2 id="F1-52-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the receive ring of Listing 1 at three moments, with each slot's owner.</p>
+<figure id="F1-52-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 330" role="img" aria-labelledby="F1-52-f1t F1-52-f1d">
+<title id="F1-52-f1t">Figure 1: ownership of an 8-slot receive ring</title>
+<desc id="F1-52-f1d">Three rows of eight slots numbered 0 to 7. Row 1, after start-up: slots 0 to 6 owned by the NIC with empty buffers, slot 7 owned by the driver; head 0, tail 7. Row 2, after 5 packets: slots 0 to 4 hold packets and belong to the driver, 5 and 6 still NIC-owned and empty, 7 driver; head 5, tail 7. Row 3, after the driver handled the 5 packets and wrote tail 4: slots 0 to 3 and 5 to 7 NIC-owned and empty, slot 4 driver; head 5, tail 4. A legend: NIC-owned, driver-owned, packet waiting.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="330"/>
+<text class="sv-tb" x="20" y="30">after start-up: head=0, tail=7</text>
+<rect class="sv-b2" x="300" y="12" width="60" height="30"/><text class="sv-ts" x="322" y="32">0</text>
+<rect class="sv-b2" x="360" y="12" width="60" height="30"/><text class="sv-ts" x="382" y="32">1</text>
+<rect class="sv-b2" x="420" y="12" width="60" height="30"/><text class="sv-ts" x="442" y="32">2</text>
+<rect class="sv-b2" x="480" y="12" width="60" height="30"/><text class="sv-ts" x="502" y="32">3</text>
+<rect class="sv-b2" x="540" y="12" width="60" height="30"/><text class="sv-ts" x="562" y="32">4</text>
+<rect class="sv-b2" x="600" y="12" width="60" height="30"/><text class="sv-ts" x="622" y="32">5</text>
+<rect class="sv-b2" x="660" y="12" width="60" height="30"/><text class="sv-ts" x="682" y="32">6</text>
+<rect class="sv-box" x="720" y="12" width="60" height="30"/><text class="sv-ts" x="742" y="32">7</text>
+<text class="sv-ts" x="300" y="60">head ▲ at 0</text><text class="sv-ts" x="720" y="60">tail ▲ at 7</text>
+<text class="sv-tb" x="20" y="120">5 packets arrived: head=5, tail=7</text>
+<rect class="sv-b6" x="300" y="102" width="60" height="30"/><text class="sv-ts" x="316" y="122">0 pkt</text>
+<rect class="sv-b6" x="360" y="102" width="60" height="30"/><text class="sv-ts" x="376" y="122">1 pkt</text>
+<rect class="sv-b6" x="420" y="102" width="60" height="30"/><text class="sv-ts" x="436" y="122">2 pkt</text>
+<rect class="sv-b6" x="480" y="102" width="60" height="30"/><text class="sv-ts" x="496" y="122">3 pkt</text>
+<rect class="sv-b6" x="540" y="102" width="60" height="30"/><text class="sv-ts" x="556" y="122">4 pkt</text>
+<rect class="sv-b2" x="600" y="102" width="60" height="30"/><text class="sv-ts" x="622" y="122">5</text>
+<rect class="sv-b2" x="660" y="102" width="60" height="30"/><text class="sv-ts" x="682" y="122">6</text>
+<rect class="sv-box" x="720" y="102" width="60" height="30"/><text class="sv-ts" x="742" y="122">7</text>
+<text class="sv-ts" x="600" y="150">head ▲ at 5</text><text class="sv-ts" x="720" y="150">tail ▲ at 7</text>
+<text class="sv-tb" x="20" y="210">driver handled 5, wrote tail=4</text>
+<rect class="sv-b2" x="300" y="192" width="60" height="30"/><text class="sv-ts" x="322" y="212">0</text>
+<rect class="sv-b2" x="360" y="192" width="60" height="30"/><text class="sv-ts" x="382" y="212">1</text>
+<rect class="sv-b2" x="420" y="192" width="60" height="30"/><text class="sv-ts" x="442" y="212">2</text>
+<rect class="sv-b2" x="480" y="192" width="60" height="30"/><text class="sv-ts" x="502" y="212">3</text>
+<rect class="sv-box" x="540" y="192" width="60" height="30"/><text class="sv-ts" x="562" y="212">4</text>
+<rect class="sv-b2" x="600" y="192" width="60" height="30"/><text class="sv-ts" x="622" y="212">5</text>
+<rect class="sv-b2" x="660" y="192" width="60" height="30"/><text class="sv-ts" x="682" y="212">6</text>
+<rect class="sv-b2" x="720" y="192" width="60" height="30"/><text class="sv-ts" x="742" y="212">7</text>
+<text class="sv-ts" x="540" y="240">tail ▲ at 4</text><text class="sv-ts" x="600" y="254">head ▲ at 5</text>
+<rect class="sv-b2" x="20" y="282" width="24" height="18"/><text class="sv-ts" x="52" y="296">NIC owns (empty buffer, may fill it)</text>
+<rect class="sv-b6" x="300" y="282" width="24" height="18"/><text class="sv-ts" x="332" y="296">driver owns, packet waiting</text>
+<rect class="sv-box" x="560" y="282" width="24" height="18"/><text class="sv-ts" x="592" y="296">driver owns (the gap slot)</text>
+<text class="sv-ts" x="20" y="320">The NIC may use slots head … tail−1, wrapping. One slot always stays with the driver, so "full" and "empty" never look alike.</text>
+</svg></div><figcaption><b>Figure 1.</b> The three ring lines Listing 1 printed (N = NIC, D = driver), drawn as slots. In the third row the NIC's part wraps from slot 5 round to slot 3. <sup class="src"><a href="#F1-52-src-R1">R1</a></sup></figcaption></figure>
+
+<p>Figure 2 is the order of events for one received packet, taken from the real e1000e trace in the lab.</p>
+<figure id="F1-52-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 380" role="img" aria-labelledby="F1-52-f2t F1-52-f2d">
+<title id="F1-52-f2t">Figure 2: receiving one frame, as in the QEMU e1000e trace</title>
+<desc id="F1-52-f2d">Three columns, driver on the CPU, host memory, NIC. Step 0, set-up: the driver writes the receive ring base 0x7f5db00 and length 0x100 into NIC registers 0x2800 and 0x2808 and the tail register 0x2818, value 8. Step 1: a frame arrives from the network at the NIC. Step 2: the NIC reads the next receive descriptor at 0x7f5db00 from memory by DMA. Step 3: the NIC writes the frame into the buffer named by the descriptor and writes the status back. Step 4: the NIC sets a cause bit in its interrupt register 0xc0 and interrupts the CPU. Step 5: the driver reads the descriptor, takes the frame, puts a fresh buffer in the slot and writes the tail register again, value 9. The next frame uses descriptor 0x7f5db10.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="380"/>
+<rect class="sv-b1" x="20" y="20" width="200" height="40" rx="5"/><text class="sv-tb" x="40" y="46">driver (CPU)</text>
+<rect class="sv-b3" x="340" y="20" width="200" height="40" rx="5"/><text class="sv-tb" x="360" y="46">host memory</text>
+<rect class="sv-b2" x="660" y="20" width="200" height="40" rx="5"/><text class="sv-tb" x="680" y="46">NIC (e1000e)</text>
+<line class="sv-dash" x1="120" y1="60" x2="120" y2="370"/><line class="sv-dash" x1="440" y1="60" x2="440" y2="370"/><line class="sv-dash" x1="760" y1="60" x2="760" y2="370"/>
+<line class="sv-line" x1="120" y1="90" x2="760" y2="90"/><polygon class="sv-head" points="760,90 752,86 752,94"/>
+<text class="sv-ts" x="130" y="84">0 set-up: write 0x2800=0x7f5db00, 0x2808=0x100, tail 0x2818=8 (MMIO)</text>
+<line class="sv-line2" x1="860" y1="130" x2="760" y2="130"/><polygon class="sv-head" points="760,130 768,126 768,134"/>
+<text class="sv-ts" x="600" y="124">1 frame arrives</text>
+<line class="sv-line" x1="760" y1="165" x2="440" y2="165"/><polygon class="sv-head" points="440,165 448,161 448,169"/>
+<text class="sv-ts" x="460" y="158">2 DMA read: descriptor at 0x7f5db00</text>
+<line class="sv-line2" x1="760" y1="205" x2="440" y2="205"/><polygon class="sv-head" points="440,205 448,201 448,209"/>
+<text class="sv-ts" x="460" y="198">3 DMA write: frame → buffer, status → descriptor</text>
+<line class="sv-line" x1="760" y1="245" x2="120" y2="245"/><polygon class="sv-head" points="120,245 128,241 128,249"/>
+<text class="sv-ts" x="300" y="238">4 cause bit set in register 0xc0, interrupt</text>
+<line class="sv-line" x1="120" y1="285" x2="440" y2="285"/><polygon class="sv-head" points="440,285 432,281 432,289"/>
+<text class="sv-ts" x="130" y="278">5a read descriptor and frame, attach new buffer</text>
+<line class="sv-line" x1="120" y1="325" x2="760" y2="325"/><polygon class="sv-head" points="760,325 752,321 752,329"/>
+<text class="sv-ts" x="130" y="318">5b write tail 0x2818 = 9 ("Setting RDT[0] = 9")</text>
+<text class="sv-ts" x="130" y="360">next frame: descriptor at 0x7f5db10 (16 bytes further)</text>
+</svg></div><figcaption><b>Figure 2.</b> One receive, in the order the QEMU trace printed it (R3). Thick arrows carry frame data, thin ones control. The names of the registers at 0x2800 and 0x2808 and of the cause register at 0xc0 are not printed by QEMU and are not verified here; QEMU names 0x2818 itself as RDT. Not to scale in time. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup> <sup class="src"><a href="#F1-52-src-D1">D1</a></sup></figcaption></figure>
+
+<h2 id="F1-52-layer1">Layer 1 — the kid explanation</h2>
+<p>A network card receives messages all the time, even when the computer's processor is busy with something else. So the card and the computer agree on a set of empty boxes in the computer's memory, arranged in a circle. When a message arrives, the card puts it into the next empty box by itself, marks the box as full and rings a bell.</p>
+<p>When the processor has time, it takes the messages out of the full boxes, puts empty boxes back and tells the card "you may use the boxes up to here". The card never goes past that point. If the processor is too slow and the card runs out of empty boxes, new messages are lost. Sending works the same way the other way round: the processor fills boxes with messages and the card picks them up.</p>
+
+<h2 id="F1-52-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F1-52-l2-why">Why rings?</h3>
+<p>Frames arrive whenever the network delivers them, at rates set by the other machines, while the CPU runs other code. The NIC therefore needs memory it can write without asking the CPU each time, and the driver needs a way to find the new frames later. A ring of descriptors in host memory does both: the driver prepares many buffers in advance, the NIC fills them by DMA as frames arrive, and the driver collects them in batches. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> <sup class="src"><a href="#F1-52-src-D4">D4</a></sup> This is the same producer–consumer idea as NVMe's queues in <a href="#F1-50">F1-50</a>; the NIC's version is older and its details differ (see Layer 3).</p>
+
+<h3 id="F1-52-l2-own">Who owns which slot</h3>
+<p>Listing 1 is the university's toy ring with 8 slots. A descriptor in the toy has a buffer number, a length and a "done" flag; a real one has a 64-bit buffer address and status bits defined by the NIC's datasheet. <sup class="src"><a href="#F1-52-src-R1">R1</a></sup> <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> The rule is in <code>ring_model.h</code>: the NIC may write slots from head up to, but not including, tail; when head equals tail it owns nothing and must drop the frame (line 33). At start-up the driver attaches a buffer to every slot but writes tail = 7, not 8, because with 8 slots a tail equal to head would mean "nothing for the NIC", the same value as "everything for the NIC"; keeping one slot back removes the ambiguity. <sup class="src"><a href="#F1-52-src-R1">R1</a></sup> NVMe solved the same ambiguity on its completion queue with a phase bit (<a href="#F1-50">F1-50</a>); here the driver owns the gap.</p>
+<p>The run (R1) shows the cycle. Five frames arrive: head moves to 5, slots 0–4 are done. The driver's interrupt handler finds them, attaches fresh buffers and writes tail = 4 — the slot before the next one it will check — so the NIC's part now wraps from 5 round to 3. Nine more frames arrive before the driver runs again: the NIC fills slots 5, 6, 7, 0, 1, 2, 3, reaches the tail at 4 and drops the last two: <code>missed=2</code>. The driver then handles 7 frames and writes tail = 3. <sup class="src"><a href="#F1-52-src-R1">R1</a></sup> Missed frames never reach memory; only the counter knows about them.</p>
+
+<h3 id="F1-52-l2-tx">Transmit is the mirror image</h3>
+<p>For sending, the driver is the producer: it writes a frame into a buffer, fills the next transmit descriptor (address, length, command bits), and writes the transmit tail register; the NIC fetches the descriptor and the frame by DMA, sends the frame, and reports completion in the descriptor or by advancing its head. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> In the lab's real trace each transmit tail write (register 0x3818, values 1, 2, 3, 4, 5) is followed by QEMU's <code>e1000e_tx_descr</code> event, and the low 16 bits of the descriptor word it prints are 0x1ad = 429, 0x46 = 70, 0x1ad = 429, 0x1b9 = 441 and 0x2a = 42 — the lengths tshark reports for the DHCP Discover, the IPv6 router solicitation, the second Discover, the DHCP Request and the ARP announcement in the same run. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></p>
+
+<h2 id="F1-52-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F1-52-l3-trace">Reading the real trace</h3>
+<p>Analogy first: Lena sets up the rack by telling the courier where it stands, how long it is and where the red marker starts. The QEMU trace (R3) shows a real driver, the iPXE boot ROM, doing exactly that with QEMU's e1000e model of the Intel 82574L (the name pci.ids gives ID 8086:10d3, R2). <sup class="src"><a href="#F1-52-src-R2">R2</a></sup> <sup class="src"><a href="#F1-52-src-R3">R3</a></sup> In order:</p>
+<ul>
+<li>Register 0x3800 ← 0x7f5da00, 0x3804 ← 0, 0x3808 ← 0x100, 0x3818 ← 0: a transmit ring at physical address 0x7f5da00, 0x100 = 256 bytes long, tail 0. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></li>
+<li>Register 0x2800 ← 0x7f5db00, 0x2808 ← 0x100, 0x2818 ← 0: the receive ring right after it, 256 bytes. QEMU itself names the write to 0x2818: "Setting RDT[0] = 0" — RDT is the receive descriptor tail. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></li>
+<li>Registers 0x5400 and 0x5404 ← 0x12005452 and 0x80005634: read as little-endian bytes these are 52 54 00 12 and 34 56 — the MAC address 52:54:00:12:34:56 given on the QEMU command line. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></li>
+<li>Register 0x2818 ← 8: "Setting RDT[0] = 8": the ROM hands 8 descriptors to the NIC. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></li>
+<li>Then five rounds: a transmit tail write, a transmitted descriptor, a receive descriptor fetched at 0x7f5db00, 0x7f5db10, 0x7f5db20, 0x7f5db30 (each 0x10 = 16 bytes after the previous one; QEMU prints "length: 16"), "Received packet written to guest", an interrupt cause bit set in register 0xc0, and the ROM moving RDT to 9, 10, 11, 12. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></li>
+</ul>
+<p>Two derived numbers: with 16-byte descriptors, each 256-byte ring holds 256 / 16 = 16 descriptors; and the ROM gives the NIC 8 of the 16 at first, then one more after each frame it takes — the refill pattern of Listing 1, on a real driver. The four received frames match tshark's list: the two DHCP Offers, the router advertisement and the DHCP ACK. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Register names and bit meanings not printed by QEMU were not checked against the Intel datasheets: that 0x2800/0x2804/0x2808/0x2810/0x2818 are RDBAL, RDBAH, RDLEN, RDH, RDT and 0x3800–0x3818 the transmit equivalents TDBAL, TDBAH, TDLEN, TDH, TDT; that 0x5400/0x5404 are the receive address registers RAL0/RAH0 with an "address valid" bit at the top of RAH (which would explain the 0x8000 in 0x80005634); that 0xc0 is the interrupt cause register ICR; the meaning of the 0xb in the transmit descriptor words; the 82574L's receive descriptor format. Check the Intel 82574 family datasheet (and the 8254x developer's manual for the e1000). QEMU names only RDT (R3).</p></div>
+
+<h3 id="F1-52-l3-compare">Comparison with NVMe queues and with virtio</h3>
+<p>Analogy first: three racks built by three different firms do the same job with different flags. <sup class="src"><a href="#F1-52-src-D2">D2</a></sup></p>
+<div class="tw"><table>
+<thead><tr><th>Question</th><th>e1000-family NIC ring (this chapter)</th><th>NVMe queue pair (F1-50)</th><th>virtio-net virtqueue</th></tr></thead>
+<tbody>
+<tr><td>How work is handed over</td><td>driver writes the tail register (RDT, TDT) <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></td><td>driver writes the SQ tail doorbell</td><td>driver adds to the "available" ring and notifies the device <sup class="src"><a href="#F1-52-src-D3">D3</a></sup></td></tr>
+<tr><td>How completion is reported</td><td>status written back into the same descriptor; head advances</td><td>separate completion queue entries with a phase bit</td><td>entries in a separate "used" ring <sup class="src"><a href="#F1-52-src-D3">D3</a></sup></td></tr>
+<tr><td>Full/empty ambiguity</td><td>driver keeps one slot back (R1)</td><td>phase bit on CQ; one slot back on SQ</td><td>free-running indices (see box)</td></tr>
+<tr><td>Who allocates receive buffers</td><td>driver, before frames arrive</td><td>(no unsolicited data: every read is a command)</td><td>driver, before frames arrive</td></tr>
+</tbody></table></div>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The virtio column comes from memory of the VIRTIO specification: the split-virtqueue layout (descriptor table, available ring, used ring), free-running 16-bit indices instead of a kept-back slot, and the notification mechanism. This build only observed that QEMU's virtio-net device exists with ID 1af4:1000 ("Virtio network device" in pci.ids) and four BARs (R2); no virtio trace was made. Check the OASIS VIRTIO specification, the chapters on virtqueues and on the network device.</p></div>
+
+<h3 id="F1-52-l3-irq">Interrupts, batching and polling</h3>
+<p>Analogy first: if the bell rang for every parcel, Lena would do nothing but walk to the door. A driver handles all done descriptors per interrupt, as Listing 1's service loop does, and NICs can delay or merge interrupts (interrupt moderation); under heavy load Linux drivers switch to polling the ring for a while (NAPI). <sup class="src"><a href="#F1-52-src-D4">D4</a></sup> <sup class="src"><a href="#F1-52-src-D5">D5</a></sup> In the trace the e1000e sets a cause bit for each received frame: register 0xc0 goes from 0x0 to 0x80, then to 0x80000083 (R3). Which bits mean what, and how the ROM acknowledges them, is in the unverified box above. Multi-queue NICs have several receive rings, steer flows between them by hashing packet headers (receive-side scaling) and give each ring its own MSI-X vector, so that several CPU cores receive in parallel. <sup class="src"><a href="#F1-52-src-D2">D2</a></sup> <sup class="src"><a href="#F1-52-src-D5">D5</a></sup> These are named here as a map; none was tested in this build.</p>
+
+<h3 id="F1-52-l3-dma">Memory rules: addresses, ordering, coherence</h3>
+<p>Analogy first: the courier only knows street addresses, not the names Lena uses inside the building. The NIC is given physical (or IOMMU-translated) addresses; the 0x7f5db00 in the trace is a physical address the ROM chose, not a pointer the CPU uses in a program. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup> <sup class="src"><a href="#F1-52-src-D4">D4</a></sup> A driver must also order its writes: the descriptor and buffer contents must be visible in memory before the tail write tells the NIC to look, and a driver must read a descriptor's "done" status before it reads the length and data the NIC wrote. Linux provides DMA-mapping functions and memory barriers for exactly these rules. <sup class="src"><a href="#F1-52-src-D5">D5</a></sup> Listing 1 runs in one thread, so it cannot show reordering; it only shows the protocol.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Named from memory, not checked: the Linux functions <code>dma_alloc_coherent</code>, <code>dma_map_single</code>, <code>wmb()</code>/<code>dma_wmb()</code> and <code>rmb()</code>/<code>dma_rmb()</code>, the NAPI functions, and the claim that the Linux e1000e driver writes its tail register only after a write barrier. Check the kernel's DMA API documentation, the memory-barriers document and <code>drivers/net/ethernet/intel/e1000e</code> in the kernel version you use.</p></div>
+
+<h2 id="F1-52-hardware">How the hardware actually does it</h2>
+<p>Inside a NIC, the receive path is a pipeline: the MAC (<a href="#F1-51">F1-51</a>) checks the FCS and the address filter, the frame goes into an on-chip packet buffer, a descriptor-fetch engine keeps a few descriptors cached ahead of head, and the DMA engine writes the frame into host memory with PCIe memory-write transactions, then writes the descriptor status back and raises the interrupt. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> <sup class="src"><a href="#F1-52-src-D2">D2</a></sup> If the descriptors run out, the on-chip buffer fills and further frames are dropped and counted. The lab's devices are QEMU's software models; they behave like this at the level of registers and memory but have no on-chip buffer, timing or PCIe link. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup> The real QEMU NICs (R2) also show the hardware differences in their BARs: the e1000 has a memory BAR and an I/O BAR; the e1000e has three memory BARs and one I/O BAR; the virtio-net device has an I/O BAR, a small memory BAR and a 64-bit prefetchable memory BAR. <sup class="src"><a href="#F1-52-src-R2">R2</a></sup></p>
+
+<h2 id="F1-52-worked">Worked example</h2>
+<p><b>Task.</b> In Listing 1's second round (head = 5, tail = 4), nine frames arrive. Which slots do they go to, how many are missed, and where are head and tail afterwards? Then, if the driver handles them and writes tail = (next − 1) mod 8, what tail does it write?</p>
+<ol>
+<li>The NIC owns slots 5, 6, 7, 0, 1, 2, 3 — seven slots (from head 5 up to tail 4, wrapping).</li>
+<li>Frames 1–7 go to slots 5, 6, 7, 0, 1, 2, 3; head becomes 4 = tail.</li>
+<li>Frames 8 and 9 find head = tail: missed = 2.</li>
+<li>The driver starts at slot 5 (its "next" after round 1) and handles 7 frames: 5, 6, 7, 0, 1, 2, 3; its next slot is 4.</li>
+<li>Tail = (4 + 8 − 1) mod 8 = 3.</li>
+</ol>
+<p>The run printed "missed=2", the seven frames in that order and "wrote tail = 3". <sup class="src"><a href="#F1-52-src-R1">R1</a></sup></p>
+<p><b>Second task: from the real trace.</b> The receive ring starts at 0x7f5db00 with 16-byte descriptors. Descriptor number k is at 0x7f5db00 + 16·k. The fourth frame (k = 3) is at 0x7f5db00 + 0x30 = 0x7f5db30 — the address QEMU printed for the fourth received frame. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup></p>
+
+<h2 id="F1-52-code">Code walk-through</h2>
+<p><b>Listing 1a</b> — <code>ring_model.h</code>: the toy NIC and its receive ring.</p>
+<pre class="listing" data-src="F1-52/ring_model.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–15</td><td><code>RxDescriptor</code></td><td>Buffer number, length, done flag.</td><td>The minimum a descriptor needs; real ones carry a physical address and status bits.</td></tr>
+<tr><td>20</td><td>constructor</td><td>Creates the ring with a fixed number of slots.</td><td>Rings are sized once, at set-up (the ROM wrote a length of 0x100 bytes).</td></tr>
+<tr><td>28</td><td><code>writeTail</code></td><td>Stores the driver's new tail.</td><td>The only way the driver gives slots to the NIC.</td></tr>
+<tr><td>31–36</td><td><code>receive</code>, no slot</td><td>If head equals tail, count a missed frame and return.</td><td>Where frames are lost when the driver falls behind.</td></tr>
+<tr><td>37–41</td><td><code>receive</code>, store</td><td>Writes length and done flag into the head slot and advances head with wrap-around.</td><td>Stands for the DMA write and status write-back.</td></tr>
+<tr><td>52–65</td><td><code>showRing</code></td><td>Prints owner (N/D) and state (+, *, .) of every slot; lines 58–60 test "head ≤ i &lt; tail" with wrap-around.</td><td>Produces the ring lines that Figure 1 draws.</td></tr>
+</tbody></table></div>
+<p><b>Listing 1b</b> — <code>ring.cpp</code>: the driver side.</p>
+<pre class="listing" data-src="F1-52/ring.cpp"></pre>
+<p><b>Build command</b> (as run by run_lab.sh): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined ring.cpp -o ring</code>, then <code>./ring</code>.</p>
+<pre class="output" data-run="F1-52/ring"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–19</td><td>start-up loop</td><td>Attaches a buffer to every slot.</td><td>The NIC can only write into buffers the driver provided.</td></tr>
+<tr><td>20</td><td><code>writeTail(slots - 1)</code></td><td>Hands 7 of 8 slots to the NIC.</td><td>The kept-back slot avoids the full/empty ambiguity.</td></tr>
+<tr><td>24</td><td><code>driverNext</code></td><td>The driver's own position.</td><td>The driver does not read the NIC's head; it follows the done flags.</td></tr>
+<tr><td>27–35</td><td>service loop</td><td>While the next slot is done: take the frame (line 29), clear done (31), attach a new buffer (32), advance (33).</td><td>One interrupt handles a batch of frames.</td></tr>
+<tr><td>37</td><td>tail write</td><td>Tail = slot before <code>driverNext</code>.</td><td>Gives the refilled slots back; forgetting it is the forensic bug.</td></tr>
+<tr><td>42–47</td><td>round 1</td><td>5 frames, then service.</td><td>Normal operation.</td></tr>
+<tr><td>49–54</td><td>round 2</td><td>9 frames before service.</td><td>More frames than free slots: 2 missed.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>run.sh</code>: the QEMU inspection and the real ring trace.</p>
+<pre class="listing" data-src="F1-52/run.sh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–23</td><td><code>rec</code></td><td>Writes each step's <code>.log</code>, including the "emulated NICs only" hardware line.</td><td>The R2 and R3 records.</td></tr>
+<tr><td>25</td><td><code>NICS</code></td><td>Three NICs, each on its own user-mode network back end.</td><td>One run shows all three device models.</td></tr>
+<tr><td>29–30</td><td>monitor run</td><td>Starts QEMU, waits 4 s, sends <code>info pci</code> and <code>quit</code> to the monitor.</td><td>Waiting lets the firmware assign the BARs before they are listed.</td></tr>
+<tr><td>33–34</td><td>filter</td><td>Strips terminal escape codes and keeps only the Ethernet controllers' blocks.</td><td>The <code>qemu_nics</code> output.</td></tr>
+<tr><td>36–39</td><td>pci.ids lookups</td><td>Finds the vendor and device names for the three IDs.</td><td>Where "82540EM", "82574L" and "Virtio network device" come from.</td></tr>
+<tr><td>46</td><td><code>EV</code></td><td>The QEMU e1000e trace events enabled.</td><td>Register writes, tail updates, descriptors, interrupts, link.</td></tr>
+<tr><td>48–50</td><td>trace run</td><td>Network boot on an e1000e with a fixed MAC address; frames saved by <code>filter-dump</code>; trace to a file; 20 s limit.</td><td>The real driver activity of Layer 3.</td></tr>
+<tr><td>55</td><td>cut</td><td>Prints the trace up to the fifth transmit descriptor.</td><td>Keeps the part that matches the first DHCP exchange.</td></tr>
+<tr><td>58</td><td>tshark</td><td>Lists the frames of the same run.</td><td>Lets you match descriptor lengths to frame lengths.</td></tr>
+<tr><td>62–64</td><td>result</td><td>Exit code 124 is expected; temporary files removed.</td><td>Why the log's 124 is not a failure.</td></tr>
+</tbody></table></div>
+
+<h2 id="F1-52-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Lena moves the marker when she likes; a driver's tail write is a precise register write.</b> It goes across PCIe to the NIC, and its order relative to the descriptor writes matters (Layer 3). <sup class="src"><a href="#F1-52-src-D5">D5</a></sup></li>
+<li><b>Parcels sent back go back to the sender; missed frames vanish.</b> Ethernet has no automatic resend; a higher protocol (for example TCP) may resend later. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup></li>
+<li><b>The rack has one courier; a modern NIC has many rings.</b> Multiple queues let several CPU cores work at once (Layer 3). <sup class="src"><a href="#F1-52-src-D2">D2</a></sup></li>
+<li><b>The courier reads the shelf number; the NIC reads a physical address.</b> The driver must translate its buffers into addresses the device can use, possibly through an IOMMU. <sup class="src"><a href="#F1-52-src-D4">D4</a></sup></li>
+<li><b>The F1-50 "doorbell" and this chapter's "bell" differ.</b> In NVMe the doorbell is the host telling the device; here the bell is the device's interrupt telling the host. The NIC's equivalent of an NVMe doorbell is the tail register write. (Owner decision recorded in NOTES.md.)</li>
+</ul>
+
+<h2 id="F1-52-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> receive works for a few seconds, then nothing; a "missed" or "no buffer" counter rises. <b>Cause:</b> tail never advanced, or buffers not refilled. <b>How to find it:</b> compare head and tail registers (forensic lab). <b>Fix:</b> write the tail after refilling.</li>
+<li><b>Symptom:</b> the NIC receives nothing at all from the start. <b>Cause:</b> tail written as 0 (equal to head) or never written, ring length 0, or receive not enabled. <b>How to find it:</b> trace or read back the ring registers. <b>Fix:</b> set base, length, then tail, then enable.</li>
+<li><b>Symptom:</b> corrupted or stale data, only sometimes. <b>Cause:</b> missing barrier or DMA synchronisation between the CPU and the device. <b>Fix:</b> use the kernel's DMA API and barriers (unverified box).</li>
+<li><b>Symptom:</b> off-by-one, ring "full" while empty. <b>Cause:</b> giving all N slots (tail = head). <b>Fix:</b> keep one slot back.</li>
+<li><b>Symptom:</b> frame lengths 4 bytes longer than tshark shows. <b>Cause:</b> the NIC was configured to keep the FCS (<a href="#F1-51">F1-51</a>). <b>Fix:</b> check the receive control settings.</li>
+</ul>
+
+<div class="co transition" id="F1-52-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F1-51">F1-51</a> (frames, FCS, MAC and PHY) and <a href="#F1-50">F1-50</a> (NVMe queues, doorbells, phase). <b>What carries over:</b> rings in host memory, a producer and a consumer, a register write that hands over work, DMA by the device, and QEMU traces as evidence. <sup class="src"><a href="#F1-52-src-R3">R3</a></sup> <b>What changes:</b> work arrives unasked from the network, so the driver must prepare receive buffers in advance and frames are lost when it falls behind; status is written back into the same descriptor; interrupts must be batched to keep up. <sup class="src"><a href="#F1-52-src-D1">D1</a></sup> <sup class="src"><a href="#F1-52-src-D4">D4</a></sup> <b>What comes next:</b> <a href="#F1-53">F1-53</a> asks what happens when the NIC writes not only into buffers the receiving driver prepared, but directly into an application's memory on another machine: RDMA.</p></div>
+
+<h2 id="F1-52-check">Check yourself</h2>
+<ol>
+<li>What two things does a receive descriptor tell the NIC, and what does the NIC write back?</li>
+<li>Head = 6, tail = 2 on an 8-slot ring. Which slots may the NIC use?</li>
+<li>Why does the driver write tail = 7, not 8, at start-up?</li>
+<li>True or false: when the receive ring is full, the NIC overwrites the oldest frame.</li>
+<li>In the real trace, what value did the ROM write to 0x2818 first, and what after the first received frame?</li>
+<li>A transmit descriptor word printed by QEMU ends in <code>b00002a</code>. Which frame in tshark's list does it belong to, and why?</li>
+<li>Explain in your own words why NIC rings need a kept-back slot but NVMe completion queues use a phase bit.</li>
+<li>Predict, then run: change Listing 1 line 49 to 6 frames. Will any be missed? What tail does interrupt 2 write?</li>
+<li>Apply it to a new case: a driver handles at most 64 frames per interrupt, frames arrive at 1 million per second, and the ring has 256 slots. If interrupts are serviced only every 0.5 ms, what happens?</li>
+</ol>
+
+<h2 id="F1-52-lab">Lab</h2>
+<p><b>Goal.</b> Watch a toy ring and a real driver's ring at work: list QEMU's three NIC models, trace iPXE driving an emulated e1000e, and match register writes, descriptors and frames.</p>
+<p><b>Hardware and software needed.</b> g++ (<code>13.3.0</code>), QEMU (<code>8.2.2</code>, TCG, no KVM), tshark (<code>4.2.2</code>). Folder <code>university/labs/F1-52</code>; run <code>university/labs/run_lab.sh university/labs/F1-52</code> (about 30 seconds).</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In <code>ring.out</code>, redraw each ring line as Figure 1 does.</li>
+<li>In <code>qemu_nics.out</code>, list each NIC's ID, name and BARs.</li>
+<li>In <code>ring_trace.out</code>, mark the ring set-up writes, every <code>RDT</code> change and every <code>e1000e_tx_descr</code>; convert the low 16 bits of each transmit word to decimal.</li>
+<li>Match those lengths with the tshark list at the end of the same file.</li>
+<li>Copy <code>run.sh</code>, add <code>-trace e1000e_rx_desc_len</code> (or another event from <code>qemu-system-x86_64 -trace help | grep e1000e</code>) and see what new information appears.</li>
+<li>Optional, untested in this build: on a Linux computer with a physical NIC, run <code>ethtool -g &lt;interface&gt;</code> for its ring sizes and <code>ethtool -S &lt;interface&gt;</code> for its counters; find a "missed" or "no buffer" counter. Write down your own values.</li>
+</ol>
+<p><b>Expected observations</b> (real outputs; the DHCP transaction ID and timestamps change between runs):</p>
+<pre class="output" data-run="F1-52/qemu_nics"></pre>
+<pre class="output" data-run="F1-52/ring_trace"></pre>
+<p><b>Verification.</b> Transmit lengths 429, 70, 429, 441, 42 match tshark's frames 1, 3, 5, 7, 9; four receive descriptors at 16-byte steps for frames 2, 4, 6, 8; RDT rises by one per received frame.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>No trace lines → the trace events were renamed in your QEMU version; list them with <code>-trace help</code>.</li>
+<li>BARs show as unassigned → the monitor was asked too early (before the firmware ran); keep the 4-second wait.</li>
+<li>The trace is cut too early → the awk cut stops after the fifth transmit descriptor; raise the number.</li>
+</ul>
+<p><b>Extension.</b> Repeat the trace with <code>-device e1000</code> (its trace events start with <code>e1000x_</code> or <code>e1000_</code>; list them) and compare the register offsets.</p>
+
+<h2 id="F1-52-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "The network dies after a few seconds." Amara has rewritten the receive path of a small embedded network driver to save memory. After boot the board answers pings for two seconds, then goes silent; rebooting brings the same two seconds back. The NIC and link are fine, and the old driver works. The evidence comes from the university's toy model (R4): a monitoring script printed the counters once per second, then dumped the ring registers and the driver's state. <sup class="src"><a href="#F1-52-src-R4">R4</a></sup></p>
+<p><b>Evidence pack.</b></p>
+<pre class="output" data-run="F1-52/rx_stall"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: how many frames are delivered per second, and when does it stop? What does the missed counter do?</li>
+<li>Hypotheses: link failure, interrupts stopped, driver stopped refilling buffers, tail not written. Which line of evidence tests each?</li>
+<li>Root cause: what do head = tail = 7 and "buffers attached in all 8 slots" together mean?</li>
+<li>Fix: which single step is missing? Where would you add it?</li>
+<li>Prevention: what test or assertion would have caught this before release?</li>
+</ol>
+<p><b>Method hints.</b> Three frames arrive every second. Count how many slots the NIC had at the start, and compare with the delivered total when it stops.</p>
+
+<h2 id="F1-52-project">Mini-project</h2>
+<p><b>The network-packet path, part 2.</b> Extend your part-1 diagram (<a href="#F1-51">F1-51</a>) with the memory side: driver, ring in memory, descriptor fetch, frame DMA, status write-back, interrupt, tail write. Annotate with the real addresses and register values from your own <code>ring_trace.out</code>, and mark which names are verified (RDT, printed by QEMU) and which are not.</p>
+<p><b>Rubric.</b> All steps of Figure 2 for both receive and transmit (3). Real values from your own run (2). Ownership rule (head … tail−1) shown (2). Every annotation tagged; unverified names marked (3).</p>
+
+<h2 id="F1-52-summary">Summary</h2>
+<ul>
+<li>A NIC moves frames by DMA through descriptor rings in host memory; separate rings for receive and transmit.</li>
+<li>The NIC owns slots from head up to tail−1; the driver hands slots over by writing the tail register.</li>
+<li>If head reaches tail, the NIC drops frames and counts them; nothing reaches memory.</li>
+<li>One slot stays with the driver so that full and empty differ.</li>
+<li>The real e1000e trace showed ring set-up, RDT 8 → 12, 16-byte descriptors and transmit lengths equal to tshark's frame lengths.</li>
+<li>NVMe and virtio solve the same handover with different completion and full/empty rules.</li>
+<li>Barriers and DMA mapping keep the CPU's and the NIC's views of memory consistent.</li>
+</ul>
+
+<h2 id="F1-52-sources">Sources</h2>
+<ol>
+<li id="F1-52-src-D1">Intel, "PCI/PCI-X Family of Gigabit Ethernet Controllers Software Developer's Manual" (8254x family, the e1000; tier 1; named in the curriculum's C9 milestone): receive and transmit descriptor rings, head and tail registers, interrupt causes, missed-packet counting. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F1-52-src-D2">Intel, "82574 Family GbE Controller Datasheet" (the device QEMU's e1000e models; tier 1): register map, descriptor formats, multiple queues and MSI-X. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-52-src-D3">OASIS, "Virtual I/O Device (VIRTIO)" specification (tier 1): virtqueues and the network device. <i>Title only — not opened during this build; version to be recorded (dossier gate G1 open).</i></li>
+<li id="F1-52-src-D4">Jonathan Corbet, Alessandro Rubini, Greg Kroah-Hartman, "Linux Device Drivers", 3rd edition (tier 3): the chapters on DMA and on network drivers. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-52-src-D5">The Linux kernel documentation and source (tier 4: DMA API, memory barriers, NAPI, <code>drivers/net/ethernet/intel/e1000e</code>). <i>Title only — not opened during this build; kernel version to be recorded (dossier gate G1 open).</i></li>
+<li id="F1-52-src-D6">Systems Curriculum (this project), section 6 catalog rows "PCIe" and "Ethernet MAC and PHY", and milestone C9 (e1000 driver) — used as a map (AH-4).</li>
+<li id="F1-52-src-R1">R1 — lab run of Listing 1 (<code>university/labs/F1-52/ring.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0. Toy model.</li>
+<li id="F1-52-src-R2">R2 — QEMU 8.2.2 monitor <code>info pci</code> for e1000, e1000e and virtio-net, with pci.ids lookups (<code>qemu_nics.log</code>), exit code 0. Emulated devices; untested on a physical NIC.</li>
+<li id="F1-52-src-R3">R3 — QEMU 8.2.2 e1000e trace events while the iPXE boot ROM did DHCP, with tshark 4.2.2's list of the same run's frames (<code>ring_trace.log</code>), exit code 124 (time limit, as designed). Emulated device; untested on a physical NIC.</li>
+<li id="F1-52-src-R4">R4 — run of <code>rx_stall.cpp</code> (<code>rx_stall.log</code>), exit code 0. Toy model, evidence for the forensic lab.</li>
+</ol>
+
+<h2 id="F1-52-glossary">Glossary links</h2>
+<p><a href="#gl-nic-network-interface-controller">NIC</a> · <a href="#gl-descriptor">Descriptor</a> · <a href="#gl-descriptor-ring">Descriptor ring</a> · <a href="#gl-head-and-tail-of-a-nic-ring">Head and tail</a> · <a href="#gl-dma-direct-memory-access">DMA</a> · <a href="#gl-interrupt-from-a-nic">Interrupt (from a NIC)</a> · <a href="#gl-missed-packet-no-descriptor">Missed packet</a> · <a href="#gl-virtqueue">virtqueue</a></p>
+
+<h2 id="F1-52-next">Next chapter</h2>
+<p>Next: <a href="#F1-53">F1-53 RDMA-capable NICs (preview)</a>. Previous: <a href="#F1-51">F1-51 Ethernet: MAC and PHY</a>. Back to the course: <a href="#HW205">HW205</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackC">Track C</a> (C9, the e1000 driver), <a href="../SYSTEMS_CURRICULUM.html#catalog">hardware catalog</a>.</p>
+
+<h2 id="F1-52-answers">Answers to Check yourself</h2>
+<ol>
+<li>Where the buffer is (its physical address) and, implicitly by its position, that it may be used; the NIC writes back the length and status (for example "done").</li>
+<li>Slots 6, 7, 0, 1 (head up to tail−1, wrapping).</li>
+<li>With 8 slots, tail = 8 mod 8 = 0 = head would look like "NIC owns nothing"; keeping one slot back keeps full and empty different.</li>
+<li>False: it drops the new frame and counts it as missed; frames already in the ring stay until the driver takes them.</li>
+<li>0 at set-up, then 8 (8 descriptors handed over); after the first received frame, 9.</li>
+<li>0x2a = 42 bytes: tshark's frame 9, the 42-byte ARP announcement.</li>
+<li>Good answers say: the NIC writes status into the same descriptor, so the driver's own position and the done flags tell it what is new, and the only shared counter (tail) must not become equal to head when full; NVMe completions go to a separate queue that the device fills without a driver-written limit per entry, so a bit that flips each lap tells new entries from old ones.</li>
+<li>No frames missed: the NIC owns 7 slots (5, 6, 7, 0, 1, 2, 3) and 6 arrive. The driver handles 6 (slots 5 to 2), next = 3, tail = 2. Run it to check.</li>
+<li>In each 0.5 ms, 500 frames arrive. Each interrupt frees at most 64 slots, so in steady state at most 64 frames per interval are delivered (128,000 per second) and about 436 of every 500 are missed: the ring size does not help once it is full. The driver must run more often, handle more frames per run, or spread the load over more queues and cores.</li>
+</ol>
+<h3 id="F1-52-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> 3 frames delivered per second for 2 seconds (3, 6), then only 1 more (7) and never again; missed rises 2, 5, 8, 11 — every frame after the seventh is dropped by the NIC.</p>
+<p><b>Root cause.</b> The NIC was given 7 slots at start-up (tail = 7). Head reached 7 = tail after 7 frames; the tail is still 7 at every sample. The driver did refill every slot ("buffers attached in all 8 slots") but never wrote the tail register again, so the NIC never learned the slots were free. Line 31 of <code>rx_stall.cpp</code> marks the missing write:</p>
+<pre class="listing" data-src="F1-52/rx_stall.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–16</td><td>start-up</td><td>Buffers in all slots; tail = 7.</td><td>Gives the NIC 7 slots, once.</td></tr>
+<tr><td>22–24</td><td>arrivals</td><td>Three frames per simulated second.</td><td>Produces the rate seen in the evidence.</td></tr>
+<tr><td>25–32</td><td>service loop</td><td>Takes each done frame and attaches a buffer.</td><td>Correct, except for the missing tail write at line 31.</td></tr>
+<tr><td>33–36</td><td>printing</td><td>Counters per second, register dump, driver state.</td><td>The evidence pack.</td></tr>
+</tbody></table></div>
+<p><b>Ruling out the alternatives.</b> Link failure: the missed counter grows, so the NIC still receives frames from the wire. Interrupts stopped: the driver's next slot (7) equals head; there is nothing new for it to find. Buffers not refilled: the dump says all slots have buffers.</p>
+<p><b>Fix.</b> After the service loop, write the tail: <code>nic.writeTail((driverNext + slots - 1) % slots);</code> as <code>ring.cpp</code> line 37 does. Verify that delivered keeps rising by 3 per second and missed stays 0.</p>
+<p><b>Prevention.</b> A test that receives more frames than the ring size (here, more than 7) must be part of the driver's test suite; and a debug check that warns when the missed counter rises while the driver holds refilled slots.</p>

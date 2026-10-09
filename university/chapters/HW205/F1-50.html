@@ -1,0 +1,313 @@
+<!--meta
+id: F1-50
+title: NVMe and its queues
+course: HW205
+level: L3
+prereqs: F1-49; HW204 (F1-41, F1-42, F1-44, F1-45)
+time: 6–9 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 emulates the NVMe controller; g++ and nasm). A physical NVMe SSD is not needed and is not touched.
+maps: Curriculum C6 (NVMe driver: queue mechanics, phase tag, doorbells); catalog (section 6) NVMe row; exam P of HW205 (explain an NVMe submission/completion trace)
+analogy: F1 — the restaurant building and its kitchen (storage = the warehouse across town)
+-->
+
+<h2 id="F1-50-hook">Story hook</h2>
+<p>The restaurant's office has two boards on the wall. On the first, the order board, the cooks write numbered requests for the warehouse in the next free row: "row 3: fetch box 5". When they have written a few, they ring a bell that is wired to the warehouse's counter, and the bell's display shows the row number after the last new request. The warehouse clerk comes, reads the new rows, and goes to work. When a request is done, the clerk writes a line on the second board, the done board: "request 7 finished, all good". The cooks glance at the done board whenever they have a moment, and ring a second bell to say how far they have read, so the clerk knows which rows may be reused.</p>
+<p>There is one clever trick. The boards are circular: after the last row, writing continues at the top. How can a cook tell a fresh "done" line from yesterday's old line in the same row? The clerk changes ink colour every time round: blue on the first pass, red on the second, blue again on the third. The cook remembers which colour is "new" this time round. That is exactly how an NVMe solid-state drive and its driver talk, and in this chapter you will read a real recording of that conversation.</p>
+
+<h2 id="F1-50-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the NVMe model: submission and completion queues in host memory, doorbell registers in the controller, DMA of commands and data, and completion signalling.</li>
+<li><b>Simulate</b> a queue pair with head and tail indices, the "queue full" rule and the phase tag, and predict every value.</li>
+<li><b>Read</b> a real NVMe trace from QEMU line by line: controller reset and enable, admin queue set-up, Identify, creating an I/O queue pair, one Read.</li>
+<li><b>Inspect</b> an emulated NVMe controller in QEMU (PCI IDs, class code, BAR) and match it to the pci.ids database.</li>
+<li><b>Diagnose</b> a driver that stops seeing completions after the completion queue wraps.</li>
+</ul>
+
+<div class="co jargon" id="F1-50-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>NVMe (NVM Express)</dt><dd><b>Simple words:</b> the language a computer uses to talk to fast SSDs over PCI Express. <b>Analogy:</b> the restaurant's order board and done board system with the warehouse. <b>Precise:</b> a family of specifications by NVM Express, Inc. defining a register interface, queue-based command submission and completion, an admin command set and I/O command sets for non-volatile memory controllers. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-D3">D3</a></sup></dd>
+<dt>Submission queue (SQ)</dt><dd><b>Simple words:</b> a ring of command slots in the computer's memory, filled by the driver. <b>Analogy:</b> the circular order board. <b>Precise:</b> a circular buffer of fixed-size command entries in host memory; the host writes entries at the tail, the controller fetches them from the head. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup></dd>
+<dt>Completion queue (CQ)</dt><dd><b>Simple words:</b> a ring of "done" slots in the computer's memory, filled by the device. <b>Analogy:</b> the circular done board. <b>Precise:</b> a circular buffer in host memory into which the controller posts completion entries (command identifier, status, SQ head pointer, phase tag); one CQ may serve several SQs. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup></dd>
+<dt>Doorbell register</dt><dd><b>Simple words:</b> a device register the driver writes to say "there is new work" or "I have read up to here". <b>Analogy:</b> the bell wired to the warehouse counter, with a number display. Not the same as the faculty's "doorbell" analogy for interrupts, which ring the other way (device to CPU, <a href="#F1-42">F1-42</a>). <b>Precise:</b> a memory-mapped controller register holding a queue's new SQ tail or CQ head index. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-D2">D2</a></sup> <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></dd>
+<dt>Phase tag</dt><dd><b>Simple words:</b> one bit in each completion that flips every time the device goes round the ring. <b>Analogy:</b> the clerk's ink colour, changed each lap of the board. <b>Precise:</b> a bit the controller writes in each completion entry, inverted on each pass through the CQ, so the host can tell new entries from stale ones without clearing memory. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-R1">R1</a></sup></dd>
+<dt>Admin queue and I/O queues</dt><dd><b>Simple words:</b> one special queue pair for managing the drive, and other queue pairs for reading and writing data. <b>Analogy:</b> the manager's board and the cooks' boards. <b>Precise:</b> queue pair 0 carries admin commands (Identify, Create I/O Completion Queue, Create I/O Submission Queue…); I/O queue pairs, created through the admin queue, carry I/O commands such as Read and Write. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></dd>
+<dt>Namespace</dt><dd><b>Simple words:</b> one numbered "disk" inside the NVMe drive. <b>Analogy:</b> one named storage area of the warehouse. <b>Precise:</b> a quantity of non-volatile memory addressed by logical blocks, identified by a namespace ID (nsid); I/O commands name the nsid they act on. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-D3">D3</a></sup></dd>
+<dt>PRP (physical region page) entry</dt><dd><b>Simple words:</b> the memory address inside a command that tells the drive where to put or take the data. <b>Analogy:</b> the shelf number written on the order. <b>Precise:</b> a pointer to a host physical memory page used to describe a command's data buffer; QEMU's trace prints it as <code>prp1</code> and <code>prp2</code>. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></dd>
+<dt>Command identifier (cid)</dt><dd><b>Simple words:</b> the number the driver gives each command so it can match the answer. <b>Analogy:</b> the request number on the order. <b>Precise:</b> a value chosen by the host in each submission entry and returned in the matching completion entry. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></dd>
+</dl></div>
+
+<h2 id="F1-50-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the four places where NVMe happens: the queues and the data buffer live in host memory; the doorbells live in the controller's register window (its BAR, <a href="#F1-45">F1-45</a>); commands, data and completions cross the PCI Express link by DMA (<a href="#F1-44">F1-44</a>); and the controller may raise an interrupt (<a href="#F1-42">F1-42</a>). The numbers are those of the real trace in the lab.</p>
+<figure id="F1-50-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 420" role="img" aria-labelledby="F1-50-f1t F1-50-f1d">
+<title id="F1-50-f1t">Figure 1: an NVMe queue pair, the doorbells and the DMA traffic of one read</title>
+<desc id="F1-50-f1d">Left half: host memory, containing the I/O submission queue 1 at address 0x7fd8000 with a tail index, the I/O completion queue 1 at 0x7fdc000 with a head index, and the data buffer at 0x7c00. Above it the CPU running the driver. Right half: the NVMe controller with a register window (BAR0) holding the controller configuration register at offset 0x14, the admin queue registers at 0x24 to 0x34, and doorbells: SQ 0 tail at 0x1000, CQ 0 head at 0x1004, SQ 1 tail at 0x1008, CQ 1 head at 0x100c. Numbered arrows: 1, the driver writes a command into the SQ; 2, the driver writes the new tail to the SQ 1 tail doorbell over PCI Express; 3, the controller fetches the command by DMA; 4, the controller writes the 512 bytes of LBA 0 to the buffer at 0x7c00 by DMA; 5, the controller writes a completion entry into the CQ by DMA; 6, an interrupt, optional and masked in this trace; 7, the driver reads the completion and writes the new head to the CQ 1 head doorbell.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="420"/>
+<rect class="sv-b1" x="20" y="14" width="360" height="40" rx="6"/><text class="sv-tb" x="34" y="39">CPU running the driver (SeaBIOS here)</text>
+<rect class="sv-box" x="20" y="74" width="360" height="330" rx="6"/><text class="sv-tb" x="34" y="96">host memory (DRAM)</text>
+<rect class="sv-b3" x="40" y="110" width="320" height="70" rx="4"/><text class="sv-t" x="52" y="130">I/O submission queue 1 @ 0x7fd8000</text>
+<rect class="sv-box" x="52" y="140" width="40" height="28"/><rect class="sv-b6" x="92" y="140" width="40" height="28"/><rect class="sv-box" x="132" y="140" width="40" height="28"/><rect class="sv-box" x="172" y="140" width="40" height="28"/>
+<text class="sv-ts" x="100" y="159">cmd</text><text class="sv-ts" x="222" y="159">… tail index</text>
+<rect class="sv-b4" x="40" y="196" width="320" height="70" rx="4"/><text class="sv-t" x="52" y="216">I/O completion queue 1 @ 0x7fdc000</text>
+<rect class="sv-b6" x="52" y="226" width="40" height="28"/><rect class="sv-box" x="92" y="226" width="40" height="28"/><rect class="sv-box" x="132" y="226" width="40" height="28"/><rect class="sv-box" x="172" y="226" width="40" height="28"/>
+<text class="sv-ts" x="56" y="245">done</text><text class="sv-ts" x="222" y="245">… head index</text>
+<rect class="sv-b5" x="40" y="284" width="320" height="50" rx="4"/><text class="sv-t" x="52" y="306">data buffer @ 0x7c00 (512 bytes)</text><text class="sv-ts" x="52" y="324">receives LBA 0 (our boot sector)</text>
+<text class="sv-ts" x="40" y="360">admin queues: SQ 0 @ 0x7fdd000, CQ 0 @ 0x7fde000</text>
+<rect class="sv-b2" x="560" y="74" width="300" height="330" rx="6"/><text class="sv-tb" x="574" y="96">NVMe controller (QEMU 1b36:0010)</text>
+<rect class="sv-box" x="576" y="110" width="268" height="168" rx="4"/><text class="sv-t" x="588" y="130">BAR0 register window</text>
+<text class="sv-ts" x="588" y="150">0x14 controller configuration</text>
+<text class="sv-ts" x="588" y="168">0x24 admin queue attributes</text>
+<text class="sv-ts" x="588" y="186">0x28 / 0x30 admin SQ / CQ address</text>
+<text class="sv-ts" x="588" y="208">0x1000 SQ 0 tail doorbell</text>
+<text class="sv-ts" x="588" y="226">0x1004 CQ 0 head doorbell</text>
+<text class="sv-ts" x="588" y="244">0x1008 SQ 1 tail doorbell</text>
+<text class="sv-ts" x="588" y="262">0x100c CQ 1 head doorbell</text>
+<rect class="sv-b7" x="576" y="296" width="268" height="90" rx="4"/><text class="sv-t" x="588" y="318">command processor + flash (in QEMU:</text><text class="sv-t" x="588" y="336">a disk image file)</text>
+<line class="sv-dash" x1="470" y1="60" x2="470" y2="410"/><text class="sv-ts" x="420" y="72">PCI Express link</text>
+<line class="sv-line" x1="200" y1="54" x2="112" y2="140"/><polygon class="sv-head" points="112,140 112,130 120,135"/><text class="sv-ts" x="160" y="100">1 write command</text>
+<line class="sv-line2" x1="380" y1="34" x2="576" y2="240"/><polygon class="sv-head" points="576,240 566,238 572,230"/><text class="sv-ts" x="400" y="134">2 doorbell: tail = 1</text>
+<line class="sv-line" x1="576" y1="300" x2="212" y2="160"/><polygon class="sv-head" points="212,160 222,159 219,167"/><text class="sv-ts" x="400" y="190">3 fetch command (DMA)</text>
+<line class="sv-line" x1="576" y1="330" x2="360" y2="310"/><polygon class="sv-head" points="360,310 369,306 369,315"/><text class="sv-ts" x="400" y="300">4 data (DMA)</text>
+<line class="sv-line" x1="576" y1="350" x2="212" y2="244"/><polygon class="sv-head" points="212,244 222,243 219,251"/><text class="sv-ts" x="390" y="270">5 completion (DMA)</text>
+<line class="sv-dash" x1="576" y1="380" x2="380" y2="50"/><text class="sv-ts" x="478" y="392">6 interrupt (masked here)</text>
+<text class="sv-ts" x="20" y="414">7 the driver reads the completion, then writes CQ 1 head doorbell = 1 (offset 0x100c)</text>
+</svg></div><figcaption><b>Figure 1.</b> Where an NVMe read happens, with the addresses and register offsets QEMU printed in the lab's trace (R3). Solid arrows are DMA transfers by the controller or writes by the CPU; the thick arrow is a doorbell write (a memory-mapped register write over PCI Express); the dashed arrow is the optional interrupt. Not to scale. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-D2">D2</a></sup> <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></figcaption></figure>
+
+<p>Figure 2 shows the trick that makes the completion queue work without anyone erasing it: the phase tag. The values are the end state printed by Listing 1.</p>
+<figure id="F1-50-fig2"><div class="svgbox">
+<svg viewBox="0 0 820 250" role="img" aria-labelledby="F1-50-f2t F1-50-f2d">
+<title id="F1-50-f2t">Figure 2: a four-slot completion queue in its first and second pass</title>
+<desc id="F1-50-f2d">Two rows of four slots. Row "after pass 1": slots 0, 1 and 2 hold cid 1, 2 and 3 with phase 1, slot 3 is still zero with phase 0; the host expects phase 1 and stops at slot 3. Row "during pass 2": slot 3 holds cid 4 with phase 1 (end of pass 1), slots 0 and 1 hold cid 5 and 6 with phase 0 (pass 2), slot 2 still holds the stale cid 3 with phase 1; the host, now expecting phase 0, consumes slots 0 and 1 and stops at slot 2 because its phase is 1, the old colour.</desc>
+<rect class="sv-bg" x="0" y="0" width="820" height="250"/>
+<text class="sv-tb" x="20" y="34">after batch 1</text>
+<rect class="sv-b3" x="170" y="14" width="120" height="40"/><text class="sv-t" x="180" y="38">0: cid 1, ph 1</text>
+<rect class="sv-b3" x="290" y="14" width="120" height="40"/><text class="sv-t" x="300" y="38">1: cid 2, ph 1</text>
+<rect class="sv-b3" x="410" y="14" width="120" height="40"/><text class="sv-t" x="420" y="38">2: cid 3, ph 1</text>
+<rect class="sv-box" x="530" y="14" width="120" height="40"/><text class="sv-t" x="540" y="38">3: empty, ph 0</text>
+<text class="sv-ts" x="670" y="30">host expects 1:</text><text class="sv-ts" x="670" y="46">stops at slot 3</text>
+<text class="sv-tb" x="20" y="134">after batch 2</text>
+<rect class="sv-b6" x="170" y="114" width="120" height="40"/><text class="sv-t" x="180" y="138">0: cid 5, ph 0</text>
+<rect class="sv-b6" x="290" y="114" width="120" height="40"/><text class="sv-t" x="300" y="138">1: cid 6, ph 0</text>
+<rect class="sv-b8" x="410" y="114" width="120" height="40"/><text class="sv-t" x="420" y="138">2: cid 3, ph 1</text>
+<rect class="sv-b3" x="530" y="114" width="120" height="40"/><text class="sv-t" x="540" y="138">3: cid 4, ph 1</text>
+<text class="sv-ts" x="670" y="126">host read slot 3 (ph 1),</text><text class="sv-ts" x="670" y="142">wrapped, now expects 0,</text><text class="sv-ts" x="670" y="158">read 0 and 1, stops at 2</text>
+<text class="sv-ts" x="420" y="174">stale: old colour</text>
+<line class="sv-dash" x1="650" y1="96" x2="170" y2="96"/><text class="sv-ts" x="300" y="90">controller wraps from slot 3 to slot 0 and inverts the phase it writes</text>
+<text class="sv-ts" x="20" y="214">ph = phase tag. Pass 1 entries carry 1 (memory started at 0); pass 2 entries carry 0; pass 3 would carry 1 again.</text>
+<text class="sv-ts" x="20" y="234">Nobody clears old entries: the expected phase alone separates new from stale.</text>
+</svg></div><figcaption><b>Figure 2.</b> The phase tag in a four-slot completion queue, using the end state printed by Listing 1 (R1): <code>0:5/0 1:6/0 2:3/1 3:4/1</code>. The host flips the phase it expects each time its head wraps; slot 2's old entry is ignored because it has the old phase. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-R1">R1</a></sup></figcaption></figure>
+
+<h2 id="F1-50-layer1">Layer 1 — the kid explanation</h2>
+<p>An SSD can do many jobs at once, so the computer does not ask one question and wait. It writes a list of jobs in its own memory and rings a bell on the drive. The drive fetches the list, does the jobs, and writes "done" notes into a second list, also in the computer's memory. The computer reads the done notes when it can.</p>
+<p>Both lists are circles: after the last place, you start again at the first. To tell new notes from old ones, the drive flips a little marker each time it goes round. The computer just remembers which marker means "new" this lap.</p>
+
+<h2 id="F1-50-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F1-50-l2-model">The model: rings in host memory, doorbells in the device</h3>
+<p>An NVMe controller is a PCI Express function (<a href="#F1-45">F1-45</a>) whose registers are memory-mapped through a BAR. QEMU's emulated controller in the lab appears as PCI device <code>1b36:0010</code> with one 64-bit memory BAR, and the pci.ids database names it "QEMU NVM Express Controller"; its class code 0x0108 with programming interface 0x02 is listed there as "Non-Volatile memory controller / NVM Express". <sup class="src"><a href="#F1-50-src-R2">R2</a></sup> (QEMU's <code>info pci</code> prints the class as 0264, its decimal form; <code>info qtree</code> prints 0108.) <sup class="src"><a href="#F1-50-src-R2">R2</a></sup></p>
+<p>Work is exchanged through queue pairs. The host allocates each submission queue and completion queue as a ring of fixed-size entries in its own memory. To submit, the driver writes a command entry at the SQ tail, advances the tail (wrapping to 0 after the last slot) and writes the new tail value to that SQ's tail doorbell register. The controller fetches entries between its head and the new tail by DMA, executes them, transfers data by DMA to or from the buffers the commands describe, and writes a completion entry at the CQ tail. The driver consumes completions from the CQ head and writes the new head to the CQ's head doorbell, which tells the controller those slots may be reused. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-D2">D2</a></sup> Each completion carries the command identifier, a status and the controller's current SQ head, which is how the host learns that SQ slots are free again. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup></p>
+<p>A ring with head and tail indices cannot use all its slots: if the tail were allowed to catch up with the head, "full" and "empty" would look the same (head = tail). So a ring of n slots holds at most n − 1 outstanding entries. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> Listing 1 shows it: with 4 slots, the fourth command is refused ("SQ full, cid 4 must wait"). <sup class="src"><a href="#F1-50-src-R1">R1</a></sup></p>
+
+<h3 id="F1-50-l2-phase">The phase tag</h3>
+<p>The host must know which CQ entries are new. Clearing each entry after reading it would cost a memory write and invite races. Instead, the controller writes a phase tag bit in every completion, and inverts the value it writes each time it wraps around the CQ. The host starts expecting the value that the first pass writes, consumes entries while their phase matches, and inverts its expectation each time its own head wraps. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> In Listing 1 (Figure 2), the first pass writes phase 1 into zeroed memory, the second pass writes phase 0, and after the second batch the host stops correctly at slot 2, whose stale entry still has phase 1. <sup class="src"><a href="#F1-50-src-R1">R1</a></sup></p>
+
+<h3 id="F1-50-l2-admin">Admin queue first, I/O queues next</h3>
+<p>Only the admin queue pair is configured through registers: the driver writes its sizes and the physical addresses of the admin SQ and CQ, then enables the controller. Every I/O queue pair is created afterwards with admin commands, completion queue first because a submission queue names the CQ it reports to. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> The real trace in the lab shows exactly this order (Create CQ with cqid 1, then Create SQ with sqid 1 and cqid 1). <sup class="src"><a href="#F1-50-src-R3">R3</a></sup> Drivers that care about performance create several I/O queue pairs, often one per CPU, each with its own interrupt vector, so that CPUs never share a queue lock (curriculum milestone C6: "one I/O queue per CPU"). <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-D5">D5</a></sup> QEMU's model lists its own limits as properties: <code>max_ioqpairs = 64</code> and <code>msix_qsize = 65</code> in the lab's run. <sup class="src"><a href="#F1-50-src-R2">R2</a></sup></p>
+
+<h2 id="F1-50-layer3">Layer 3 — the engineer's depth</h2>
+<p>Analogy first, briefly: the order board, the bell, the done board and the ink colours map to SQ, doorbell, CQ and phase tag. Now the trace. The lab boots QEMU's firmware (SeaBIOS 1.16.3, as it printed itself) with one NVMe disk whose LBA 0 holds a 512-byte boot sector. SeaBIOS's NVMe driver initialises the controller and reads LBA 0; QEMU's <code>pci_nvme_*</code> trace events record every register access and command. <sup class="src"><a href="#F1-50-src-D4">D4</a></sup> <sup class="src"><a href="#F1-50-src-R3">R3</a></sup> Reading it line by line is HW205's practical exam skill.</p>
+
+<h3 id="F1-50-l3-init">Controller reset and enable</h3>
+<ol>
+<li><code>pci_nvme_mmio_read addr 0x8</code>, <code>0x0</code>, <code>0x4</code>: the driver reads registers at the start of the BAR. QEMU does not name them in these lines; the unverified box gives their names to check.</li>
+<li><code>mmio_write addr 0x14 data 0x0</code>, which QEMU labels "config controller config=0x0": the driver writes 0 to the controller configuration register, disabling the controller before setting it up. Then it reads offset <code>0x1c</code> (the status register, according to the unverified box below), as a driver does when it waits for the controller to report that it has stopped. <sup class="src"><a href="#F1-50-src-R3">R3</a></sup> <sup class="src"><a href="#F1-50-src-D1">D1</a></sup></li>
+<li><code>addr 0x24 data 0xff003f</code>, labelled "admin queue attributes": two size fields, 0x3f = 63 in the low part and 0xff = 255 in the high part. <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></li>
+<li><code>addr 0x28</code> / <code>0x2c</code>: the admin submission queue address 0x7fdd000 (low and high halves); <code>0x30</code> / <code>0x34</code>: the admin completion queue address 0x7fde000. Both end in 000 hexadecimal: page-aligned buffers. <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></li>
+<li><code>addr 0x14 data 0x460001</code>, then "setting controller enable bit succeeded": bit 0 (the final 1) enables the controller; the 0x46 in the upper bits sets entry sizes (see the unverified box). <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></li>
+</ol>
+<p>Are the size fields "number of slots minus one"? The trace answers it without any document. Listing 2 found that the admin SQ tail wrapped from 63 to 0 (so it has 64 slots) and the admin CQ head wrapped from 255 to 0 (256 slots): the register held 63 and 255, one less than the slot counts. <sup class="src"><a href="#F1-50-src-R4">R4</a></sup> The NVMe documents call such values "0's based"; that term must be confirmed in D1.</p>
+
+<h3 id="F1-50-l3-first">The first admin command</h3>
+<pre class="output" data-run="F1-50/nvme_trace"></pre>
+<p>In the excerpt above, after enabling: <code>mmio_write addr 0x1000 data 0x1</code> = "doorbell_sq sqid 0 new_tail 1". The driver had written one command into admin SQ slot 0 and told the controller the tail is now 1. The controller immediately fetched it: <code>admin_cmd cid 0 sqid 0 opc 0x6 'NVME_ADM_CMD_IDENTIFY'</code> with <code>cns 0x1</code>, which QEMU decodes as "identify controller". The data buffer is described by <code>prp1 0x6fdd000</code>, 4096 bytes, and QEMU writes the Identify data there by DMA (<code>map_addr</code>). Then <code>enqueue_req_completion cid 0 cqid 0 ... status 0x0</code>: a completion with status 0 (success) was posted to CQ 0; <code>irq_pin pulsing IRQ pin</code>: QEMU signalled a legacy pin interrupt. Finally the driver wrote <code>0x1004</code> = "doorbell_cq cqid 0 new_head 1": it consumed one completion. <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></p>
+<p>The doorbell offsets in this trace are 0x1000 (SQ 0 tail), 0x1004 (CQ 0 head), 0x1008 (SQ 1 tail) and 0x100c (CQ 1 head): a 4-byte step, SQ then CQ, per queue number. <sup class="src"><a href="#F1-50-src-R3">R3</a></sup> The general rule, including a stride the controller advertises, is in D1 and D2 (unverified box).</p>
+
+<h3 id="F1-50-l3-io">Creating an I/O queue pair and reading LBA 0</h3>
+<p><code>opc 0x5 'NVME_ADM_CMD_CREATE_CQ'</code> creates CQ 1 at 0x7fdc000 with <code>qsize=255</code>, <code>vector=0</code> and <code>ien=0</code>: interrupts disabled for this queue, so the driver will poll. Then <code>opc 0x1 'NVME_ADM_CMD_CREATE_SQ'</code> creates SQ 1 at 0x7fd8000, bound to <code>cqid=1</code>. <sup class="src"><a href="#F1-50-src-R3">R3</a></sup> Next, SeaBIOS sends Identify Namespace (<code>cns 0x0</code>) for namespace IDs 1 to 256: that is the long trimmed middle of the trace (257 Identify commands in total, Listing 2), and it is what made the 64-slot admin SQ wrap four times. <sup class="src"><a href="#F1-50-src-R4">R4</a></sup></p>
+<p>The I/O path is the last thirteen lines. <code>0x1008</code> = "doorbell_sq sqid 1 new_tail 1"; <code>io_cmd cid 0 nsid 0x1 sqid 1 opc 0x2 'NVME_NVM_CMD_READ'</code>; <code>pci_nvme_read ... nlb 1 count 512 lba 0x0</code>: one 512-byte block from LBA 0 of namespace 1; <code>map_prp ... prp1 0x7c00</code>: the destination is physical address 0x7c00, where PC firmware loads boot sectors; <code>rw_cb</code>/<code>rw_complete_cb</code>: QEMU's back end read the disk image; <code>enqueue_req_completion cid 0 cqid 1 ... status 0x0</code>; <code>irq_masked IRQ is masked</code>: no interrupt this time; <code>0x100c</code> = "doorbell_cq cqid 1 new_head 1". <sup class="src"><a href="#F1-50-src-R3">R3</a></sup> The proof that the 512 bytes really arrived: the boot sector they contain ran and printed "boot sector arrived from NVMe LBA 0 and is running" on QEMU's debug console, then made QEMU exit with status 33. <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Register names and fields written from memory, to be checked in the NVM Express Base Specification (controller registers section) and the NVMe PCIe Transport Specification (doorbell registers) of the version recorded in the dossier: offset 0x0 = CAP (controller capabilities, including the doorbell stride DSTRD and the maximum queue size MQES), 0x8 = VS (version), 0x14 = CC (controller configuration; EN in bit 0; I/O SQ and CQ entry sizes in fields IOSQES and IOCQES, so 0x46 would mean 2<sup>6</sup> = 64-byte submission entries and 2<sup>4</sup> = 16-byte completion entries), 0x1c = CSTS (controller status; RDY), 0x24 = AQA, 0x28 = ASQ, 0x30 = ACQ; SQ y tail doorbell at 0x1000 + (2y × (4 &lt;&lt; DSTRD)) and CQ y head doorbell at 0x1000 + ((2y + 1) × (4 &lt;&lt; DSTRD)). The trace itself only proves the offsets and the labels QEMU printed.</p></div>
+
+<h2 id="F1-50-hardware">How the hardware actually does it</h2>
+<p>A doorbell write is a posted memory write from the CPU, carried as a PCI Express transaction to the controller's BAR; the CPU does not wait for it (<a href="#F1-45">F1-45</a>). <sup class="src"><a href="#F1-50-src-D2">D2</a></sup> Everything else is the controller acting as a bus master: it reads submission entries and writes data and completion entries in host memory by DMA (<a href="#F1-44">F1-44</a>), which is why queue memory must be physically contiguous or page-described, and why a driver on a system with an IOMMU must map these buffers for the device (curriculum milestone C7). <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-D5">D5</a></sup> Ordering matters: the driver must make sure the command entry is visible in memory before the doorbell write reaches the device; on weakly ordered CPUs that needs a write barrier (<a href="#F1-37">F1-37</a>). <sup class="src"><a href="#F1-50-src-D5">D5</a></sup> Completion signalling is either an interrupt (legacy pin, MSI or MSI-X, one vector per CQ) or polling; the trace shows both a pulsed pin for the admin CQ and a masked interrupt for the polled I/O CQ. <sup class="src"><a href="#F1-50-src-R3">R3</a></sup> Inside a real SSD, the controller turns each Read into flash page reads through its FTL (<a href="#F1-49">F1-49</a>); QEMU's model instead reads a disk image file, so nothing here measures a real drive's speed. <sup class="src"><a href="#F1-50-src-R3">R3</a></sup></p>
+<div class="co warning"><span class="lbl">Watch out</span><p>Untested on hardware: every observation in this chapter comes from QEMU's emulated controller (QEMU 8.2.2) driven by SeaBIOS. A physical controller follows the same specification but adds timing, errata and firmware behaviour that this build could not observe. The curriculum orders the work the same way: QEMU first, then a disk you are allowed to erase on spare hardware (milestone C12).</p></div>
+
+<h2 id="F1-50-worked">Worked example</h2>
+<p><b>Task.</b> A driver uses an SQ and a CQ of 8 slots each, both starting at index 0, and the CQ memory starts zeroed. It submits 7 commands and rings once. The controller completes all 7. The driver consumes them. Then it submits 5 more and rings; all 5 complete. Give every doorbell value, and the phase the driver expects after each batch.</p>
+<ol>
+<li>Batch 1: SQ slots 0–6 filled; tail = 7. Doorbell SQ tail = 7. (An 8th command would have to wait: 7 + 1 = 8 → 0 = head.)</li>
+<li>The controller posts completions in CQ slots 0–6 with phase 1. The driver consumes 7 entries; its head is 7; it writes CQ head doorbell = 7; it still expects phase 1 (no wrap yet). The completions report SQ head 7.</li>
+<li>Batch 2: SQ slots 7, 0, 1, 2, 3; tail = 4. Doorbell SQ tail = 4.</li>
+<li>Completions go to CQ slot 7 (phase 1), then the controller wraps and writes slots 0, 1, 2, 3 with phase 0.</li>
+<li>The driver reads slot 7 (phase 1, matches), its head wraps to 0 and it now expects phase 0; it reads slots 0–3 (phase 0), stops at slot 4 (stale phase 1 from batch 1). CQ head doorbell = 4.</li>
+</ol>
+<p>Check with the simulator: set <code>entries = 8</code> in Listing 1 and adjust the loops; the pattern is the one Listing 1 printed for 4 slots. <sup class="src"><a href="#F1-50-src-R1">R1</a></sup></p>
+
+<h2 id="F1-50-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>nvme_model.h</code> and <code>nvme_ring.cpp</code>: the university's simplified queue pair (not a driver; entries hold only what the lesson needs).</p>
+<pre class="listing" data-src="F1-50/nvme_model.h"></pre>
+<pre class="listing" data-src="F1-50/nvme_ring.cpp"></pre>
+<p><b>Build command</b> (the one actually used): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined nvme_ring.cpp -o nvme_ring</code>, then <code>./nvme_ring</code>.</p>
+<pre class="output" data-run="F1-50/nvme_ring"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>h 9–14</td><td><code>Completion</code></td><td>Command id, SQ head, phase.</td><td>The three completion fields this chapter needs; real entries have more.</td></tr>
+<tr><td>h 24–37</td><td><code>sqTailDoorbell</code></td><td>The controller's reaction to a doorbell write: run every command from its head to the new tail, post a completion for each.</td><td>The device never reads past the tail the host announced.</td></tr>
+<tr><td>h 33–35</td><td>phase flip</td><td>When the CQ tail wraps to 0, the controller inverts the phase it writes.</td><td>Figure 2.</td></tr>
+<tr><td>h 54–64</td><td><code>submit</code></td><td>Refuses when tail + 1 = head, otherwise writes the command and advances the tail.</td><td>n slots hold n − 1 commands.</td></tr>
+<tr><td>h 66–70</td><td><code>ring</code></td><td>Writes the SQ tail doorbell.</td><td>Many commands can share one doorbell write (batching).</td></tr>
+<tr><td>h 73–94</td><td><code>poll</code></td><td>Consumes entries while their phase matches, records the SQ head, flips the expectation on wrap, writes the CQ head doorbell.</td><td>Line 88: the flip that the forensic lab's driver forgot.</td></tr>
+<tr><td>c 13–18</td><td>batch 1</td><td>Four submits (the fourth refused), one doorbell, one poll.</td><td>Output lines 1–13.</td></tr>
+<tr><td>c 20–25</td><td>batch 2</td><td>Three submits that wrap the SQ, one doorbell, one poll that crosses the CQ wrap.</td><td>The phase flip in action.</td></tr>
+<tr><td>c 27–31</td><td>memory dump</td><td>Prints each CQ slot as cid/phase.</td><td>Slot 2's stale entry is still there, and harmless.</td></tr>
+</tbody></table></div>
+<p>(Lines marked "h" are in <code>nvme_model.h</code>, "c" in <code>nvme_ring.cpp</code>.)</p>
+
+<p><b>Listing 2</b> — <code>nvme_trace.cc</code>: a summariser for QEMU's NVMe trace. It is compiled and run by the lab's <code>run.sh</code> on the complete trace (2,887 lines), which is not kept in the repository.</p>
+<pre class="listing" data-src="F1-50/nvme_trace.cc"></pre>
+<pre class="output" data-run="F1-50/trace_summary"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–24</td><td><code>field</code></td><td>Finds "key value" or "key=value" in a line and parses decimal or 0x hexadecimal.</td><td>QEMU's trace lines mix both styles.</td></tr>
+<tr><td>26–31</td><td><code>quoted</code></td><td>Extracts the command name QEMU prints in quotes.</td><td>Opcode names come from QEMU, not from memory.</td></tr>
+<tr><td>45–66</td><td>doorbell lines</td><td>Remembers the last tail or head per queue; a smaller new value means a wrap; the first wrap is printed with the slot count it implies.</td><td>How the run proved the 0's-based size fields (64 and 256 slots).</td></tr>
+<tr><td>67–74</td><td>command lines</td><td>Counts each command name and keeps the first six plus every I/O command.</td><td>257 Identify, 1 Create CQ, 1 Create SQ, 1 Read.</td></tr>
+<tr><td>75–80</td><td>completion lines</td><td>Counts completions and non-zero statuses.</td><td>260 completions for 260 commands, all status 0.</td></tr>
+<tr><td>82–96</td><td>report</td><td>Prints the per-queue counts, the command names and the list of commands kept.</td><td>The summary shown above.</td></tr>
+</tbody></table></div>
+<p>The lab's other real records: <code>qemu_pci.out</code> (step "Inspect" below) and the boot sector <code>boot.asm</code>, assembled with NASM 2.16.01:</p>
+<pre class="listing" data-src="F1-50/boot.asm"></pre>
+
+<h2 id="F1-50-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The warehouse clerk walks to the office; the controller reaches into host memory.</b> The queues are in the host's memory, and the device reads and writes them by DMA without the CPU's help. A clerk in the story would never write directly on the restaurant's board while the cooks are busy; the controller does exactly that. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup></li>
+<li><b>One bell, one board, in the story; many queue pairs in reality.</b> A controller can serve many queue pairs at once, and it may complete commands in a different order from submission; the command identifier, not the slot order, matches a completion to its command. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup></li>
+<li><b>Ink colours are seen; the phase is a single bit inside a binary entry.</b> And it only works if the host flips its expectation at exactly the wrap; a story reader would notice the colour change, a driver that forgets does not (forensic lab). <sup class="src"><a href="#F1-50-src-R5">R5</a></sup></li>
+<li><b>"Doorbell" means two things in this faculty.</b> The registered F1 analogy uses the doorbell for interrupts (device to CPU); NVMe's doorbell registers ring the other way (CPU to device).</li>
+</ul>
+
+<h2 id="F1-50-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> the first few commands complete, then the driver waits for ever. <b>Cause:</b> the expected phase is not flipped on CQ wrap. <b>How to find it:</b> dump the CQ memory: entries with the "other" phase are sitting there. <b>Fix:</b> flip on wrap (Listing 1, line 88 of the header).</li>
+<li><b>Symptom:</b> the controller never starts executing. <b>Cause:</b> doorbell written with the wrong value (the slot index of the last command instead of the index after it), or to the wrong offset. <b>How to find it:</b> QEMU's <code>doorbell_sq ... new_tail</code> trace line. <b>Fix:</b> write the new tail (one past the last command).</li>
+<li><b>Symptom:</b> commands seem to vanish or the controller reports an error after many commands. <b>Cause:</b> the host overwrote SQ slots the controller had not consumed (ignored the SQ head reported in completions). <b>How to find it:</b> count outstanding commands; never exceed n − 1. <b>Fix:</b> track the SQ head from completions.</li>
+<li><b>Symptom:</b> stale or garbage data in a read buffer on some machines only. <b>Cause:</b> missing barrier or cache maintenance between filling an entry and ringing the doorbell, or reading the buffer before the completion. <b>How to find it:</b> reproduce on a weakly ordered architecture; review barriers. <b>Fix:</b> barrier before the doorbell; read data only after its completion.</li>
+<li><b>Symptom:</b> I/O queue creation fails. <b>Cause:</b> SQ created before its CQ, or sizes beyond the controller's limit. <b>How to find it:</b> the completion status of the Create command. <b>Fix:</b> create the CQ first; respect the limit in the capabilities register.</li>
+</ul>
+
+<div class="co transition" id="F1-50-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F1-49">F1-49</a> (what is inside an SSD) and <a href="#HW204">HW204</a> (MMIO, interrupts, DMA, PCI Express). <b>What carries over:</b> the device is a PCI Express function with BARs; it moves data by DMA and may interrupt; the block interface is an array of LBAs. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <b>What changes:</b> instead of programming a few device registers per transfer, the driver and device share rings in host memory and use registers only as doorbells; many commands are in flight at once and may complete out of order; correctness depends on index arithmetic, the phase tag and memory ordering, not on timing. <sup class="src"><a href="#F1-50-src-D1">D1</a></sup> <sup class="src"><a href="#F1-50-src-D5">D5</a></sup> <b>What comes next:</b> <a href="#F1-51">F1-51</a> leaves storage for networking, starting at the wire: the Ethernet MAC and PHY. The ring idea returns in <a href="#F1-52">F1-52</a> as NIC descriptor rings.</p></div>
+
+<h2 id="F1-50-check">Check yourself</h2>
+<ol>
+<li>Where do the SQ and CQ live, and where do the doorbells live?</li>
+<li>With a 16-slot SQ, head 5 and tail 4, how many more commands can the host submit?</li>
+<li>In the real trace, what did the write <code>addr 0x1000 data 0x1</code> mean, and what did the controller do next?</li>
+<li>Why does the host not need to clear completion entries after reading them?</li>
+<li>Which statement is true? (a) The controller writes the SQ; (b) the driver writes CQ entries; (c) the driver writes SQ entries and the CQ head doorbell; (d) the doorbell holds the command itself.</li>
+<li>Explain in your own words how the lab's trace proves that the admin SQ has 64 slots.</li>
+<li>Apply it to a new case: a trace shows <code>doorbell_sq sqid 2 new_tail 9</code> followed by four <code>io_cmd ... sqid 2</code> lines. What was the previous tail of SQ 2 (assuming no wrap)?</li>
+<li>Predict, then run: in Listing 1, change line 9 to <code>entries = 3</code>. How many commands of batch 1 are accepted, and in which batch does the phase flip happen?</li>
+<li>Why must the CQ be created before the SQ that reports to it?</li>
+</ol>
+
+<h2 id="F1-50-lab">Lab</h2>
+<p><b>Goal.</b> Inspect QEMU's NVMe controller and explain, line by line, a real submission/completion trace of a firmware driver reading one block (the course's practical-exam skill).</p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU (this build: <code>QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)</code>), NASM (<code>NASM version 2.16.01</code>), g++ (<code>13.3.0</code>), the pci.ids database used by <code>lspci</code>. Folder <code>university/labs/F1-50</code>; run <code>university/labs/run_lab.sh university/labs/F1-50</code> from the repository root (about 15 seconds).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>The lab uses a 1 MiB image file as the NVMe disk; nothing touches a real disk. If you later experiment on real hardware, use only a disk you are allowed to erase, on a spare machine (curriculum safety rules, milestone C12): a wrong LBA in a Write command destroys data.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li><b>Inspect.</b> Run the lab and open <code>qemu_pci.out</code>. Find the NVMe function: bus/device/function, vendor:device ID, the BAR's address and size, the class code. Confirm the names from the pci.ids lines.</li>
+<li><b>Read the trace.</b> Open <code>nvme_trace.out</code>. Mark every line as one of: register set-up, doorbell, command fetched, data DMA, completion posted, interrupt.</li>
+<li><b>Explain the read.</b> For the last 13 lines, write one sentence per line in the style of Layer 3. Then answer: which queue, which command identifier, which LBA, how many bytes, to which address?</li>
+<li><b>Check the summary.</b> Open <code>trace_summary.out</code> and confirm with your own count that the numbers of commands and completions agree.</li>
+<li><b>Change the experiment.</b> Copy the lab folder, add a second NVMe device to the QEMU command in <code>run.sh</code> (a second <code>-drive</code>/<code>-device nvme</code> pair with its own serial), and predict what changes in <code>info pci</code> and in the trace before running.</li>
+</ol>
+<p><b>Expected observations</b> (real output of the lab's step 1):</p>
+<pre class="output" data-run="F1-50/qemu_pci"></pre>
+<p><b>Verification.</b> The milestone C6 acceptance test, verbatim from the curriculum: "Identify Controller and Identify Namespace fields match QEMU's configured NVMe device." In this lab you verify the part you can see without writing a driver: the trace shows Identify Controller (cns 0x1) and Identify Namespace (cns 0x0, nsid 1) completing with status 0, and the serial <code>HW205NVME</code> you configured appears in <code>info qtree</code>. The full field comparison belongs to your C6 driver.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>BAR addresses print as <code>0xffffffffffffffff</code> → the monitor was queried before the firmware assigned them (QEMU started with <code>-S</code>) → let the firmware run a few seconds first (the lab's second monitor session does).</li>
+<li>No <code>pci_nvme_*</code> lines in the trace → your QEMU build has no trace back end for these events → run <code>qemu-system-x86_64 -trace help</code> and look for them.</li>
+<li>QEMU never exits → the boot sector did not run (missing 0x55AA signature or wrong image) or the <code>isa-debug-exit</code> device is missing → check <code>boot.asm</code> line 26 and the QEMU command.</li>
+</ul>
+<p><b>Extension.</b> Change <code>boot.asm</code> to read a second sector with the BIOS disk service and watch a second Read appear on SQ 1 in the trace (the BIOS disk-service details must come from a BIOS interface reference, not from memory).</p>
+
+<h2 id="F1-50-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Mei is writing a hobby NVMe driver for her own kernel (curriculum milestone C6), tested against the university's queue model. The first three reads after boot always work. From the fourth or fifth read on, reads "time out", although the controller's own counters say it executed every command.</p>
+<p><b>Evidence pack.</b> The model's log of her driver, with a dump of the CQ memory at the end (generated by <code>nvme_forensic.cpp</code>, R5):</p>
+<pre class="output" data-run="F1-50/nvme_forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which completions did the device write, in which slots and with which phase? Which ones did the driver consume?</li>
+<li>Hypotheses: state at least two (the device lost commands; the doorbell value was wrong; the driver's completion check is wrong). Which lines rule each in or out?</li>
+<li>Root cause: what exactly is wrong in the driver, and why does it only show after a few commands?</li>
+<li>Fix: which line of <code>nvme_model.h</code> implements the correct behaviour?</li>
+<li>Prevention: what test would have caught this on the first day?</li>
+</ol>
+<p><b>Method hints.</b> Compare the phase written by the device with the phase the driver expects, slot by slot, and note where the device's CQ tail wrapped.</p>
+
+<h2 id="F1-50-project">Mini-project</h2>
+<p><b>The disk-block path, part 2.</b> Extend your F1-49 diagram with the NVMe layer: draw the exact sequence of one 512-byte read as the trace shows it (doorbell, fetch, data DMA, completion, interrupt or poll, head doorbell), labelling each arrow with the real address or offset from the lab. Add a second version for a driver with one queue pair per CPU and MSI-X: what changes, and what stays?</p>
+<p><b>Rubric.</b> Sequence correct and complete (4). Every label taken from the real trace or tagged to a source (3). The per-CPU version correctly shows separate queues and interrupt vectors (2). Unverified items marked as such (1).</p>
+
+<h2 id="F1-50-summary">Summary</h2>
+<ul>
+<li>NVMe exchanges work through rings in host memory: submission queues written by the driver, completion queues written by the controller.</li>
+<li>Doorbell registers carry only indices: the new SQ tail, the new CQ head.</li>
+<li>A ring of n slots holds n − 1 entries; completions report the SQ head so the host can reuse slots.</li>
+<li>The phase tag flips each pass, so new completions are recognised without clearing memory.</li>
+<li>The admin queue pair is set up by registers; I/O queue pairs by admin commands, CQ before SQ.</li>
+<li>The real QEMU trace showed reset, enable, Identify, Create CQ/SQ and one Read of LBA 0 into 0x7c00, whose boot sector then ran.</li>
+<li>The trace proved the admin queue sizes (64 and 256 slots) from doorbell wraps alone.</li>
+</ul>
+
+<h2 id="F1-50-sources">Sources</h2>
+<ol>
+<li id="F1-50-src-D1">NVM Express, Inc., "NVM Express Base Specification" (tier 1; curriculum item 42; version to be recorded): controller registers; queue mechanics (submission and completion queues, head and tail, full and empty, phase tag); admin commands Identify, Create I/O Completion Queue, Create I/O Submission Queue. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F1-50-src-D2">NVM Express, Inc., "NVMe PCIe Transport Specification" (tier 1; curriculum item 42): doorbell registers and PCI Express specifics. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-50-src-D3">NVM Express, Inc., "NVM Command Set Specification" (tier 1; curriculum item 42): Read, Write, Flush; namespaces. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-50-src-D4">QEMU project, QEMU documentation: the NVMe emulation and trace-event documentation (tier 2; version 8.2.2 to match the lab). <i>Title only — not opened during this build; the lab's behaviour is cited from the run itself (R2–R4).</i></li>
+<li id="F1-50-src-D5">The Linux kernel's NVMe host driver, <code>drivers/nvme/host</code> (tier 4; curriculum section 4.2; release tag to be recorded): per-CPU queue pairs, barriers before doorbells, DMA mapping. Cited as "what this implementation does". <i>Not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-50-src-R1">R1 — lab run of Listing 1 (<code>university/labs/F1-50/nvme_ring.log</code>), toolchain <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0. A model, not a driver.</li>
+<li id="F1-50-src-R2">R2 — QEMU monitor <code>info pci</code>/<code>info qtree</code> and pci.ids lookups (<code>qemu_pci.log</code>), QEMU 8.2.2, exit code 0.</li>
+<li id="F1-50-src-R3">R3 — QEMU <code>pci_nvme_*</code> trace of SeaBIOS (version 1.16.3-debian-1.16.3-2, as it printed itself) reading LBA 0, plus the boot sector's debug-console line (<code>nvme_trace.log</code>), exit code 33 as designed. Emulated controller only: untested on a physical SSD.</li>
+<li id="F1-50-src-R4">R4 — Listing 2 run over the complete trace (<code>trace_summary.log</code>), exit code 0.</li>
+<li id="F1-50-src-R5">R5 — run of <code>nvme_forensic.cpp</code> (<code>nvme_forensic.log</code>), exit code 0.</li>
+</ol>
+
+<h2 id="F1-50-glossary">Glossary links</h2>
+<p><a href="#gl-nvme-nvm-express">NVMe</a> · <a href="#gl-submission-queue-sq">Submission queue</a> · <a href="#gl-completion-queue-cq">Completion queue</a> · <a href="#gl-doorbell-register">Doorbell register</a> · <a href="#gl-phase-tag">Phase tag</a> · <a href="#gl-admin-queue-and-i-o-queues">Admin queue and I/O queues</a> · <a href="#gl-namespace">Namespace</a> · <a href="#gl-prp-physical-region-page-entry">PRP entry</a> · <a href="#gl-command-identifier-cid">Command identifier</a></p>
+
+<h2 id="F1-50-next">Next chapter</h2>
+<p>Next: <a href="#F1-51">F1-51 Ethernet: MAC and PHY</a>. Previous: <a href="#F1-49">F1-49 Disks: HDD, SSD and flash</a>. Back to the course: <a href="#HW205">HW205</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackC">Track C</a> (milestone C6).</p>
+
+<h2 id="F1-50-answers">Answers to Check yourself</h2>
+<ol>
+<li>Both queues live in host memory (DRAM); the doorbells are registers in the controller's BAR.</li>
+<li>Outstanding = (tail − head) mod 16 = (4 − 5) mod 16 = 15, which is the maximum (n − 1): zero more commands until a completion moves the head.</li>
+<li>The driver told the controller that SQ 0's tail is now 1 (one new command in slot 0). The controller fetched the command: Identify, controller data structure (cns 0x1), cid 0.</li>
+<li>Because of the phase tag: the host compares each entry's phase with the value expected for the current pass; old entries have the other value.</li>
+<li>(c). (a) the controller only reads the SQ; (b) the controller writes CQ entries; (d) the doorbell holds only an index.</li>
+<li>Good answers say: the SQ 0 tail doorbell values go 1, 2, … 63 and then 0; a tail can only return to 0 after the last slot, which is slot 63, so there are 64 slots; the AQA write held 63 for that queue, one less.</li>
+<li>9 − 4 = 5.</li>
+<li>Two commands are accepted (3 − 1); cid 3 waits. With 3 slots, the CQ tail wraps after the third completion, which happens during batch 2, so the phase flips there. (Run it to check: the exact lines depend on your loop changes.)</li>
+<li>Because the Create SQ command names the CQ that will receive its completions; that CQ must already exist.</li>
+</ol>
+<h3 id="F1-50-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> The device ran all six commands: cid 1–3 into CQ slots 0–2 with phase 1, cid 4 into slot 3 with phase 1, then (after wrapping) cid 5 and 6 into slots 0 and 1 with phase 0. The driver consumed cid 1–4 and then, at slot 0, printed "has phase 0, expected 1 → nothing new" three times and reported a timeout of 2 commands. The final dump <code>0:5/0 1:6/0 2:3/1 3:4/1</code> shows both missing completions sitting in memory.</p>
+<p><b>Root cause.</b> The driver does not invert its expected phase when its CQ head wraps from 3 to 0 (built with <code>flipPhaseOnWrap = false</code>). The device correctly writes phase 0 on its second pass; the driver keeps waiting for phase 1, which will only come back on the third pass. It shows only after the first wrap, i.e. after as many completions as the CQ has slots, which is why "the first few reads always work".</p>
+<p><b>Ruling out the alternatives.</b> "The device lost commands": the device lines show cid 5 and 6 executed and the dump holds their completions. "Wrong doorbell": the doorbell value 2 is exactly one past slot 1, where cid 6 was placed, and the device ran both commands.</p>
+<p><b>Fix.</b> Flip the expected phase on wrap: line 88 of <code>nvme_model.h</code> (<code>if (cqHead_ == 0 &amp;&amp; flip_) expectedPhase_ ^= 1;</code> with <code>flip_</code> true), as in Listing 1, whose run consumes cid 5 and 6.</p>
+<p><b>Prevention.</b> A unit test that submits at least two full rings of commands (more than 2 × n completions) and checks that every command completes; and a driver assertion that counts outstanding commands against the SQ head reported in completions.</p>
+<p><b>How the evidence was made.</b> <code>nvme_forensic.cpp</code> runs the model of Listing 1 with the host constructed as <code>Host buggy(ctrl, entries, false)</code>.</p>
