@@ -22,7 +22,10 @@ university/
 ├─ README.md                ← this file
 ├─ build/
 │  ├─ build.py              ← Integrator: assembles UNIVERSITY.html and checks links/ids/HTML
-│  └─ AUTHOR_BRIEF*.md      ← the exact briefs the chapter-author agents received
+│  ├─ AUTHOR_BRIEF*.md      ← the exact briefs the chapter-author agents received
+│  ├─ prompts/<COURSE>.txt  ← the full task given to each course's author agent
+│  ├─ QUEUE.txt, PROGRESS.md← build order of all 87 courses and what is done so far
+│  └─ RESUME.md, resume.sh, commit_course.sh ← how to continue after an interruption
 ├─ chapters/
 │  ├─ FRAGMENT_FORMAT.md    ← the chapter file format (21 template sections)
 │  └─ <COURSE>/             ← one folder per course, e.g. KID101/
@@ -43,6 +46,12 @@ university/
 university/labs/run_lab.sh university/labs/F0-29     # re-run one chapter's listings
 python3 university/build/build.py --check            # regenerate UNIVERSITY.html; fails on any problem
 ```
+
+## Build progress
+
+The build is in progress. [`build/PROGRESS.md`](build/PROGRESS.md) lists every course as done or
+pending and is updated with each course commit; [`build/RESUME.md`](build/RESUME.md) says how to
+continue after an interruption.
 
 ## Status and honesty
 
