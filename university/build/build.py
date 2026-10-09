@@ -608,6 +608,8 @@ def build():
         target = m.group(1)
         if target in seen:
             return m.group(0)
+        if target.startswith("gl-") and target.rstrip("-") in seen:
+            return 'href="#%s"' % target.rstrip("-")
         if "cat-" + target in seen:
             return 'href="#cat-%s"' % target
         if target in guide_ids:
