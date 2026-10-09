@@ -1,0 +1,323 @@
+<!--meta
+id: F3-25
+title: Timers and time keeping
+course: OS302
+level: L3
+prereqs: F3-24; HW204
+time: 10–14 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with TCG; HPET on and off; the host's monotonic clock as the reference)
+maps: Curriculum Track B, milestone B8 (timers and time keeping); OS302 project (B8 complete with all earlier tests green)
+analogy: F3 — the school (the hall clock, the stopwatch and the alarm clock on the principal's desk)
+-->
+
+<h2 id="F3-25-hook">Story hook</h2>
+<p>The school has a big clock in the hall, accurate and checked by the caretaker, but a long walk from the principal's office. On her desk the principal has a fast little desk counter that clicks very quickly; nobody told her how many clicks make a second. So once a morning she walks to the hall with a stopwatch, counts clicks while the hall clock moves 50 seconds, and writes the rate on a sticky note. From then on the desk counter tells the time.</p>
+<p>She also has an alarm clock that she sets for the next appointment only, not every minute. When it rings she handles every appointment that is due and sets it again for the next one.</p>
+<p>In the old building there was no hall clock, only the gym teacher's stopwatch, whose dial went up to 65,535. One day a new teacher asked it to time 119,318 ticks. The stopwatch quietly timed 53,782 instead, the principal wrote down a rate that was 2.6 times too small, and every lesson that day finished early by the hall clock.</p>
+<p>This chapter builds the kernel's sense of time: a clock source (the hall clock or the desk counter), calibration (the stopwatch walk), a one-shot timer with a sorted queue of deadlines (the alarm clock), sleep functions, and a measurement of how accurate they are.</p>
+
+<h2 id="F3-25-able">What you will be able to do</h2>
+<ul>
+<li><b>Read</b> the HPET from its ACPI table: period, comparators, counter width; and fall back to the PIT when there is none.</li>
+<li><b>Calibrate</b> the TSC and the local APIC timer against a reference, and cancel fixed overheads with two windows.</li>
+<li><b>Convert</b> counts to nanoseconds exactly, without overflow, and prove it on the host against 128-bit arithmetic.</li>
+<li><b>Choose</b> a clock source by a stated policy, and build a monotonic <code>now_ns()</code> on it.</li>
+<li><b>Implement</b> a tickless one-shot timer with a sorted timer queue, periodic timers, and <code>sleep_ns</code> without a lost wake-up.</li>
+<li><b>Measure</b> a 10-second sleep against the host's clock and report the error with a tolerance, separately for TCG and KVM.</li>
+</ul>
+
+<div class="co jargon" id="F3-25-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Clock source</dt><dd><b>Simple words:</b> the counter the kernel reads to know what time it is. <b>Analogy:</b> the hall clock or the desk counter. <b>Precise:</b> a monotonically increasing hardware counter with a known rate, read by <code>now_ns()</code>; here the TSC or the HPET main counter. <sup class="src"><a href="#F3-25-src-D5">D5</a></sup></dd>
+<dt>Monotonic clock</dt><dd><b>Simple words:</b> a clock that never goes backwards. <b>Analogy:</b> a clock nobody is allowed to set back. <b>Precise:</b> a time base whose successive reads are non-decreasing, unaffected by changes to wall-clock time; required for timeouts and intervals. <sup class="src"><a href="#F3-25-src-D5">D5</a></sup></dd>
+<dt>HPET</dt><dd><b>Simple words:</b> a precise timer chip with one fast counter and a few alarms. <b>Analogy:</b> the accurate hall clock. <b>Precise:</b> the High Precision Event Timer: a memory-mapped block with a main counter of fixed period (at most 100 ns), and several comparators; described by the ACPI "HPET" table. <sup class="src"><a href="#F3-25-src-D1">D1</a></sup></dd>
+<dt>PIT (8254)</dt><dd><b>Simple words:</b> the old timer chip of the PC, with 16-bit counters. <b>Analogy:</b> the gym teacher's stopwatch that only counts to 65,535. <b>Precise:</b> the Intel 8254 Programmable Interval Timer: three 16-bit down-counters at 1,193,182 Hz; channel 0 drives IRQ 0, channel 2 is gated by port 0x61 and readable through its output bit. <sup class="src"><a href="#F3-25-src-D3">D3</a></sup></dd>
+<dt>TSC (time-stamp counter)</dt><dd><b>Simple words:</b> a counter inside the CPU that goes up very fast. <b>Analogy:</b> the desk counter. <b>Precise:</b> a 64-bit per-CPU counter read with <code>rdtsc</code>; its rate is not reported directly on many CPUs and must be measured. <sup class="src"><a href="#F3-25-src-D2">D2</a></sup></dd>
+<dt>Invariant TSC</dt><dd><b>Simple words:</b> a TSC that ticks at the same rate whatever the CPU's speed or sleep state. <b>Analogy:</b> a desk counter that does not slow down when the principal does. <b>Precise:</b> a TSC that runs at a constant rate in all ACPI P-, C- and T-states, reported by CPUID leaf 0x80000007, EDX bit 8. <sup class="src"><a href="#F3-25-src-D2">D2</a></sup></dd>
+<dt>APIC timer</dt><dd><b>Simple words:</b> the alarm built into each CPU's interrupt receiver. <b>Analogy:</b> the alarm clock on the principal's desk. <b>Precise:</b> the local APIC's timer: an initial-count register counting down at the bus or core crystal rate divided by a configurable divisor, raising the vector in its LVT entry in one-shot, periodic or TSC-deadline mode. <sup class="src"><a href="#F3-25-src-D2">D2</a></sup></dd>
+<dt>Tickless timer</dt><dd><b>Simple words:</b> a timer set only for the next thing that must happen, instead of ringing regularly. <b>Analogy:</b> setting the alarm for the next appointment only. <b>Precise:</b> programming a one-shot timer for the earliest pending deadline; no interrupts arrive while nothing is due. <sup class="src"><a href="#F3-25-src-D5">D5</a></sup></dd>
+<dt>Timer queue</dt><dd><b>Simple words:</b> the list of things waiting for a time, earliest first. <b>Analogy:</b> the principal's appointment book. <b>Precise:</b> a priority queue of timers keyed by deadline; the timer interrupt runs every expired timer, re-queues periodic ones and re-arms the hardware for the new head. <sup class="src"><a href="#F3-25-src-R1">R1</a></sup></dd>
+</dl></div>
+<p>As in the whole course, "kernel" means the operating-system kernel; the "kernel (GPU)" of F6 is a function launched on a GPU.</p>
+
+<h2 id="F3-25-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the chain of trust in time: a reference with a known rate (HPET, or the PIT) measures the TSC and the APIC timer; the chosen clock source gives <code>now_ns()</code>; the APIC timer wakes the CPU for the earliest deadline in the queue. Figure 2 shows the two-window calibration with the PIT and what the forensic bug does to it.</p>
+<figure id="F3-25-fig1"><div class="svgbox">
+<svg viewBox="0 0 900 350" role="img" aria-labelledby="F3-25-f1t F3-25-f1d">
+<title id="F3-25-f1t">Figure 1: references, clock source, APIC timer and timer queue</title>
+<desc id="F3-25-f1d">Top left: the references with a known rate. The HPET (from the ACPI HPET table; in QEMU at 0xfed00000, period 10,000,000 femtoseconds, 100 MHz) or, when the HPET is absent, PIT channel 2 at 1,193,182 Hz. An arrow labelled "calibrate" goes to the TSC (measured about 2.1 GHz under TCG). The policy box chooses the clock source: an invariant TSC first, then the HPET, then a plain TSC with a warning. The chosen source feeds now_ns(), the exact conversion of counts to nanoseconds. A second arrow labelled "calibrate against now_ns, 50 ms" goes to the local APIC timer (divide by 16, about 62.4 MHz). Bottom: the timer queue, sorted by deadline (for example tick at 10 ms, sleep at 12 ms, test timer at 30 ms). arm() programs the APIC timer's initial count for the head's deadline. When the count reaches zero the timer raises vector 0x40; the handler expires all due timers, re-queues periodic ones, re-arms and sends EOI.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="350"/>
+<rect class="sv-b2" x="20" y="20" width="200" height="60" rx="6"/><text class="sv-tb" x="30" y="44">HPET 100 MHz</text><text class="sv-ts" x="30" y="64">ACPI table, MMIO fed00000</text>
+<rect class="sv-b2" x="20" y="100" width="200" height="60" rx="6"/><text class="sv-tb" x="30" y="124">or PIT ch. 2</text><text class="sv-ts" x="30" y="144">1,193,182 Hz, 16-bit</text>
+<rect class="sv-b3" x="290" y="60" width="170" height="60" rx="6"/><text class="sv-tb" x="300" y="84">TSC</text><text class="sv-ts" x="300" y="104">rate measured ≈ 2.1 GHz</text>
+<line class="sv-line" x1="220" y1="50" x2="284" y2="80"/><polygon class="sv-head" points="290,84 278,84 282,74"/>
+<line class="sv-line" x1="220" y1="130" x2="284" y2="100"/><polygon class="sv-head" points="290,96 282,106 278,96"/>
+<text class="sv-ts" x="226" y="96">calibrate</text>
+<rect class="sv-b5" x="520" y="20" width="170" height="110" rx="6"/><text class="sv-tb" x="530" y="44">clock source</text><text class="sv-ts" x="530" y="66">1. invariant TSC</text><text class="sv-ts" x="530" y="84">2. HPET</text><text class="sv-ts" x="530" y="102">3. TSC + warning</text>
+<line class="sv-line" x1="460" y1="90" x2="514" y2="80"/><polygon class="sv-head" points="520,78 509,74 510,86"/>
+<rect class="sv-b4" x="740" y="40" width="140" height="70" rx="6"/><text class="sv-tb" x="750" y="66">now_ns()</text><text class="sv-ts" x="750" y="86">exact conversion</text>
+<line class="sv-line" x1="690" y1="75" x2="734" y2="75"/><polygon class="sv-head" points="740,75 730,69 730,81"/>
+<rect class="sv-b6" x="520" y="170" width="170" height="70" rx="6"/><text class="sv-tb" x="530" y="194">APIC timer</text><text class="sv-ts" x="530" y="214">÷16 ≈ 62.4 MHz, one-shot</text>
+<line class="sv-dash" x1="810" y1="110" x2="694" y2="190"/><polygon class="sv-head" points="690,194 696,182 702,192"/>
+<text class="sv-ts" x="720" y="160">calibrate, 50 ms</text>
+<rect class="sv-b1" x="20" y="200" width="420" height="120" rx="6"/><text class="sv-tb" x="30" y="224">timer queue (sorted by deadline)</text>
+<rect class="sv-box" x="30" y="240" width="120" height="40"/><text class="sv-ts" x="38" y="264">tick 10 ms ↻</text>
+<rect class="sv-box" x="160" y="240" width="120" height="40"/><text class="sv-ts" x="168" y="264">sleep 12 ms</text>
+<rect class="sv-box" x="290" y="240" width="120" height="40"/><text class="sv-ts" x="298" y="264">test 30 ms</text>
+<text class="sv-ts" x="30" y="304">arm(): initial count = (head − now) × rate</text>
+<line class="sv-line" x1="440" y1="250" x2="514" y2="215"/><polygon class="sv-head" points="520,212 508,212 512,222"/>
+<rect class="sv-b8" x="520" y="270" width="360" height="60" rx="6"/><text class="sv-tb" x="530" y="294">vector 0x40: expire due timers,</text><text class="sv-ts" x="530" y="314">re-queue periodic, arm(), EOI</text>
+<line class="sv-line" x1="605" y1="240" x2="605" y2="264"/><polygon class="sv-head" points="605,270 599,260 611,260"/>
+<line class="sv-line" x1="520" y1="300" x2="446" y2="290"/><polygon class="sv-head" points="440,289 450,284 449,296"/>
+</svg></div><figcaption><b>Figure 1.</b> Time keeping in <code>ktime.cc</code>, with the rates of the HPET run (R2). The policy is this course's choice; Linux's clocksource rating is similar in spirit <sup class="src"><a href="#F3-25-src-D5">D5</a></sup>.</figcaption></figure>
+
+<figure id="F3-25-fig2"><div class="svgbox">
+<svg viewBox="0 0 900 260" role="img" aria-labelledby="F3-25-f2t F3-25-f2d">
+<title id="F3-25-f2t">Figure 2: two-window PIT calibration and the 16-bit truncation</title>
+<desc id="F3-25-f2d">Top: the correct calibration. A short window of 11,931 PIT ticks (10 ms) and a long window of 59,659 ticks (50 ms). Each measured TSC count includes the same fixed overhead of starting and polling the PIT. Subtracting the short count from the long one removes the overhead and leaves the TSC cycles of 47,728 ticks, exactly 40 ms. Bottom: the forensic bug. The long window was meant to be 119,318 ticks (100 ms), but the PIT's counter has 16 bits, so the value written is 119,318 minus 65,536 = 53,782 ticks (45 ms). The code still divides by the intended 107,387 ticks of difference instead of the real 41,851, so the computed TSC rate is 41,851 / 107,387 = 0.39 times the truth: 818 MHz instead of about 2.1 GHz. Every time computed from the TSC is then 2.57 times too long, and a 10-second sleep ends after 3.9 seconds of real time.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="260"/>
+<text class="sv-tb" x="20" y="26">correct: windows of 11,931 and 59,659 ticks</text>
+<rect class="sv-b5" x="20" y="40" width="40" height="30"/><text class="sv-ts" x="24" y="60">ovh</text>
+<rect class="sv-b3" x="60" y="40" width="100" height="30"/><text class="sv-ts" x="66" y="60">10 ms</text>
+<rect class="sv-b5" x="20" y="80" width="40" height="30"/><text class="sv-ts" x="24" y="100">ovh</text>
+<rect class="sv-b3" x="60" y="80" width="500" height="30"/><text class="sv-ts" x="66" y="100">50 ms</text>
+<rect class="sv-b4" x="160" y="80" width="400" height="30"/><text class="sv-ts" x="168" y="100">difference: 47,728 ticks = 40 ms, overhead cancelled</text>
+<text class="sv-tb" x="20" y="146">forensic: 119,318 requested, 16-bit register keeps 53,782</text>
+<rect class="sv-b5" x="20" y="160" width="40" height="30"/><text class="sv-ts" x="24" y="180">ovh</text>
+<rect class="sv-b3" x="60" y="160" width="450" height="30"/><text class="sv-ts" x="66" y="180">45 ms really timed</text>
+<rect class="sv-b8" x="510" y="160" width="550" height="30"/><text class="sv-ts" x="518" y="180">55 ms assumed, never timed</text>
+<text class="sv-ts" x="20" y="222">rate = cycles(41,851 ticks) ÷ time(107,387 ticks) → 0.39 × true rate: 818 MHz instead of 2.1 GHz</text>
+<text class="sv-ts" x="20" y="244">every interval measured with the TSC is 2.57 × too long: "10 s" ends after 3.9 s</text>
+</svg></div><figcaption><b>Figure 2.</b> The calibration of <code>ktime.cc</code> lines 145–158, with the numbers of the PIT run (R3) and the forensic run (R4). The 16-bit counter after the 8254 datasheet <sup class="src"><a href="#F3-25-src-D3">D3</a></sup>.</figcaption></figure>
+
+<h2 id="F3-25-layer1">Layer 1 — the kid explanation</h2>
+<p>A computer has several counters that go up by themselves. Some are slow but tell you exactly how fast they are (the PIT, the HPET). One is very fast but does not say how fast it is (the TSC). So the kernel watches the fast counter while the careful counter counts a known amount of time, and works out the fast counter's speed. After that it can tell the time by reading the fast counter.</p>
+<p>To wake up later, the kernel writes down when, in a list sorted by time, and sets an alarm for the earliest one only. When the alarm rings, it does everything that is due and sets the alarm again.</p>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The hall clock is the HPET, the gym stopwatch is the PIT, the desk counter is the TSC, the sticky note with the rate is the calibration, and the alarm clock set for the next appointment is the tickless APIC timer.</p></div>
+
+<h2 id="F3-25-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F3-25-l2-hpet">The HPET</h3>
+<p>The ACPI "HPET" table (found in F3-24) contains a Generic Address Structure whose 64-bit address, at offset 44 of the table, is the HPET's register block <sup class="src"><a href="#F3-25-src-D1">D1</a></sup><sup class="src"><a href="#F3-25-src-D4">D4</a></sup>. Register 0x000 holds the capabilities: bits 63:32 the period in femtoseconds (10<sup>−15</sup> s), bits 12:8 the number of comparators minus one, bit 13 "64-bit counter". Register 0x010 is the configuration (bit 0 enables counting), register 0x0F0 the main counter. QEMU: base <code>fed00000</code>, capabilities <code>009896808086a201</code>: period 0x00989680 = 10,000,000 fs = 10 ns, so 100 MHz, 3 comparators, 64-bit counter <sup class="src"><a href="#F3-25-src-R2">R2</a></sup>. The kernel stops the counter, zeroes it and starts it.</p>
+<h3 id="F3-25-l2-pit">The PIT as a stopwatch</h3>
+<p>Without an HPET (QEMU's <code>-machine pc,hpet=off</code>), the reference is the 8254 PIT at 1,193,182 Hz. Channel 2 is convenient for measuring: its gate is bit 0 of port 0x61 and its output can be read as bit 5 of the same port. In mode 0 ("interrupt on terminal count") the output goes high when the count reaches zero <sup class="src"><a href="#F3-25-src-D3">D3</a></sup>. The kernel writes the count (low byte, then high byte), reads the TSC when the high byte is written, polls bit 5, and reads the TSC again. The counter is 16 bits: at most 65,535 ticks, about 55 ms per window.</p>
+<h3 id="F3-25-l2-tsc">Calibrating the TSC</h3>
+<p>With the HPET: read the HPET counter and the TSC, wait 50 ms of HPET counts (5,000,000), read both again; TSC rate = TSC difference × HPET rate / HPET difference. The run: 2,099,868,140 Hz over 5,004,551 HPET counts <sup class="src"><a href="#F3-25-src-R2">R2</a></sup>. With the PIT: each window includes a fixed cost (port writes and the first poll) that is large under emulation, where each port access is slow. Two windows of 11,931 and 59,659 ticks have the same fixed cost; the difference of their TSC counts is the TSC cycles of exactly 47,728 PIT ticks. The run: 2,098,933,108 Hz, within 0.05 % of the HPET-calibrated value <sup class="src"><a href="#F3-25-src-R3">R3</a></sup>. (An earlier single-window version of this lab gave a 10-second sleep that was 1.15 % off the host clock under TCG.)</p>
+<h3 id="F3-25-l2-source">Choosing the clock source</h3>
+<p>A good clock source is fast to read, has a known rate, and never changes speed. The TSC is the fastest to read (one instruction), but without the "invariant" flag its rate may change with power states. The HPET is slower to read (a device register access) but has a fixed, reported rate. The policy: an invariant TSC first; otherwise the HPET; otherwise the TSC with a warning. QEMU's TCG <code>qemu64</code> CPU reports no invariant TSC, so the HPET run chose 'hpet', and the run without HPET chose 'tsc' and logged the warning <sup class="src"><a href="#F3-25-src-R2">R2</a></sup><sup class="src"><a href="#F3-25-src-R3">R3</a></sup>. The cost difference is visible: 10 million reads took 3,978 ms with the HPET and 665 ms with the TSC under TCG.</p>
+<h3 id="F3-25-l2-apic">The APIC timer, one-shot</h3>
+<p>The local APIC timer counts down from an initial count at a rate the kernel does not know: on real hardware the bus or crystal clock divided by the divide configuration (here 16, register 0x3E0 = 3). So it is calibrated too: masked, initial count 0xFFFFFFFF, wait 50 ms by <code>now_ns()</code>, read the current count. The run: 62,469,022 Hz <sup class="src"><a href="#F3-25-src-R2">R2</a></sup>. The LVT timer entry (0x320) is then set to vector 0x40, one-shot. Vector 0x40 has priority class 4, above the devices of F3-24 (class 3).</p>
+<h3 id="F3-25-l2-queue">The timer queue and tickless operation</h3>
+<p>A timer is a deadline in nanoseconds, an optional period, and a function. The queue keeps up to 32 timers sorted by deadline (insertion into a sorted array: fine for 32; OS303 will want something better). <code>arm()</code> programs the APIC timer for the head's deadline only; an empty queue stops the timer. The interrupt handler runs all expired timers, re-queues periodic ones, re-arms and sends EOI. If a periodic timer falls behind by more than a period, the missed periods are skipped rather than run in a burst. A 100 Hz "scheduler tick" is one more periodic timer in the queue; when OS303 has nothing to run, it can cancel the tick and the CPU sleeps until the next real deadline.</p>
+<h3 id="F3-25-l2-sleep">Sleeping without losing the wake-up</h3>
+<p><code>sleep_ns</code> queues a timer that sets a flag, then loops: disable interrupts, check the flag, and if it is not set, <code>sti; hlt</code>. The pair matters. If the kernel enabled interrupts, checked, and then halted, the timer interrupt could arrive between the check and the <code>hlt</code>, and the CPU would halt with nothing left to wake it. <code>sti</code> delays interrupt delivery until after the next instruction, so the interrupt can only arrive once the CPU is halted, and wakes it <sup class="src"><a href="#F3-25-src-D2">D2</a></sup>.</p>
+
+<h2 id="F3-25-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-25-l3-convert">Exact conversion without overflow</h3>
+<p>Nanoseconds from counts: <code>cycles × 10<sup>9</sup> / hz</code>. The product overflows 64 bits when cycles exceed 2<sup>64</sup> / 10<sup>9</sup> ≈ 1.84 × 10<sup>10</sup>: about 8.8 seconds of a 2.1 GHz TSC. The lab's 10-second sleep would already break. <code>clock.h</code> splits: whole seconds (<code>cycles / hz</code>) times 10<sup>9</sup>, plus the remainder (below <code>hz</code>) times 10<sup>9</sup> / <code>hz</code>. The remainder product fits as long as <code>hz</code> &lt; 1.8 × 10<sup>10</sup>. The host test checks 1,128,426 random cases at six rates against 128-bit arithmetic and shows the naive formula's result for one hour of TSC: 7,452,083,202 ns instead of 3,600,000,000,000 <sup class="src"><a href="#F3-25-src-R1">R1</a></sup>. Linux avoids division altogether with a precomputed multiplier and shift (<code>mult</code>/<code>shift</code>), trading a tiny rounding error for speed <sup class="src"><a href="#F3-25-src-D5">D5</a></sup>.</p>
+<h3 id="F3-25-l3-accuracy">How accurate, and how to know</h3>
+<p>The milestone's first acceptance test measures a 10-second kernel sleep against the host clock with a tolerance (for example 1 %) under KVM, and logs TCG separately. The host program <code>hostclock.py</code> stamps every serial line with the host's monotonic clock as it arrives and compares the interval between "sleep: start" and "sleep: end" with the kernel's own measurement. Results (TCG only, no KVM in the build container):</p>
+<div class="tw"><table>
+<thead><tr><th>Run</th><th>Clock source</th><th>Kernel</th><th>Host</th><th>Difference</th></tr></thead>
+<tbody>
+<tr><td>HPET (R2)</td><td>hpet, 100 MHz</td><td>10.000195 s</td><td>10.000 s</td><td>−0.00 %</td></tr>
+<tr><td>PIT fallback (R3)</td><td>tsc, 2,098,933,108 Hz</td><td>10.000273 s</td><td>9.995 s</td><td>+0.05 %</td></tr>
+<tr><td>forensic (R4)</td><td>tsc, 817,626,796 Hz</td><td>10.000643 s</td><td>3.894 s</td><td>+156.82 %</td></tr>
+</tbody></table></div>
+<p>The comparison has limits. Serial output passes through a pipe and Python, so each stamp has a delay of maybe milliseconds; over 10 s that is well under 0.1 %. Under TCG, guest time is tied to host time by QEMU's virtual clock, so a good result shows the kernel is consistent with QEMU, not that it would be accurate on hardware. The lab requires the TCG result to be within 5 % (a sanity bound, set by this course); the 1 % KVM test is <b>not run</b>.</p>
+<p>Individual sleeps finish late, never early: 1 ms took 1,235 µs, 10 ms took 10,126 µs, 100 ms took 100,212 µs in the HPET run <sup class="src"><a href="#F3-25-src-R2">R2</a></sup>. Lateness comes from interrupt latency, the handler's work, and under TCG from QEMU's translation and scheduling; how much of the 100–250 µs is TCG behaviour would need KVM to judge (an earlier run of the same lab showed 2.4 ms on 100 ms, so the numbers vary from run to run). During the 10 s sleep the 100 Hz tick fired 1,000 times in this run; an earlier run counted 996, when the catch-up rule dropped periods because the emulator fell behind.</p>
+<h3 id="F3-25-l3-mono">Monotonic, on one CPU and later on many</h3>
+<p>On one CPU, a counter that only increases and an exact conversion give a monotonic clock: 10,000,000 reads, 0 went backwards, 0 repeated <sup class="src"><a href="#F3-25-src-R2">R2</a></sup>. The milestone asks for this "on all CPUs (after B11)": with several CPUs, each has its own TSC, which may be offset or drift between sockets unless the TSC is invariant and synchronised; a clock that is monotonic per CPU can still go backwards when a thread moves between CPUs. OS303 repeats this test across CPUs; this chapter can only test one. The largest step between two reads, 4,059 µs with the HPET, is the CPU being interrupted (or QEMU being descheduled), not the clock jumping.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, pending D1–D4: the HPET register offsets (0x000, 0x010, 0x0F0), capability bits (period 63:32, comparators 12:8, 64-bit 13), the 100 ns period limit, and the ACPI HPET table's address field at offset 44; the PIT's ports (0x42, 0x43, 0x61), command byte 0xB0 and mode 0 behaviour, and its frequency 1,193,182 Hz; the APIC timer registers (LVT 0x320, initial 0x380, current 0x390, divide 0x3E0 with value 3 = divide by 16); the invariant-TSC bit (CPUID 0x80000007 EDX bit 8); the one-instruction interrupt shadow of <code>sti</code>. The 1 % KVM test is not run; nothing here is tested on hardware.</p></div>
+
+<h2 id="F3-25-hardware">How the hardware actually does it</h2>
+<p>On current x86 processors the TSC is invariant and runs at a fixed reference rate, and newer CPUs report that rate through CPUID leaf 0x15 (crystal clock and ratio), so calibration can be skipped <sup class="src"><a href="#F3-25-src-D2">D2</a></sup>. The local APIC timer also offers TSC-deadline mode: the kernel writes an absolute TSC value to an MSR and the interrupt arrives when the TSC reaches it, with no separate calibration or rounding of counts. Many modern laptops disable the HPET or the PIT to save power; a kernel must cope with either being missing.</p>
+<p>Under KVM, the guest usually sees an invariant TSC (when the host has one) and a paravirtual clock (kvmclock) that the host keeps consistent across migrations. TCG emulates everything in software: a PIT port access or an HPET read costs microseconds, and guest time follows QEMU's virtual clock. That is why this chapter reports TCG separately and why the KVM numbers are a decision for the owner.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p>Untested on hardware, and untested under KVM. On real hardware the APIC timer may stop in deep C-states on older CPUs (the "ARAT" feature says it does not); a tickless kernel that sleeps with <code>hlt</code> must know this.</p></div>
+
+<h2 id="F3-25-worked">Worked example</h2>
+<p>How many APIC timer counts for a 10 ms deadline, and what does the forensic calibration do to a 10 s sleep?</p>
+<ol>
+<li>APIC rate 62,469,022 Hz (R2). <code>ns_to_cycles(10,000,000, 62,469,022)</code> = 0 × 62,469,022 + 10,000,000 × 62,469,022 / 10<sup>9</sup> = 624,690 counts (624,690.22 rounded down). That fits easily in the 32-bit initial count; the longest one-shot is 2<sup>32</sup> / 62.47 MHz ≈ 68.8 s, after which <code>arm()</code> wakes early and re-arms.</li>
+<li>Forensic calibration: windows of 11,931 and 53,782 ticks really timed, but the code assumes 119,318 − 11,931 = 107,387 ticks of difference, i.e. 90 ms, where 41,851 ticks (35.1 ms) passed. TSC rate = true rate × 41,851 / 107,387 = 2.1 GHz × 0.3897 ≈ 818 MHz; the run printed 817,626,796 Hz.</li>
+<li>A 10 s sleep waits until the TSC has advanced by 10 × 818 × 10<sup>6</sup> cycles, which at the true 2.1 GHz takes 10 × 0.3897 ≈ 3.9 s. The host measured 3.894 s <sup class="src"><a href="#F3-25-src-R4">R4</a></sup>.</li>
+<li>The kernel itself saw nothing wrong: by its own clock the sleep took 10.000643 s. Only an outside reference catches a calibration error.</li>
+</ol>
+
+<h2 id="F3-25-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F3-25/</code>.</p>
+<p><b>Listing 1</b> — <code>clock.h</code> and <code>timerq.h</code></p>
+<pre class="listing" data-src="F3-25/clock.h"></pre>
+<pre class="listing" data-src="F3-25/timerq.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>clock 6–10</td><td><code>ClockSource</code></td><td>Name, read function, rate.</td><td>One interface for TSC and HPET.</td></tr>
+<tr><td>clock 14–22</td><td>conversions</td><td>Split into seconds and remainder.</td><td>No overflow up to 1.8 × 10<sup>10</sup> Hz.</td></tr>
+<tr><td>timerq 7–13</td><td><code>Timer</code></td><td>Deadline, period, function, context, queued flag.</td><td>The caller owns the memory: no allocation.</td></tr>
+<tr><td>timerq 18–31</td><td><code>add</code></td><td>Insertion into a sorted array.</td><td>Head is always the earliest deadline.</td></tr>
+<tr><td>timerq 47–64</td><td><code>expire</code></td><td>Runs due timers; periodic re-arm with catch-up (55–57).</td><td>Behind schedule: skip, do not burst.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>ktime.h</code> and <code>ktime.cc</code></p>
+<pre class="listing" data-src="F3-25/ktime.h"></pre>
+<pre class="listing" data-src="F3-25/ktime.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>25–52</td><td><code>hpet_init</code></td><td>Address from ACPI, period check, start the counter.</td><td>Rejects an impossible period.</td></tr>
+<tr><td>58–68</td><td><code>pit_window_tsc</code></td><td>Channel 2, mode 0, TSC around the count.</td><td>The <code>uint16_t</code> parameter is where the forensic bug hides.</td></tr>
+<tr><td>74–83</td><td><code>tsc_invariant</code></td><td>CPUID 0x80000007 EDX bit 8.</td><td>Decides the clock source.</td></tr>
+<tr><td>96–112</td><td><code>arm</code></td><td>Initial count for the head's deadline, clamped.</td><td>Tickless: nothing queued, no interrupts.</td></tr>
+<tr><td>114–120</td><td><code>on_timer</code></td><td>Expire, re-arm, EOI.</td><td>Runs with interrupts off.</td></tr>
+<tr><td>136–159</td><td>TSC calibration</td><td>HPET 50 ms window, or two PIT windows.</td><td>Line 146: the forensic constant.</td></tr>
+<tr><td>161–171</td><td>source policy</td><td>Invariant TSC, HPET, plain TSC.</td><td>The warning when only a plain TSC remains.</td></tr>
+<tr><td>173–185</td><td>APIC calibration</td><td>Divide 16, masked count-down for 50 ms, then one-shot vector 0x40.</td><td>Calibrated against the chosen source.</td></tr>
+<tr><td>189–204</td><td><code>add_timer</code>, <code>cancel_timer</code></td><td>Queue change and re-arm with interrupts off.</td><td>The handler changes the same queue.</td></tr>
+<tr><td>206–222</td><td><code>sleep_ns</code></td><td><code>cli</code>, check, <code>sti; hlt</code>.</td><td>No lost wake-up.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>b8_main.cc</code>, <code>hostclock.py</code> and the host test <code>clock_host.cpp</code></p>
+<pre class="listing" data-src="F3-25/b8_main.cc"></pre>
+<pre class="listing" data-src="F3-25/hostclock.py"></pre>
+<pre class="listing" data-src="F3-25/clock_host.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>b8 28–48</td><td><code>queue_test</code></td><td>Adds 30, 10, 20 ms; checks firing order.</td><td>Ordering through the real interrupt path.</td></tr>
+<tr><td>b8 50–60</td><td><code>short_sleeps</code></td><td>1, 10, 100 ms; never early.</td><td>Lateness is reported, earliness is a failure.</td></tr>
+<tr><td>b8 62–81</td><td><code>monotonic_test</code></td><td>10 million reads, backwards and equal counts.</td><td>Acceptance test 2 (one CPU).</td></tr>
+<tr><td>b8 100</td><td><code>log_set_clock</code></td><td>Log lines get timestamps.</td><td>F3-23's hook used.</td></tr>
+<tr><td>b8 104–119</td><td>tick and 10 s sleep</td><td>100 Hz periodic timer; the measured sleep.</td><td>Acceptance test 1.</td></tr>
+<tr><td>hostclock 17–34</td><td>stamps and verdict</td><td>Host monotonic time per line; percentage difference.</td><td>The outside reference.</td></tr>
+<tr><td>host 17–44</td><td>conversions</td><td>Random cases against 128-bit arithmetic; the naive formula.</td><td>Proves the split is exact.</td></tr>
+<tr><td>host 46–79</td><td>queue</td><td>Capacity, cancel, re-arm, catch-up.</td><td>The paths the kernel run rarely hits.</td></tr>
+</tbody></table></div>
+
+<h2 id="F3-25-breaks">Where the analogy breaks</h2>
+<ul>
+<li>The hall clock is far away but always right. The HPET is "far" (slow to read) and right only to the extent its reported period is; QEMU makes it exactly 10 ns, real hardware has a crystal tolerance.</li>
+<li>The principal checks the desk counter once a day. The kernel calibrates once at boot; a TSC that changes speed afterwards (non-invariant) silently makes every later time wrong.</li>
+<li>An alarm clock rings on time. The APIC timer's interrupt can be delayed by masked interrupts, higher-priority handlers and, under emulation, by the host.</li>
+</ul>
+
+<h2 id="F3-25-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>16-bit overflow</b> in PIT counts: the forensic lab. A <code>static_assert</code> on the constant prevents it.</li>
+<li><b>Naive <code>cycles × 10<sup>9</sup> / hz</code></b>: wraps after about 8.8 s at 2.1 GHz.</li>
+<li><b>One calibration window under emulation</b>: the fixed overhead biases the rate (a 1.15 % sleep error here before the two-window fix).</li>
+<li><b>Checking the flag with interrupts on, then <code>hlt</code></b>: a lost wake-up and a hang.</li>
+<li><b>Changing the timer queue with interrupts on</b>: the handler and the caller corrupt the array.</li>
+<li><b>Forgetting the IRQ 0 → GSI 2 override</b> when using the PIT's channel 0 for interrupts (not used here: channel 2 is polled).</li>
+<li><b>Trusting the kernel's own clock</b> to check the kernel's own clock: compare against an outside reference.</li>
+</ul>
+
+<div class="co transition" id="F3-25-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F3-24, ACPI tables, the local APIC and the IOAPIC, and the first device interrupts. <b>What carries over:</b> the HPET table found by the ACPI walk, the local APIC and its EOI, uncached device mappings, interrupt priorities by vector class, the log with a timestamp hook, and host tests of pure logic. <b>What changes:</b> the kernel knows what time it is, can wait for a time without spinning, and has a periodic tick it can switch off; milestone B8 completes OS302. <b>What comes next:</b> OS303 starts from this kernel: the tick and the timer queue drive a scheduler with threads and context switches, and sleep becomes "block this thread until its timer fires" instead of halting the whole CPU.</p></div>
+
+<h2 id="F3-25-check">Check yourself</h2>
+<ol>
+<li>The HPET's period field reads 69,841,279 fs. What is its frequency, and is the period allowed?</li>
+<li>Why does the two-window PIT method cancel the fixed overhead? Write the formula.</li>
+<li>Explain in your own words why the kernel prefers an invariant TSC over the HPET, and the HPET over a non-invariant TSC.</li>
+<li>Compute <code>cycles_to_ns(5,000,000,000, 2,000,000,000)</code> by the split method, and say what the naive formula gives.</li>
+<li>Why must <code>sleep_ns</code> use <code>sti; hlt</code> rather than <code>sti</code>, a check, and then <code>hlt</code>?</li>
+<li>Apply to a new case: a kernel needs a 500 µs timeout while the queue's head is a tick 8 ms away. What does <code>add_timer</code> do to the APIC timer, and what happens at 500 µs and at 8 ms?</li>
+<li>Predict-then-run: change the tick's period to 1 ms. Predict the number of ticks counted during the 10 s sleep under TCG, then run the lab and explain the difference.</li>
+<li>What does the 10-million-read test prove, and what does it not prove before B11?</li>
+<li>Why did the forensic kernel's own log say the sleep took 10.000643 s?</li>
+</ol>
+
+<h2 id="F3-25-lab">Lab</h2>
+<p><b>Goal.</b> Milestone B8: a monotonic clock, a periodic or tickless scheduler interrupt, and sleep functions with known accuracy.</p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2 (pc machine, with and without HPET), g++ 13.3.0, Python 3. Run <code>university/labs/run_lab.sh university/labs/F3-25</code> (about 45 seconds: three runs each include a 10-second sleep).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>Channel 2 of the PIT also drives the PC speaker. The code clears the speaker-enable bit (bit 1 of port 0x61); on real hardware a mistake there produces a tone, not damage, but keep it off.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Compare <code>hpet.out</code> and <code>pit.out</code> line by line: what differs, and why?</li>
+<li>Read <code>clock_host.out</code>; add a test for <code>hz</code> = 1 (a counter in seconds).</li>
+<li>Add a <code>static_assert(kLong &lt;= 0xFFFF)</code> and build the forensic kernel: what happens?</li>
+<li>If you have a machine with KVM: run the HPET case with <code>-enable-kvm -cpu host</code> and record the error and whether the TSC is invariant (acceptance test 1 as written).</li>
+</ol>
+<p><b>Expected observations.</b></p>
+<pre class="output" data-run="F3-25/clock_host"></pre>
+<pre class="output" data-run="F3-25/hpet"></pre>
+<pre class="output" data-run="F3-25/pit"></pre>
+<p><b>Verification</b> (the milestone's acceptance tests, verbatim):</p>
+<ul>
+<li>A 10-second kernel sleep measured against the host clock differs by less than a tolerance you set (for example 1 %) under KVM; the TCG result is logged separately.</li>
+<li>The monotonic clock never goes backwards across 10 million reads on all CPUs (after B11).</li>
+<li>Boot with the HPET disabled in QEMU falls back to the PIT and still passes.</li>
+</ul>
+<p>In this build: test 1, TCG result logged (−0.00 % with HPET, +0.05 % with the PIT fallback; the exact figures change from run to run); the KVM measurement is <b>not run</b> (no KVM in the build container). Test 2: 0 backwards in 10,000,000 reads on one CPU; the all-CPU version waits for B11. Test 3: passes (R3).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The kernel hangs in calibration: the PIT gate (port 0x61 bit 0) is off, or the HPET is not enabled (configuration bit 0).</li>
+<li>Sleeps return at once: the conversion overflowed or the APIC rate is zero; print <code>g_apic_hz</code>.</li>
+<li>Sleeps never return: the timer vector has no handler, the LVT entry is still masked, or EOI is missing.</li>
+<li>Large errors against the host only under TCG: check the host's load; TCG time follows QEMU's virtual clock.</li>
+</ul>
+<p><b>Extension.</b> Use TSC-deadline mode when CPUID reports it (leaf 1, ECX bit 24, to be verified in D2): write absolute TSC deadlines to the deadline MSR and compare sleep lateness with one-shot mode.</p>
+
+<h2 id="F3-25-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Ana's kernel passes every test on her laptop's QEMU, which has an HPET. On a test machine configured without an HPET, timeouts end far too early: a 10-second watchdog fires after about 4 seconds. The kernel's own log insists 10 seconds passed.</p>
+<p><b>Evidence pack.</b> The host-stamped serial log of the run with <code>hpet=off</code> (R4):</p>
+<pre class="output" data-run="F3-25/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare the TSC rate and the APIC timer rate with those of <code>pit.out</code>. What is the ratio?</li>
+<li>Which line already shows the bug before any sleep happens?</li>
+<li>Hypotheses: QEMU is slow on this machine; the TSC changed speed; the calibration is wrong. Which numbers decide?</li>
+<li>Root cause: what happens to 119,318 in a 16-bit register, and why does the kernel not notice?</li>
+<li>Fix and prevention: change the constant and add a check that would have failed the build.</li>
+</ol>
+<p><b>Method hints.</b> 65,536 is 2<sup>16</sup>. The host stamps show real time; the kernel's timestamps in brackets show the kernel's time. Divide one by the other at the end of the run.</p>
+
+<h2 id="F3-25-project">Mini-project</h2>
+<p><b>OS302 project: B8 complete with all earlier tests green.</b> Run the labs of F3-18 to F3-25 in order with one script, collect each acceptance test's verdict (pass, expected-fail exit codes, untested) into one table, and add the B8 extension of your choice (TSC-deadline mode, or an interrupt-driven serial sink with timestamps). Write a one-page report of what was tested under TCG only, and what would need KVM or hardware.</p>
+<p><b>Rubric.</b> One command runs all eight labs and produces the table (3). Every acceptance test of B1–B8 listed with its evidence file (3). Extension works and is measured against the host clock (2). Honest report of untested items (2).</p>
+
+<h2 id="F3-25-summary">Summary</h2>
+<ul>
+<li>References with known rates: the HPET (period from its capabilities) or the PIT (1,193,182 Hz, 16-bit counters).</li>
+<li>The TSC and the APIC timer are calibrated against a reference; two PIT windows cancel fixed overheads.</li>
+<li>Policy: invariant TSC, then HPET, then a plain TSC with a warning.</li>
+<li>Counts become nanoseconds by splitting into seconds and remainder: exact and overflow-free.</li>
+<li>Tickless: the APIC timer is armed for the earliest deadline in a sorted queue; a periodic tick is one more timer.</li>
+<li><code>sti; hlt</code> prevents a lost wake-up in <code>sleep_ns</code>.</li>
+<li>Under TCG the 10 s sleep matched the host within 0.01 %; KVM and hardware are untested; a calibration error is only visible against an outside clock.</li>
+</ul>
+
+<h2 id="F3-25-sources">Sources</h2>
+<ol>
+<li id="F3-25-src-D1">Intel, "IA-PC HPET (High Precision Event Timers) Specification" (tier 1; named in B8). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-25-src-D2">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3 (tier 1; named in B8), sections "APIC Timer" and "Time-Stamp Counter"; Volume 2 for CPUID leaves and <code>sti</code>. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-25-src-D3">Intel, "8254 Programmable Interval Timer" datasheet (tier 1; named in B8). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-25-src-D4">UEFI Forum, "Advanced Configuration and Power Interface (ACPI) Specification" (tier 1; named in B8 as "ACPI HPET table"), and the HPET specification's table description. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-25-src-D5">The Linux kernel documentation and source (tier 2 and 4; curriculum item 40): clocksource and clockevents frameworks, <code>mult</code>/<code>shift</code> conversion, NO_HZ. Cited as "what this implementation does". <i>Not opened during this build (dossier gate G1 open).</i></li>
+<li id="F3-25-src-R1">R1 — lab run <code>university/labs/F3-25/clock_host.log</code>: host test of <code>clock.h</code> and <code>timerq.h</code>, g++ 13.3.0 with AddressSanitizer, exit code 0.</li>
+<li id="F3-25-src-R2">R2 — lab run <code>hpet.log</code>: the B8 kernel with QEMU's HPET, QEMU 8.2.2 (TCG), host-stamped by <code>hostclock.py</code>, exit code 33. Untested on hardware and under KVM.</li>
+<li id="F3-25-src-R3">R3 — lab run <code>pit.log</code>: the same kernel with <code>-machine pc,hpet=off</code>, exit code 33.</li>
+<li id="F3-25-src-R4">R4 — forensic run <code>forensic.log</code>: the <code>B8_PIT_BUG</code> kernel with <code>hpet=off</code>, exit code 33 (the kernel believes it passed).</li>
+</ol>
+
+<h2 id="F3-25-glossary">Glossary links</h2>
+<p><a href="#gl-clock-source">Clock source</a> · <a href="#gl-monotonic-clock">Monotonic clock</a> · <a href="#gl-hpet">HPET</a> · <a href="#gl-pit-8254">PIT (8254)</a> · <a href="#gl-tsc-time-stamp-counter">TSC</a> · <a href="#gl-invariant-tsc">Invariant TSC</a> · <a href="#gl-apic-timer">APIC timer</a> · <a href="#gl-tickless-timer">Tickless timer</a> · <a href="#gl-timer-queue">Timer queue</a> · <a href="#gl-local-apic">Local APIC</a></p>
+
+<h2 id="F3-25-next">Next chapter</h2>
+<p>This is the last chapter of OS302. Next course: <a href="#OS303">OS303</a> (Kernel II: threads, SMP, user mode and processes), which starts from this kernel with F3-26, kernel threads and context switching. Previous: <a href="#F3-24">F3-24 ACPI tables, local APIC and IOAPIC</a>. Back to the course: <a href="#OS302">OS302</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (milestone B8).</p>
+
+<h2 id="F3-25-answers">Answers to Check yourself</h2>
+<ol>
+<li>10<sup>15</sup> / 69,841,279 ≈ 14,318,180 Hz (14.318 MHz, a common HPET rate); 69.8 ns is below the 100 ns limit, so allowed.</li>
+<li>Each measured count is overhead + rate × window. Subtracting the short window's count from the long one's removes the overhead: rate = (C<sub>long</sub> − C<sub>short</sub>) / ((T<sub>long</sub> − T<sub>short</sub>) / 1,193,182 Hz).</li>
+<li>Good answers say: an invariant TSC is both cheap to read (one instruction) and constant in rate; the HPET is constant and has a reported rate but each read is a slow device access; a non-invariant TSC is cheap but its rate may change, making time silently wrong, so it is last and comes with a warning.</li>
+<li>5 × 10<sup>9</sup> / 2 × 10<sup>9</sup> = 2 whole seconds → 2 × 10<sup>9</sup> ns; remainder 10<sup>9</sup> cycles × 10<sup>9</sup> / 2 × 10<sup>9</sup> = 5 × 10<sup>8</sup> ns; total 2.5 × 10<sup>9</sup> ns. Naive: 5 × 10<sup>18</sup> fits in 64 bits (below 1.84 × 10<sup>19</sup>), so it is correct here too; it fails beyond about 1.84 × 10<sup>10</sup> cycles.</li>
+<li>Between the check and the <code>hlt</code>, with interrupts on, the timer interrupt could fire and set the flag; the CPU would then halt with no further interrupt due and sleep forever (or until an unrelated interrupt). <code>sti</code>'s one-instruction delay makes the interrupt arrive only after the CPU has halted, so it wakes it.</li>
+<li>The 500 µs timer becomes the head; <code>arm()</code> reprograms the APIC timer for 500 µs. At 500 µs the handler runs it and re-arms for the tick (7.5 ms later); at 8 ms the tick runs and is re-queued for 18 ms.</li>
+<li>About 10,000 if the emulator keeps up; under TCG expect fewer, because when the handler runs late the catch-up rule skips missed periods. Run it and report the count.</li>
+<li>That on this one CPU, the clock source and conversion never produce a smaller value than a previous read. It does not test different CPUs' TSCs against each other, which is where non-monotonic time usually comes from.</li>
+<li>The kernel measures its sleep with the same wrong TSC rate it used to compute the deadline; a consistent error is invisible from inside.</li>
+</ol>
+<h3 id="F3-25-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> TSC 817,626,796 Hz against 2,098,933,108 Hz in <code>pit.out</code>: a ratio of 0.390. APIC timer 24,300,654 Hz against 62,434,288 Hz: 0.389. Both are wrong by the same factor, because the APIC timer was calibrated against the TSC-based <code>now_ns()</code>. The host saw 3.894 s for the kernel's "10.000643 s"; between "sleep: start" and "B8 ok" the kernel's timestamps advance 12.35 − 0.20 = 12.15 s while the host's advance 5.00 − 0.27 = 4.73 s, the same ratio.</p>
+<p><b>The tell-tale line.</b> "windows of 11931 and 53782 ticks (119318 requested)": the long window requested and the one programmed differ.</p>
+<p><b>Hypotheses.</b> A slow QEMU would make the kernel's clock lag, not run fast. A non-invariant TSC changing speed would drift over time, not be wrong by a constant factor from the start. The calibration line shows the cause directly.</p>
+<p><b>Root cause.</b> <code>kLong = kPitHz / 10 = 119,318</code> does not fit in the PIT's 16-bit counter; the cast to <code>uint16_t</code> (line 154, and the parameter of <code>pit_window_tsc</code>) keeps 119,318 − 65,536 = 53,782. The arithmetic on line 155 uses the intended 119,318, so the TSC cycles of 41,851 real ticks are divided by the time of 107,387 ticks. The kernel cannot notice, because every later measurement uses the same wrong rate.</p>
+<p><b>Fix and prevention.</b> Use a window that fits (59,659 ticks, 50 ms, as the normal build does) or chain several windows for longer ones. Add <code>static_assert(kLong &lt;= 0xFFFF &amp;&amp; kShort &lt;= 0xFFFF)</code>, and make <code>-Wconversion</code> part of the kernel build so that narrowing casts are visible. Keep the host-clock comparison in the lab: it is the only test that sees calibration errors.</p>

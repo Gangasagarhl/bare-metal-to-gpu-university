@@ -1,0 +1,330 @@
+<!--meta
+id: F3-23
+title: Consoles, logging and the panic screen
+course: OS302
+level: L3
+prereqs: F3-22; F3-19; SP203
+time: 8–12 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with TCG and its standard VGA device; QMP for screendumps)
+maps: Curriculum Track B, milestone B6 (consoles, logging, panic screen, SMBIOS banner)
+analogy: F3 — the school (the noticeboard, the loudspeaker and the fire alarm)
+-->
+
+<h2 id="F3-23-hook">Story hook</h2>
+<p>The school has two ways to tell everyone something: the noticeboard in the hall, which anyone walking past can read, and the loudspeaker, which reaches the caretaker's room even when nobody is in the hall. Messages carry a label (for your information, warning, emergency) so people know which ones to read first. Only one person may speak on the loudspeaker at a time; there is a key to the microphone.</p>
+<p>One morning the fire alarm goes off while the deputy head is halfway through an announcement, holding the microphone key. The principal runs to the microphone to say "leave the building", finds it locked, and waits politely for the key. The school stands in silence, waiting for an announcement that never comes. Everyone agrees afterwards: in an emergency, nobody waits for the key.</p>
+<p>This chapter builds the kernel's noticeboard (a text console drawn into a framebuffer), keeps the loudspeaker (the serial port of F3-18), adds message levels and a lock, prints a boot banner with the machine's name read from the firmware's SMBIOS tables, and makes sure that a panic speaks even when the lock is held.</p>
+
+<h2 id="F3-23-able">What you will be able to do</h2>
+<ul>
+<li><b>Find</b> QEMU's display device on PCI, set a 640 × 480 × 32 mode, and map its framebuffer write-combining.</li>
+<li><b>Draw</b> text with a bitmap font, scroll, and colour lines by log level.</li>
+<li><b>Prove</b> the screen is right with a screenshot test: replay the serial log on the host and compare the image pixel by pixel.</li>
+<li><b>Parse</b> SMBIOS entry points and structures of types 0, 1 and 2 for a boot banner, and show that QEMU's <code>-smbios</code> option changes it.</li>
+<li><b>Design</b> an output lock that interrupt handlers cannot deadlock on, and a panic path that never waits for it.</li>
+<li><b>Diagnose</b> a silent hang from a register dump, <code>addr2line</code> and a disassembly.</li>
+</ul>
+
+<div class="co jargon" id="F3-23-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Framebuffer</dt><dd><b>Simple words:</b> a block of memory whose bytes are the pixels on the screen. <b>Analogy:</b> the noticeboard: what you pin there is what people see. <b>Precise:</b> a region of (usually device) memory in which each pixel has a fixed position and format; in this lab, 640 × 480 pixels of 32 bits (0x00RRGGBB), one row after another, mapped from the display device's BAR0. <sup class="src"><a href="#F3-23-src-D2">D2</a></sup></dd>
+<dt>Bitmap font</dt><dd><b>Simple words:</b> letters stored as little grids of on and off pixels. <b>Analogy:</b> stencils for the noticeboard. <b>Precise:</b> a table mapping each character to a fixed-size pixel pattern; this course draws its own 5 × 7 font in a 6 × 10 cell. <sup class="src"><a href="#F3-23-src-R2">R2</a></sup></dd>
+<dt>Log level</dt><dd><b>Simple words:</b> a label saying how important a message is. <b>Analogy:</b> "for your information", "warning", "emergency" on a notice. <b>Precise:</b> an ordered severity (here Debug &lt; Info &lt; Warn &lt; Error) attached to each message, used to filter output and to choose its colour. <sup class="src"><a href="#F3-23-src-R1">R1</a></sup></dd>
+<dt>SMBIOS</dt><dd><b>Simple words:</b> tables in which the firmware describes the machine: maker, model, firmware version. <b>Analogy:</b> the plaque at the school gate. <b>Precise:</b> the DMTF System Management BIOS specification: an entry point (found by an anchor string, 32-bit "_SM_" or 64-bit "_SM3_") gives the address of a table of typed structures (type 0 firmware, type 1 system, type 2 baseboard, …), each a formatted area followed by strings. <sup class="src"><a href="#F3-23-src-D3">D3</a></sup></dd>
+<dt>Write-combining</dt><dd><b>Simple words:</b> a way for the CPU to collect several writes and send them to a device together. <b>Analogy:</b> carrying a whole stack of notices to the board in one trip. <b>Precise:</b> a memory type in which writes may be buffered and merged before reaching memory, with weak ordering; selected for a page through the PAT (F3-21). <sup class="src"><a href="#F3-23-src-D4">D4</a></sup></dd>
+<dt>Deadlock</dt><dd><b>Simple words:</b> waiting for something that will never happen, because the one who could make it happen is waiting too (or is you). <b>Analogy:</b> the principal waiting for the microphone key the deputy will never return. <b>Precise:</b> a state in which a set of execution contexts each wait for a resource held by another member of the set; here a CPU spinning for a lock it already holds. <sup class="src"><a href="#F3-23-src-D5">D5</a></sup></dd>
+<dt>Panic mode</dt><dd><b>Simple words:</b> the kernel's emergency state, in which it only tries to report and stop. <b>Analogy:</b> the fire alarm rule: nobody waits for the key. <b>Precise:</b> in this kernel, a flag set once by the panic or fatal-exception path; from then on output ignores the output lock and the framebuffer switches to the panic screen. <sup class="src"><a href="#F3-23-src-R3">R3</a></sup></dd>
+<dt>Screendump</dt><dd><b>Simple words:</b> a picture of the emulated screen, saved by QEMU. <b>Analogy:</b> a photograph of the noticeboard. <b>Precise:</b> the QEMU monitor command <code>screendump FILE</code>, which writes the display's current contents as an image (PPM by default). <sup class="src"><a href="#F3-23-src-D6">D6</a></sup></dd>
+</dl></div>
+<p>As in the whole course, "kernel" means the operating-system kernel; the "kernel (GPU)" of F6 is a function launched on a GPU.</p>
+
+<h2 id="F3-23-pictures">The idea in pictures</h2>
+<p>Figure 1 shows where a log line goes: through the lock, out to every sink. The panic path enters below the lock. Figure 2 shows how the kernel finds the SMBIOS strings for its banner.</p>
+<figure id="F3-23-fig1"><div class="svgbox">
+<svg viewBox="0 0 900 340" role="img" aria-labelledby="F3-23-f1t F3-23-f1d">
+<title id="F3-23-f1t">Figure 1: the path of a log line and the panic path</title>
+<desc id="F3-23-f1d">On the left, klog(level, format) checks the minimum level, then takes the output lock: interrupts off on this CPU, then spin with an atomic exchange. Inside the lock it sets the colour for the level, prints a prefix with a sequence number or a timestamp, formats the message, and passes every character to kprint's fan-out, which calls each registered sink: the serial sink (COM1, F3-18) and the framebuffer console sink (6 by 10 pixel cells, 106 columns by 48 rows, scrolling). Then it releases the lock and restores the interrupt flag. Below, the panic path: a fatal exception or PANIC calls kprint_panic_mode, which sets the panic flag and draws the panic screen (a red background and a title) once; afterwards kprintf skips the lock entirely, so the report reaches both sinks even if the crashed code held the lock. A dashed arrow marks the forensic kernel, in which panic mode is disabled and the report waits for the lock forever.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="340"/>
+<rect class="sv-box" x="20" y="40" width="170" height="70" rx="6"/><text class="sv-tb" x="30" y="66">klog(level, …)</text><text class="sv-ts" x="30" y="88">level ≥ minimum?</text>
+<rect class="sv-b5" x="240" y="40" width="190" height="70" rx="6"/><text class="sv-tb" x="250" y="66">output lock</text><text class="sv-ts" x="250" y="88">cli, then spin (xchg)</text>
+<rect class="sv-b3" x="480" y="40" width="170" height="70" rx="6"/><text class="sv-tb" x="490" y="66">kprint fan-out</text><text class="sv-ts" x="490" y="88">colour, prefix, text</text>
+<rect class="sv-b4" x="700" y="20" width="180" height="50" rx="6"/><text class="sv-tb" x="710" y="42">serial sink</text><text class="sv-ts" x="710" y="60">COM1, 115200 baud</text>
+<rect class="sv-b4" x="700" y="90" width="180" height="50" rx="6"/><text class="sv-tb" x="710" y="112">framebuffer console</text><text class="sv-ts" x="710" y="130">106 × 48 cells, scrolls</text>
+<line class="sv-line" x1="190" y1="75" x2="234" y2="75"/><polygon class="sv-head" points="240,75 230,69 230,81"/>
+<line class="sv-line" x1="430" y1="75" x2="474" y2="75"/><polygon class="sv-head" points="480,75 470,69 470,81"/>
+<line class="sv-line" x1="650" y1="65" x2="694" y2="48"/><polygon class="sv-head" points="700,46 688,46 692,56"/>
+<line class="sv-line" x1="650" y1="85" x2="694" y2="110"/><polygon class="sv-head" points="700,114 692,104 688,114"/>
+<rect class="sv-b8" x="20" y="210" width="190" height="80" rx="6"/><text class="sv-tb" x="30" y="236">fatal exception</text><text class="sv-ts" x="30" y="256">or PANIC(…)</text><text class="sv-ts" x="30" y="276">interrupts off</text>
+<rect class="sv-b6" x="260" y="210" width="230" height="80" rx="6"/><text class="sv-tb" x="270" y="236">kprint_panic_mode()</text><text class="sv-ts" x="270" y="256">flag set once</text><text class="sv-ts" x="270" y="276">draw the panic screen</text>
+<line class="sv-line" x1="210" y1="250" x2="254" y2="250"/><polygon class="sv-head" points="260,250 250,244 250,256"/>
+<line class="sv-line" x1="490" y1="230" x2="560" y2="116"/><polygon class="sv-head" points="564,110 552,116 562,122"/>
+<text class="sv-ts" x="530" y="200">report skips the lock</text>
+<line class="sv-dash" x1="210" y1="270" x2="330" y2="116"/><polygon class="sv-head" points="334,110 322,114 330,122"/>
+<text class="sv-ts" x="40" y="320">dashed: the forensic kernel, panic mode disabled: the report waits for the lock it already holds</text>
+</svg></div><figcaption><b>Figure 1.</b> Logging and panic paths, as implemented in <code>log.cc</code> and in <code>kprint.cc</code> (F3-18, lines 47–69). Cell counts from 640 / 6 and 480 / 10. Measured behaviour in R3 (panic while locked: exit 35) and R5 (forensic: hang).</figcaption></figure>
+
+<figure id="F3-23-fig2"><div class="svgbox">
+<svg viewBox="0 0 900 250" role="img" aria-labelledby="F3-23-f2t F3-23-f2d">
+<title id="F3-23-f2t">Figure 2: from the SMBIOS entry point to the banner strings</title>
+<desc id="F3-23-f2d">The kernel scans physical addresses 0xF0000 to 0xFFFFF in steps of 16 bytes for the anchor "_SM3_" (64-bit entry point) or "_SM_" (32-bit), with a valid checksum. In QEMU the 64-bit entry point is at 0xf52d0; it gives the table address 0xf52f0 and the maximum table size. The table is a sequence of structures. Each structure starts with a type byte and a length byte; the formatted area holds string numbers; after it come the strings, each ending with a zero byte, and the structure ends with two zero bytes. Type 0 (firmware) gives vendor, version and date; type 1 (system) gives manufacturer and product; type 2 (baseboard) gives the board product, but QEMU's pc machine provides none. Type 127 ends the table.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="250"/>
+<rect class="sv-box" x="20" y="30" width="200" height="80" rx="6"/><text class="sv-tb" x="30" y="54">scan 0xF0000–0xFFFFF</text><text class="sv-ts" x="30" y="74">"_SM3_" or "_SM_"</text><text class="sv-ts" x="30" y="94">checksum = 0</text>
+<rect class="sv-b3" x="270" y="30" width="200" height="80" rx="6"/><text class="sv-tb" x="280" y="54">entry point f52d0</text><text class="sv-ts" x="280" y="74">version 3.0</text><text class="sv-ts" x="280" y="94">table at f52f0</text>
+<line class="sv-line" x1="220" y1="70" x2="264" y2="70"/><polygon class="sv-head" points="270,70 260,64 260,76"/>
+<line class="sv-line" x1="470" y1="70" x2="514" y2="70"/><polygon class="sv-head" points="520,70 510,64 510,76"/>
+<rect class="sv-b4" x="520" y="20" width="110" height="100"/><text class="sv-tb" x="528" y="44">type, len</text><text class="sv-ts" x="528" y="66">formatted</text><text class="sv-ts" x="528" y="84">area: string</text><text class="sv-ts" x="528" y="102">numbers</text>
+<rect class="sv-b2" x="630" y="20" width="250" height="100"/><text class="sv-tb" x="640" y="44">strings</text><text class="sv-ts" x="640" y="66">"QEMU\0Standard PC …\0"</text><text class="sv-ts" x="640" y="84">… "\0\0" ends the structure</text><text class="sv-ts" x="640" y="102">next structure follows</text>
+<rect class="sv-b1" x="20" y="150" width="200" height="70" rx="6"/><text class="sv-tb" x="30" y="176">type 0: firmware</text><text class="sv-ts" x="30" y="198">vendor, version, date</text>
+<rect class="sv-b1" x="240" y="150" width="200" height="70" rx="6"/><text class="sv-tb" x="250" y="176">type 1: system</text><text class="sv-ts" x="250" y="198">manufacturer, product</text>
+<rect class="sv-b1" x="460" y="150" width="200" height="70" rx="6"/><text class="sv-tb" x="470" y="176">type 2: baseboard</text><text class="sv-ts" x="470" y="198">none in QEMU pc</text>
+<rect class="sv-b1" x="680" y="150" width="200" height="70" rx="6"/><text class="sv-tb" x="690" y="176">type 127</text><text class="sv-ts" x="690" y="198">end of table</text>
+</svg></div><figcaption><b>Figure 2.</b> SMBIOS layout as read by <code>smbios.cc</code>; field positions from memory, pending the specification <sup class="src"><a href="#F3-23-src-D3">D3</a></sup>; addresses from the lab run (R4).</figcaption></figure>
+
+<h2 id="F3-23-layer1">Layer 1 — the kid explanation</h2>
+<p>A screen is a big grid of coloured dots. The computer keeps one number for every dot in memory; change the number and the dot changes colour. To write a letter, the kernel looks up a tiny picture of the letter (five dots wide, seven tall) and colours those dots. When the screen is full, it moves every line up by one and writes at the bottom.</p>
+<p>Every message has a label: debug, info, warning or error, and each label has its own colour. Only one part of the kernel may write at a time, so there is a lock. But when the kernel crashes, it ignores the lock: a crash report that waits politely is no use to anyone.</p>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The noticeboard is the screen, the loudspeaker is the serial port, the labels on notices are the levels, and the microphone key is the lock. In a fire, nobody waits for the key.</p></div>
+
+<h2 id="F3-23-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F3-23-l2-device">Finding a framebuffer</h3>
+<p>The curriculum's milestone assumes a UEFI boot, where the firmware's Graphics Output Protocol hands the kernel a framebuffer address, its size and a pixel format <sup class="src"><a href="#F3-23-src-D2">D2</a></sup>. This course boots with Multiboot through QEMU's <code>-kernel</code> option (F3-18), which gives no framebuffer, so the kernel sets one up itself on QEMU's standard VGA device (<code>-vga std</code>). It scans PCI bus 0 for vendor 0x1234, device 0x1111 (the configuration mechanism of F1-45), reads BAR0 for the framebuffer's physical address, and programs the device's Bochs "DISPI" registers: width, height, 32 bits per pixel, enable with linear framebuffer <sup class="src"><a href="#F3-23-src-R1">R1</a></sup>. The lab's log: device at slot 2, BAR0 <code>fd000000</code>, DISPI id <code>b0c5</code>, mode 640 × 480 mapped at <code>0xffffe00000000000</code>.</p>
+<h3 id="F3-23-l2-console">A console on pixels</h3>
+<p>Each character occupies a 6 × 10 cell: 5 × 7 pixels of glyph, a column and three rows of space. That gives 106 columns and 48 rows. The font is the university's own, drawn by hand in <code>font5x7.h</code> (lower-case letters use the upper-case shapes, a stated simplification). <code>FbConsole</code> keeps a cursor; <code>put</code> draws a cell; a newline at the last row copies every pixel row up by ten and clears the last text line. It is a header with no hardware in it, so the host checker can run the same code into an array.</p>
+<h3 id="F3-23-l2-log">Levels, prefixes and colours</h3>
+<p><code>klog(level, fmt, …)</code> drops messages below the minimum level, takes the lock, sets the colour for the level (grey, light grey, yellow, red), prints a prefix (a sequence number <code>[#0001]</code> now, a timestamp once F3-25 provides a clock), the message and a newline, and releases the lock. All of it goes through <code>kprint</code>'s fan-out of F3-18 to the serial sink and the console sink. The serial log is the record; the screen is for a human in front of the machine.</p>
+<h3 id="F3-23-l2-banner">The SMBIOS banner</h3>
+<p>The boot banner names the machine from SMBIOS. The kernel scans 0xF0000–0xFFFFF on 16-byte boundaries for "_SM3_" (or "_SM_"), checks the entry point's checksum, and walks the structures. QEMU 8.2.2 with SeaBIOS provides a 3.0 entry point at 0xf52d0, eight structures, and the banner "Booted on: QEMU Standard PC (i440FX + PIIX, 1996)" with "Firmware: SeaBIOS, version 1.16.3-debian-1.16.3-2, date 04/01/2014". With <code>-smbios "type=1,manufacturer=OS302 Lab,product=Kernel I Test Board"</code> the banner says "Booted on: OS302 Lab Kernel I Test Board" <sup class="src"><a href="#F3-23-src-R4">R4</a></sup>. QEMU's pc machine has no type 2 structure, which the banner says plainly.</p>
+<h3 id="F3-23-l2-lock">A lock interrupts cannot deadlock</h3>
+<p>Output from two places at once would interleave characters, so <code>klog</code> holds a lock. A plain spinlock (SP203) is not enough: if an interrupt handler logs while the code it interrupted holds the lock, the handler spins forever on its own CPU. So <code>log_lock_acquire</code> first saves the flags and clears the interrupt flag, then spins; <code>log_lock_release</code> restores the flags, turning interrupts back on only if they were on <sup class="src"><a href="#F3-23-src-D5">D5</a></sup>. Exceptions cannot be masked, though: a page fault inside a locked region reaches its handler with the lock held. That is the case the panic path must survive.</p>
+
+<h2 id="F3-23-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-23-l3-panic">The panic path</h3>
+<p>The rule: once the kernel decides it is dying, nothing on the reporting path may wait for anything. <code>kprint_panic_mode()</code> (F3-18's <code>kprint.cc</code>, lines 47–57) sets a flag once and calls the panic-screen hook; from then on <code>kvprintf</code> does not take the lock (line 61). The exception handler of F3-19 calls it for every non-recoverable exception before printing, and <code>panic_at</code> calls it as its second action, after <code>cli</code>. The panic screen clears the framebuffer to dark red (0xa01010) and writes "*** KERNEL PANIC: THE SYSTEM IS HALTED ***"; the report follows in white.</p>
+<p>Ignoring the lock has a cost: if another CPU is printing at that moment, the outputs interleave, and a half-drawn console state (cursor, colours) may be inconsistent. On one CPU, the code that held the lock will never run again, so nothing is lost. With several CPUs (OS303), the panicking CPU must also stop the others (an inter-processor interrupt) before it trusts any shared state; Linux's panic path does both <sup class="src"><a href="#F3-23-src-D7">D7</a></sup>.</p>
+<p>The acceptance test, "panicking while holding the log lock": the test kernel logs a warning, calls <code>log_lock_acquire()</code>, and executes <code>ud2</code>. The run prints the exception, the registers and "PANIC at ../F3-19/interrupts.cc:119: unhandled exception 6 (#UD invalid opcode)", then exits with status 35 <sup class="src"><a href="#F3-23-src-R3">R3</a></sup>. A deadlock would end at the 30-second time limit with 124.</p>
+<h3 id="F3-23-l3-wc">Write-combining and the framebuffer</h3>
+<p>A framebuffer is device memory. Mapped uncached, every 4-byte pixel write is a separate bus transaction; mapped write-back, writes may sit in the cache and never reach the device in time. Write-combining collects writes into buffers and sends them in bursts, which suits a stream of pixels <sup class="src"><a href="#F3-23-src-D4">D4</a></sup>. The kernel reprograms PAT entry 4 to write-combining (the MSR changed from <code>0007040600070406</code> to <code>0007040100070406</code>) and maps the framebuffer with the PAT bit set (F3-21's <code>kPat4K</code>). Under TCG, memory types are not modelled, so this setting has no visible effect in the lab: it is correct by reading, not by test.</p>
+<h3 id="F3-23-l3-test">The screenshot test</h3>
+<p>Pixel tests are fragile when the reference is a stored image: any font change breaks them. This lab builds the reference instead. The host program <code>fbcheck</code> reads QEMU's screendump (a PPM file), reads the serial log, replays every line after "console: started" through the same <code>FbConsole</code> and font with the same colours, and compares all 307,200 pixels. The run: 61 lines replayed, 0 pixels differ, a pixel-exact match <sup class="src"><a href="#F3-23-src-R2">R2</a></sup>. The replay works because the serial log and the screen receive the same characters from the same fan-out; a bug in the console (scrolling, wrapping, colours) shows as differing pixels, and the first difference is printed. The tolerance is zero; a real display path with scaling would need a documented tolerance, as the milestone allows.</p>
+<h3 id="F3-23-l3-serial">The serial line, revisited</h3>
+<p>The serial sink is the 16550-compatible UART of F3-18, polled: each character waits until the transmitter holding register is empty. At 115,200 baud that is about 87 µs per character on a real line, so a 100-character log line costs nearly 9 ms of busy waiting: logging changes timing, which matters for the timer measurements of F3-25. The 16550's FIFO and an interrupt-driven, buffered sink are the usual fixes; a panic must still fall back to polling <sup class="src"><a href="#F3-23-src-D1">D1</a></sup>.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Written from memory and not checked against the documents: the Bochs/QEMU DISPI register numbers and ports (0x1CE/0x1CF, registers 0–4, enable bits 0x01 and 0x40) and the PCI ids 1234:1111 (the lab shows they work in QEMU 8.2.2, which is not a specification); the SMBIOS entry-point offsets (table address at 0x10 for "_SM3_", 0x18 for "_SM_", lengths at 0x0C and 0x16) and the string-number offsets of types 0, 1, 2 (D3); the PAT encoding of write-combining as 0x01 (D4); the UEFI GOP pixel-format names (D2); the 16550 timing figure (D1).</p></div>
+
+<h2 id="F3-23-hardware">How the hardware actually does it</h2>
+<p>On real PCs booted through UEFI, the firmware's GOP driver has already set a mode and reports the framebuffer's base, size, resolution, pixels per scan line (often larger than the width: the pitch) and one of a few pixel formats (red-green-blue or blue-green-red with 8 bits each, a bit-mask format, or "blit only" with no framebuffer at all) <sup class="src"><a href="#F3-23-src-D2">D2</a></sup>. After the kernel exits boot services, it may only write pixels; changing the mode needs a real display driver (Track C and later). The DISPI interface used here exists only in emulators and some virtual machines.</p>
+<p>A display controller scans the framebuffer out to the screen many times a second; the CPU's writes appear at the next scan, which can tear a scrolling image. Real consoles double-buffer or scroll by changing the scan-out start address. SMBIOS on real machines carries more structures (memory devices, processors, slots) and sometimes strings such as "To Be Filled By O.E.M.": a banner must cope with missing and placeholder strings <sup class="src"><a href="#F3-23-src-D3">D3</a></sup>.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p>Untested on hardware. The framebuffer code works only with QEMU's standard VGA device; on real hardware, use the GOP framebuffer from the bootloader (Limine or UEFI) instead.</p></div>
+
+<h2 id="F3-23-worked">Worked example</h2>
+<p>Where does the character of column 10, row 3 start in the framebuffer, and how many bytes does one scroll move?</p>
+<ol>
+<li>Cell origin: x = 10 × 6 = 60, y = 3 × 10 = 30.</li>
+<li>Pixel index = y × pitch + x = 30 × 640 + 60 = 19,260; byte offset = 19,260 × 4 = 77,040 = 0x12CF0. Virtual address <code>0xffffe00000000000 + 0x12CF0</code>.</li>
+<li>One scroll copies rows 10 to 479 into rows 0 to 469: (48 − 1) × 10 = 470 pixel rows × 640 pixels × 4 bytes = 1,203,200 bytes, then clears 10 rows (25,600 bytes).</li>
+<li>Which line is at the top after the lab's boot? The checker replays 61 lines ("console: started", 59 log lines, "B6 screen ready…"). Lines 1 to 47 fill rows 0 to 46; line 48 goes to row 47 and its newline scrolls once; every later line scrolls once more. After 61 lines: 61 − 47 = 14 scrolls, so the top row holds line 15, which is <code>[#0014]</code>, and the bottom row is empty, waiting for the next line.</li>
+</ol>
+<p>Check the last step against the zoomed picture in <code>screen.out</code>: the first two visible lines read "[#0014] [ INFO] SCRO" and "[#0015] [ INFO] SCRO" in the hand-drawn upper-case font <sup class="src"><a href="#F3-23-src-R2">R2</a></sup>. The three <code>fb:</code> lines never reach the screen: they are printed before the console exists.</p>
+
+<h2 id="F3-23-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F3-23/</code>, plus F3-18's <code>kprint.cc</code>.</p>
+<p><b>Listing 1</b> — <code>fb.cc</code></p>
+<pre class="listing" data-src="F3-23/fb.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–16</td><td>constants</td><td>DISPI ports and registers, framebuffer virtual address.</td><td>From memory: see the unverified box.</td></tr>
+<tr><td>18–23</td><td><code>pci_read32</code></td><td>PCI configuration mechanism #1.</td><td>Finds the device without a PCI driver.</td></tr>
+<tr><td>43–50</td><td>scan</td><td>Slots 0–31 of bus 0 for id 0x11111234; BAR0.</td><td>The framebuffer's physical address.</td></tr>
+<tr><td>51–57</td><td>PAT</td><td>Entry 4 becomes write-combining.</td><td>F3-21's PAT bit now selects WC.</td></tr>
+<tr><td>58–62</td><td>mode</td><td>Disable, set width, height, depth, enable with linear framebuffer.</td><td>The order matters: change the mode while disabled.</td></tr>
+<tr><td>63–73</td><td>map</td><td>1.2 MB mapped writable, no-execute, PAT entry 4.</td><td>Device memory never executes.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>fbconsole.h</code> and <code>font5x7.h</code></p>
+<pre class="listing" data-src="F3-23/fbconsole.h"></pre>
+<pre class="listing" data-src="F3-23/font5x7.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–13</td><td>cell and colours</td><td>6 × 10 cells, default colours.</td><td>Shared with the checker.</td></tr>
+<tr><td>42–53</td><td><code>put</code></td><td>Newline, wrap at the last column, draw.</td><td>Long lines wrap rather than vanish.</td></tr>
+<tr><td>58–70</td><td><code>draw</code></td><td>Every pixel of the cell: ink or background.</td><td>Drawing the background too makes overwrites clean.</td></tr>
+<tr><td>71–89</td><td><code>newline</code></td><td>Scroll by copying pixel rows, clear the last line.</td><td>The slow part: 1.2 MB per scroll.</td></tr>
+<tr><td>font</td><td><code>kGlyphs</code></td><td>Hand-drawn 5 × 7 glyphs as strings of '#' and '.'.</td><td>Readable in the source; no third-party font.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>log.h</code>, <code>log.cc</code> and <code>kprint.cc</code> (F3-18)</p>
+<pre class="listing" data-src="F3-23/log.h"></pre>
+<pre class="listing" data-src="F3-23/log.cc"></pre>
+<pre class="listing" data-src="F3-18/kprint.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>log.cc 20–21</td><td><code>kColor</code>, <code>kName</code></td><td>Colour and name per level.</td><td>The checker uses the same colours.</td></tr>
+<tr><td>log.cc 33–44</td><td><code>panic_screen</code></td><td>Red background, white title.</td><td>Called once by panic mode.</td></tr>
+<tr><td>log.cc 50–64</td><td>lock</td><td>Save flags and <code>cli</code>, spin with <code>xchg</code>; release restores flags.</td><td>Interrupt handlers cannot deadlock on it.</td></tr>
+<tr><td>log.cc 66–78</td><td><code>log_init</code></td><td>Sinks, lock and panic hooks.</td><td>kprint knows nothing about framebuffers.</td></tr>
+<tr><td>log.cc 98–123</td><td><code>klog</code></td><td>Filter, lock, colour, prefix, message, unlock.</td><td>The one way kernel code should log.</td></tr>
+<tr><td>kprint.cc 47–57</td><td><code>kprint_panic_mode</code></td><td>Flag and panic screen; disabled by <code>PANIC_KEEPS_LOCK</code>.</td><td>The forensic kernel's switch.</td></tr>
+<tr><td>kprint.cc 59–69</td><td><code>kvprintf</code></td><td>Takes the lock unless in panic mode.</td><td>The line that prevents the deadlock.</td></tr>
+</tbody></table></div>
+<p><b>Listing 4</b> — <code>smbios.cc</code></p>
+<pre class="listing" data-src="F3-23/smbios.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>19–26</td><td><code>sum_is_zero</code></td><td>Byte sum modulo 256.</td><td>The same checksum style as ACPI (F3-24).</td></tr>
+<tr><td>29–42</td><td><code>string_of</code></td><td>String number n after the formatted area; 0 means none.</td><td>Strings are referenced by number, not offset.</td></tr>
+<tr><td>49–65</td><td>entry point</td><td>Scan for "_SM3_" then "_SM_".</td><td>QEMU offers the 64-bit one.</td></tr>
+<tr><td>79–96</td><td>walk</td><td>Types 0, 1, 2; skip the strings to the double zero.</td><td>The length byte covers only the formatted area.</td></tr>
+</tbody></table></div>
+<p><b>Listing 5</b> — <code>b6_main.cc</code>, the checker <code>fbcheck.cc</code> and the QMP helper <code>qmp_cmds.py</code></p>
+<pre class="listing" data-src="F3-23/b6_main.cc"></pre>
+<pre class="listing" data-src="F3-23/fbcheck.cc"></pre>
+<pre class="listing" data-src="F3-23/qmp_cmds.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>b6 29–33</td><td><code>B6_PANIC_TEST</code></td><td>Holds the lock, then <code>ud2</code>.</td><td>Acceptance test 3.</td></tr>
+<tr><td>b6 35–45</td><td>default</td><td>One line per level, 50 lines to force scrolling, then wait.</td><td>Content for the screenshot.</td></tr>
+<tr><td>fbcheck 81–102</td><td>replay</td><td>Serial lines after "console: started" through <code>FbConsole</code>.</td><td>Builds the reference image.</td></tr>
+<tr><td>fbcheck 103–122</td><td>compare</td><td>Counts differing pixels, prints the first.</td><td>Acceptance test 1, tolerance 0.</td></tr>
+<tr><td>qmp 38–68</td><td>monitor</td><td>Waits for a marker in the serial file, then runs monitor commands.</td><td>Screendumps and register dumps without a human.</td></tr>
+</tbody></table></div>
+
+<h2 id="F3-23-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A noticeboard keeps old notices; the console forgets lines that scroll off. Only the serial log is a record.</li>
+<li>The deputy holding the microphone key could, in principle, come back. A CPU spinning for a lock it holds itself, with interrupts off, never lets the holder run again: the wait is provably endless.</li>
+<li>Ignoring the key in a real fire has no cost. Ignoring the lock can garble output on a machine with other CPUs still running.</li>
+</ul>
+
+<h2 id="F3-23-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Logging from an interrupt handler with a plain spinlock</b>: a hang the first time an interrupt arrives during a log line.</li>
+<li><b>Taking the lock on the panic path</b>: the forensic lab.</li>
+<li><b>Ignoring the pitch</b>: on real displays a row can be longer than the width; the image slants.</li>
+<li><b>Mapping the framebuffer write-back</b>: pixels arrive late or in pieces on real hardware; under TCG, nothing shows the bug.</li>
+<li><b>Trusting SMBIOS strings</b>: string number 0 means "none"; strings may be missing or placeholders.</li>
+<li><b>Comparing against a stored screenshot</b>: one font change and every test fails; build the reference from the same code.</li>
+<li><b>A silent hang</b>: get the RIP from the QEMU monitor (<code>info registers</code>), then <code>addr2line</code> and <code>objdump</code> it.</li>
+</ul>
+
+<div class="co transition" id="F3-23-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F3-22, a heap and C++ allocation in the kernel. <b>What carries over:</b> the kprint fan-out and panic of F3-18, the exception handler of F3-19, PAT and mapping from F3-21, checksums and firmware tables found by scanning memory. <b>What changes:</b> the kernel has a screen, levelled and coloured logging, a machine banner, a lock that interrupts respect, and a panic path that never waits. <b>What comes next:</b> F3-24 reads the firmware's ACPI tables (more checksummed tables found by scanning), switches from the old 8259 PIC to the local APIC and IOAPIC, and handles the first real device interrupts: the keyboard and the serial port.</p></div>
+
+<h2 id="F3-23-check">Check yourself</h2>
+<ol>
+<li>How many columns and rows does a 1024 × 768 framebuffer give with 6 × 10 cells?</li>
+<li>Why does <code>log_lock_acquire</code> disable interrupts before spinning, and why save the flags instead of always enabling interrupts at release?</li>
+<li>Explain in your own words why the panic path must not take the lock, and what it gives up by not taking it.</li>
+<li>Why does the screenshot test replay the serial log instead of comparing with a stored image?</li>
+<li>What does string number 0 in an SMBIOS structure mean, and what does the banner print for it?</li>
+<li>Apply to a new case: a page fault happens inside <code>klog</code> while the lock is held, and the page-fault handler can fix the fault and return. Can the handler log a debug line? What should it do?</li>
+<li>Predict-then-run: run the screen test with <code>-smbios type=1,manufacturer=X,product=Y</code> added. Which pixels change, and does the test still pass?</li>
+<li>Why is write-combining correct for a framebuffer but wrong for the IOAPIC's registers of F3-24?</li>
+<li>The forensic kernel hangs with interrupts off. Why does the QEMU monitor still answer?</li>
+</ol>
+
+<h2 id="F3-23-lab">Lab</h2>
+<p><b>Goal.</b> Milestone B6: a logging subsystem with levels, output to UART and framebuffer, a readable panic screen, and a boot banner using SMBIOS data.</p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2 with <code>-vga std</code>, g++ 13.3.0, Python 3 for QMP, binutils for <code>addr2line</code>. Run <code>university/labs/run_lab.sh university/labs/F3-23</code> (about 40 seconds; one step waits for a 15-second time limit on purpose).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>The DISPI ports exist only on emulated hardware. Do not run this framebuffer code on a real machine: writing to unknown I/O ports can upset real devices.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Read <code>boot.out</code>, then <code>screen.out</code>: match the zoomed picture with the log lines.</li>
+<li>Read <code>smbios.out</code>. Add a type 2 override (<code>-smbios type=2,product=…</code>) and check that the board appears.</li>
+<li>Read <code>panic_lock.out</code> and <code>panic_screen.out</code>: what is on the screen, and what is on the serial line?</li>
+<li>Add a minimum level from the command line (Multiboot passes one: F3-18) and show the screen test still passes with Debug lines filtered (the replay must filter the same way).</li>
+</ol>
+<p><b>Expected observations.</b></p>
+<pre class="output" data-run="F3-23/boot"></pre>
+<pre class="output" data-run="F3-23/screen"></pre>
+<pre class="output" data-run="F3-23/smbios"></pre>
+<pre class="output" data-run="F3-23/panic_lock"></pre>
+<pre class="output" data-run="F3-23/panic_screen"></pre>
+<p><b>Verification</b> (the milestone's acceptance tests, verbatim):</p>
+<ul>
+<li>Screenshot test: QEMU's screen-dump of the framebuffer after boot matches a reference image (pixel-exact or with a documented tolerance).</li>
+<li>The banner prints QEMU's SMBIOS strings; overriding them with QEMU's SMBIOS options changes the banner accordingly.</li>
+<li>Logging from an exception handler during a panic does not deadlock (tested by panicking while holding the log lock).</li>
+</ul>
+<p>In this build: 0 of 307,200 pixels differ (R2); the banner changes with <code>-smbios</code> (R4); the locked panic prints and exits with 35 (R3); the panic screen covers 297,455 of 307,200 pixels in panic red (R6).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"fb: no display device found": QEMU was started without <code>-vga std</code> (the lab uses <code>-nodefaults</code>).</li>
+<li>Screendump all black: the kernel had not reached the marker yet, or the DISPI enable was written before the resolution.</li>
+<li>Pixels differ from the first text line: colours or prefix differ between kernel and checker; compare <code>kColor</code> with <code>color_for</code>.</li>
+<li>The locked panic hangs: <code>kprint_panic_mode</code> is not called before the first print of the exception handler.</li>
+</ul>
+<p><b>Extension.</b> Make the serial sink interrupt-driven with a ring buffer (after F3-24), keep a polled path for panic mode, and measure how much faster the 50-line scroll test runs.</p>
+
+<h2 id="F3-23-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Mei's kernel "freezes" in a test that faults while logging. The serial log stops after the warning line; the screen shows the same; the test harness kills QEMU after 15 seconds. No exception report, no panic line. She suspects the IDT is broken.</p>
+<p><b>Evidence pack.</b> The serial log (R5) and the monitor session with the symbol lookups (R7):</p>
+<pre class="output" data-run="F3-23/forensic_serial"></pre>
+<pre class="output" data-run="F3-23/forensic_monitor"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: where is the CPU (RIP, function, source line)? Is it halted? Are interrupts enabled (RFL)?</li>
+<li>Hypotheses: the IDT is broken; the CPU is in an endless exception loop; the CPU is waiting for something. Which register values decide?</li>
+<li>Root cause: what is the loop at the RIP waiting for, who holds it, and why will it never be released?</li>
+<li>Fix: which line of the kernel's build or source changes, and where should the panic flag be set?</li>
+<li>Prevention: which test catches this regression, and what does it check?</li>
+</ol>
+<p><b>Method hints.</b> <code>HLT=0</code> means the CPU is executing, not halted. Bit 9 of RFLAGS is IF. Look at the instruction at RIP and the jump after it.</p>
+
+<h2 id="F3-23-project">Mini-project</h2>
+<p><b>A log you can read after a crash.</b> Keep the last 64 KiB of log text in a ring buffer in memory. On panic, after the report, dump the ring buffer's last 20 lines to the panic screen, and make it readable from the QEMU monitor (<code>x</code> or <code>pmemsave</code>) after a hang. Write a host script that extracts and prints it from a <code>pmemsave</code> file.</p>
+<p><b>Rubric.</b> Ring buffer correct across wrap-around, tested on the host (3). Panic screen shows the last lines (2). Extraction works on a hung kernel, demonstrated with the forensic kernel (4). Locking of the ring buffer explained (1).</p>
+
+<h2 id="F3-23-summary">Summary</h2>
+<ul>
+<li>The kernel finds QEMU's VGA device on PCI, sets a 640 × 480 × 32 mode, and maps the framebuffer write-combining.</li>
+<li>A 5 × 7 font in 6 × 10 cells gives a 106 × 48 console that scrolls by copying pixel rows.</li>
+<li><code>klog</code> filters by level, colours by level, prefixes a sequence number, and writes to serial and screen through one fan-out.</li>
+<li>The screenshot test rebuilds the expected image from the serial log with the same code: pixel-exact.</li>
+<li>The banner reads SMBIOS types 0 and 1 (type 2 is absent in QEMU's pc machine); <code>-smbios</code> changes it.</li>
+<li>The output lock disables interrupts; the panic path never takes it.</li>
+<li>A silent hang is diagnosed from the monitor's RIP with <code>addr2line</code> and <code>objdump</code>.</li>
+</ul>
+
+<h2 id="F3-23-sources">Sources</h2>
+<ol>
+<li id="F3-23-src-D1">National Semiconductor (Texas Instruments), "PC16550D Universal Asynchronous Receiver/Transmitter with FIFOs" datasheet (tier 1; named in B6). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-23-src-D2">UEFI Forum, "Unified Extensible Firmware Interface Specification" (tier 1; named in B6), Graphics Output Protocol, pixel formats. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-23-src-D3">DMTF, "System Management BIOS (SMBIOS) Reference Specification" (tier 1; named in B6), entry points and structure types 0, 1, 2. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-23-src-D4">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3 (tier 1), memory types and "Page Attribute Table (PAT)". <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-23-src-D5">Remzi H. Arpaci-Dusseau and Andrea C. Arpaci-Dusseau, "Operating Systems: Three Easy Pieces" (tier 3; curriculum item 2), "Locks" and "Common Concurrency Problems". <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-23-src-D6">QEMU documentation (tier 2): the monitor commands <code>screendump</code>, <code>info registers</code> and <code>x</code>, QMP <code>human-monitor-command</code>, and the <code>-smbios</code> option. <i>Not opened during this build (dossier gate G1 open); behaviour observed in the lab runs.</i></li>
+<li id="F3-23-src-D7">The Linux kernel source (tier 4; curriculum item 40), <code>kernel/panic.c</code>. Cited as "what this implementation does". <i>Not opened during this build (dossier gate G1 open).</i></li>
+<li id="F3-23-src-R1">R1 — lab run <code>university/labs/F3-23/boot.log</code>: the B6 kernel's serial log, QEMU 8.2.2 (TCG), <code>-vga std</code>, exit code 0. Untested on hardware.</li>
+<li id="F3-23-src-R2">R2 — lab run <code>screen.log</code>: <code>fbcheck</code> on the screendump, g++ 13.3.0 with AddressSanitizer, exit code 0.</li>
+<li id="F3-23-src-R3">R3 — lab run <code>panic_lock.log</code>: panic while holding the log lock, exit code 35 (expected).</li>
+<li id="F3-23-src-R4">R4 — lab run <code>smbios.log</code>: banner with QEMU's and overridden SMBIOS strings.</li>
+<li id="F3-23-src-R5">R5 — forensic run <code>forensic_serial.log</code>: the <code>PANIC_KEEPS_LOCK</code> kernel, stopped by the time limit, exit code 124.</li>
+<li id="F3-23-src-R6">R6 — lab run <code>panic_screen.log</code>: screendump of the panic screen, exit code 0.</li>
+<li id="F3-23-src-R7">R7 — forensic run <code>forensic_monitor.log</code>: <code>info registers</code> and <code>x /16xb $pc</code> through QMP, <code>addr2line</code> and <code>objdump</code> (GNU binutils 2.42).</li>
+</ol>
+
+<h2 id="F3-23-glossary">Glossary links</h2>
+<p><a href="#gl-framebuffer">Framebuffer</a> · <a href="#gl-bitmap-font">Bitmap font</a> · <a href="#gl-log-level">Log level</a> · <a href="#gl-smbios">SMBIOS</a> · <a href="#gl-write-combining">Write-combining</a> · <a href="#gl-deadlock">Deadlock</a> · <a href="#gl-panic-mode">Panic mode</a> · <a href="#gl-screendump">Screendump</a> · <a href="#gl-panic">Panic</a> · <a href="#gl-serial-port-uart">Serial port (UART)</a></p>
+
+<h2 id="F3-23-next">Next chapter</h2>
+<p>Next: <a href="#F3-24">F3-24 ACPI tables, local APIC and IOAPIC</a>. Previous: <a href="#F3-22">F3-22 The kernel heap and C++ allocation</a>. Back to the course: <a href="#OS302">OS302</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (milestone B6).</p>
+
+<h2 id="F3-23-answers">Answers to Check yourself</h2>
+<ol>
+<li>1024 / 6 = 170 columns (4 pixels left over), 768 / 10 = 76 rows (8 left over).</li>
+<li>An interrupt handler on the same CPU that logs while the interrupted code holds the lock would spin forever; with interrupts off, it cannot arrive. Saving the flags matters because code that already runs with interrupts off (an exception handler, early boot) must not have them turned on by a log call.</li>
+<li>Good answers say: the code that holds the lock may be the code that crashed, and it will never run again, so waiting is endless; skipping the lock risks interleaved or garbled output if another CPU is printing, and a console state left half-updated; a readable but possibly garbled report beats no report.</li>
+<li>A stored image breaks whenever the font, colours or messages change, and does not say why; replaying the log through the same code checks the console logic (wrapping, scrolling, colours) and the device path, and survives intended changes.</li>
+<li>No string; the banner prints "(none)" (<code>string_of</code>, line 32).</li>
+<li>No: the lock is held by the code it interrupted on the same CPU; a debug line would deadlock (this is not panic mode). It should not log at all, or log into a lock-free per-CPU buffer that is printed later, or use a recursion-aware lock that detects the owner is this CPU.</li>
+<li>The banner line (line 4) changes its text, so its pixels change; the test still passes, because the reference is rebuilt from the same serial log. Run it to confirm.</li>
+<li>Pixels are written in streams and their order does not matter, and nothing is read back; device registers have side effects, need every write in order and immediately, and are read back, so they must be uncached (F3-24 maps them that way).</li>
+<li>The monitor runs in QEMU, outside the guest; the guest CPU's state (spinning, IF=0) does not affect QEMU's main loop.</li>
+</ol>
+<h3 id="F3-23-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> RIP = <code>ffffffff80110ec2</code>, which <code>addr2line</code> places in <code>log_lock_acquire()</code>, <code>log.cc:53</code>: the <code>while</code> loop with <code>__atomic_exchange_n</code>. <code>HLT=0</code>: the CPU is running. RFL = <code>00000002</code>: IF (bit 9) is clear. The disassembly is the spin: <code>mov %edx,%eax; xchg %eax,g_lock_word; test %eax,%eax; jne</code> back to <code>pause</code>. RAX = 1: the last exchange returned 1, the lock is taken.</p>
+<p><b>Hypotheses.</b> A broken IDT would end in a triple fault and a reset (F3-19), not a CPU running in the log lock. An exception loop would show RIP in an exception stub and a growing count in an interrupt log. The evidence fits "waiting for a lock".</p>
+<p><b>Root cause.</b> The test took the log lock and executed <code>ud2</code>. The #UD handler's report calls <code>kprintf</code>, which takes the lock, already held by the same CPU, with interrupts off: no one can ever release it. In this kernel <code>PANIC_KEEPS_LOCK</code> compiled out the body of <code>kprint_panic_mode</code> (kprint.cc lines 49–56), so the handler's call to it did nothing and <code>kvprintf</code> still locked.</p>
+<p><b>Fix.</b> Remove <code>-DPANIC_KEEPS_LOCK</code> (in a real kernel: set the panic flag before the first print on every fatal path, and make <code>kvprintf</code> skip the lock in panic mode). The normal kernel does this and prints the full report (R3).</p>
+<p><b>Prevention.</b> Acceptance test 3, the <code>B6_PANIC_TEST</code> kernel, run on every build: it must exit with 35 within 30 seconds; a hang ends with 124 and fails the lab.</p>

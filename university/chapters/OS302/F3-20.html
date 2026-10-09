@@ -1,0 +1,322 @@
+<!--meta
+id: F3-20
+title: The physical memory manager
+course: OS302
+level: L3
+prereqs: F3-19; SP203; OS201 (F3-04)
+time: 8–12 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with 128 MiB, 1 GiB and 4 GiB of guest RAM)
+maps: Curriculum Track B, milestone B3 (physical memory manager); course forensic lab "the leaking frames"
+analogy: F3 — the school (the caretaker's room plan and the cupboards)
+-->
+
+<h2 id="F3-20-hook">Story hook</h2>
+<p>The caretaker leaves the principal a plan of the building: "rooms 1 to 40 usable; room 41 is the boiler, never enter; rooms 42 to 300 usable; the roof is under repair". The principal now has to hand out cupboards to teachers, every day, for years. Some teachers want one cupboard. The science teacher wants eight cupboards side by side, because the equipment does not fit in separate ones. Teachers return cupboards when they leave, but not always the way they borrowed them.</p>
+<p>After a term, the school office notices something odd: every evening the list of free cupboards gets a little shorter, although every teacher swears they returned everything. One day the science teacher asks for two neighbouring cupboards and gets "none available", while the list still shows thousands of free ones. This chapter builds the cupboard office of your kernel, the physical memory manager, and then solves that mystery.</p>
+
+<h2 id="F3-20-able">What you will be able to do</h2>
+<ul>
+<li><b>Read</b> the firmware's memory map and explain each range type.</li>
+<li><b>Normalise</b> the map: round to pages, sort, merge, and subtract the kernel image, boot data and low memory.</li>
+<li><b>Implement</b> a bitmap allocator and a binary buddy allocator for 4 KiB frames, with contiguous, aligned allocations.</li>
+<li><b>Account</b> for every KiB of conventional memory: what the allocator manages and why the rest is not managed.</li>
+<li><b>Test</b> the allocator on the host against a reference model, and in QEMU with three memory sizes.</li>
+<li><b>Diagnose</b> a slow frame leak and the fragmentation it causes from allocator statistics over time.</li>
+</ul>
+
+<div class="co jargon" id="F3-20-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Frame (physical page)</dt><dd><b>Simple words:</b> one 4 KiB piece of real memory. <b>Analogy:</b> one cupboard. <b>Precise:</b> a naturally aligned 4 KiB block of physical address space, the unit the page tables map (larger page sizes are multiples of it). <sup class="src"><a href="#F3-20-src-D1">D1</a></sup></dd>
+<dt>Memory map (firmware)</dt><dd><b>Simple words:</b> the firmware's list of which address ranges are RAM you may use and which are not. <b>Analogy:</b> the caretaker's room plan. <b>Precise:</b> a list of (base, length, type) entries delivered by the firmware or loader (BIOS E820 through Multiboot here, the UEFI memory map in A3); only "available" ranges may be used freely. <sup class="src"><a href="#F3-20-src-D2">D2</a></sup> <sup class="src"><a href="#F3-20-src-D3">D3</a></sup></dd>
+<dt>Physical memory manager (PMM)</dt><dd><b>Simple words:</b> the part of the kernel that hands out and takes back frames. <b>Analogy:</b> the cupboard office. <b>Precise:</b> an allocator over physical frames, built from the memory map, offering allocation of single frames and of contiguous, aligned runs. <sup class="src"><a href="#F3-20-src-D4">D4</a></sup></dd>
+<dt>Bitmap allocator</dt><dd><b>Simple words:</b> one bit per frame: 1 used, 0 free. <b>Analogy:</b> a tick list with one box per cupboard. <b>Precise:</b> a frame allocator whose state is a bit array; allocation searches for a clear bit (or a run of them). <sup class="src"><a href="#F3-20-src-D4">D4</a></sup></dd>
+<dt>Buddy allocator</dt><dd><b>Simple words:</b> an allocator that keeps memory in blocks of 1, 2, 4, 8… frames, splitting big blocks and joining neighbours back. <b>Analogy:</b> cupboards grouped in pairs, pairs of pairs, and so on; a returned cupboard rejoins its partner when the partner is free. <b>Precise:</b> a power-of-two allocator: a block of order k has 2^k frames and is aligned to 2^k frames; its buddy is found by flipping bit k of its frame number; freeing merges buddies recursively. <sup class="src"><a href="#F3-20-src-D5">D5</a></sup> <sup class="src"><a href="#F3-20-src-D6">D6</a></sup></dd>
+<dt>Order</dt><dd><b>Simple words:</b> the size class of a buddy block, as a power of two. <b>Analogy:</b> "a group of 2^order cupboards". <b>Precise:</b> the exponent k of a block of 2^k frames; this kernel uses orders 0 (4 KiB) to 10 (4 MiB). <sup class="src"><a href="#F3-20-src-R2">R2</a></sup></dd>
+<dt>Fragmentation (external)</dt><dd><b>Simple words:</b> enough free memory in total, but not enough of it in one piece. <b>Analogy:</b> many free cupboards, none of them next to another free one. <b>Precise:</b> the state in which free memory is split into blocks smaller than a request, so the request fails although the free total exceeds it. <sup class="src"><a href="#F3-20-src-D5">D5</a></sup> <sup class="src"><a href="#F3-20-src-R4">R4</a></sup></dd>
+<dt>Direct map</dt><dd><b>Simple words:</b> a window in the kernel's address space where every physical address can be read at a fixed offset. <b>Analogy:</b> a master key that opens every cupboard by its number. <b>Precise:</b> a virtual range (here <code>0xffff800000000000</code> + physical) mapping all of RAM, used by the kernel to touch frames it does not otherwise map. <sup class="src"><a href="#F3-20-src-R1">R1</a></sup></dd>
+</dl></div>
+<p>"Kernel" here is the operating-system kernel; "kernel (GPU)" in F6 names a GPU function, an unrelated meaning.</p>
+
+<h2 id="F3-20-pictures">The idea in pictures</h2>
+<p>Figure 1 shows what happens between the firmware's map and the allocator: only part of the RAM ends up managed, and the accounting line of the lab explains every missing KiB. Figure 2 shows a buddy allocator splitting a block for an allocation and merging it back on free.</p>
+<figure id="F3-20-fig1"><div class="svgbox">
+<svg viewBox="0 0 900 300" role="img" aria-labelledby="F3-20-f1t F3-20-f1d">
+<title id="F3-20-f1t">Figure 1: from the firmware's memory map to the managed ranges</title>
+<desc id="F3-20-f1d">Three horizontal bars for the 128 MiB QEMU machine, not to scale. Top bar, the firmware map: available 0 to 0x9fbff (639 KiB), reserved 0x9fc00 to 0x9ffff, a gap, reserved 0xf0000 to 0xfffff, available 0x100000 to 0x7fdffff (129,920 KiB), reserved 0x7fe0000 to 0x7ffffff. Middle bar, after subtracting what the kernel keeps: low memory below 1 MiB kept out (636 KiB after rounding), the kernel image from 1 MiB (88 KiB), the allocator's state bytes (32 KiB). Bottom bar: the managed range 0x11e000 to 0x7fdffff, 129,800 KiB. Below, the accounting equation: conventional 130,559 KiB = managed 129,800 + below 1 MiB 636 + kernel 88 + boot info 0 + metadata 32 + rounding 3.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="300"/>
+<text class="sv-tb" x="20" y="28">firmware map (Multiboot)</text>
+<rect class="sv-b3" x="20" y="40" width="90" height="40"/><text class="sv-ts" x="26" y="64">avail 639K</text>
+<rect class="sv-b8" x="110" y="40" width="20" height="40"/>
+<rect class="sv-box" x="130" y="40" width="40" height="40"/><text class="sv-ts" x="132" y="64">gap</text>
+<rect class="sv-b8" x="170" y="40" width="30" height="40"/>
+<rect class="sv-b3" x="200" y="40" width="620" height="40"/><text class="sv-t" x="420" y="64">available 0x100000–0x7fdffff, 129,920 KiB</text>
+<rect class="sv-b8" x="820" y="40" width="60" height="40"/><text class="sv-ts" x="824" y="64">ACPI</text>
+<text class="sv-tb" x="20" y="118">what the kernel keeps out</text>
+<rect class="sv-b6" x="20" y="130" width="180" height="40"/><text class="sv-ts" x="26" y="154">below 1 MiB: 636 KiB</text>
+<rect class="sv-b1" x="200" y="130" width="70" height="40"/><text class="sv-ts" x="204" y="154">kernel 88K</text>
+<rect class="sv-b2" x="270" y="130" width="70" height="40"/><text class="sv-ts" x="274" y="154">state 32K</text>
+<text class="sv-tb" x="20" y="208">handed to the buddy allocator</text>
+<rect class="sv-b4" x="340" y="220" width="480" height="40"/><text class="sv-t" x="380" y="244">0x11e000–0x7fdffff, 129,800 KiB</text>
+<line class="sv-dash" x1="340" y1="80" x2="340" y2="220"/><line class="sv-dash" x1="820" y1="80" x2="820" y2="220"/>
+<text class="sv-ts" x="20" y="288">conventional 130,559 = managed 129,800 + below 1 MiB 636 + kernel 88 + boot info 0 + metadata 32 + rounding 3 (KiB); not to scale</text>
+</svg></div><figcaption><b>Figure 1.</b> The 128 MiB machine's memory map and accounting, drawn from the lab output R2. Range types after the Multiboot specification's memory-map description <sup class="src"><a href="#F3-20-src-D2">D2</a></sup>.</figcaption></figure>
+
+<figure id="F3-20-fig2"><div class="svgbox">
+<svg viewBox="0 0 900 330" role="img" aria-labelledby="F3-20-f2t F3-20-f2d">
+<title id="F3-20-f2t">Figure 2: a buddy allocator splits on allocation and merges on free</title>
+<desc id="F3-20-f2d">Four rows over the same 8 frames, numbered 0 to 7. Row 1: one free block of order 3 (frames 0 to 7). Row 2: allocating one frame (order 0) splits it: frames 4 to 7 become a free order-2 block, frames 2 to 3 a free order-1 block, frame 1 a free order-0 block, and frame 0 is allocated. Row 3: freeing frame 0 with order 0: its buddy is frame 0 XOR 1 = 1, which is a free order-0 block, so they merge into an order-1 block at frame 0; its buddy is frame 0 XOR 2 = 2, free with order 1, merge to order 2 at frame 0; its buddy 0 XOR 4 = 4, free with order 2, merge to order 3. Row 4: the leak: freeing frame 0 with order 0 after allocating it with order 1 leaves frame 1 marked as not free forever; frame 0 cannot merge because its buddy frame 1 is not free, and every later order-1 request needs a new pair.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="330"/>
+<text class="sv-ts" x="20" y="22">frame:</text>
+<text class="sv-ts" x="200" y="22">0</text><text class="sv-ts" x="280" y="22">1</text><text class="sv-ts" x="360" y="22">2</text><text class="sv-ts" x="440" y="22">3</text><text class="sv-ts" x="520" y="22">4</text><text class="sv-ts" x="600" y="22">5</text><text class="sv-ts" x="680" y="22">6</text><text class="sv-ts" x="760" y="22">7</text>
+<text class="sv-tb" x="20" y="60">1 start</text>
+<rect class="sv-b3" x="180" y="36" width="640" height="40"/><text class="sv-t" x="420" y="60">free, order 3 (8 frames)</text>
+<text class="sv-tb" x="20" y="120">2 alloc(0)</text>
+<rect class="sv-b1" x="180" y="96" width="80" height="40"/><text class="sv-ts" x="186" y="120">used</text>
+<rect class="sv-b3" x="260" y="96" width="80" height="40"/><text class="sv-ts" x="266" y="120">free o0</text>
+<rect class="sv-b3" x="340" y="96" width="160" height="40"/><text class="sv-ts" x="350" y="120">free, order 1</text>
+<rect class="sv-b3" x="500" y="96" width="320" height="40"/><text class="sv-ts" x="600" y="120">free, order 2</text>
+<text class="sv-tb" x="20" y="180">3 free(0, 0)</text>
+<rect class="sv-b3" x="180" y="156" width="640" height="40"/><text class="sv-t" x="230" y="180">merge: 0^1=1 → o1, 0^2=2 → o2, 0^4=4 → o3: back to row 1</text>
+<text class="sv-tb" x="20" y="240">4 the leak</text>
+<rect class="sv-b3" x="180" y="216" width="80" height="40"/><text class="sv-ts" x="186" y="240">free o0</text>
+<rect class="sv-b8" x="260" y="216" width="80" height="40"/><text class="sv-ts" x="264" y="240">lost</text>
+<rect class="sv-b3" x="340" y="216" width="160" height="40"/><text class="sv-ts" x="350" y="240">free, order 1</text>
+<rect class="sv-b3" x="500" y="216" width="320" height="40"/><text class="sv-ts" x="600" y="240">free, order 2</text>
+<text class="sv-ts" x="180" y="290">row 4: allocated as order 1 (frames 0–1), freed as order 0: frame 1 is never returned,</text>
+<text class="sv-ts" x="180" y="308">and frame 0 can never merge, because its buddy is frame 1</text>
+</svg></div><figcaption><b>Figure 2.</b> Split, merge and the leak of the forensic lab, on 8 frames. Buddy rule after Knuth's description of the buddy system <sup class="src"><a href="#F3-20-src-D5">D5</a></sup>; the merge loop is lines 146–159 of <code>buddy.h</code>.</figcaption></figure>
+
+<h2 id="F3-20-layer1">Layer 1 — the kid explanation</h2>
+<p>A computer's memory is a long row of bytes. The kernel cuts it into small pieces of 4096 bytes and lends them out: to page tables, to the heap, to programs. It must never lend a piece twice, and it must never lend a piece that belongs to someone else, like the firmware or the kernel's own code.</p>
+<p>So the kernel first reads a list from the firmware that says which parts are free memory. It removes the parts it already uses. Then it keeps the rest in groups of 1, 2, 4, 8 and more pieces, so that it can quickly find a big group when someone needs many pieces side by side. When pieces come back, it joins neighbours into bigger groups again.</p>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The caretaker's plan (memory map) says which rooms exist and which are off limits. The cupboard office (PMM) lends cupboards (frames). It keeps them in pairs, pairs of pairs and so on, so that a teacher who needs eight side by side can get them at once. A cupboard returned next to its free partner is joined with it again.</p></div>
+
+<h2 id="F3-20-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F3-20-l2-map">The map the firmware gives us</h3>
+<p>On a BIOS machine the firmware reports memory through a list of ranges (the E820 interface); a Multiboot loader copies that list into the information structure, with entries of base, length and type <sup class="src"><a href="#F3-20-src-D2">D2</a></sup>. Type 1 is available RAM; other types are reserved, ACPI tables that may be reclaimed after reading, ACPI non-volatile storage, or bad memory. A UEFI loader passes the UEFI memory map instead, with more types (boot services data, runtime services code and so on) that the kernel maps onto the same idea <sup class="src"><a href="#F3-20-src-D3">D3</a></sup>.</p>
+<p>The lab prints QEMU's map for 128 MiB: available below 640 KiB, two reserved ranges below 1 MiB (the extended BIOS data area and the BIOS), available from 1 MiB to 128 KiB below 128 MiB, a 128 KiB reserved range at the top (where SeaBIOS keeps the ACPI tables, as F3-24 shows), the firmware's flash below 4 GiB, and one large reserved range at <code>0xfd00000000</code> <sup class="src"><a href="#F3-20-src-R2">R2</a></sup>. Note what is not in the list at all: the VGA hole at 640 KiB–768 KiB, the PCI device windows, the local APIC. "Not listed" is not "free".</p>
+<h3 id="F3-20-l2-normalise">Normalising</h3>
+<p>Maps can overlap, be unsorted, or start and end in the middle of a page. <code>memmap.h</code> rounds every available range <em>inwards</em> to whole pages (a partial page at the edge is not ours), sorts, and merges overlapping or touching ranges. Then it subtracts what the kernel keeps, rounding those ranges <em>outwards</em>: everything below 1 MiB (firmware data and the real-mode area, kept for later use such as starting other CPUs in OS304), the kernel image up to the end of BSS, the boot information and the map itself, and the allocator's own state.</p>
+<h3 id="F3-20-l2-bitmap">First allocator: a bitmap</h3>
+<p>One bit per frame is the simplest correct allocator: start with all bits set ("used"), clear the bits of the usable ranges, and allocate by searching for a clear bit. <code>bitmap_pmm.h</code> does this and is tested on the host. It is easy to trust but slow to search, and finding 512 contiguous clear bits aligned to 2 MiB means scanning. The kernel therefore uses a buddy allocator, which the curriculum names as the second step <sup class="src"><a href="#F3-20-src-D7">D7</a></sup>.</p>
+<h3 id="F3-20-l2-buddy">The buddy allocator</h3>
+<p>Free memory is kept as blocks of 2^k frames, each aligned to its own size, on one list per order k. To allocate order k, take a block from list k; if it is empty, take a bigger block and split it in halves until one half has the right size, putting the other halves on their lists. To free, look at the block's buddy, the block of the same size that it was split from: its frame number is the block's frame number with bit k flipped. If the buddy is free and has the same order, unlink it and merge, then repeat one order higher <sup class="src"><a href="#F3-20-src-D5">D5</a></sup>. Figure 2 shows both directions. Allocation and free cost at most one step per order, and contiguous, aligned requests come for free: an order-9 block is 2 MiB and 2 MiB-aligned, exactly what a 2 MiB page or a DMA buffer needs.</p>
+
+<h2 id="F3-20-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-20-l3-state">Where the allocator keeps its state</h3>
+<p>The free lists are doubly linked lists whose nodes live <em>inside the free frames themselves</em>: a free frame is not used by anyone, so its first 16 bytes can hold the next and previous pointers. The allocator reaches a frame's bytes through a "window", the kernel's direct map (<code>0xffff800000000000</code> + physical) <sup class="src"><a href="#F3-20-src-R1">R1</a></sup>. In the host test the window is an ordinary array, so the same code runs on both sides. Besides the lists, the allocator keeps one state byte per frame: <code>0xFF</code> for "not the head of a free block", or the order of the free block that starts there. Merging needs that byte: the buddy may be merged only if it heads a free block <em>of the same order</em>; a buddy that is free but part of a bigger or smaller block must not be touched.</p>
+<p>With <code>check_order</code> on, the byte also records the order of each allocated block (<code>0x80 | order</code>). Then a free with the wrong order, or a second free of the same block, is refused. The lab kernel runs with checking on; the forensic driver runs with it off, which is the configuration in which its bug stays invisible.</p>
+<h3 id="F3-20-l3-meta">How big is the state, and where does it go?</h3>
+<p>One byte per frame up to the highest usable address: for 128 MiB, <code>0x7fe0000 / 4096 = 32,736</code> frames, rounded to 32 KiB. The state needs memory before an allocator exists, so <code>pmm.cc</code> takes it from the first usable range big enough, then subtracts it from the map. For the 4 GiB machine the state is 1,280 KiB: the highest usable address is 5 GiB, because QEMU places 1 GiB above 4 GiB (R2). That is the price of a dense array: memory holes cost state bytes too. Larger kernels keep a per-frame structure as well (Linux's <code>struct page</code>) and handle sparse layouts with sections <sup class="src"><a href="#F3-20-src-D8">D8</a></sup>.</p>
+<h3 id="F3-20-l3-add">Adding a range</h3>
+<p><code>add_frames</code> cuts each usable range into the largest aligned blocks that fit: at each position it tries order 10 and lowers the order while the position is not aligned or the block would run past the end. The 128 MiB machine's range runs from frame 0x11e to frame 0x7fe0: it begins with blocks of order 1, 5, 6, 7 and 9, continues with order-10 blocks and ends with blocks of order 9, 8, 7, 6 and 5. The lab's "free blocks by order" line at boot, <code>0 1 0 0 0 2 2 2 1 2 30</code>, is exactly that count <sup class="src"><a href="#F3-20-src-R2">R2</a></sup>. Each block is released through the normal free path, so neighbours merge as they arrive.</p>
+<h3 id="F3-20-l3-account">Accounting: every KiB explained</h3>
+<p>The acceptance test asks that free memory after boot match "conventional memory minus the kernel within a documented tolerance". Rather than a tolerance, the kernel counts every subtraction and prints an equation that must hold exactly: conventional = managed + below 1 MiB + kernel + boot info + metadata + rounding. For 128 MiB: 130,559 = 129,800 + 636 + 88 + 0 + 32 + 3 KiB. The 3 KiB of rounding is the partial page at 0x9fc00 (639 KiB is not a whole number of pages); boot info is 0 because QEMU put it below 1 MiB, where it is already excluded. The same equation holds for 1 GiB and 4 GiB <sup class="src"><a href="#F3-20-src-R2">R2</a></sup>. The documented tolerance is therefore zero; the design note should say so.</p>
+<h3 id="F3-20-l3-tests">Testing</h3>
+<p>The host test <code>pmm_host.cpp</code> checks normalisation and subtraction on hand-made maps; allocates every frame one by one and frees them all, checking that the free count and the shape of the free lists come back; and runs 200,000 random operations of random orders against a reference model (an owner number for every frame), checking at each allocation that the block is aligned and that none of its frames is already owned or outside the usable map, and at the end that the free count and the block shape come back <sup class="src"><a href="#F3-20-src-R1">R1</a></sup>. Under AddressSanitizer, an off-by-one in the window arithmetic is caught at once. In QEMU, the kernel repeats allocate-everything and free-everything, and allocates order 4 and order 9 to show alignment <sup class="src"><a href="#F3-20-src-R2">R2</a></sup>.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not from the documents: the Multiboot memory-map entry layout (a <code>size</code> field that does not count itself) and its type values 1–5 (Multiboot Specification, D2); the E820 interface and type meanings (ACPI Specification, "System Address Map Interfaces", D9); the UEFI memory types (UEFI Specification, D3); that the reserved range at <code>0xfd00000000</code> is QEMU's reservation for its own use on large address spaces (check the QEMU source or documentation, D10). The runs confirm only that QEMU 8.2.2 with SeaBIOS reported the ranges shown.</p></div>
+
+<h2 id="F3-20-hardware">How the hardware actually does it</h2>
+<p>Physical memory has no "free" or "used" state in hardware: the memory controller answers any address that decodes to DRAM, and the platform's address decoders send other addresses to devices, firmware flash or nowhere <sup class="src"><a href="#F3-20-src-D1">D1</a></sup>. Which ranges are RAM is decided by the platform at boot: the firmware trains the memory, programs the decoders (including the PCI hole below 4 GiB, which is why QEMU's 4 GiB machine shows 3 GiB below and 1 GiB above 4 GiB), and reports the result in its memory map <sup class="src"><a href="#F3-20-src-R2">R2</a></sup>. Reading a reserved range may return device registers whose reads have side effects; writing it may change firmware state. That is why the allocator must take ranges only from the map's available type, and why F3-21 maps reserved ranges read-only or not at all.</p>
+<p>DMA is the other hardware reason for contiguous allocation: many devices read and write physical addresses directly and need a buffer that is contiguous in physical memory, sometimes below a limit (for example 4 GiB for 32-bit DMA engines) <sup class="src"><a href="#F3-20-src-D7">D7</a></sup>. A buddy allocator can be split into zones by address for that purpose; this kernel has one zone and records the limit as an extension.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p>Untested on hardware. On a real PC the memory map has many more entries, ranges may overlap, and some firmware reports ranges that are not page-aligned. The normaliser handles those cases in the host test, but no real firmware's map was read in this build. Never "test" an allocator on a real machine by writing to memory the map does not list as available.</p></div>
+
+<h2 id="F3-20-worked">Worked example</h2>
+<p>A free request: <code>free(frame 0x7fc0, order 4)</code> on the 128 MiB machine, after the lab's order-4 allocation at physical <code>0x7fc0000</code> (R2). Which blocks does the merge loop look at?</p>
+<ol>
+<li>Order 4: block 0x7fc0 (16 frames). Buddy = 0x7fc0 XOR 0x10 = 0x7fd0. When the order-4 block was split from a bigger one, 0x7fd0 stayed free at order 4, so merge: block 0x7fc0, order 5.</li>
+<li>Order 5: buddy = 0x7fc0 XOR 0x20 = 0x7fe0. Frame 0x7fe0 is physical 0x7fe0000, the start of the reserved ACPI range, and 0x7fe0 = 32,736 is also the number of frames the allocator tracks: the buddy lies outside the state array, so the loop stops (line 151). No merge.</li>
+<li>Result: one free block of order 5 at 0x7fc0 (128 KiB, 0x7fc0000–0x7fdffff), the end of the usable range. The allocation came from there in the first place: the order-4 list was empty, so <code>alloc</code> popped the block most recently pushed on the order-5 list (the one <code>add_frames</code> added last, at the end of the range) and split it.</li>
+</ol>
+<p>Check: the run's line <code>contiguous: order 4 (64 KiB) at 0000000007fc0000, aligned to its size: yes</code>; 0x7fc0000 is a multiple of 0x10000.</p>
+
+<h2 id="F3-20-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F3-20/</code>. The headers <code>memmap.h</code>, <code>bitmap_pmm.h</code> and <code>buddy.h</code> are pure logic and shared by the kernel and the host test.</p>
+<p><b>Listing 1</b> — <code>memmap.h</code></p>
+<pre class="listing" data-src="F3-20/memmap.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–28</td><td><code>Range</code>, <code>RangeList</code></td><td>Half-open ranges in a fixed array.</td><td>No heap exists yet; 64 ranges are plenty for a PC map.</td></tr>
+<tr><td>45–68</td><td><code>normalize</code></td><td>Round inwards, drop empties, sort, merge.</td><td>Line 49–50: inwards rounding.</td></tr>
+<tr><td>71–90</td><td><code>subtract</code></td><td>Remove a range, splitting where needed.</td><td>Line 73–74: outwards rounding.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>buddy.h</code></p>
+<pre class="listing" data-src="F3-20/buddy.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–21</td><td>constants, <code>Stats</code></td><td>Orders 0–10; state-byte codes; counters and free blocks per order.</td><td>The statistics the forensic lab reads.</td></tr>
+<tr><td>24–37</td><td><code>init</code></td><td>Window, state array, all frames "not free".</td><td>Nothing is free until a range is added.</td></tr>
+<tr><td>40–56</td><td><code>add_frames</code></td><td>Largest aligned blocks, released one by one.</td><td>Neighbouring blocks merge as they arrive.</td></tr>
+<tr><td>59–77</td><td><code>alloc</code></td><td>Smallest non-empty order ≥ request, split down.</td><td>The upper halves go back on their lists.</td></tr>
+<tr><td>81–92</td><td><code>free</code></td><td>Refuses double frees and, with checking, wrong orders.</td><td>Line 86: the check the forensic driver did not have.</td></tr>
+<tr><td>109–144</td><td>list operations</td><td>Push, unlink and pop on intrusive lists inside free frames.</td><td>No memory needed beyond the frames themselves.</td></tr>
+<tr><td>146–159</td><td><code>release</code></td><td>Merge with the buddy while it heads a free block of the same order.</td><td>Line 150: the XOR that finds the buddy.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>pmm.h</code> and <code>pmm.cc</code></p>
+<pre class="listing" data-src="F3-20/pmm.h"></pre>
+<pre class="listing" data-src="F3-20/pmm.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>h 10–16</td><td><code>kDirectMap</code>, <code>phys_to_virt</code></td><td>The boot direct map from F3-18.</td><td>F3-21 keeps the same window in its own tables.</td></tr>
+<tr><td>h 18–26</td><td><code>Accounting</code></td><td>The seven parts of the equation.</td><td>Acceptance test 2.</td></tr>
+<tr><td>28–39</td><td>map loop</td><td>Prints every entry, collects type-1 ranges.</td><td>Line 38: the size field does not count itself.</td></tr>
+<tr><td>40–51</td><td>normalise and take</td><td>Counts what each subtraction removes.</td><td>The accounting is measured, not estimated.</td></tr>
+<tr><td>52–67</td><td>metadata</td><td>Caps at the direct map's 8 GiB, sizes and places the state bytes.</td><td>The state needs memory before an allocator exists.</td></tr>
+<tr><td>68–76</td><td>build</td><td>Initialises the buddy allocator and adds every range.</td><td>The printed ranges are what R2 shows.</td></tr>
+</tbody></table></div>
+<p><b>Listing 4</b> — <code>b3_main.cc</code></p>
+<pre class="listing" data-src="F3-20/b3_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–41</td><td><code>allocate_everything_test</code></td><td>Allocates until failure, chaining frames through their own first word; frees all.</td><td>Acceptance test 3, with no extra memory needed.</td></tr>
+<tr><td>43–58</td><td><code>contiguous_test</code></td><td>Order 4 and 9, alignment, refused wrong-order and double frees.</td><td>Contiguous and aligned requests honoured.</td></tr>
+<tr><td>62–81</td><td><code>leaking_driver</code></td><td>The forensic driver: order 1 in, order 0 out; statistics every 4,000 packets.</td><td>"Allocator statistics over time".</td></tr>
+<tr><td>94–101</td><td>accounting</td><td>Prints and asserts the equation.</td><td>Zero tolerance.</td></tr>
+</tbody></table></div>
+<p><b>Listing 5</b> — <code>bitmap_pmm.h</code> and the host test <code>pmm_host.cpp</code></p>
+<pre class="listing" data-src="F3-20/bitmap_pmm.h"></pre>
+<pre class="listing" data-src="F3-20/pmm_host.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Part</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>bitmap</td><td><code>alloc</code>, <code>free</code></td><td>Scan for a clear bit; refuse freeing a free frame.</td><td>The reference-simple allocator.</td></tr>
+<tr><td>host test</td><td>memmap cases</td><td>Overlaps, partial pages, splits.</td><td>The edge cases real firmware produces.</td></tr>
+<tr><td>host test</td><td>random model</td><td>200,000 operations against a per-frame owner model; alignment, double-allocation and final-count checks.</td><td>Acceptance test 1.</td></tr>
+<tr><td>host test</td><td>leak demo</td><td>Order check off: alloc order 1, free order 0, one frame lost.</td><td>The forensic bug in four lines.</td></tr>
+</tbody></table></div>
+
+<h2 id="F3-20-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A cupboard office can look inside a cupboard to see whether it is empty. The PMM cannot tell a used frame from a free one by its contents; only its own bookkeeping knows, which is why a wrong-order free corrupts it silently.</li>
+<li>Cupboards are physically grouped in pairs. Frames are "paired" only by arithmetic (the XOR rule); nothing in the hardware groups them.</li>
+<li>A teacher who keeps a cupboard too long is visible in the corridor. A leaked frame is invisible: it is neither on a free list nor owned by anyone.</li>
+</ul>
+
+<h2 id="F3-20-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Trusting the map blindly</b>: unsorted or overlapping entries, partial pages. Normalise first.</li>
+<li><b>Forgetting to exclude the kernel or the boot information</b>: the allocator hands out the page that holds your own code; the crash comes much later.</li>
+<li><b>Merging with a buddy of a different order</b>: the free lists end up with overlapping blocks. The state byte must equal the order.</li>
+<li><b>Freeing with the wrong order</b>: frames leak (smaller order) or blocks double-count (larger order). Record the order at allocation, at least in debug builds.</li>
+<li><b>Touching a frame through a mapping that does not exist</b>: before F3-21 only the boot direct map's 8 GiB are reachable; <code>pmm.cc</code> ignores RAM above that and says so.</li>
+<li><b>Debugging</b>: print the statistics line at intervals; a free count that falls while allocation and free counts stay equal is a size mismatch, not a missing free.</li>
+</ul>
+
+<div class="co transition" id="F3-20-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F3-19, a kernel with exception reports but no memory management: every buffer was a static array. <b>What carries over:</b> the boot direct map, the panic and assertion machinery, and host testing of pure logic. <b>What changes:</b> memory becomes a resource the kernel hands out and takes back at run time; correctness now includes "never twice, never someone else's". <b>What comes next:</b> F3-21 uses these frames to build the kernel's own page tables, with permissions and guard pages, and replaces the boot tables.</p></div>
+
+<h2 id="F3-20-check">Check yourself</h2>
+<ol>
+<li>Why are available ranges rounded inwards and reserved ranges rounded outwards?</li>
+<li>Compute the buddy of the order-3 block at frame 0x48, and of the order-0 block at frame 0x7.</li>
+<li>Explain in your own words why the free lists can live inside the free frames.</li>
+<li>Which line of R2 proves that the free lists returned to the same shape after free-all, and why is the free count alone not enough?</li>
+<li>For the 4 GiB machine, why is the state 1,280 KiB rather than 1,024 KiB?</li>
+<li>Apply to a new case: a firmware map lists available RAM 0x100000–0x7fffffff and reserved 0x7ff00000–0x80ffffff (overlapping). What should the normaliser and the subtract step produce?</li>
+<li>Predict-then-run: change <code>kMaxOrder</code> to 9. What changes in the "free blocks by order" line of the 128 MiB run, and does B3 still pass?</li>
+<li>Which allocator would you choose for 32-bit DMA buffers below 4 GiB, and what would you add to this one?</li>
+</ol>
+
+<h2 id="F3-20-lab">Lab</h2>
+<p><b>Goal.</b> Milestone B3: allocate and free 4 KiB frames (and contiguous runs for DMA) from the firmware memory map, never touching reserved, ACPI or MMIO ranges.</p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2, g++ 13.3.0 (host test with AddressSanitizer and UBSan). Folder <code>university/labs/F3-20</code>; run <code>university/labs/run_lab.sh university/labs/F3-20</code> (about 20 seconds; the 4 GiB run allocates a million frames one by one under TCG).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>The 4 GiB run needs that much free memory on the host for QEMU. Close other large programs first. On real hardware, an allocator bug can hand out a frame the firmware still uses; test in QEMU first, always.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Read <code>pmm_host.out</code>; every line must pass.</li>
+<li>Read <code>mem_128M.out</code>, <code>mem_1G.out</code> and <code>mem_4G.out</code>. For each, check the accounting equation by hand.</li>
+<li>Mark in Figure 1 where each reserved range of the 4 GiB map would go.</li>
+<li>Add a 512 MiB run to <code>run.sh</code> and predict its accounting line before running.</li>
+</ol>
+<p><b>Expected observations.</b></p>
+<pre class="output" data-run="F3-20/pmm_host"></pre>
+<pre class="output" data-run="F3-20/mem_128M"></pre>
+<pre class="output" data-run="F3-20/mem_1G"></pre>
+<pre class="output" data-run="F3-20/mem_4G"></pre>
+<p><b>Verification</b> (the milestone's acceptance tests, verbatim):</p>
+<ul>
+<li>Host unit tests: random allocate/free sequences against a reference model; no double allocation, all frames returned at the end; contiguous and aligned allocation requests honoured.</li>
+<li>In QEMU with 128 MiB, 1 GiB and 4 GiB, free memory reported after boot matches conventional memory minus the kernel within a documented tolerance.</li>
+<li>A test that allocates all memory then frees it all ends with the same free count it started with.</li>
+</ul>
+<p>In this build: <code>pmm_host</code> passes (R1); the three accounting lines hold exactly (tolerance 0; the parts other than the kernel are listed by name); free-all returns to the same count and the same block shape (R2).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Panic in <code>pmm::init</code> with <code>meta != 0</code>: no usable range is large enough for the state bytes; your map parsing probably stopped early (check the <code>size + 4</code> step).</li>
+<li>Free count after free-all is higher than at start: a frame was added twice (overlapping ranges not merged).</li>
+<li>The allocate-everything test page-faults: a usable range lies above the boot direct map; check the 8 GiB cap.</li>
+<li>Very slow 4 GiB run: TCG emulates every store of the chaining loop; that is expected. KVM would be much faster, but it is not available in this build.</li>
+</ul>
+<p><b>Extension.</b> Add a zone limit to <code>alloc</code> (only blocks below a given physical address) for 32-bit DMA, and a host test for it.</p>
+
+<h2 id="F3-20-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "The leaking frames." Lucía's kernel runs a toy network driver that receives packets into frame buffers. After a recent change, long tests end in "out of memory", yet her allocator statistics show thousands of free frames at the moment of failure. Every allocation has a matching free in her code review. She logged the allocator's statistics every 4,000 packets.</p>
+<p><b>Evidence pack.</b> The serial log of the run (R4):</p>
+<pre class="output" data-run="F3-20/forensic_leak"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: how do the free frames, the allocation count, the free count and the free blocks per order change per 4,000 packets?</li>
+<li>Hypotheses: a missing free; a free of the wrong size; fragmentation by a long-lived allocation. Which numbers decide?</li>
+<li>Root cause: what exactly is wrong, and why does the allocation fail with about 16,000 frames still free?</li>
+<li>Fix: which lines change? Which allocator setting would have turned the silent leak into an immediate error?</li>
+<li>Prevention: which statistic and which test would show this within the first second?</li>
+</ol>
+<p><b>Method hints.</b> Divide the drop in free frames by the number of packets. Then look at the first number of each "free blocks by order" list, and recall what order the driver asks for.</p>
+
+<h2 id="F3-20-project">Mini-project</h2>
+<p><b>A leak detector for frames.</b> In debug builds, store a small "owner tag" (an 8-bit subsystem id) next to each allocated block's state byte. Add <code>pmm::report_owners()</code> that prints, per owner, the number of frames held. Use it to show the forensic driver's leak within the first 100 packets, and show the clean run for comparison.</p>
+<p><b>Rubric.</b> Owner tags set and cleared correctly, host-tested (4). Report output from real runs for the leaking and the fixed driver (3). Memory cost of the tags computed and documented (2). Design note updated (1).</p>
+
+<h2 id="F3-20-summary">Summary</h2>
+<ul>
+<li>The firmware's map lists RAM and reserved ranges; anything not listed as available is not ours.</li>
+<li>Normalise: round available ranges inwards, kept ranges outwards; sort and merge.</li>
+<li>A buddy allocator keeps aligned power-of-two blocks; the buddy of block f at order k is f XOR 2^k.</li>
+<li>Free lists live inside free frames, reached through the direct map; one state byte per frame guards merging.</li>
+<li>Exact accounting replaces a tolerance: every subtracted KiB is named.</li>
+<li>A wrong-order free leaks frames silently and fragments memory; equal allocation and free counts do not prove there is no leak.</li>
+</ul>
+
+<h2 id="F3-20-sources">Sources</h2>
+<ol>
+<li id="F3-20-src-D1">Intel Corporation, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3 (tier 1; curriculum item 10): "Paging" (page frames and page sizes); memory-type and address-space overview. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-20-src-D2">Free Software Foundation, "Multiboot Specification" version 1 (tier 1 for the protocol): the memory-map fields of the information structure. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-20-src-D3">UEFI Forum, "Unified Extensible Firmware Interface (UEFI) Specification" (tier 1; curriculum item 12): memory type definitions and <code>GetMemoryMap</code>. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-20-src-D4">Remzi H. Arpaci-Dusseau and Andrea C. Arpaci-Dusseau, "Operating Systems: Three Easy Pieces" (tier 3; curriculum item 2), chapter "Free-Space Management". <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-20-src-D5">Donald E. Knuth, "The Art of Computer Programming", Volume 1, section on dynamic storage allocation (the buddy system) (tier 3). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-20-src-D6">Daniel P. Bovet and Marco Cesati, "Understanding the Linux Kernel" (tier 3; named in curriculum B3): the buddy system algorithm. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-20-src-D7">Systems Curriculum, milestone B3 (map only, guide AH-4): goal, build steps (bitmap then buddy) and acceptance tests quoted verbatim in the Lab.</li>
+<li id="F3-20-src-D8">The Linux kernel source, <code>mm/page_alloc.c</code> and the memory-model documentation (tier 4; curriculum item 40; release tag to be recorded): what this implementation does with <code>struct page</code> and sparse memory. <i>Not opened during this build (dossier gate G1 open).</i></li>
+<li id="F3-20-src-D9">UEFI Forum, "Advanced Configuration and Power Interface (ACPI) Specification" (tier 1; curriculum item 20): "System Address Map Interfaces" (E820 types). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-20-src-D10">QEMU project, QEMU 8.2 documentation and source for the PC machine's memory layout (tier 2/4). <i>Not opened during this build; the layout is cited from the runs (R2).</i></li>
+<li id="F3-20-src-R1">R1 — lab run <code>university/labs/F3-20/pmm_host.log</code>: host tests of <code>memmap.h</code>, <code>bitmap_pmm.h</code>, <code>buddy.h</code>; g++ 13.3.0 with AddressSanitizer and UBSan; exit code 0.</li>
+<li id="F3-20-src-R2">R2 — lab runs <code>mem_128M.log</code>, <code>mem_1G.log</code>, <code>mem_4G.log</code>: the B3 kernel on QEMU 8.2.2 (TCG) with 128 MiB, 1 GiB, 4 GiB; exit code 33 each. Untested on hardware.</li>
+<li id="F3-20-src-R4">R4 — forensic run <code>forensic_leak.log</code>: the leaking driver kernel, exit code 35 (panic, expected).</li>
+</ol>
+
+<h2 id="F3-20-glossary">Glossary links</h2>
+<p><a href="#gl-frame-physical-page">Frame</a> · <a href="#gl-memory-map-firmware">Memory map</a> · <a href="#gl-physical-memory-manager-pmm">PMM</a> · <a href="#gl-bitmap-allocator">Bitmap allocator</a> · <a href="#gl-buddy-allocator">Buddy allocator</a> · <a href="#gl-order">Order</a> · <a href="#gl-fragmentation-external">Fragmentation</a> · <a href="#gl-direct-map">Direct map</a></p>
+
+<h2 id="F3-20-next">Next chapter</h2>
+<p>Next: <a href="#F3-21">F3-21 Paging and the kernel address space</a>. Previous: <a href="#F3-19">F3-19 GDT, TSS, IDT and exceptions</a>. Back to the course: <a href="#OS302">OS302</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (milestone B3).</p>
+
+<h2 id="F3-20-answers">Answers to Check yourself</h2>
+<ol>
+<li>A partial page at the edge of an available range also contains bytes the firmware did not give us, so it is dropped; a partial page touched by a reserved range must not be handed out, so the whole page is excluded.</li>
+<li>0x48 XOR 0x8 = 0x40 (order 3 means bit 3, value 8). 0x7 XOR 0x1 = 0x6.</li>
+<li>Good answers say: a free frame holds no one's data, so its first bytes can store list pointers; the allocator reaches them through the direct map; this costs no extra memory and the lists are always exactly as long as the number of free blocks.</li>
+<li><code>free-all: free count 32450 (start 32450), free blocks back to the start shape: yes</code>. The count would also match if blocks had not merged back (many order-0 blocks instead of order-10 ones), which would leave memory fragmented.</li>
+<li>The state covers every frame up to the highest usable address, 0x13fffffff (5 GiB), including the PCI hole: 5 GiB / 4 KiB = 1,310,720 frames, one byte each = 1,280 KiB.</li>
+<li>Normalising leaves available 0x100000–0x7fffffff (one range); subtracting the reserved range rounded outwards (0x7ff00000–0x81000000) cuts it to 0x100000–0x7fefffff. Overlaps are resolved in favour of "reserved", never of "available".</li>
+<li>Free blocks are at most order 9 (2 MiB), so the last column now counts 2 MiB blocks: about twice as many as the 30 order-10 blocks, plus one order-9 block from the odd ones. B3 still passes: order 9 is the largest test allocation. Run it to see the exact numbers.</li>
+<li>A buddy allocator with a zone limit: keep separate free lists (or a separate allocator) for frames below 4 GiB and use them only when asked, so ordinary allocations do not use up low memory.</li>
+</ol>
+<h3 id="F3-20-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Every 4,000 packets: free frames drop by exactly 4,000 (32,450 → 28,450 → … → 16,450), allocations and frees both grow by 4,000, and the order-0 free-block count grows by 4,000 while the large blocks disappear (order 10: 30 → 23 → 16 → 8 → 0).</p>
+<p><b>Hypotheses.</b> A missing free would make the free count lag the allocation count; they are equal, so every allocation was freed. Fragmentation by long-lived allocations would not lose exactly one frame per packet. A size mismatch fits: one frame lost per packet, and one new order-0 free block per packet.</p>
+<p><b>Root cause.</b> The driver allocates order 1 (8 KiB, lines 62 and 70) and frees order 0 (line 63, 74). The first frame of each pair goes back as an order-0 block; the second is never freed. The returned frame cannot merge, because its buddy is the lost frame (Figure 2, row 4). After 16,000 packets there are 16,000 free frames, all single, and no two of them are buddies: an order-1 request finds no block of order ≥ 1 and fails at packet 16,226, with roughly 16,200 frames still counted as free.</p>
+<p><b>Fix.</b> Free with the order used for allocation: one constant for both (<code>kRxOrder = 1</code>), or let the allocator remember the order. With <code>pmm::init(info, true)</code> (order checking on), the first wrong-order free would have returned false; checking the return value would have stopped the driver at packet 1.</p>
+<p><b>Prevention.</b> Keep order checking on in debug builds; assert on the return value of every free; and watch the statistic "free frames versus allocations minus frees", which must stay constant in a steady-state driver.</p>
