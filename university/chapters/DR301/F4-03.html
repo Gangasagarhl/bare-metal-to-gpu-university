@@ -1,0 +1,350 @@
+<!--meta
+id: F4-03
+title: Interrupt-driven UART and PS/2
+course: DR301
+level: L3
+prereqs: F4-01, F4-02; OS302 (F3-19, F3-24); HW204 (F1-42, F1-43, F1-47)
+time: 8–10 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with TCG, pc machine). A spare PC with a PS/2 port or USB legacy emulation is optional and untested in this build.
+maps: Curriculum Track C, milestone C2 (interrupt-driven UART and PS/2 keyboard and mouse)
+analogy: F4 — the school and its visitors (the doorbell, and the visitor who speaks faster than the interpreter can write)
+-->
+
+<h2 id="F4-03-hook">Story hook</h2>
+<p>The interpreter of F4-01 had a bad habit: every few seconds she walked to the visitor and asked "did you say something?". It worked, but she did nothing else all day, and when the visitor spoke quickly she missed words between two visits. The school fixes this with a doorbell. The visitor presses it when there is something to say; the interpreter comes, writes everything down in a notebook as fast as possible, and goes back to her other work. Later she reads the notebook at her own pace. When she has an answer to deliver, she leaves it in a second notebook, and the visitor's side rings again whenever it is ready for more.</p>
+<p>There is one rule that the school secretary enforces strictly: after answering the bell, the interpreter must tell the secretary "done". Until she does, the secretary holds back that bell and every bell of lower importance. This chapter builds both doorbell drivers of the old PC, the serial port and the PS/2 keyboard and mouse controller, makes 64 KiB pass through the serial port without losing a byte, and shows what one forgotten "done" does to a keyboard.</p>
+
+<h2 id="F4-03-able">What you will be able to do</h2>
+<ul>
+<li><b>Program</b> the legacy 8259 interrupt controllers and the PIT, install interrupt handlers, and send end-of-interrupt correctly for both controllers.</li>
+<li><b>Write</b> an interrupt-driven 16550 driver with receive and transmit rings, using the FIFO trigger level, the interrupt identification register and on-demand transmit interrupts.</li>
+<li><b>Initialise</b> the i8042 controller with its self-tests, reset the keyboard and the mouse, decode scan codes and 3-byte mouse packets.</li>
+<li><b>Build</b> a single-producer, single-consumer ring that is safe between an interrupt handler and normal code on one CPU.</li>
+<li><b>Write</b> a line discipline with echo and backspace.</li>
+<li><b>Test</b> input drivers automatically by injecting keys and mouse moves through QEMU's monitor and by feeding a serial port from a host program, with checksums.</li>
+<li><b>Diagnose</b> a missing end-of-interrupt from interrupt counters and an emulator trace.</li>
+</ul>
+
+<div class="co jargon" id="F4-03-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>8259 PIC</dt><dd><b>Simple words:</b> the PC's original interrupt controller chip, two of them chained. <b>Analogy:</b> the school secretary who decides which bell to pass on first. <b>Precise:</b> a programmable interrupt controller with eight request lines, an interrupt mask register (IMR), an interrupt request register (IRR) and an in-service register (ISR); the PC chains a slave to the master's line 2, giving 15 usable lines, and both must be remapped so their vectors do not overlap CPU exceptions. <sup class="src"><a href="#F4-03-src-D3">D3</a></sup></dd>
+<dt>End-of-interrupt (EOI)</dt><dd><b>Simple words:</b> the message a handler sends to the interrupt controller to say "I am done with this one". <b>Analogy:</b> telling the secretary "done" after answering the bell. <b>Precise:</b> a command (for the 8259, writing 0x20 to its command port) that clears the highest-priority in-service bit, allowing that line and lines of lower priority to be delivered again; slave lines need an EOI at both controllers. <sup class="src"><a href="#F4-03-src-D3">D3</a></sup></dd>
+<dt>FIFO trigger level</dt><dd><b>Simple words:</b> how many received bytes the UART collects before it rings. <b>Analogy:</b> the visitor waits until there are 14 words to say before pressing the bell. <b>Precise:</b> the 16550's receive FIFO raises the "received data available" interrupt when it holds at least the programmed number of bytes (1, 4, 8 or 14); a "character timeout" interrupt reports fewer bytes that have waited for a while. <sup class="src"><a href="#F4-03-src-D1">D1</a></sup></dd>
+<dt>Ring buffer (SPSC)</dt><dd><b>Simple words:</b> a circular queue where one side only writes and the other side only reads. <b>Analogy:</b> the interpreter's notebook, written by one hand and read by another. <b>Precise:</b> a fixed array with a producer index and a consumer index, each written by only one party; with one producer and one consumer it needs no lock, only the right ordering of the data write before the index update. <sup class="src"><a href="#F4-03-src-D5">D5</a></sup></dd>
+<dt>i8042</dt><dd><b>Simple words:</b> the PC's keyboard and mouse controller. <b>Analogy:</b> a receptionist who collects the keyboard's and mouse's messages and passes them through one window. <b>Precise:</b> a controller with a data port (0x60) and a status/command port (0x64) that connects up to two PS/2 devices, raises line 1 for the keyboard and line 12 for the mouse, and can translate the keyboard's scan code set 2 into set 1. <sup class="src"><a href="#F4-03-src-D2">D2</a></sup></dd>
+<dt>Scan code</dt><dd><b>Simple words:</b> the number a keyboard sends for a key going down or coming up. <b>Analogy:</b> the key's seat number, not its letter. <b>Precise:</b> a byte sequence identifying a key position and a make (press) or break (release) event; in set 1 a break is the make code with bit 7 set, in set 2 a break is <code>0xF0</code> followed by the make code. <sup class="src"><a href="#F4-03-src-D2">D2</a></sup></dd>
+<dt>Line discipline</dt><dd><b>Simple words:</b> the layer that turns key presses into finished lines of text. <b>Analogy:</b> the interpreter writing a sentence, crossing out a wrong word, and handing it over only at the full stop. <b>Precise:</b> the TTY component that buffers input in canonical mode, applies editing characters (erase, kill), echoes, and delivers a line to the reader when a line terminator arrives. <sup class="src"><a href="#F4-03-src-D6">D6</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-03-pictures">The idea in pictures</h2>
+<p>Figure 1 is the interrupt flow of guide 9.2 for this chapter's devices: a device raises a line, the PIC passes it to the CPU as a vector, the handler runs, and the EOI goes back. Figure 2 shows the two rings of the UART driver and who writes which index.</p>
+<figure id="F4-03-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 300" role="img" aria-labelledby="F4-03-f1t F4-03-f1d">
+<title id="F4-03-f1t">Figure 1: interrupt flow through the two 8259 controllers</title>
+<desc id="F4-03-f1d">Left: devices. PIT on line 0, keyboard via the i8042 on line 1, COM2 on line 3, COM1 on line 4, mouse via the i8042 on line 12. Lines 0 to 7 go into the master PIC; lines 8 to 15 into the slave PIC, whose output enters the master on line 2. The master raises INTR to the CPU and supplies the vector: line plus 32 after remapping (line 12 becomes vector 44). The CPU looks up the IDT entry, the stub pushes the frame, interrupt_dispatch calls the handler registered for the line, then writes EOI 0x20 to the slave (for lines 8 to 15) and to the master. A note: until the EOI, the in-service bit blocks this line and all lower-priority lines; line 0 has the highest priority, and slave lines sit at the priority of master line 2.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="300"/>
+<rect class="sv-b3" x="10" y="20" width="150" height="30" rx="4"/><text class="sv-ts" x="18" y="40">PIT, line 0</text>
+<rect class="sv-b3" x="10" y="60" width="150" height="30" rx="4"/><text class="sv-ts" x="18" y="80">keyboard (i8042), line 1</text>
+<rect class="sv-b3" x="10" y="100" width="150" height="30" rx="4"/><text class="sv-ts" x="18" y="120">COM2, line 3</text>
+<rect class="sv-b3" x="10" y="140" width="150" height="30" rx="4"/><text class="sv-ts" x="18" y="160">COM1, line 4</text>
+<rect class="sv-b3" x="10" y="210" width="150" height="30" rx="4"/><text class="sv-ts" x="18" y="230">mouse (i8042), line 12</text>
+<rect class="sv-b2" x="220" y="20" width="140" height="160" rx="6"/><text class="sv-tb" x="232" y="42">master 8259</text><text class="sv-ts" x="232" y="62">lines 0–7</text><text class="sv-ts" x="232" y="80">vectors 32–39</text><text class="sv-ts" x="232" y="100">IMR, IRR, ISR</text><text class="sv-ts" x="232" y="120">line 2 = cascade</text>
+<rect class="sv-b2" x="220" y="200" width="140" height="70" rx="6"/><text class="sv-tb" x="232" y="222">slave 8259</text><text class="sv-ts" x="232" y="242">lines 8–15</text><text class="sv-ts" x="232" y="260">vectors 40–47</text>
+<line class="sv-line" x1="160" y1="35" x2="208" y2="35"/><polygon class="sv-head" points="208,30 208,40 220,35"/>
+<line class="sv-line" x1="160" y1="75" x2="208" y2="75"/><polygon class="sv-head" points="208,70 208,80 220,75"/>
+<line class="sv-line" x1="160" y1="115" x2="208" y2="115"/><polygon class="sv-head" points="208,110 208,120 220,115"/>
+<line class="sv-line" x1="160" y1="155" x2="208" y2="155"/><polygon class="sv-head" points="208,150 208,160 220,155"/>
+<line class="sv-line" x1="160" y1="225" x2="208" y2="225"/><polygon class="sv-head" points="208,220 208,230 220,225"/>
+<line class="sv-line" x1="290" y1="200" x2="290" y2="192"/><polygon class="sv-head" points="285,192 295,192 290,180"/>
+<rect class="sv-b1" x="420" y="60" width="120" height="70" rx="6"/><text class="sv-tb" x="436" y="84">CPU</text><text class="sv-ts" x="436" y="104">IDT[vector]</text><text class="sv-ts" x="436" y="120">stub, frame</text>
+<line class="sv-line" x1="360" y1="95" x2="408" y2="95"/><polygon class="sv-head" points="408,90 408,100 420,95"/>
+<text class="sv-ts" x="366" y="86">INTR + vector</text>
+<rect class="sv-b4" x="600" y="60" width="260" height="70" rx="6"/><text class="sv-tb" x="612" y="84">interrupt_dispatch</text><text class="sv-ts" x="612" y="104">count, call handler(line)</text><text class="sv-ts" x="612" y="120">EOI: slave (8–15), then master</text>
+<line class="sv-line" x1="540" y1="95" x2="588" y2="95"/><polygon class="sv-head" points="588,90 588,100 600,95"/>
+<line class="sv-dash" x1="730" y1="130" x2="730" y2="190"/><line class="sv-dash" x1="730" y1="190" x2="372" y2="190"/><polygon class="sv-head" points="372,185 372,195 360,190"/>
+<text class="sv-ts" x="420" y="210">EOI 0x20: clears the in-service bit</text>
+<text class="sv-ts" x="420" y="250">Until the EOI, this line and every lower-priority line are held back.</text>
+<text class="sv-ts" x="420" y="268">Priority: 0 highest, then 1, then 2 (all slave lines 8–15), then 3–7.</text>
+</svg></div><figcaption><b>Figure 1.</b> The interrupt path of the lab kernel: device line, PIC, vector, handler, EOI. The lab keeps the 8259 pair for brevity; your B-track kernel routes the same lines through the IOAPIC and acknowledges at the local APIC (F3-24). Priority rules from D3 (unverified). <sup class="src"><a href="#F4-03-src-D3">D3</a></sup></figcaption></figure>
+
+<figure id="F4-03-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 230" role="img" aria-labelledby="F4-03-f2t F4-03-f2d">
+<title id="F4-03-f2t">Figure 2: the receive and transmit rings of the UART driver</title>
+<desc id="F4-03-f2d">Top row, receive: the UART's 16-byte receive FIFO feeds the interrupt handler, which pushes bytes into the RX ring and advances its head index; normal code pops from the RX ring and advances the tail index. Bottom row, transmit: normal code pushes into the TX ring (head) and, if transmit interrupts are off, turns them on in IER; the handler, on a "transmitter empty" interrupt, pops up to 16 bytes into the transmit FIFO (tail) and turns transmit interrupts off when the ring is empty. Labels: each index has exactly one writer.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="230"/>
+<text class="sv-tb" x="20" y="22">receive</text>
+<rect class="sv-b6" x="20" y="34" width="150" height="50" rx="5"/><text class="sv-ts" x="30" y="56">UART RX FIFO</text><text class="sv-ts" x="30" y="72">16 bytes, trigger 14</text>
+<line class="sv-line" x1="170" y1="59" x2="218" y2="59"/><polygon class="sv-head" points="218,54 218,64 230,59"/>
+<rect class="sv-b4" x="230" y="34" width="160" height="50" rx="5"/><text class="sv-ts" x="240" y="56">interrupt handler</text><text class="sv-ts" x="240" y="72">writes head</text>
+<line class="sv-line" x1="390" y1="59" x2="438" y2="59"/><polygon class="sv-head" points="438,54 438,64 450,59"/>
+<rect class="sv-b5" x="450" y="34" width="200" height="50" rx="5"/><text class="sv-ts" x="460" y="56">RX ring, 4096 bytes</text><text class="sv-ts" x="460" y="72">full: count a drop</text>
+<line class="sv-line" x1="650" y1="59" x2="698" y2="59"/><polygon class="sv-head" points="698,54 698,64 710,59"/>
+<rect class="sv-b1" x="710" y="34" width="150" height="50" rx="5"/><text class="sv-ts" x="720" y="56">normal code</text><text class="sv-ts" x="720" y="72">writes tail</text>
+<text class="sv-tb" x="20" y="122">transmit</text>
+<rect class="sv-b1" x="20" y="134" width="150" height="50" rx="5"/><text class="sv-ts" x="30" y="156">normal code</text><text class="sv-ts" x="30" y="172">writes head; IER.THRI on</text>
+<line class="sv-line" x1="170" y1="159" x2="218" y2="159"/><polygon class="sv-head" points="218,154 218,164 230,159"/>
+<rect class="sv-b5" x="230" y="134" width="200" height="50" rx="5"/><text class="sv-ts" x="240" y="156">TX ring, 4096 bytes</text><text class="sv-ts" x="240" y="172">full: the writer sleeps</text>
+<line class="sv-line" x1="430" y1="159" x2="478" y2="159"/><polygon class="sv-head" points="478,154 478,164 490,159"/>
+<rect class="sv-b4" x="490" y="134" width="190" height="50" rx="5"/><text class="sv-ts" x="500" y="156">handler on THRE</text><text class="sv-ts" x="500" y="172">writes tail; empty: THRI off</text>
+<line class="sv-line" x1="680" y1="159" x2="728" y2="159"/><polygon class="sv-head" points="728,154 728,164 740,159"/>
+<rect class="sv-b6" x="740" y="134" width="120" height="50" rx="5"/><text class="sv-ts" x="750" y="156">UART TX FIFO</text><text class="sv-ts" x="750" y="172">up to 16 per ring</text>
+<text class="sv-ts" x="20" y="216">Each index has exactly one writer, so on one CPU no lock is needed; IER is shared and is changed with interrupts off.</text>
+</svg></div><figcaption><b>Figure 2.</b> The two rings of <code>uart_irq.cc</code>. Sizes are the lab's choices; the 16-byte FIFO and trigger levels are from D1 (unverified). <sup class="src"><a href="#F4-03-src-D1">D1</a></sup> <sup class="src"><a href="#F4-03-src-D5">D5</a></sup></figcaption></figure>
+
+<h2 id="F4-03-layer1">Layer 1 — the kid explanation</h2>
+<p>A keyboard does not wait to be asked. When you press a key, it rings a little bell inside the computer. The processor stops what it is doing for a moment, runs a tiny piece of code that writes the key down in a notebook, and goes back to work. Later the rest of the program reads the notebook. After each ring the code must say "done", or the bell stays silent forever.</p>
+
+<h2 id="F4-03-layer2">Layer 2 — the student explanation</h2>
+<p>Polling, as in F4-01, wastes the CPU and loses data when the device is faster than the polling loop. Interrupts reverse the direction: the device signals when it needs attention. On a PC with legacy devices, each device drives one interrupt request line; the 8259 PIC turns the highest-priority pending line into a vector number for the CPU; the CPU saves its state and jumps to the handler from the interrupt descriptor table (F3-19); the handler services the device, sends an EOI to the PIC, and returns. <sup class="src"><a href="#F4-03-src-D3">D3</a></sup> <sup class="src"><a href="#F4-03-src-D4">D4</a></sup></p>
+<p>A handler must be short and must leave the device in a state where it will interrupt again. For the 16550 that means reading the interrupt identification register (IIR) until it says "no interrupt pending", servicing each cause it reports: received data (read bytes until the line status register says the FIFO is empty), transmitter empty (write the next bytes), line status (read the line status register) or modem status (read the modem status register). Each read is what clears the cause in the chip. For the i8042, each interrupt means one byte is waiting in the data port; reading it clears the condition. <sup class="src"><a href="#F4-03-src-D1">D1</a></sup> <sup class="src"><a href="#F4-03-src-D2">D2</a></sup></p>
+<p>Between the handler and the rest of the kernel sits a ring buffer. The handler is the producer for received data and the consumer for data to send; normal code is the other side. Because each index has a single writer, the ring needs no lock on one CPU, only the guarantee that the byte is written before the index that publishes it.</p>
+<p>The i8042 carries the keyboard and the mouse. The keyboard sends scan codes: one or more bytes per key press and per release. The controller normally translates the keyboard's native set 2 into the older set 1, in which a release is the press code with bit 7 set. The mouse sends 3-byte packets: buttons and sign bits, then X movement, then Y movement. A line discipline above the keyboard driver collects characters, handles backspace and delivers a finished line on Enter, which is what a shell reads.</p>
+
+<h2 id="F4-03-layer3">Layer 3 — the engineer's depth</h2>
+<h3>The 8259 pair and the PIT</h3>
+<p>At reset the master PIC delivers its lines as vectors 8–15, which collide with CPU exceptions in protected mode, so the kernel reprograms both PICs with four initialisation words each: ICW1 (start, ICW4 follows), ICW2 (vector base: 32 for the master, 40 for the slave), ICW3 (the master has a slave on line 2; the slave's cascade identity is 2), ICW4 (8086 mode). The interrupt mask register then enables only the lines with handlers. The priority scheme in the default mode is fixed: line 0 highest; the whole slave sits at the priority of master line 2. EOI is non-specific (0x20 to the command port) and clears the highest in-service bit; a slave line needs an EOI at the slave and then at the master. The PIT's channel 0 is programmed in mode 2 with divisor 1193, which gives about one interrupt per millisecond from its input clock; the lab kernel uses that tick as its monotonic clock. <sup class="src"><a href="#F4-03-src-D3">D3</a></sup> <sup class="src"><a href="#F4-03-src-D7">D7</a></sup></p>
+<div class="co note"><span class="lbl">Note</span><p>The legacy PIC is a decision for this lab, not a recommendation. A modern x86 kernel masks the 8259 entirely, routes legacy lines through the IOAPIC using ACPI's interrupt source overrides, and acknowledges at the local APIC; PCI devices then move to MSI or MSI-X (F4-08). Your B7 kernel already has that path (F3-24). The drivers in this chapter do not change: only <code>irq.cc</code> does. The decision is recorded in NOTES.md.</p></div>
+<h3>The 16550 in interrupt mode</h3>
+<p>Interrupt-driven operation needs four things set. The FIFO control register enables the FIFOs, clears them and selects the receive trigger level (14 bytes in the lab, bits 7–6 = 11b). The modem control register sets OUT2, which on PC serial hardware connects the UART's interrupt output to the bus; without it the UART never interrupts. The interrupt enable register selects causes: received data available (bit 0) always, transmitter holding register empty (bit 1) only while there is something to send. And the PIC line is unmasked after the handler is installed. <sup class="src"><a href="#F4-03-src-D1">D1</a></sup></p>
+<p>The transmit side has a classic subtlety. The "transmitter empty" interrupt fires when the transmitter becomes empty, and also, on enabling, if it already is. If the driver left it enabled with nothing to send, the UART would interrupt continuously. So the driver turns it on when it puts the first byte into an empty ring (<code>uart_irq_putc</code>) and off when the handler finds the ring empty. Both places change IER and a flag, so the normal-code side does it with interrupts disabled. On each transmit interrupt the handler writes up to 16 bytes, the FIFO depth, which divides the number of transmit interrupts by up to 16. <sup class="src"><a href="#F4-03-src-D1">D1</a></sup></p>
+<p>The receive trigger trades interrupts against latency and overrun risk. With trigger 14 the UART interrupts when 14 bytes are waiting; at that point only two more bytes fit before an overrun. On QEMU the bytes arrive as fast as the emulator delivers them, and R3 shows no overrun and no ring drop, with the ring's high-water mark well below 4096. On a real 16550 at a high bit rate, a handler delayed by other interrupts could lose bytes at trigger 14; a lower trigger or hardware flow control (RTS/CTS) is the remedy. <sup class="src"><a href="#F4-03-src-D1">D1</a></sup> <sup class="src"><a href="#F4-03-src-R3">R3</a></sup></p>
+<h3>The i8042 and its devices</h3>
+<p>The controller has a status register (bit 0: output buffer full, a byte is waiting at port 0x60 for the CPU; bit 1: input buffer full, the controller has not yet taken the last byte the CPU wrote; bit 5: the waiting byte came from the second port), a configuration byte (bit 0 and 1: interrupts for port 1 and 2; bits 4 and 5: clocks of port 1 and 2 disabled; bit 6: translation), and commands written to port 0x64: 0x20/0x60 read/write the configuration byte, 0xAA self-test (answer 0x55), 0xAB/0xA9 port tests (answer 0), 0xAD/0xAE and 0xA7/0xA8 disable/enable ports, 0xD4 "send the next data byte to the second port". Bytes written to port 0x60 go to the keyboard; the devices answer commands with ACK 0xFA, and a reset (0xFF) with 0xAA after their self-test (the mouse adds its ID byte). The mouse starts reporting only after 0xF4. <sup class="src"><a href="#F4-03-src-D2">D2</a></sup></p>
+<p>The initialisation order matters, and the lab found out the hard way: enabling a port with 0xAE/0xA8 clears that port's clock-disable bit in the configuration byte, so writing back an old copy of the configuration byte afterwards disables the ports again and no interrupt ever arrives. The driver re-reads the byte before setting the interrupt bits (Listing 3, lines 102–107). This is the kind of ordering rule that a register map alone does not show. <sup class="src"><a href="#F4-03-src-R2">R2</a></sup></p>
+<p>Mouse packets are re-synchronised with bit 3 of the first byte, which is always 1: if a byte is lost, the decoder drops bytes until it sees a plausible first byte. The X and Y movements are 9-bit two's complement values whose sign bits are bits 4 and 5 of the first byte. <sup class="src"><a href="#F4-03-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Written from memory and confirmed only by QEMU 8.2.2's models answering as expected (R2, R3): the 8259 initialisation words, priority and EOI rules (check the Intel 8259A datasheet, D3); the PIT mode and the input clock behind divisor 1193 (8254 datasheet, D7); the i8042 command, status and configuration bits and the device command and answer values (the OSDev wiki pages named in the curriculum, D2, and better the controller's own documentation if you can find it); the 16550 FIFO trigger encoding and OUT2's role on PC hardware (PC16550D datasheet, D1). The UART constants also agree with Linux's <code>serial_reg.h</code> (F4-01, R5 there). The direction of the mouse's Y axis relative to QEMU's <code>mouse_move</code> is an observation of R2 (monitor −5 became +5), not a documented fact.</p></div>
+<h3>Rings, volatile and ordering</h3>
+<p>The ring in Listing 4 keeps free-running indices (they only grow; the slot is index mod N, N a power of two), so "full" is <code>head − tail == N</code> and "empty" is <code>head == tail</code> without a wasted slot. Each index is written by one side only. <code>volatile</code> stops the compiler from keeping an index in a register across a loop; the empty <code>asm volatile("" ::: "memory")</code> stops it from moving the byte store after the index store. That is enough on one CPU because the interrupt and the normal code run on the same CPU, which sees its own stores in order. With two CPUs, the same ring needs atomic indices with release and acquire ordering (SP203, F3-27). <sup class="src"><a href="#F4-03-src-D5">D5</a></sup></p>
+<h3>Testing input without a person</h3>
+<p>The curriculum's acceptance tests are automatic. QEMU's monitor command <code>sendkey</code> presses and releases a key on the emulated keyboard, and <code>mouse_move</code>/<code>mouse_button</code> generate mouse events; the lab drives the monitor through QMP's <code>human-monitor-command</code> from a Python script (Listing 6) and compares the shell's line with the typed text. QEMU's trace event <code>ps2_put_keycode</code> logs every scan code byte the emulated keyboard produced, an independent record of what the driver should have seen. For the serial port, a host program connects to COM2 through a socket, sends 64 KiB, reads the echo and compares checksums on both sides. <sup class="src"><a href="#F4-03-src-D8">D8</a></sup> <sup class="src"><a href="#F4-03-src-R2">R2</a></sup> <sup class="src"><a href="#F4-03-src-R3">R3</a></sup></p>
+
+<h2 id="F4-03-hardware">How the hardware actually does it</h2>
+<p>On an original PC, each ISA device drove its interrupt line high to request service, and the 8259 detected a rising edge. Edge triggering explains a classic failure: if a device keeps its line high because the handler did not clear the cause, there is no new edge and no further interrupt. On a modern PC there are no physical 8259 chips or ISA lines; the chipset emulates the legacy controllers and the "devices" (the i8042 is usually emulated by the embedded controller, and the UART, if present, sits in a Super I/O chip). The project's DRIVERS.html notes for the test machine that its PS/2 port is emulated by the embedded controller and that the touchpad behind it has its own firmware. The keyboard itself contains a microcontroller that scans the key matrix and sends codes over a two-wire synchronous serial link clocked by the device. <sup class="src"><a href="#F4-03-src-D3">D3</a></sup> <sup class="src"><a href="#F4-03-src-D2">D2</a></sup> <sup class="src"><a href="#F4-03-src-D9">D9</a></sup></p>
+<p>In QEMU, all of this is software: the 16550 model hands bytes to and from a host character device, and the PS/2 model queues scan codes generated by the monitor. Timing in the lab is emulated (TCG), so the milliseconds printed in R3 describe the emulator on a busy build machine, not a UART at any bit rate.</p>
+
+<h2 id="F4-03-worked">Worked example</h2>
+<p><b>Following the letter "h".</b> The script sends <code>sendkey h</code>. QEMU's keyboard model produces set 2 make code <code>0x33</code>, then (on release) <code>0xF0 0x33</code>: the first three lines of the trace in R2. The controller translates: set 1 make <code>0x23</code>, break <code>0xA3</code>. Each byte raises line 1. The handler reads port 0x60 (status bit 0 was set) and pushes the byte into the keyboard ring; EOI. In <code>get_key</code>, <code>0x23</code> has bit 7 clear (a press), code <code>0x23</code>, and <code>kLower[0x23]</code> is <code>'h'</code>; the line discipline stores and echoes it. <code>0xA3</code> is the release, ignored by the test. Count the interrupts: 23 keys typed (including <code>shift-d</code>, which presses Shift around D) produced 75 set 2 bytes (R2 trace count) and 50 line-1 interrupts after translation; check the 50 yourself in the exercise. <sup class="src"><a href="#F4-03-src-R2">R2</a></sup></p>
+<p><b>Decoding a mouse packet.</b> <code>mouse_move 10 -5</code> produced a packet that the driver printed as <code>dx=10 dy=5</code>. The bytes were first byte <code>0x08</code> (bit 3 always set, no buttons, sign bits 4 and 5 clear), X = <code>0x0A</code> = 10, Y = <code>0x05</code> = 5. Had Y been −5, byte 0 would have had bit 5 set and Y would have been <code>0xFB</code>: 251 − 256 = −5. Then <code>mouse_button 1</code> and <code>mouse_button 0</code> produced two packets with zero movement and the left button bit set and cleared. Nine bytes, nine line-12 interrupts: <code>irq12=9</code> in R2's status line. <sup class="src"><a href="#F4-03-src-R2">R2</a></sup></p>
+<p><b>The paste in numbers.</b> R3: 65536 bytes received, FNV-1a <code>7c0c9dc5</code> on the kernel side and on the host side, the echo identical, no overruns, no ring drops. The number of interrupts printed is several times smaller than the number of bytes received plus sent, because each receive interrupt drains up to a FIFO's worth and each transmit interrupt refills up to 16 bytes. <sup class="src"><a href="#F4-03-src-R3">R3</a></sup></p>
+
+<h2 id="F4-03-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F4-03/</code>. <code>isr.S</code> provides 48 identical entry stubs (dummy error code where the CPU pushes none, vector number, common entry that saves registers and calls <code>interrupt_dispatch</code>); it is the 32-bit twin of F3-19's stubs and is not walked through again. <code>tty.cc</code> (23 lines) is the line discipline; <code>mkpaste.py</code> makes the 64 KiB test file.</p>
+<p><b>Listing 1</b> — <code>irq.cc</code>, IDT, PIC, dispatch and PIT</p>
+<pre class="listing" data-src="F4-03/irq.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–15</td><td><code>Gate</code></td><td>The 8-byte 32-bit interrupt gate; type 0x8E.</td><td>An interrupt gate clears IF on entry: handlers run with interrupts off.</td></tr>
+<tr><td>27–39</td><td><code>pic_remap</code></td><td>ICW1–ICW4 to both PICs; mask all but the cascade.</td><td>Vectors 32–47; lines enabled one by one later.</td></tr>
+<tr><td>44–49</td><td>exceptions</td><td>Vectors below 32 print and panic.</td><td>A fault in a handler is visible on the serial log.</td></tr>
+<tr><td>51–55</td><td><code>F403_FORGET_EOI_LINE</code></td><td>The forensic build skips EOI for one line.</td><td>The only difference between R2 and R4.</td></tr>
+<tr><td>56–63</td><td>count, handler, EOI</td><td>Counts per line, calls the handler, EOI to the slave for 8–15 and always to the master.</td><td>Counts are the first diagnostic tool (forensic lab).</td></tr>
+<tr><td>82–92</td><td><code>unmask</code>, <code>mask</code></td><td>Read-modify-write of the right IMR.</td><td>Line 12 also needs line 2 unmasked (the cascade).</td></tr>
+<tr><td>98–108</td><td><code>timer::init</code></td><td>PIT channel 0, mode 2, divisor 1193; handler counts milliseconds.</td><td>The emulated monotonic clock of every DR301 lab.</td></tr>
+<tr><td>110–116</td><td><code>ms()</code></td><td>Reads the 64-bit counter until two reads agree.</td><td>A 32-bit CPU reads it in two halves; an interrupt can come in between.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>uart_irq.cc</code>, the interrupt-driven 16550 driver</p>
+<pre class="listing" data-src="F4-03/uart_irq.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>16–21</td><td>handler loop</td><td>Reads IIR until bit 0 says nothing is pending.</td><td>Several causes can be pending; leaving one unserviced can leave the line asserted with no new edge.</td></tr>
+<tr><td>23–25</td><td>line status</td><td>Reading LSR clears it; counts overruns.</td><td>Overruns are the measure of a too-slow handler.</td></tr>
+<tr><td>26–33</td><td>received data, timeout</td><td>Drain RBR while LSR.DR; push into the ring; note the level.</td><td>Draining everything means one interrupt per FIFO load.</td></tr>
+<tr><td>34–43</td><td>transmitter empty</td><td>Up to 16 bytes from the TX ring; none left: IER back to receive only.</td><td>Stops the endless THRE interrupt.</td></tr>
+<tr><td>52–66</td><td><code>uart_irq_init</code></td><td>Divisor, 8N1, FIFOs with trigger 14, DTR/RTS/OUT2, handler, unmask, IER.</td><td>IER last: no interrupt before the handler exists.</td></tr>
+<tr><td>70–80</td><td><code>uart_irq_putc</code></td><td>Waits while the ring is full; pushes; turns THRE interrupts on with IF off.</td><td>The only place normal code touches IER, protected against the handler.</td></tr>
+<tr><td>94–99</td><td><code>uart_irq_regs</code></td><td>Reads IER, LSR, MCR for the stall diagnostic.</td><td>Avoids IIR: reading it could clear a pending transmit cause.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>i8042.cc</code>, controller, keyboard and mouse</p>
+<pre class="listing" data-src="F4-03/i8042.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>22–35</td><td>wait helpers</td><td>Bounded waits on the input and output buffer bits.</td><td>A missing controller must not hang the boot.</td></tr>
+<tr><td>38–43</td><td><code>device_cmd</code></td><td>Optional 0xD4 for the mouse; write; expect ACK 0xFA.</td><td>All device commands go through the controller.</td></tr>
+<tr><td>45–46</td><td>handlers</td><td>One byte per interrupt into the right ring.</td><td>Decoding happens outside the handler.</td></tr>
+<tr><td>49–59</td><td>set 1 tables</td><td>Make codes to characters, with and without Shift.</td><td>Translation on: the controller delivers set 1.</td></tr>
+<tr><td>65–83</td><td>controller tests</td><td>Disable ports, flush, read config, interrupts off, self-test, port tests.</td><td>R2's first lines.</td></tr>
+<tr><td>84–95</td><td>device resets</td><td>Enable ports, reset keyboard and mouse, mouse reporting on.</td><td>R2: both ACK and answer 0xAA; mouse ID 0.</td></tr>
+<tr><td>96–107</td><td>interrupts on</td><td>Handlers, unmask 1, 2 and 12, re-read config, set bits 0–1, clear 4–5.</td><td>The ordering lesson of Layer 3.</td></tr>
+<tr><td>111–125</td><td><code>get_key</code></td><td>Skips <code>0xE0</code>, tracks Shift, maps make codes.</td><td>Extended keys are an exercise.</td></tr>
+<tr><td>127–145</td><td><code>get_mouse</code></td><td>Resync on bit 3, 9-bit sign extension, buttons.</td><td>Robust against a lost byte.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>ring.h</code>, the single-producer, single-consumer ring</p>
+<pre class="listing" data-src="F4-03/ring.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11</td><td>power of two</td><td>Compile-time check.</td><td>Modulo is a mask; free-running indices wrap correctly.</td></tr>
+<tr><td>13–20</td><td><code>push</code></td><td>Full: count a drop; else store, barrier, advance head.</td><td>A drop is counted, never silent (R3 prints it).</td></tr>
+<tr><td>21–28</td><td><code>pop</code></td><td>Empty: false; else read, barrier, advance tail.</td><td>Mirror image of push.</td></tr>
+<tr><td>36–38</td><td>indices</td><td><code>volatile</code> indices and drop counter.</td><td>Enough on one CPU; not enough on two.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 5</b> — <code>f403_main.cc</code>, the two tests</p>
+<pre class="listing" data-src="F4-03/f403_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>34–67</td><td><code>keyboard_test</code></td><td>Keys into the line discipline, mouse packets printed; a status line once a second while input is quiet; ends after two lines and three packets.</td><td>Status lines make a stall visible (forensic lab).</td></tr>
+<tr><td>69–101</td><td><code>paste_test</code></td><td>COM2 with interrupts; checksum and echo of each byte; a diagnostic line after 10 s without a byte; statistics at the end.</td><td>Acceptance test 2, with its own evidence.</td></tr>
+<tr><td>104–115</td><td><code>kmain</code></td><td>IDT and PIC, PIT, interrupts on, then one test chosen by the command line.</td><td>One kernel, several runs.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 6</b> — <code>qmp_drive.py</code>, typing through QEMU's monitor</p>
+<pre class="listing" data-src="F4-03/qmp_drive.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–20</td><td>start QEMU</td><td>Adds <code>-qmp stdio</code> and talks JSON over QEMU's standard input and output.</td><td>No sockets to clean up.</td></tr>
+<tr><td>47–61</td><td><code>wait:</code></td><td>Polls the serial log for a text.</td><td>Keys are sent only after "tty ready".</td></tr>
+<tr><td>62–66</td><td><code>hmp:</code></td><td>Runs one monitor command, echoes it.</td><td>The run record lists every injected key.</td></tr>
+<tr><td>69–81</td><td><code>exit</code>, <code>quit</code></td><td>Wait for the kernel's own exit, or stop QEMU; kill on timeout.</td><td>A hung kernel cannot leave a stray QEMU behind.</td></tr>
+</tbody></table></div>
+<p><b>Listing 7</b> — <code>paste_feed.py</code>, the host end of COM2</p>
+<pre class="listing" data-src="F4-03/paste_feed.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–22</td><td>connect</td><td>Retries until QEMU's socket exists.</td><td>QEMU and the feeder start at the same time.</td></tr>
+<tr><td>23–31</td><td>wait for the prompt</td><td>Sends nothing before the kernel says it is ready.</td><td>Bytes sent earlier would be discarded when the driver clears the FIFOs.</td></tr>
+<tr><td>32–46</td><td>send and compare</td><td>Sends 64 KiB, collects the echo, compares, reports a stall instead of crashing.</td><td>The host's half of the checksum test.</td></tr>
+</tbody></table></div>
+<p>The runs: build (R1), keyboard and mouse with the injected keys and QEMU's trace (R2), the paste (R3).</p>
+<pre class="output" data-run="F4-03/build"></pre>
+<pre class="output" data-run="F4-03/keyboard"></pre>
+<pre class="output" data-run="F4-03/paste"></pre>
+<div class="co warning"><span class="lbl">Watch out</span><p>One of about ten runs of the paste test in this build, made while other emulators were running on the same machine, stalled with nothing received; it could not be reproduced afterwards, even under deliberate CPU load. The cause is not known (candidates: the feeder and QEMU's socket set-up racing, or a lost receive interrupt). <code>run.sh</code> therefore records a failed first attempt in <code>paste.out</code> and tries once more, and the kernel prints the UART registers if no byte arrives for 10 s. If you see the diagnostic line, you have evidence for the investigation; NOTES.md keeps this open.</p></div>
+
+<h2 id="F4-03-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A doorbell rings once; an interrupt line can stay asserted.</b> A level-triggered line keeps requesting until the device's cause is cleared; an edge-triggered one may never ring again if the cause is left set. A doorbell has neither problem.</li>
+<li><b>The secretary blocks more than one bell.</b> A missing EOI blocks this line and every lower-priority line, including all slave lines behind line 2. No school secretary would stop passing on unrelated visitors because one interpreter forgot to report back.</li>
+<li><b>Visitors do not lose words if the notebook is full; UARTs do.</b> A full FIFO overwrites or drops data with only a status bit as trace (overrun). The analogy suggests the visitor would wait.</li>
+</ul>
+
+<h2 id="F4-03-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>No EOI, or EOI only to the master for a slave line.</b> Symptom: one interrupt and then silence, often for several devices. Check the per-line counters (forensic lab).</li>
+<li><b>Forgetting OUT2.</b> Symptom: the 16550 never interrupts although IER is set. Check MCR bit 3.</li>
+<li><b>Leaving THRE interrupts on.</b> Symptom: the CPU spends all its time in the UART handler; the system feels frozen. Check that IER bit 1 is cleared when the ring empties.</li>
+<li><b>Servicing one IIR cause and returning.</b> Symptom: lost interrupts under load. Loop until IIR bit 0 is 1.</li>
+<li><b>Writing back a stale i8042 configuration byte.</b> Symptom: the keyboard never interrupts after an apparently good initialisation. Re-read before writing.</li>
+<li><b>Unmasking line 12 but not line 2.</b> Symptom: the mouse is silent, the keyboard works.</li>
+<li><b>Doing work in the handler.</b> Symptom: overruns at high rates. Move decoding and echo out of the handler, as the lab does.</li>
+</ul>
+
+<div class="co transition" id="F4-03-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F4-01's polled UART driver; F3-19 and F3-24, where your kernel took exceptions and timer interrupts; F1-42 and F1-43, where interrupts and interrupt controllers were hardware. <b>What carries over:</b> the register layer and the UART register map; the driver model; the serial log as the oracle. <b>What changes:</b> the device decides when the driver runs; driver code splits into a handler that must be short and normal code that consumes rings; every handler owes an EOI; tests inject input from outside the guest. <b>What comes next:</b> F4-04 reads a device whose registers change on their own (the RTC), where the problem is not "when" but "a consistent snapshot".</p></div>
+
+<h2 id="F4-03-check">Check yourself</h2>
+<ol>
+<li>Why must the PICs be remapped before interrupts are enabled in protected mode?</li>
+<li>Which three conditions must all hold for COM2 to raise an interrupt the CPU sees?</li>
+<li>Explain in your own words why the transmit interrupt is switched on only while the TX ring holds data.</li>
+<li>Predict: with trigger level 1 instead of 14, would the paste test take more or fewer interrupts? Why?</li>
+<li>Which statement is false: (a) in set 1 a release is the press code with bit 7 set; (b) the controller delivers set 2 when translation is on; (c) the mouse's first packet byte always has bit 3 set; (d) a reset keyboard answers 0xFA and then 0xAA. Explain each.</li>
+<li>Apply to a new case: a classmate's ring uses <code>head == tail</code> for empty and <code>(head + 1) % N == tail</code> for full with wrapped indices. How many bytes can it hold, and why does the lab's version hold N?</li>
+<li>In R2, irq12 = 9 and three packets were decoded. Is that consistent? Show the arithmetic.</li>
+<li>Why does <code>timer::ms()</code> read the counter twice?</li>
+<li>What would you add to the ring to make it safe with two CPUs?</li>
+<li>The 23 keys typed in R2 produced 50 line-1 interrupts. Account for the 50 (hint: Shift).</li>
+</ol>
+
+<h2 id="F4-03-lab">Lab</h2>
+<p><b>Goal.</b> Milestone C2: "Input devices with interrupt handling, ring buffers and a TTY line discipline."</p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2 (<code>pc</code> machine), g++ 13.3, GNU ld 2.42, Python 3. Run <code>university/labs/run_lab.sh university/labs/F4-03</code> from the repository root (about a minute).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>QEMU first (curriculum safety box). On a spare PC, an i8042 initialisation that goes wrong can leave the keyboard unusable until reboot; keep a serial console or a second way in. Do not test on a laptop you depend on: its PS/2 controller is emulated by the embedded controller, whose behaviour with unusual commands is not documented here.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In R2, match the injected keys with the echoed text and the two shell lines; find the backspace.</li>
+<li>Verify the worked example's packet decoding against R2's three mouse lines.</li>
+<li>In R3, compare the kernel's and the host's checksums and read the statistics line.</li>
+<li>Change the trigger level to 1 (<code>FCR</code> bits 7–6 = 00) and re-run; compare the number of interrupts and the high-water mark.</li>
+<li>Add support for the <code>0xE0</code> prefix and the arrow keys; extend the injected keys with <code>sendkey left</code> and check the trace.</li>
+</ol>
+<p><b>Expected observations.</b> R2: two shell lines, exactly <code>hello world</code> and <code>DR301 ok</code>; three mouse packets; exit code 33. R3: 65536 bytes, matching checksums, identical echo, 0 overruns, 0 drops.</p>
+<p><b>Verification</b> (the milestone's acceptance tests, verbatim):</p>
+<ul>
+<li>QEMU input injection (through its monitor's key-sending command) types a line that appears in the shell exactly. — R2 (the "shell" is the lab kernel's line discipline; a real shell arrives with Track U).</li>
+<li>Pasting 64 KiB through the serial port loses no bytes (checksum). — R3.</li>
+<li>On the spare PC (if it has PS/2 or USB legacy emulation), typing works. — <b>Untested in this build:</b> no spare PC is available. To run it you need a spare PC with a PS/2 port or firmware USB legacy emulation, a USB stick for the kernel and a serial console or a second way to see output.</li>
+</ul>
+<p><b>Troubleshooting.</b> No keyboard interrupts: print the configuration byte after initialisation (bits 4–5 must be 0, bit 0 must be 1). The paste stalls: read the diagnostic line; IER should be 0x01 or 0x03, MCR must include 0x08 (OUT2). Exit code 124: a test waited for input that never came.</p>
+<p><b>Extension.</b> Replace the PIC with the IOAPIC and local APIC of your B7 kernel (F3-24): route ISA lines 1, 3, 4 and 12 using MADT interrupt source overrides and acknowledge at the local APIC. The drivers must not change.</p>
+
+<h2 id="F4-03-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> After a refactor of the interrupt dispatcher, Tomasz reports that "the keyboard is broken": the first key appears, then nothing; the mouse is dead too; the timer still works, because the status lines keep coming. The test machine is the lab's QEMU configuration, with the same keys injected.</p>
+<p><b>Evidence pack.</b> The serial log and QEMU's trace counts (R4):</p>
+<pre class="output" data-run="F4-03/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: how many keyboard bytes did the emulated keyboard produce, how many did the CPU read, and how many keyboard interrupts were counted?</li>
+<li>Hypotheses: the keyboard model stopped producing codes; the driver stopped reading port 0x60; the interrupts stopped arriving. Which numbers decide?</li>
+<li>Why did the mouse (line 12) never interrupt even once, while the timer (line 0) keeps going?</li>
+<li>Name the missing step and the exact line of the dispatcher that should perform it.</li>
+<li>Why did the CPU read port 0x60 twenty times if only one keyboard interrupt was handled? (The trace covers the whole run of QEMU, firmware included.)</li>
+</ol>
+<p><b>Method hints.</b> Use Figure 1's priority rule. Compare <code>irq0</code>, <code>irq1</code> and <code>irq12</code> in the status lines. Read the initialisation in Listing 3 for reads of port 0x60 that do not come from the handler.</p>
+
+<h2 id="F4-03-project">Mini-project</h2>
+<p><b>A serial console with flow control and a scrollback.</b> Turn COM1 into the kernel's interactive console: the line discipline from this chapter on top of the interrupt-driven driver, a 16 KiB scrollback ring that a command <code>log</code> prints, and RTS/CTS hardware flow control (MCR RTS, MSR CTS, modem status interrupt). Test it by pasting 1 MiB from a host program that honours CTS through a QEMU socket chardev, with a deliberately slow consumer in the kernel (sleep 1 ms every 64 bytes).</p>
+<p><b>Rubric</b> (10 points): no loss at 1 MiB with the slow consumer (4); flow control visible in counters (RTS dropped and raised N times) (2); scrollback correct after wrap (2); a short note on what QEMU's model does and does not emulate about flow control, marked unverified where it is (2).</p>
+
+<h2 id="F4-03-summary">Summary</h2>
+<ul>
+<li>Interrupts let devices signal; the 8259 pair maps lines to vectors after remapping, enforces priority and needs an EOI per interrupt (both controllers for slave lines).</li>
+<li>An interrupt-driven 16550 needs FIFOs, OUT2, IER and an unmasked line; the handler loops over IIR causes; transmit interrupts are enabled only while data waits.</li>
+<li>The i8042 initialisation is an ordered sequence of self-tests, resets and configuration writes; re-read the configuration byte before changing it.</li>
+<li>Handlers and normal code meet in single-producer, single-consumer rings that need ordering but no lock on one CPU.</li>
+<li>Input drivers are tested automatically: monitor key injection with an emulator trace, and a host-fed serial port with checksums.</li>
+<li>A missing EOI silences the line and everything below it in priority; per-line counters reveal it.</li>
+</ul>
+
+<h2 id="F4-03-sources">Sources</h2>
+<ol>
+<li id="F4-03-src-D1">National Semiconductor (now Texas Instruments), "PC16550D Universal Asynchronous Receiver/Transmitter with FIFOs" datasheet (C2 reading: interrupt enable and identification registers, FIFO control). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-03-src-D2">OSDev wiki, pages "8042 PS/2 Controller", "PS/2 Keyboard", "PS/2 Mouse" (curriculum item 8; C2 reading). <i>Title only — not opened during this build; the Source Researcher must confirm the pages and their revision (dossier gate G1 open).</i></li>
+<li id="F4-03-src-D3">Intel, "8259A Programmable Interrupt Controller" datasheet: initialisation command words, priority, end of interrupt, edge and level modes. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-03-src-D4">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3, "Interrupt and Exception Handling" (curriculum item 10): IDT gates, interrupt gates clearing IF. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-03-src-D5">Anthony Williams, "C++ Concurrency in Action" (curriculum item 3): single-producer, single-consumer queues and memory ordering. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-03-src-D6">The Open Group, "The Single UNIX Specification" (POSIX), General Terminal Interface: canonical mode input processing. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-03-src-D7">Intel, "8254 Programmable Interval Timer" datasheet: modes, counter programming, input clock. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-03-src-D8">QEMU project, documentation for version 8.2: the monitor commands <code>sendkey</code>, <code>mouse_move</code>, <code>mouse_button</code>, QMP <code>human-monitor-command</code>, socket character devices, trace events. <i>Title only — not opened during this build; the behaviour used is cited from the runs (R2, R3).</i></li>
+<li id="F4-03-src-D9">This project's <code>DRIVERS.html</code>, List 1, row <code>i8042prt</code> (opened in this build; the project's own page).</li>
+<li id="F4-03-src-R1">R1 — lab run, step <code>build</code>: <code>university/labs/F4-03/build.out</code>, <code>build.log</code> (g++ 13.3.0, GNU ld 2.42).</li>
+<li id="F4-03-src-R2">R2 — lab run, step <code>keyboard</code>: <code>keyboard.out</code>, <code>keyboard.log</code> (QEMU 8.2.2, keys and mouse through QMP, trace <code>ps2_put_keycode</code>).</li>
+<li id="F4-03-src-R3">R3 — lab run, step <code>paste</code>: <code>paste.out</code>, <code>paste.log</code> (64 KiB through a socket chardev on COM2).</li>
+<li id="F4-03-src-R4">R4 — lab run, step <code>forensic</code>: <code>forensic.out</code>, <code>forensic.log</code> (kernel built with <code>-DF403_FORGET_EOI_LINE=1</code>; traces <code>ps2_put_keycode</code> and <code>pckbd_kbd_read_data</code>).</li>
+</ol>
+
+<h2 id="F4-03-glossary">Glossary links</h2>
+<p><a href="#gl-8259-pic">8259 PIC</a> · <a href="#gl-end-of-interrupt-eoi">End-of-interrupt (EOI)</a> · <a href="#gl-fifo-trigger-level">FIFO trigger level</a> · <a href="#gl-ring-buffer-spsc">Ring buffer (SPSC)</a> · <a href="#gl-i8042">i8042</a> · <a href="#gl-scan-code">Scan code</a> · <a href="#gl-line-discipline">Line discipline</a> · <a href="#gl-interrupt">Interrupt</a></p>
+
+<h2 id="F4-03-next">Next chapter</h2>
+<p>Next: <a href="#F4-04">F4-04 RTC and wall-clock time</a>. Previous: <a href="#F4-02">F4-02 PCI and PCI Express enumeration and a driver model</a>. Back to the course: <a href="#DR301">DR301</a>. Related: <a href="#F1-42">F1-42 Interrupts: the doorbell</a>, <a href="#F1-43">F1-43 Interrupt controllers</a>, <a href="#F3-24">F3-24 ACPI tables, local APIC and IOAPIC</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackC">Track C</a> (milestone C2).</p>
+
+<h2 id="F4-03-answers">Answers to Check yourself</h2>
+<ol>
+<li>At reset the master delivers vectors 8–15, which protected mode uses for CPU exceptions (double fault, page fault, ...); a timer interrupt would look like a double fault.</li>
+<li>The UART has an enabled cause in IER and OUT2 set in MCR; the PIC line 3 is unmasked (and no higher-priority interrupt is in service); the CPU has IF set.</li>
+<li>Good answers say: the UART raises "transmitter empty" whenever it has room, including immediately when enabled; if nothing is waiting, it would interrupt again and again with no work, so the driver enables it only when the ring has data and disables it when the ring runs dry.</li>
+<li>More: each receive interrupt would come after one byte instead of fourteen, so roughly one interrupt per received byte (the character timeout matters less); the high-water mark of the ring would hardly change because the consumer is the same.</li>
+<li>(b) is false: with translation on, the controller delivers set 1 (the keyboard sends set 2 and the controller translates). (a), (c), (d) are true by Layer 3 (unverified, D2).</li>
+<li>N − 1 bytes: one slot stays empty to tell full from empty. With free-running indices, full is <code>head − tail == N</code>, distinct from empty <code>head == tail</code>, so all N slots are usable.</li>
+<li>Yes: three packets of three bytes each, one interrupt per byte: 3 × 3 = 9.</li>
+<li>On a 32-bit CPU the 64-bit counter is read as two 32-bit loads; a timer interrupt between them can change the upper half, so the value is read again until two reads agree.</li>
+<li>Atomic indices (<code>std::atomic&lt;size_t&gt;</code> or the compiler's atomic built-ins) with a release store after writing the byte and an acquire load before reading it, and each index on its own cache line to avoid false sharing.</li>
+<li>Each key gives a press and a release byte after translation: 23 × 2 = 46. The two shifted keys (<code>shift-d</code>, <code>shift-r</code>) add a Shift press and release each: 46 + 4 = 50.</li>
+</ol>
+<h3 id="F4-03-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>The keyboard produced 75 set 2 bytes (trace); the CPU read port 0x60 20 times; one keyboard interrupt was counted (<code>irq1=1</code>).</li>
+<li>The third. The keyboard kept producing codes (75, as in the healthy R2), so the first is out; the driver reads port 0x60 in its handler, and no handler ran after the first, so the second is a consequence, not the cause; <code>irq1</code> stopped at 1 while the keys kept coming.</li>
+<li>The first keyboard interrupt was never acknowledged, so the master's in-service bit 1 stays set: line 1 and every lower-priority line, including line 2 and thus the whole slave with line 12, are blocked. Line 0 has higher priority than line 1 and is not blocked.</li>
+<li>The end of interrupt to the master for line 1: Listing 1, line 62 (<code>outb(PIC1_CMD, PIC_EOI)</code>), skipped by the condition on line 60 in the forensic build.</li>
+<li>Only one read comes from the handler. The others are polled reads before interrupts were enabled: the kernel's own initialisation (count them in Listing 3: the configuration byte twice, the self-test and port-test answers, the ACKs, the reset results and the mouse ID, plus any flushed bytes) and the firmware's keyboard initialisation before the kernel started, because the trace covers the whole QEMU run.</li>
+</ol>
