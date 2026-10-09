@@ -12,7 +12,7 @@ apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
     qemu-system-x86 qemu-system-arm qemu-system-misc ovmf qemu-efi-aarch64 \
     gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-riscv64-linux-gnu g++-riscv64-linux-gnu \
-    mtools gdisk dosfstools
+    mtools gdisk dosfstools qemu-user
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
     nvidia-cuda-toolkit hipcc
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \

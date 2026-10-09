@@ -27,7 +27,7 @@ changes for the higher levels. Where they differ, this file wins.
 - Emulators: `qemu-system-x86_64`, `qemu-system-aarch64`, `qemu-system-riscv64` (QEMU 8.2.2)
   with OVMF in `/usr/share/OVMF/` and `/usr/share/ovmf/`, AArch64 UEFI firmware
   (qemu-efi-aarch64); cross compilers `aarch64-linux-gnu-g++`, `riscv64-linux-gnu-g++`;
-  mtools, gdisk, dosfstools. **Firmware, boot and kernel labs can really boot in QEMU**
+  mtools, gdisk, dosfstools; user-mode `qemu-aarch64` / `qemu-riscv64` (run cross-compiled Linux programs with `-L /usr/aarch64-linux-gnu` or `/usr/riscv64-linux-gnu`). **Firmware, boot and kernel labs can really boot in QEMU**
   (use `-nographic`/`-serial stdio`, `-no-reboot`, a `timeout`, and the isa-debug-exit
   device as the curriculum describes). Keep code small enough to be a chapter listing;
   a lab may have several files.
