@@ -1,0 +1,303 @@
+<!--meta
+id: F1-57
+title: Warps, wavefronts and SIMT execution
+course: HW301
+level: L3
+prereqs: F1-55; F1-56; HW202 (F1-24, F1-25); MA102 (masks and bit fields)
+time: 6–10 hours including the lab
+hardware: none: the simulator, the compiler-output steps and the forensic lab run on any computer with g++, nvcc and hipcc (this build: no GPU); running Listings 2 and 3 needs an NVIDIA or AMD GPU
+maps: Curriculum 13.1 vocabulary table (lock-step thread group: warp, wavefront); bridges BR-02 and BR-03
+analogy: F1 — the restaurant building and its kitchen; its banquet hall uses the registered mappings of the great kitchen hall (F6)
+-->
+
+<h2 id="F1-57-hook">Story hook</h2>
+<p>In each section of the banquet hall, helpers stand in rows. A row does not get one recipe card per helper; it gets one supervisor who calls out one step at a time, and every helper in the row does that step on their own bowl. "Ladle the soup." Thirty-two ladles move. "Add the herbs." Thirty-two pinches of herbs. One voice, thirty-two pairs of hands: the supervisor's voice is cheap, and the hands do the work.</p>
+<p>Then a card says: "If the guest ordered it spicy, add chili; otherwise add cream." Kofi's row has a problem. Nine bowls are spicy, twenty-three are not. The supervisor cannot call two steps at once. So she calls "chili" and the nine spicy helpers act while the other twenty-three wait with their hands still; then she calls "cream", and the twenty-three act while the nine wait. Both groups are back together for the next step, "serve". The row took two steps of time for one step of work.</p>
+<p>In AMD's building next door, the rows are sixty-four helpers long. The voice is shared even more widely, and a single spicy bowl now keeps sixty-three helpers waiting instead of thirty-one. This chapter is about these rows, which NVIDIA calls <b>warps</b> and AMD calls <b>wavefronts</b>, and about what the hardware does when the bowls disagree.</p>
+
+<h2 id="F1-57-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> SIMT execution: one instruction stream driving a warp or wavefront of lanes, with an active mask.</li>
+<li><b>Predict</b> the cost of a divergent branch from the lanes' data, and compute SIMD efficiency.</li>
+<li><b>Read</b> divergence and vote instructions in real PTX, SASS and AMD assembly, and find the warp or wavefront width in compiler output.</li>
+<li><b>Write</b> warp-width-independent code, and explain why lane masks are 32-bit on NVIDIA and 64-bit on wave64 AMD targets.</li>
+<li><b>Diagnose</b> a reduction that is correct on 32-wide warps and wrong on 64-wide wavefronts.</li>
+</ul>
+
+<div class="co jargon" id="F1-57-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Warp / wavefront</dt><dd><b>Simple words:</b> a group of GPU threads that always do the same step at the same time. <b>Analogy:</b> a row of helpers who follow one supervisor's voice. <b>Precise:</b> the group of threads that the hardware schedules and executes together with one instruction stream; NVIDIA calls it a warp (32 threads on the targets compiled in this build: the <code>sm_80</code> SASS replaces <code>warpSize</code> by 0x20), AMD a wavefront (64 lanes on gfx90a and gfx942, 32 by default on the RDNA targets gfx1030 and gfx1100 in this build's compiler). <sup class="src"><a href="#F1-57-src-D3">D3</a></sup> <sup class="src"><a href="#F1-57-src-R4">R4</a></sup> <sup class="src"><a href="#F1-57-src-R6">R6</a></sup></dd>
+<dt>Lane</dt><dd><b>Simple words:</b> one position in a warp; one thread's slot. <b>Analogy:</b> one helper's place in the row. <b>Precise:</b> the index of a thread within its warp or wavefront (0 to width − 1); lane-indexed bits form the masks used by votes and by the hardware's active mask. <sup class="src"><a href="#F1-57-src-D3">D3</a></sup> <sup class="src"><a href="#F1-57-src-D6">D6</a></sup></dd>
+<dt>SIMT</dt><dd><b>Simple words:</b> "single instruction, multiple threads": you write code for one thread, the hardware runs it for a whole row at once. <b>Analogy:</b> one recipe card read aloud to a row. <b>Precise:</b> NVIDIA's name for its execution model, in which threads are programmed as independent scalar threads but executed in warps that share instruction issue; divergent threads are handled by masking. <sup class="src"><a href="#F1-57-src-D3">D3</a></sup> <sup class="src"><a href="#F1-57-src-D1">D1</a></sup></dd>
+<dt>Active mask / EXEC</dt><dd><b>Simple words:</b> a row of on/off switches saying which threads of the warp take part in the current step. <b>Analogy:</b> which helpers in the row have their hands up. <b>Precise:</b> a bit mask with one bit per lane; disabled lanes do not write results. On AMD GCN/CDNA it is the architectural 64-bit register <code>EXEC</code>, manipulated by instructions such as <code>s_and_saveexec_b64</code>; on NVIDIA it is maintained by the hardware and the compiler (predicates and convergence barriers). <sup class="src"><a href="#F1-57-src-D6">D6</a></sup> <sup class="src"><a href="#F1-57-src-R5">R5</a></sup></dd>
+<dt>Divergence</dt><dd><b>Simple words:</b> when threads of one warp need different steps, so they take turns. <b>Analogy:</b> the spicy bowls and the creamy bowls in one row. <b>Precise:</b> the situation in which lanes of a warp or wavefront evaluate a branch condition differently; the paths are executed one after the other with complementary masks, and the lanes reconverge afterwards. <sup class="src"><a href="#F1-57-src-D3">D3</a></sup> <sup class="src"><a href="#F1-57-src-D1">D1</a></sup></dd>
+<dt>Predication</dt><dd><b>Simple words:</b> doing both little steps for everybody, but each thread only keeps the result of the step meant for it. <b>Analogy:</b> the supervisor calls both short steps, and each helper's card says which one to really do. <b>Precise:</b> guarding individual instructions with a per-lane predicate instead of branching; NVIDIA SASS writes it as <code>@P0</code> / <code>@!P0</code>. Compilers use it for short divergent paths. <sup class="src"><a href="#F1-57-src-D5">D5</a></sup> <sup class="src"><a href="#F1-57-src-R3">R3</a></sup></dd>
+<dt>Warp vote (ballot)</dt><dd><b>Simple words:</b> every thread in the warp says yes or no, and everybody gets the whole list of answers. <b>Analogy:</b> a show of hands in the row, written down as a row of ticks. <b>Precise:</b> an intrinsic that returns a mask with bit <i>l</i> set if lane <i>l</i>'s predicate is true: <code>__ballot_sync(mask, p)</code> returns a 32-bit <code>unsigned</code> in CUDA; HIP's <code>__ballot(p)</code> returns a 64-bit value on wave64 targets. <sup class="src"><a href="#F1-57-src-D3">D3</a></sup> <sup class="src"><a href="#F1-57-src-D8">D8</a></sup> <sup class="src"><a href="#F1-57-src-R1">R1</a></sup></dd>
+<dt>SIMD efficiency</dt><dd><b>Simple words:</b> how many of the lanes did useful work, on average, per step. <b>Analogy:</b> the share of helpers in the row whose hands moved. <b>Precise:</b> useful lane-slots ÷ (instructions issued × width); 100 % without divergence, lower with it. Profilers report related metrics under vendor-specific names. <sup class="src"><a href="#F1-57-src-D1">D1</a></sup> <sup class="src"><a href="#F1-57-src-R2">R2</a></sup></dd>
+</dl></div>
+
+<h2 id="F1-57-pictures">The idea in pictures</h2>
+<p>Figure 1 follows one warp of 8 lanes (drawn small for readability) through the branch of Listing 2: <code>if (v is odd) v = 3v + 1; else v = v / 2;</code>. Figure 2 compares the masks and widths of the two vendors, with the evidence from this build's compilers.</p>
+<figure id="F1-57-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 290" role="img" aria-labelledby="F1-57-f1t F1-57-f1d">
+<title id="F1-57-f1t">Figure 1: one warp of eight lanes through a divergent branch</title>
+<desc id="F1-57-f1d">Eight columns, lanes 0 to 7, with the values 0 to 7 written at the top; odd lanes are 1, 3, 5, 7. Time runs downward through four rows. Row 1, evaluate condition: all eight lanes active. Row 2, path A (v = 3v + 1), two instructions: lanes 1, 3, 5 and 7 active (filled), lanes 0, 2, 4 and 6 masked off (empty, dashed). Row 3, path B (v = v / 2), one instruction: lanes 0, 2, 4, 6 active, odd lanes masked. Row 4, reconverged (out = v): all lanes active. A note says useful lane-slots 20 of 32 issued for the branch and the store, efficiency 62.5 percent, as printed by the simulator.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="290"/>
+<text class="sv-ts" x="10" y="28">lane</text>
+<text class="sv-t" x="215" y="28">0</text><text class="sv-t" x="265" y="28">1</text><text class="sv-t" x="315" y="28">2</text><text class="sv-t" x="365" y="28">3</text><text class="sv-t" x="415" y="28">4</text><text class="sv-t" x="465" y="28">5</text><text class="sv-t" x="515" y="28">6</text><text class="sv-t" x="565" y="28">7</text>
+<text class="sv-ts" x="10" y="48">v</text>
+<text class="sv-ts" x="215" y="48">0</text><text class="sv-ts" x="265" y="48">1</text><text class="sv-ts" x="315" y="48">2</text><text class="sv-ts" x="365" y="48">3</text><text class="sv-ts" x="415" y="48">4</text><text class="sv-ts" x="465" y="48">5</text><text class="sv-ts" x="515" y="48">6</text><text class="sv-ts" x="565" y="48">7</text>
+<text class="sv-t" x="10" y="82">test: v odd?</text>
+<rect class="sv-b1" x="200" y="64" width="36" height="28"/><rect class="sv-b1" x="250" y="64" width="36" height="28"/><rect class="sv-b1" x="300" y="64" width="36" height="28"/><rect class="sv-b1" x="350" y="64" width="36" height="28"/><rect class="sv-b1" x="400" y="64" width="36" height="28"/><rect class="sv-b1" x="450" y="64" width="36" height="28"/><rect class="sv-b1" x="500" y="64" width="36" height="28"/><rect class="sv-b1" x="550" y="64" width="36" height="28"/>
+<text class="sv-t" x="10" y="130">path A: v = 3v + 1</text><text class="sv-ts" x="10" y="146">2 instructions</text>
+<rect class="sv-box" x="200" y="112" width="36" height="28"/><rect class="sv-b6" x="250" y="112" width="36" height="28"/><rect class="sv-box" x="300" y="112" width="36" height="28"/><rect class="sv-b6" x="350" y="112" width="36" height="28"/><rect class="sv-box" x="400" y="112" width="36" height="28"/><rect class="sv-b6" x="450" y="112" width="36" height="28"/><rect class="sv-box" x="500" y="112" width="36" height="28"/><rect class="sv-b6" x="550" y="112" width="36" height="28"/>
+<line class="sv-dash" x1="204" y1="116" x2="232" y2="136"/><line class="sv-dash" x1="304" y1="116" x2="332" y2="136"/><line class="sv-dash" x1="404" y1="116" x2="432" y2="136"/><line class="sv-dash" x1="504" y1="116" x2="532" y2="136"/>
+<text class="sv-t" x="10" y="178">path B: v = v / 2</text><text class="sv-ts" x="10" y="194">1 instruction</text>
+<rect class="sv-b5" x="200" y="160" width="36" height="28"/><rect class="sv-box" x="250" y="160" width="36" height="28"/><rect class="sv-b5" x="300" y="160" width="36" height="28"/><rect class="sv-box" x="350" y="160" width="36" height="28"/><rect class="sv-b5" x="400" y="160" width="36" height="28"/><rect class="sv-box" x="450" y="160" width="36" height="28"/><rect class="sv-b5" x="500" y="160" width="36" height="28"/><rect class="sv-box" x="550" y="160" width="36" height="28"/>
+<line class="sv-dash" x1="254" y1="164" x2="282" y2="184"/><line class="sv-dash" x1="354" y1="164" x2="382" y2="184"/><line class="sv-dash" x1="454" y1="164" x2="482" y2="184"/><line class="sv-dash" x1="554" y1="164" x2="582" y2="184"/>
+<text class="sv-t" x="10" y="226">reconverged: out = v</text>
+<rect class="sv-b1" x="200" y="208" width="36" height="28"/><rect class="sv-b1" x="250" y="208" width="36" height="28"/><rect class="sv-b1" x="300" y="208" width="36" height="28"/><rect class="sv-b1" x="350" y="208" width="36" height="28"/><rect class="sv-b1" x="400" y="208" width="36" height="28"/><rect class="sv-b1" x="450" y="208" width="36" height="28"/><rect class="sv-b1" x="500" y="208" width="36" height="28"/><rect class="sv-b1" x="550" y="208" width="36" height="28"/>
+<line class="sv-line" x1="620" y1="64" x2="620" y2="236"/><polygon class="sv-head" points="620,236 616,228 624,228"/><text class="sv-ts" x="628" y="150">time</text>
+<text class="sv-ts" x="10" y="262">filled = lane active; empty with a diagonal dash = lane masked off (it waits, its result is not written)</text>
+<text class="sv-ts" x="10" y="280">simt.cpp, alternating odd/even, width 8: issued 4, useful lane-slots 20 of 32, SIMD efficiency 62.5 %</text>
+</svg></div><figcaption><b>Figure 1.</b> SIMT divergence: the two paths of a branch run one after the other with complementary masks, then the warp reconverges. The drawing matches the output of Listing 1 (R2) for the alternating pattern; the mechanism is described in D1 and D3. Real compilers may replace a short branch by predicated instructions with the same effect (R3). <sup class="src"><a href="#F1-57-src-D1">D1</a></sup> <sup class="src"><a href="#F1-57-src-D3">D3</a></sup> <sup class="src"><a href="#F1-57-src-R2">R2</a></sup> <sup class="src"><a href="#F1-57-src-R3">R3</a></sup></figcaption></figure>
+
+<figure id="F1-57-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 210" role="img" aria-labelledby="F1-57-f2t F1-57-f2d">
+<title id="F1-57-f2t">Figure 2: warp and wavefront widths and their masks, with the compiler evidence</title>
+<desc id="F1-57-f2d">Three horizontal bars. Top: an NVIDIA warp drawn as 32 small cells, labelled 32 lanes, 32-bit masks; evidence: PTX vote.sync.ballot.b32 and SASS warpSize replaced by 0x20 for sm_80. Middle: an AMD wave64 wavefront drawn as 64 small cells, labelled 64 lanes, 64-bit EXEC mask; evidence: gfx90a metadata .wavefront_size 64 and s_and_saveexec_b64. Bottom: an AMD wave32 bar of 32 cells for gfx1030 and gfx1100, with the note that the compiler defines the wavefront size 32 by default and 64 with -mwavefrontsize64 for gfx1100.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="210"/>
+<text class="sv-tb" x="10" y="22">NVIDIA warp (sm_80 in this build)</text>
+<rect class="sv-b1" x="10" y="30" width="352" height="22"/>
+<line class="sv-line" x1="98" y1="30" x2="98" y2="52"/><line class="sv-line" x1="186" y1="30" x2="186" y2="52"/><line class="sv-line" x1="274" y1="30" x2="274" y2="52"/>
+<text class="sv-ts" x="372" y="46">32 lanes; masks are 32-bit: PTX vote.sync.ballot.b32; SASS: warpSize → 0x20</text>
+<text class="sv-tb" x="10" y="84">AMD wave64 wavefront (gfx90a, gfx942)</text>
+<rect class="sv-b2" x="10" y="92" width="704" height="22"/>
+<line class="sv-line" x1="98" y1="92" x2="98" y2="114"/><line class="sv-line" x1="186" y1="92" x2="186" y2="114"/><line class="sv-line" x1="274" y1="92" x2="274" y2="114"/><line class="sv-line" x1="362" y1="92" x2="362" y2="114"/><line class="sv-line" x1="450" y1="92" x2="450" y2="114"/><line class="sv-line" x1="538" y1="92" x2="538" y2="114"/><line class="sv-line" x1="626" y1="92" x2="626" y2="114"/>
+<text class="sv-ts" x="10" y="132">64 lanes; EXEC and vote masks are 64-bit: s_and_saveexec_b64, s_bcnt1_i32_b64; metadata .wavefront_size: 64</text>
+<text class="sv-tb" x="10" y="160">AMD wave32 (gfx1030, gfx1100 default)</text>
+<rect class="sv-b5" x="10" y="168" width="352" height="22"/>
+<line class="sv-line" x1="98" y1="168" x2="98" y2="190"/><line class="sv-line" x1="186" y1="168" x2="186" y2="190"/><line class="sv-line" x1="274" y1="168" x2="274" y2="190"/>
+<text class="sv-ts" x="372" y="184">__AMDGCN_WAVEFRONT_SIZE 32; 64 with -mwavefrontsize64</text>
+</svg></div><figcaption><b>Figure 2.</b> Width and mask size per target, each fact read from this build's compiler output: PTX and SASS of Listing 2 for <code>sm_80</code> (R3), gfx90a assembly of Listing 3 (R5), and the AMD compiler's predefined wavefront-size macro for four targets (R6). Cells are grouped in eights for readability. <sup class="src"><a href="#F1-57-src-R3">R3</a></sup> <sup class="src"><a href="#F1-57-src-R5">R5</a></sup> <sup class="src"><a href="#F1-57-src-R6">R6</a></sup></figcaption></figure>
+
+<h2 id="F1-57-layer1">Layer 1 — the kid explanation</h2>
+<p>A GPU does not give every thread its own supervisor. That would cost far too much. Instead, threads stand in rows, and one supervisor reads each step to the whole row. On NVIDIA GPUs a row has 32 threads; on many AMD GPUs it has 64.</p>
+<p>When everybody in the row needs the same step, this is wonderful: one call, many hands. When the row disagrees, for example at an "if", the supervisor reads the "yes" steps while the "no" threads wait, and then the "no" steps while the "yes" threads wait. Nobody gets a wrong answer. But the row spends time on both sides.</p>
+<p>So the rule of thumb is: inside one row, try to make threads take the same path. Across different rows, it does not matter, because each row has its own supervisor.</p>
+
+<h2 id="F1-57-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F1-57-l2-model">The SIMT model</h3>
+<p>In CUDA and HIP you write a kernel as the code of one thread. The hardware groups consecutive threads of a block into warps (NVIDIA) or wavefronts (AMD) and executes each group with one instruction stream: one fetch and decode, many lanes. <sup class="src"><a href="#F1-57-src-D3">D3</a></sup> <sup class="src"><a href="#F1-57-src-D1">D1</a></sup> Which threads form a warp is defined by the programming guide in terms of the thread index within the block: consecutive threads (by <code>threadIdx.x</code> first) form consecutive warps. <sup class="src"><a href="#F1-57-src-D3">D3</a></sup> The width is not a language constant. CUDA exposes it as the built-in variable <code>warpSize</code>; this build's compiler leaves it symbolic in PTX (<code>mov.u32 %r16, WARP_SZ;</code>) and replaces it by 0x20 = 32 in the SASS for <code>sm_80</code> (<code>IADD3 R5, R4, 0x20, R5</code>). <sup class="src"><a href="#F1-57-src-R3">R3</a></sup> <sup class="src"><a href="#F1-57-src-D4">D4</a></sup> HIP defines <code>warpSize</code> as the compiler macro <code>__AMDGCN_WAVEFRONT_SIZE</code> (in the installed header <code>amd_warp_functions.h</code>), which this build's compiler sets to 64 for gfx90a and gfx942 and to 32 for gfx1030 and gfx1100 unless <code>-mwavefrontsize64</code> is given; the gfx90a assembly adds the constant 64 where the source says <code>warpSize</code> (<code>v_add3_u32 v2, v2, s0, 64</code>). <sup class="src"><a href="#F1-57-src-H2">H2</a></sup> <sup class="src"><a href="#F1-57-src-R5">R5</a></sup> <sup class="src"><a href="#F1-57-src-R6">R6</a></sup></p>
+<h3 id="F1-57-l2-div">Divergence and its cost</h3>
+<p>When the lanes of a warp evaluate a branch differently, the hardware executes each path with only the lanes that took it enabled, and the lanes reconverge where the paths join. <sup class="src"><a href="#F1-57-src-D3">D3</a></sup> <sup class="src"><a href="#F1-57-src-D1">D1</a></sup> Correctness is preserved; time is not. Listing 1 models it: for the branch of Figure 1, a warp whose lanes all agree issues 2 instructions (one path plus the store), while a warp whose lanes alternate issues 4 (both paths plus the store), and SIMD efficiency falls to 62.5 % (R2). The cost depends only on whether <em>any</em> lane takes each path: a single odd lane forces the whole warp through path A ("only lane 0 odd": 50.8 % at width 32, 50.4 % at width 64). <sup class="src"><a href="#F1-57-src-R2">R2</a></sup></p>
+<p>The width matters. The pattern "lanes 0–31 even, lanes 32–63 odd" is perfectly uniform inside each 32-wide NVIDIA warp (100 %), but the same data inside one 64-wide wavefront diverges (62.5 %). Code tuned so that warps never diverge on NVIDIA can diverge on wave64 AMD targets. <sup class="src"><a href="#F1-57-src-R2">R2</a></sup></p>
+<h3 id="F1-57-l2-vote">Masks you can see: votes</h3>
+<p>Warp-level intrinsics expose the lane structure to the programmer. <code>__ballot_sync(0xffffffff, p)</code> returns a 32-bit mask with one bit per lane of the warp whose predicate is true; its first argument names the lanes that take part. <sup class="src"><a href="#F1-57-src-D3">D3</a></sup> In this build's PTX it is <code>vote.sync.ballot.b32</code>, in the SASS <code>VOTE.ANY R4, PT, P0</code> followed by <code>POPC</code> (population count) for <code>__popc</code>. <sup class="src"><a href="#F1-57-src-R3">R3</a></sup> HIP's <code>__ballot(p)</code> returns a 64-bit value (Listing 3 stores it in <code>unsigned long long</code>); on gfx90a the compiler counts its bits with <code>s_bcnt1_i32_b64 s0, vcc</code>, a scalar instruction on a 64-bit register pair, because the comparison result is already a 64-lane mask in <code>vcc</code>. <sup class="src"><a href="#F1-57-src-R5">R5</a></sup> <sup class="src"><a href="#F1-57-src-D6">D6</a></sup></p>
+
+<h2 id="F1-57-layer3">Layer 3 — the engineer's depth</h2>
+<p>The analogy in one line: the supervisor's job is now done partly by the compiler and partly by the hardware, and the two vendors split it differently.</p>
+<h3 id="F1-57-l3-amd">AMD: the mask is a register you can read</h3>
+<p>On GCN and CDNA, the 64-bit <code>EXEC</code> register is the active mask; every vector instruction only affects lanes whose bit is set. <sup class="src"><a href="#F1-57-src-D6">D6</a></sup> The compiler lowers an <code>if/else</code> into explicit mask arithmetic, which this build's gfx90a assembly of Listing 3 shows line by line: <code>v_cmp_eq_u32_e32 vcc, 1, v2</code> writes the per-lane condition into the 64-bit <code>vcc</code>; <code>s_and_saveexec_b64 s[0:1], vcc</code> saves the old <code>EXEC</code> and keeps only the "then" lanes; <code>s_xor_b64 s[0:1], exec, s[0:1]</code> computes the "else" lanes; the "then" path runs (<code>v_mad_u64_u32 … 3, 1</code>); <code>s_andn2_saveexec_b64</code> switches <code>EXEC</code> to the "else" lanes; the "else" path runs (the shift sequence for <code>v / 2</code>); and <code>s_or_b64 exec, exec, s[0:1]</code> restores the full mask at the reconvergence point. <sup class="src"><a href="#F1-57-src-R5">R5</a></sup> Earlier, the bounds check <code>if (i &gt;= n) return;</code> became <code>s_and_saveexec_b64</code> plus <code>s_cbranch_execz</code>: if no lane remains active, the scalar unit jumps over the body entirely. That is the hardware's way of skipping a path no lane takes, the "skipped" line in Listing 1's drawing. <sup class="src"><a href="#F1-57-src-R5">R5</a></sup> <sup class="src"><a href="#F1-57-src-R2">R2</a></sup></p>
+<h3 id="F1-57-l3-nv">NVIDIA: predicates and convergence</h3>
+<p>For the same short branch, the CUDA compiler did not branch at all: the SASS computes the predicate once (<code>ISETP.NE.U32.AND P0, PT, R4, 0x1, PT</code>) and executes both arms as predicated instructions (<code>@!P0 IMAD R5, R2, R5, 0x1</code> for 3v + 1 and <code>@P0 SHF.R.S32.HI R5, RZ, 0x1, R4</code> for the halving). <sup class="src"><a href="#F1-57-src-R3">R3</a></sup> The cost is the same as in the model: both arms are issued for the warp. For longer divergent regions the compiler emits real branches, and the hardware tracks which lanes are on which path; since the Volta generation NVIDIA documents "independent thread scheduling", in which each thread has its own program counter and divergent paths may interleave, which is why warp-level intrinsics carry the <code>_sync</code> suffix and an explicit participation mask. <sup class="src"><a href="#F1-57-src-D3">D3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The description of independent thread scheduling (per-thread program counters since Volta; the requirement that all lanes named in the mask of a <code>*_sync</code> intrinsic execute it; the SASS convergence-barrier instructions used for divergent branches) is written from memory and could not be checked in this build; the SASS of Listing 2 contains no such barrier because the compiler chose predication. Check: the CUDA Programming Guide sections "SIMT Architecture" and "Warp Vote Functions" for the toolkit version in the dossier, and the CUDA Binary Utilities instruction-set reference.</p></div>
+<h3 id="F1-57-l3-port">Portability rules that follow</h3>
+<ul>
+<li>Never hard-code 32 as the warp size in portable code; use <code>warpSize</code> or a compile-time constant derived from the target (guide 13.4; bridge BR-02). <sup class="src"><a href="#F1-57-src-C1">C1</a></sup></li>
+<li>Lane masks must be 64-bit where the wavefront is 64 wide: <code>unsigned long long</code> for HIP ballots on wave64. A 32-bit variable silently drops lanes 32–63. <sup class="src"><a href="#F1-57-src-R1">R1</a></sup></li>
+<li>Shuffle-based reductions start from <code>warpSize / 2</code>, not from 16 (the forensic lab).</li>
+<li>Block sizes should be multiples of the width, or the last warp of every block runs partly empty: a block of 100 threads uses 4 warps of 32 (28 idle lanes) or 2 wavefronts of 64 (28 idle lanes).</li>
+</ul>
+
+<h2 id="F1-57-hardware">How the hardware actually does it</h2>
+<p>One instruction fetched and decoded per warp drives many lanes; the lanes are physical arithmetic units, sometimes fewer than the width, in which case one warp instruction takes several cycles to pass through them (a design detail that differs by generation, see the unverified box in <a href="#F1-56">F1-56</a>). <sup class="src"><a href="#F1-57-src-D1">D1</a></sup> <sup class="src"><a href="#F1-57-src-D2">D2</a></sup> The active mask gates the write of results: a masked-off lane computes nothing useful and writes nothing, so its time slot is lost. On AMD the mask is the <code>EXEC</code> register set by scalar instructions, exactly as the assembly in Layer 3 shows; the scalar unit also evaluates uniform branches (<code>s_cbranch_execz</code>) so that a path no lane needs costs only the test. <sup class="src"><a href="#F1-57-src-D6">D6</a></sup> <sup class="src"><a href="#F1-57-src-R5">R5</a></sup> On NVIDIA the predicate registers (<code>P0</code> to <code>P6</code>, <code>PT</code> = always true) gate individual instructions, and the hardware maintains the warp's active threads across real branches. <sup class="src"><a href="#F1-57-src-D5">D5</a></sup> <sup class="src"><a href="#F1-57-src-R3">R3</a></sup> Votes are cheap because the per-lane predicate bits already sit side by side in the hardware: <code>VOTE.ANY R4, PT, P0</code> gathers them into one register, and AMD's comparison writes them directly into the 64-bit <code>vcc</code>. <sup class="src"><a href="#F1-57-src-R3">R3</a></sup> <sup class="src"><a href="#F1-57-src-R5">R5</a></sup></p>
+
+<h2 id="F1-57-worked">Worked example</h2>
+<p><b>Task.</b> A kernel processes particles; each thread runs <code>if (p.alive) { 10 instructions } else { 2 instructions }</code>, then 4 common instructions. Compute the instructions issued and the SIMD efficiency for one warp of 32 and one wavefront of 64 when (a) all particles are alive, (b) exactly one particle per group is dead, (c) particles are sorted so that the first 40 of every 64 are alive.</p>
+<ol>
+<li><b>(a) All alive.</b> Only the "alive" path runs: 10 + 4 = 14 instructions, all lanes active: efficiency 100 % for both widths.</li>
+<li><b>(b) One dead per group.</b> Both paths run: 10 + 2 + 4 = 16 instructions. Width 32: useful lane-slots = 31 × 10 + 1 × 2 + 32 × 4 = 310 + 2 + 128 = 440 of 16 × 32 = 512: 85.9 %. Width 64: 63 × 10 + 2 + 64 × 4 = 630 + 2 + 256 = 888 of 16 × 64 = 1,024: 86.7 %. The cost per group is the same 16 instructions; one dead particle costs a whole extra path.</li>
+<li><b>(c) Sorted, 40 alive of every 64.</b> Width 64: every wavefront has 40 alive and 24 dead: 16 instructions, useful = 40 × 10 + 24 × 2 + 64 × 4 = 400 + 48 + 256 = 704 of 1,024 = 68.8 %. Width 32: lanes 0–31 of each 64 are all alive (14 instructions, 100 %); lanes 32–63 hold 8 alive and 24 dead (16 instructions, useful 80 + 48 + 128 = 256 of 512 = 50 %). Two warps issue 30 instructions for the same 64 particles that one wavefront handles in 16, but 30 warp-instructions of 32 lanes are 960 lane-slots, fewer than the wavefront's 1,024.</li>
+</ol>
+<p>The arithmetic follows the model of Listing 1 (each path issued once if any lane takes it; useful = instructions × active lanes). Sorting work so that groups agree is a standard optimisation; how much it helps depends on the width of the target. <sup class="src"><a href="#F1-57-src-D1">D1</a></sup></p>
+
+<h2 id="F1-57-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>simt.cpp</code>: a SIMT model with an active mask.</p>
+<pre class="listing" data-src="F1-57/simt.cpp"></pre>
+<p><b>Build command</b> (the one actually used): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined simt.cpp -o simt</code>, then <code>./simt</code>.</p>
+<pre class="output" data-run="F1-57/simt"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–16</td><td><code>struct Cost</code></td><td>Counts issued instructions and useful lane-slots.</td><td>The two numbers that define SIMD efficiency.</td></tr>
+<tr><td>18–23</td><td><code>maskText</code></td><td>Draws a mask as <code>#</code> (active) and <code>.</code> (masked).</td><td>The pictures in the output are the masks of Figure 1.</td></tr>
+<tr><td>29–30</td><td><code>odd</code>, <code>even</code></td><td>The per-lane branch condition and its complement.</td><td>Two complementary masks, like AMD's <code>vcc</code> and the <code>s_xor_b64</code> result.</td></tr>
+<tr><td>31–41</td><td><code>issue</code> lambda</td><td>Issues a path for the whole group with a mask; skips it if no lane is active.</td><td>"Any lane takes it" decides the cost, not "how many".</td></tr>
+<tr><td>42–45</td><td>the program</td><td>Path A (2 instructions), path B (1), then the reconverged store (1).</td><td>The branch of Listings 2 and 3.</td></tr>
+<tr><td>49–57</td><td><code>report</code></td><td>Builds lane values from a pattern function, runs the group and prints efficiency.</td><td>Only width 8 is drawn; 32 and 64 are summarised.</td></tr>
+<tr><td>59–62</td><td>patterns</td><td>All even; alternating; only lane 0 odd; first 32 even, rest odd.</td><td>The last pattern exposes the width dependence.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>warp_vote.cu</code>: a divergent branch and a warp vote in CUDA (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F1-57/warp_vote.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings warp_vote.cu -o warp_vote</code>, then <code>./warp_vote</code>.</p>
+<pre class="output" data-run="F1-57/warp_vote"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–13</td><td>index and bounds check</td><td>Threads past <code>n</code> leave.</td><td>Becomes <code>@P0 EXIT</code> in SASS and <code>s_and_saveexec_b64</code> + <code>s_cbranch_execz</code> on AMD.</td></tr>
+<tr><td>15–19</td><td><code>if (v &amp; 1) … else …</code></td><td>The divergent branch.</td><td>Lanes with odd and even values disagree.</td></tr>
+<tr><td>20</td><td><code>__ballot_sync(0xffffffffu, v &gt; 10)</code></td><td>All 32 lanes vote; the result has one bit per lane.</td><td>The mask is 32 bits: <code>unsigned</code>.</td></tr>
+<tr><td>21</td><td><code>__popc(votes) + warpSize</code></td><td>Counts the "yes" lanes and adds the width.</td><td>Lets you see <code>warpSize</code> in the generated code.</td></tr>
+<tr><td>34–48</td><td>host code</td><td>Allocates, copies, launches 4 blocks of 256, copies back, prints four results.</td><td>Every call checked; the first one fails in this build.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>warp_vote_amd.hip</code>: the same kernel in HIP (complete program; untested on hardware). Only lines 20–21 differ in substance.</p>
+<pre class="listing" data-src="F1-57/warp_vote_amd.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a warp_vote_amd.hip -o warp_vote_amd</code>, then <code>./warp_vote_amd</code>.</p>
+<pre class="output" data-run="F1-57/warp_vote_amd"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listings 2 and 3 were built for real; their runs stopped at the first allocation because the build container has no GPU (<code>cudaErrorNoDevice</code>; <code>hipErrorInvalidDevice</code>, as printed by HIP 5.7). The values they print on a GPU have not been verified; for input <code>i</code> they should be <code>v + (lanes with v &gt; 10) + width</code>, which you can check by hand for lanes 0–3.</p></div>
+
+<p><b>Generated code</b> — the compiler output that Layers 2 and 3 quote, produced in this build without a GPU. First the PTX of <code>collatzStep</code> (<code>nvcc -arch=sm_80 -ptx</code>):</p>
+<pre class="output" data-run="F1-57/ptx"></pre>
+<p>The SASS for <code>sm_80</code> (encodings and NOP padding removed by the recorded command):</p>
+<pre class="output" data-run="F1-57/sass"></pre>
+<p>The gfx90a assembly of Listing 3's kernel, comments removed, followed by its metadata lines:</p>
+<pre class="output" data-run="F1-57/amd_isa"></pre>
+<p>The wavefront size the AMD compiler defines for four targets:</p>
+<pre class="output" data-run="F1-57/wavesize"></pre>
+<div class="tw"><table>
+<thead><tr><th>Where</th><th>Instruction</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>PTX</td><td><code>vote.sync.ballot.b32</code>, <code>mov.u32 %r16, WARP_SZ</code></td><td>32-bit ballot; width left symbolic.</td><td>PTX is a virtual ISA; the width is resolved for the real target. <sup class="src"><a href="#F1-57-src-D4">D4</a></sup></td></tr>
+<tr><td>SASS</td><td><code>@!P0 IMAD R5, R2, R5, 0x1</code> / <code>@P0 SHF.R.S32.HI R5, RZ, 0x1, R4</code></td><td>Both arms predicated, no branch.</td><td>Divergence handled by predication.</td></tr>
+<tr><td>SASS</td><td><code>IADD3 R5, R4, 0x20, R5</code></td><td>Adds 32 for <code>warpSize</code>.</td><td>The width of this target, in the machine code.</td></tr>
+<tr><td>gfx90a</td><td><code>s_and_saveexec_b64</code>, <code>s_xor_b64</code>, <code>s_andn2_saveexec_b64</code>, <code>s_or_b64 exec</code></td><td>Saves, splits, switches and restores the 64-bit EXEC mask.</td><td>Divergence as explicit mask arithmetic.</td></tr>
+<tr><td>gfx90a</td><td><code>v_add3_u32 v2, v2, s0, 64</code>; <code>.wavefront_size: 64</code></td><td>Adds 64 for <code>warpSize</code>; metadata states the width.</td><td>The wavefront width of gfx90a, twice confirmed.</td></tr>
+</tbody></table></div>
+
+<h2 id="F1-57-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Waiting helpers could chat; masked lanes do nothing.</b> In the hall, a waiting helper might prepare the next bowl. A masked-off lane's slot is lost for that instruction; the SM fills time with <em>other warps</em>, not with the waiting lanes (<a href="#F1-60">F1-60</a>). <sup class="src"><a href="#F1-57-src-D1">D1</a></sup></li>
+<li><b>The supervisor sometimes reads both steps to everybody.</b> With predication the hardware issues both arms to all lanes and each lane keeps one result (R3); there is no "waiting" at all, only wasted slots. <sup class="src"><a href="#F1-57-src-R3">R3</a></sup></li>
+<li><b>Rows are not fixed by the room.</b> AMD's RDNA targets can compile for wave32 or wave64 (R6): the row length is chosen by the compiler for the target, not by the building. <sup class="src"><a href="#F1-57-src-R6">R6</a></sup></li>
+</ul>
+
+<h2 id="F1-57-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> a reduction returns half the expected sum on an AMD GPU. <b>Cause:</b> shuffle offsets start at 16 (a hard-coded 32-wide warp). <b>How to find it:</b> test with all inputs equal to 1 and compare with the width (the forensic lab). <b>Fix:</b> start at <code>warpSize / 2</code>.</li>
+<li><b>Symptom:</b> a ballot shows no votes from lanes 32–63. <b>Cause:</b> the result was stored in a 32-bit variable. <b>How to find it:</b> compile with warnings for narrowing; print the mask in hex. <b>Fix:</b> <code>unsigned long long</code> (Listing 3).</li>
+<li><b>Symptom:</b> a kernel is slower than expected with "rare" special cases. <b>Cause:</b> one lane per warp takes the rare path, so every warp runs it. <b>How to find it:</b> the profiler's branch-efficiency metrics; or count with Listing 1's model. <b>Fix:</b> sort or bin the work so that groups agree; move rare work to a second kernel.</li>
+<li><b>Symptom:</b> a CUDA warp intrinsic hangs or gives wrong results after a refactor. <b>Cause:</b> not all lanes named in the mask reach the call (it is inside a divergent branch). <b>How to find it:</b> Compute Sanitizer's synchronisation checks (F6-05). <b>Fix:</b> call it where all named lanes are converged, or pass the correct mask (see the unverified box above).</li>
+</ul>
+
+<div class="co transition" id="F1-57-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F1-56">F1-56</a> (SMs and CUs) and <a href="#HW202">HW202</a>'s single-thread datapath, where one instruction worked on one set of operands; SP203's CPU threads, each with its own program counter. <b>What carries over:</b> instructions, registers, branches and the idea of a control unit; masks and bit operations from <a href="#MA102">MA102</a>. <b>What changes:</b> one instruction now drives 32 or 64 lanes; a branch can cost the time of both paths; the width differs between vendors and targets (32 on <code>sm_80</code>, 64 on gfx90a, 32 or 64 on RDNA targets, all read from this build's compilers), so masks and reductions must follow it. <sup class="src"><a href="#F1-57-src-R3">R3</a></sup> <sup class="src"><a href="#F1-57-src-R5">R5</a></sup> <sup class="src"><a href="#F1-57-src-R6">R6</a></sup> <b>What comes next:</b> <a href="#F1-58">F1-58</a> looks at where each lane's data lives: registers, shared memory or LDS, and the caches.</p></div>
+
+<h2 id="F1-57-check">Check yourself</h2>
+<ol>
+<li>What is shared by all the lanes of a warp, and what does each lane have of its own?</li>
+<li>A warp of 32 runs <code>if (c) { 6 instr } else { 6 instr }</code> then 2 instructions. How many instructions are issued if 31 lanes have <code>c</code> true? If all 32 do?</li>
+<li>Which is correct for HIP on gfx90a? (a) <code>__ballot</code> returns 32 bits like CUDA. (b) <code>__ballot</code> returns 64 bits because a wavefront has 64 lanes. (c) the width depends on the block size. (d) <code>warpSize</code> is 32 on every GPU.</li>
+<li>Explain in your own words what the four AMD instructions <code>s_and_saveexec_b64</code>, <code>s_xor_b64</code>, <code>s_andn2_saveexec_b64</code> and <code>s_or_b64 exec</code> do together.</li>
+<li>Apply to a new case: a block has 96 threads. How many warps (width 32) and wavefronts (width 64) does it use, and how many lanes are idle in each case?</li>
+<li>Why did the CUDA compiler not emit a branch for the <code>if/else</code> in Listing 2, and is the cost different from a real branch for this short code?</li>
+<li>Predict, then run: change pattern <code>halves32</code> in Listing 1 to make lanes 0–15 even and the rest odd. What efficiencies do you expect for widths 32 and 64?</li>
+<li>Where in the compiler output of this chapter can you find the warp or wavefront width of each target? Name three places.</li>
+</ol>
+
+<h2 id="F1-57-lab">Lab</h2>
+<p><b>Goal.</b> Measure the cost of divergence in the SIMT model, read the masks and widths in real compiler output, and fix a warp-width bug.</p>
+<p><b>Hardware and software needed.</b> No GPU: g++ (this build: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>), nvcc (<code>Cuda compilation tools, release 12.0, V12.0.140</code>), hipcc (HIP 5.7, Ubuntu clang 17.0.6). Running Listings 2 and 3 for real needs an NVIDIA or AMD GPU (optional extension). Folder <code>university/labs/F1-57</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F1-57</code>. Compare <code>simt.out</code> with Figure 1.</li>
+<li>Add a pattern to Listing 1 where every fourth lane is odd. Predict the efficiency for widths 8, 32 and 64, then run.</li>
+<li>In <code>sass.out</code>, find the bounds check, the predicate of the branch, the vote and the instruction that adds 32. Write their addresses.</li>
+<li>In <code>amd_isa.out</code>, mark the save, split, switch and restore of <code>EXEC</code>, and the instruction that adds 64.</li>
+<li>Change the branch in a copy of Listing 3 so that the "then" path is long (for example a loop of 20 multiply-adds). Compile it with the <code>amd_isa</code> command from <code>run.sh</code> and check that the mask instructions are still there; do the same with the CUDA version and look for a branch instead of predication.</li>
+<li>Fix the forensic program <code>reduce_sim.cpp</code> (below) and rerun.</li>
+</ol>
+<p><b>Expected observations.</b> The model's output matches the hand calculation; the recorded compiler outputs contain the instructions named in Layer 3; after the fix, both widths give the expected sums.</p>
+<p><b>Verification.</b> Your hand predictions for step 2 match <code>simt.out</code>; <code>reduce_sim.out</code> after the fix shows equal "expected" and "hard-coded tree" values for widths 32 and 64.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>hipcc prints warnings about unused arguments (<code>--hip-link</code>, <code>--rtlib</code>) when compiling to assembly → these come from hipcc's default flags in this installation and are harmless → the recorded commands discard them with <code>2&gt;/dev/null</code>; check the exit code instead.</li>
+<li>The SASS has no predicated arms after your change → the compiler chose a real branch → look for <code>BRA</code> and the reconvergence point instead.</li>
+<li><code>cuobjdump</code> says the file has no SASS → you compiled to PTX only → compile with <code>-cubin</code> and an <code>-arch=sm_XY</code>.</li>
+</ul>
+<p><b>Extension.</b> On a real GPU, time a kernel whose branch condition is <code>threadIdx.x % k == 0</code> for k = 1, 2, 4, …, 64, and explain the curve with the model and your GPU's width.</p>
+
+<h2 id="F1-57-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Ana ported a CUDA histogram-normalisation kernel to HIP. Its warp-level sum was written with five shuffle-down steps (offsets 16, 8, 4, 2, 1). On the NVIDIA test machine the totals are right; on the lab's gfx90a target the totals are about half of what they should be. A colleague says "HIP shuffles must be broken".</p>
+<p><b>Evidence pack.</b> (1) A host model of the warp sum as Ana wrote it, run on 32-lane and 64-lane groups with every lane holding 1 (R7); (2) the wavefront size of gfx90a from this build's compiler (the <code>wavesize</code> and <code>amd_isa</code> outputs above, R5, R6).</p>
+<pre class="listing" data-src="F1-57/reduce_sim.cpp"></pre>
+<pre class="output" data-run="F1-57/reduce_sim"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: for width 64, what sum does the hard-coded tree give, and which lanes' values are missing?</li>
+<li>Hypotheses: list at least two (broken shuffles; a wrong width assumption; a race). Which evidence tests each?</li>
+<li>Root cause: explain why offsets starting at 16 sum exactly 32 lanes into lane 0.</li>
+<li>Fix: change one line, and show that the fix also works for width 32.</li>
+<li>Prevention: name a coding rule and a test that would have caught this before the port.</li>
+</ol>
+<p><b>Method hints.</b> Follow lane 0's value step by step: after offset 16 it holds lanes 0 and 16; after 8, lanes 0, 8, 16, 24; and so on. Which lanes can ever reach lane 0?</p>
+
+<h2 id="F1-57-project">Mini-project</h2>
+<p><b>A divergence report.</b> Extend Listing 1 into a small tool that reads a list of per-lane branch decisions for a whole block (one line per thread), groups them into warps of a given width, and prints the issued instructions and SIMD efficiency per warp and in total for widths 32 and 64. Use it on a real decision list you generate (for example "is this pixel inside the circle?" for a 64 × 64 image, with row-major and with tiled thread numbering).</p>
+<p><b>Rubric.</b> Correct counts, checked on the patterns of this chapter (4). Width is a parameter, never a constant (2). A clear comparison of the two thread numberings with an explanation (2). Honest statement of what the model ignores (instruction latencies, predication versus branching) (2).</p>
+
+<h2 id="F1-57-summary">Summary</h2>
+<ul>
+<li>SIMT: you write one thread's code; the hardware runs it for a warp (NVIDIA) or wavefront (AMD) with one instruction stream.</li>
+<li>Widths read from this build's compilers: 32 for <code>sm_80</code>; 64 for gfx90a and gfx942; 32 by default (64 optional) for gfx1030 and gfx1100.</li>
+<li>Divergent lanes run the paths one after the other under an active mask; the cost is decided by whether any lane takes a path.</li>
+<li>AMD exposes the mask as the 64-bit EXEC register; NVIDIA uses predicates and hardware-tracked convergence.</li>
+<li>Votes return one bit per lane: 32-bit masks in CUDA, 64-bit on wave64 HIP targets.</li>
+<li>Portable code never hard-codes 32: use <code>warpSize</code>, 64-bit masks and width-derived loop bounds.</li>
+</ul>
+
+<h2 id="F1-57-sources">Sources</h2>
+<ol>
+<li id="F1-57-src-D1">D1 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): the chapter on compute architecture and scheduling (warps and SIMD hardware, control divergence). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F1-57-src-D2">D2 — John Hennessy, David Patterson, "Computer Architecture: A Quantitative Approach" (tier 3): the chapter on data-level parallelism (SIMD and GPU execution, masking). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-57-src-D3">D3 — NVIDIA, "CUDA C++ Programming Guide" (tier 1; version to be recorded): sections "SIMT Architecture", the built-in variable <code>warpSize</code>, "Warp Vote Functions". <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-57-src-D4">D4 — NVIDIA, "Parallel Thread Execution ISA" (tier 1): the special register/constant <code>WARP_SZ</code> and the <code>vote</code> instruction. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-57-src-D5">D5 — NVIDIA, "CUDA Binary Utilities" (tier 1): SASS instruction-set reference (predicates, VOTE, POPC). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-57-src-D6">D6 — AMD, "AMD Instinct MI200" Instruction Set Architecture reference guide (CDNA2) (tier 1): the EXEC mask, VCC, scalar and vector instructions, <code>s_and_saveexec_b64</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-57-src-D8">D8 — AMD, HIP documentation (HIP Programming Guide: warp cross-lane functions; HIP API reference) (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-57-src-H2">H2 — HIP 5.7 header <code>hip/amd_detail/amd_warp_functions.h</code> as installed (Ubuntu package libamdhip64-dev 5.7.1-3), read in this build: <code>static constexpr int warpSize = __AMDGCN_WAVEFRONT_SIZE;</code>. Tier 1.</li>
+<li id="F1-57-src-C1">C1 — Systems Curriculum (this project), section 13.1 (lock-step thread group: "never hard-code 32 in portable code") and guide 13.4 / bridge BR-02. A map, not a source (AH-4).</li>
+<li id="F1-57-src-R1">R1 — builds and runs of Listings 2 and 3 (<code>university/labs/F1-57/warp_vote.log</code>, <code>warp_vote_amd.log</code>), CUDA 12.0 and HIP 5.7; untested on hardware, exit code 1.</li>
+<li id="F1-57-src-R2">R2 — run of Listing 1 (<code>simt.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0.</li>
+<li id="F1-57-src-R3">R3 — PTX and SASS of Listing 2 for <code>sm_80</code> (<code>ptx.log</code>, <code>sass.log</code>), CUDA 12.0, compiled only.</li>
+<li id="F1-57-src-R4">R4 — the same SASS, line <code>0160  IADD3 R5, R4, 0x20, R5</code> (<code>sass.log</code>).</li>
+<li id="F1-57-src-R5">R5 — gfx90a assembly and metadata of Listing 3 (<code>amd_isa.log</code>), Ubuntu clang 17.0.6 via hipcc (HIP 5.7), compiled only.</li>
+<li id="F1-57-src-R6">R6 — predefined wavefront-size macro for gfx90a, gfx942, gfx1030, gfx1100 and gfx1100 with <code>-mwavefrontsize64</code> (<code>wavesize.log</code>), same compiler.</li>
+<li id="F1-57-src-R7">R7 — run of the forensic model (<code>reduce_sim.log</code>), same g++ toolchain, exit code 0.</li>
+</ol>
+
+<h2 id="F1-57-glossary">Glossary links</h2>
+<p><a href="#gl-warp-wavefront">Warp / wavefront</a> · <a href="#gl-lane">Lane</a> · <a href="#gl-simt">SIMT</a> · <a href="#gl-active-mask-exec">Active mask / EXEC</a> · <a href="#gl-divergence">Divergence</a> · <a href="#gl-predication">Predication</a> · <a href="#gl-warp-vote-ballot">Warp vote (ballot)</a> · <a href="#gl-simd-efficiency">SIMD efficiency</a> · <a href="#gl-ptx-sass">PTX / SASS</a></p>
+
+<h2 id="F1-57-next">Next chapter</h2>
+<p>Next: <a href="#F1-58">F1-58 Registers, shared memory, LDS and caches</a>. Previous: <a href="#F1-56">F1-56 SMs and CUs</a>. Back to the course: <a href="#HW301">HW301</a>.</p>
+
+<h2 id="F1-57-answers">Answers to Check yourself</h2>
+<ol>
+<li>Shared: the instruction stream (fetch, decode, the program position of a converged warp) and the issue slot. Own: registers, thread index, the per-lane result and the lane's bit in the active mask.</li>
+<li>31 true, 1 false: both paths run: 6 + 6 + 2 = 14 instructions. All true: 6 + 2 = 8.</li>
+<li>(b). (a) is the CUDA case. (c) is false: the width is a property of the target and compilation mode, not of the block. (d) is false: gfx90a's <code>warpSize</code> is 64 in this build's compiler (R5, R6).</li>
+<li>Good answers: the first saves the full mask and keeps only lanes whose condition is true; the second computes the lanes that must run the else path; the third switches EXEC to those lanes (saving the then-lanes); the last restores the union, so all lanes continue together after the if/else.</li>
+<li>Width 32: 3 warps, 0 idle lanes. Width 64: 2 wavefronts (128 lanes), 32 idle lanes in the second.</li>
+<li>Both arms are one or two instructions, so predication is cheaper than branching and reconverging; the issued instructions are the same as for a divergent branch (both arms for the warp), so the SIMD efficiency is the same, but no branch or reconvergence overhead is added.</li>
+<li>Width 32: every warp has 16 even and 16 odd lanes: 4 instructions, useful = 16 × 2 + 16 × 1 + 32 = 80 of 128 = 62.5 %. Width 64: 16 even and 48 odd: 4 instructions, useful = 48 × 2 + 16 + 64 = 176 of 256 = 68.8 %. Check against your run.</li>
+<li>Any three of: PTX <code>WARP_SZ</code> (symbolic) and SASS constant 0x20; PTX <code>vote.sync.ballot.b32</code> (32-bit mask); AMD metadata <code>.wavefront_size: 64</code>; AMD constant 64 in <code>v_add3_u32</code>; <code>_b64</code> mask instructions; the predefined macro <code>__AMDGCN_WAVEFRONT_SIZE</code>.</li>
+</ol>
+<h3 id="F1-57-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Width 32: expected 32, hard-coded 32. Width 64: expected 64, hard-coded 32; the portable tree gives 64. Lanes 32–63 never reach lane 0.</p>
+<p><b>Root cause.</b> Line 11 starts the tree at offset 16, which is correct only for a 32-lane group. With offsets 16, 8, 4, 2, 1, lane 0 accumulates lanes 0–31 only: the largest distance a value can travel is 16 + 8 + 4 + 2 + 1 = 31 lanes. On gfx90a the wavefront is 64 lanes wide (<code>.wavefront_size: 64</code>, <code>__AMDGCN_WAVEFRONT_SIZE 64</code>), so half the values are never added. HIP's shuffles are not broken; the model shows the same result with no GPU at all.</p>
+<p><b>Wrong answers and why.</b> "HIP shuffles are broken": the model reproduces the error without any library. "A race": the model is sequential and deterministic, and the sum is exactly 32 every time.</p>
+<p><b>Fix.</b> <code>for (int offset = warpSize / 2; offset &gt; 0; offset /= 2)</code> (the portable tree, line 24); for width 32 it starts at 16 as before.</p>
+<p><b>How the evidence was produced.</b> The Lab Engineer wrote the model with the hard-coded offset (the planted fault of bridge BR-02) and the portable version, and ran both. <b>Prevention:</b> the rule "no literal 32 in kernels" (guide 13.4) enforced in review or by a grep in CI, and a unit test with all-ones input on every target width.</p>

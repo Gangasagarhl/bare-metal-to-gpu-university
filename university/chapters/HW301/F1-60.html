@@ -1,0 +1,505 @@
+<!--meta
+id: F1-60
+title: Schedulers and latency hiding
+course: HW301
+level: L3
+prereqs: F1-55; F1-57; F1-58; F1-59; HW202 (pipelines and hazards)
+time: 6–10 hours including the lab
+hardware: none: the scheduler model, the compiler-output steps and the forensic lab run on any computer with g++, nvcc and hipcc (this build: no GPU); running Listings 2 and 3 needs an NVIDIA or AMD GPU
+maps: Curriculum 13.1 vocabulary table (occupancy, lock-step group); guide 9.2 warp execution timeline
+analogy: F1 — the restaurant building and its kitchen; its banquet hall uses the registered mappings of the great kitchen hall (F6)
+-->
+
+<h2 id="F1-60-hook">Story hook</h2>
+<p>A supervisor in the banquet hall runs four rows of helpers, and she has one voice: each moment she can call one step to one row. Row 0 asks the warehouse for flour; the flour will take a long time to arrive. A careless supervisor would stand and wait for row 0's flour. Ours turns to row 1 and calls its next step, then row 2, then row 3. When row 0's flour arrives, she goes back to row 0. As long as some row has a step it can do, her voice is never idle.</p>
+<p>One week the hall's manager "simplifies" the work: instead of sixteen rows each doing sixteen dishes, four rows do sixty-four dishes each. The same number of dishes, the same supervisor. Service takes more than twice as long. Nobody is lazy; the supervisor runs out of rows to turn to while flour is on its way.</p>
+<p>The supervisor is the <b>warp scheduler</b>, and turning to another row is <b>latency hiding</b> by switching warps. This chapter measures it in a model, shows the compiler's part of the job in real machine code, and explains the manager's mistake.</p>
+
+<h2 id="F1-60-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> how a warp scheduler hides latency by issuing from another ready warp, and why switching costs nothing.</li>
+<li><b>Draw and read</b> a warp execution timeline: issuing, stalling and switching.</li>
+<li><b>Estimate</b> with Little's law how much independent work must be in flight to cover a latency.</li>
+<li><b>Distinguish</b> the two sources of independent work: more warps (thread-level) and more independent instructions per warp (instruction-level, prefetching).</li>
+<li><b>Find</b> the compiler's waits for memory in real AMD and NVIDIA machine code.</li>
+</ul>
+
+<div class="co jargon" id="F1-60-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Warp scheduler</dt><dd><b>Simple words:</b> the part of an SM that picks, every cycle, which warp gets to do its next step. <b>Analogy:</b> the supervisor choosing a row. <b>Precise:</b> the issue logic that selects, among the resident warps assigned to it, one whose next instruction has its operands and resources ready, and issues it; an SM has one or more schedulers. <sup class="src"><a href="#F1-60-src-D1">D1</a></sup> <sup class="src"><a href="#F1-60-src-D3">D3</a></sup></dd>
+<dt>Latency hiding</dt><dd><b>Simple words:</b> doing other useful work while waiting, so the waiting does not cost time. <b>Analogy:</b> calling another row while the flour is on its way. <b>Precise:</b> overlapping the latency of an operation with the issue of independent instructions, from the same warp (ILP) or from other warps (TLP), so that the issue slots stay busy. <sup class="src"><a href="#F1-60-src-D1">D1</a></sup> <sup class="src"><a href="#F1-60-src-D2">D2</a></sup></dd>
+<dt>Stall</dt><dd><b>Simple words:</b> a warp that cannot take its next step yet. <b>Analogy:</b> a row whose next step needs flour that has not arrived. <b>Precise:</b> a warp is stalled when its next instruction depends on a result that is not ready (memory or arithmetic latency), or waits at a barrier or for a busy unit; profilers classify stall reasons. <sup class="src"><a href="#F1-60-src-D3">D3</a></sup></dd>
+<dt>Zero-cost switching</dt><dd><b>Simple words:</b> moving from one warp to another takes no extra time. <b>Analogy:</b> each row keeps its own bowls on its own bench; nothing has to be packed away. <b>Precise:</b> every resident warp keeps its registers in the register file (F1-58), so the scheduler can issue from a different warp in the next cycle without saving or restoring state, unlike a CPU context switch. <sup class="src"><a href="#F1-60-src-D1">D1</a></sup> <sup class="src"><a href="#F1-60-src-D2">D2</a></sup></dd>
+<dt>Little's law (for latency hiding)</dt><dd><b>Simple words:</b> work in flight = rate × waiting time. <b>Analogy:</b> to serve one dish per minute when each needs ten minutes of waiting, ten dishes must be under way. <b>Precise:</b> L = λW; to sustain a throughput λ against a latency W, about λW independent operations must be in flight (F1-55). <sup class="src"><a href="#F1-60-src-D4">D4</a></sup></dd>
+<dt><code>s_waitcnt</code></dt><dd><b>Simple words:</b> an AMD instruction that says "wait until at most N of my memory requests are still outstanding". <b>Analogy:</b> "wait until the flour is here before mixing". <b>Precise:</b> a scalar instruction on GCN/CDNA that stalls the wavefront until counters of outstanding operations (<code>vmcnt</code> for vector memory, <code>lgkmcnt</code> for scalar memory, LDS and others) fall to the given value; the compiler places it before the first use of loaded data. <sup class="src"><a href="#F1-60-src-D6">D6</a></sup> <sup class="src"><a href="#F1-60-src-R4">R4</a></sup></dd>
+</dl></div>
+
+<h2 id="F1-60-pictures">The idea in pictures</h2>
+<p>Figure 1 is drawn from the first 48 cycles of the recorded model run with four warps (Listing 1, R1): each load takes 20 cycles, and each warp then does four dependent compute steps 4 cycles apart.</p>
+<figure id="F1-60-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F1-60-f1t F1-60-f1d">
+<title id="F1-60-f1t">Figure 1: warp execution timeline of four warps issuing, stalling and switching</title>
+<desc id="F1-60-f1d">Four rows, warps 0 to 3, over cycles 0 to 47, and an issued row below. In cycles 0 to 3 the scheduler issues one load from each warp in turn (0, 1, 2, 3). Each warp then stalls on memory for about 20 cycles, shown as a thin bar, and nothing issues in cycles 4 to 19. From cycle 20 the loads' data arrive one warp after another, and the scheduler issues compute instructions round robin, 0 1 2 3 0 1 2 3, through cycle 39; each warp's own compute steps are 4 cycles apart (stalled on compute between them), and the other warps fill the gaps. After issuing its fourth compute step a warp is ready and issues its next load near cycle 36 to 39, and from cycle 40 all four wait for memory again. Data from the recorded model output.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-ts" x="10" y="36">cycle</text>
+<text class="sv-ts" x="110" y="36">0</text>
+<line class="sv-dash" x1="110" y1="42" x2="110" y2="230"/>
+<text class="sv-ts" x="206" y="36">8</text>
+<line class="sv-dash" x1="206" y1="42" x2="206" y2="230"/>
+<text class="sv-ts" x="302" y="36">16</text>
+<line class="sv-dash" x1="302" y1="42" x2="302" y2="230"/>
+<text class="sv-ts" x="398" y="36">24</text>
+<line class="sv-dash" x1="398" y1="42" x2="398" y2="230"/>
+<text class="sv-ts" x="494" y="36">32</text>
+<line class="sv-dash" x1="494" y1="42" x2="494" y2="230"/>
+<text class="sv-ts" x="590" y="36">40</text>
+<line class="sv-dash" x1="590" y1="42" x2="590" y2="230"/>
+<text class="sv-ts" x="686" y="36">48</text>
+<line class="sv-dash" x1="686" y1="42" x2="686" y2="230"/>
+<text class="sv-t" x="10" y="78">warp 0</text>
+<rect class="sv-b1" x="110" y="60" width="12" height="24"/>
+<rect class="sv-b8" x="122" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="134" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="146" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="158" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="170" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="182" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="194" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="206" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="218" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="230" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="242" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="254" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="266" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="278" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="290" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="302" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="314" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="326" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="338" y="69" width="12" height="6"/>
+<rect class="sv-b5" x="350" y="60" width="12" height="24"/>
+<rect class="sv-b3" x="362" y="69" width="12" height="6"/>
+<rect class="sv-b3" x="374" y="69" width="12" height="6"/>
+<rect class="sv-b3" x="386" y="69" width="12" height="6"/>
+<rect class="sv-b5" x="398" y="60" width="12" height="24"/>
+<rect class="sv-b3" x="410" y="69" width="12" height="6"/>
+<rect class="sv-b3" x="422" y="69" width="12" height="6"/>
+<rect class="sv-b3" x="434" y="69" width="12" height="6"/>
+<rect class="sv-b5" x="446" y="60" width="12" height="24"/>
+<rect class="sv-b3" x="458" y="69" width="12" height="6"/>
+<rect class="sv-b3" x="470" y="69" width="12" height="6"/>
+<rect class="sv-b3" x="482" y="69" width="12" height="6"/>
+<rect class="sv-b5" x="494" y="60" width="12" height="24"/>
+<rect class="sv-box" x="508" y="66" width="8" height="12"/>
+<rect class="sv-box" x="520" y="66" width="8" height="12"/>
+<rect class="sv-box" x="532" y="66" width="8" height="12"/>
+<rect class="sv-b1" x="542" y="60" width="12" height="24"/>
+<rect class="sv-b8" x="554" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="566" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="578" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="590" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="602" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="614" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="626" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="638" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="650" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="662" y="69" width="12" height="6"/>
+<rect class="sv-b8" x="674" y="69" width="12" height="6"/>
+<text class="sv-t" x="10" y="112">warp 1</text>
+<rect class="sv-box" x="112" y="100" width="8" height="12"/>
+<rect class="sv-b1" x="122" y="94" width="12" height="24"/>
+<rect class="sv-b8" x="134" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="146" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="158" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="170" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="182" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="194" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="206" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="218" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="230" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="242" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="254" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="266" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="278" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="290" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="302" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="314" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="326" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="338" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="350" y="103" width="12" height="6"/>
+<rect class="sv-b5" x="362" y="94" width="12" height="24"/>
+<rect class="sv-b3" x="374" y="103" width="12" height="6"/>
+<rect class="sv-b3" x="386" y="103" width="12" height="6"/>
+<rect class="sv-b3" x="398" y="103" width="12" height="6"/>
+<rect class="sv-b5" x="410" y="94" width="12" height="24"/>
+<rect class="sv-b3" x="422" y="103" width="12" height="6"/>
+<rect class="sv-b3" x="434" y="103" width="12" height="6"/>
+<rect class="sv-b3" x="446" y="103" width="12" height="6"/>
+<rect class="sv-b5" x="458" y="94" width="12" height="24"/>
+<rect class="sv-b3" x="470" y="103" width="12" height="6"/>
+<rect class="sv-b3" x="482" y="103" width="12" height="6"/>
+<rect class="sv-b3" x="494" y="103" width="12" height="6"/>
+<rect class="sv-b5" x="506" y="94" width="12" height="24"/>
+<rect class="sv-box" x="520" y="100" width="8" height="12"/>
+<rect class="sv-box" x="532" y="100" width="8" height="12"/>
+<rect class="sv-box" x="544" y="100" width="8" height="12"/>
+<rect class="sv-b1" x="554" y="94" width="12" height="24"/>
+<rect class="sv-b8" x="566" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="578" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="590" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="602" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="614" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="626" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="638" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="650" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="662" y="103" width="12" height="6"/>
+<rect class="sv-b8" x="674" y="103" width="12" height="6"/>
+<text class="sv-t" x="10" y="146">warp 2</text>
+<rect class="sv-box" x="112" y="134" width="8" height="12"/>
+<rect class="sv-box" x="124" y="134" width="8" height="12"/>
+<rect class="sv-b1" x="134" y="128" width="12" height="24"/>
+<rect class="sv-b8" x="146" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="158" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="170" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="182" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="194" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="206" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="218" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="230" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="242" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="254" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="266" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="278" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="290" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="302" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="314" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="326" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="338" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="350" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="362" y="137" width="12" height="6"/>
+<rect class="sv-b5" x="374" y="128" width="12" height="24"/>
+<rect class="sv-b3" x="386" y="137" width="12" height="6"/>
+<rect class="sv-b3" x="398" y="137" width="12" height="6"/>
+<rect class="sv-b3" x="410" y="137" width="12" height="6"/>
+<rect class="sv-b5" x="422" y="128" width="12" height="24"/>
+<rect class="sv-b3" x="434" y="137" width="12" height="6"/>
+<rect class="sv-b3" x="446" y="137" width="12" height="6"/>
+<rect class="sv-b3" x="458" y="137" width="12" height="6"/>
+<rect class="sv-b5" x="470" y="128" width="12" height="24"/>
+<rect class="sv-b3" x="482" y="137" width="12" height="6"/>
+<rect class="sv-b3" x="494" y="137" width="12" height="6"/>
+<rect class="sv-b3" x="506" y="137" width="12" height="6"/>
+<rect class="sv-b5" x="518" y="128" width="12" height="24"/>
+<rect class="sv-box" x="532" y="134" width="8" height="12"/>
+<rect class="sv-box" x="544" y="134" width="8" height="12"/>
+<rect class="sv-box" x="556" y="134" width="8" height="12"/>
+<rect class="sv-b1" x="566" y="128" width="12" height="24"/>
+<rect class="sv-b8" x="578" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="590" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="602" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="614" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="626" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="638" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="650" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="662" y="137" width="12" height="6"/>
+<rect class="sv-b8" x="674" y="137" width="12" height="6"/>
+<text class="sv-t" x="10" y="180">warp 3</text>
+<rect class="sv-box" x="112" y="168" width="8" height="12"/>
+<rect class="sv-box" x="124" y="168" width="8" height="12"/>
+<rect class="sv-box" x="136" y="168" width="8" height="12"/>
+<rect class="sv-b1" x="146" y="162" width="12" height="24"/>
+<rect class="sv-b8" x="158" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="170" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="182" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="194" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="206" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="218" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="230" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="242" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="254" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="266" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="278" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="290" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="302" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="314" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="326" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="338" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="350" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="362" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="374" y="171" width="12" height="6"/>
+<rect class="sv-b5" x="386" y="162" width="12" height="24"/>
+<rect class="sv-b3" x="398" y="171" width="12" height="6"/>
+<rect class="sv-b3" x="410" y="171" width="12" height="6"/>
+<rect class="sv-b3" x="422" y="171" width="12" height="6"/>
+<rect class="sv-b5" x="434" y="162" width="12" height="24"/>
+<rect class="sv-b3" x="446" y="171" width="12" height="6"/>
+<rect class="sv-b3" x="458" y="171" width="12" height="6"/>
+<rect class="sv-b3" x="470" y="171" width="12" height="6"/>
+<rect class="sv-b5" x="482" y="162" width="12" height="24"/>
+<rect class="sv-b3" x="494" y="171" width="12" height="6"/>
+<rect class="sv-b3" x="506" y="171" width="12" height="6"/>
+<rect class="sv-b3" x="518" y="171" width="12" height="6"/>
+<rect class="sv-b5" x="530" y="162" width="12" height="24"/>
+<rect class="sv-box" x="544" y="168" width="8" height="12"/>
+<rect class="sv-box" x="556" y="168" width="8" height="12"/>
+<rect class="sv-box" x="568" y="168" width="8" height="12"/>
+<rect class="sv-b1" x="578" y="162" width="12" height="24"/>
+<rect class="sv-b8" x="590" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="602" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="614" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="626" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="638" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="650" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="662" y="171" width="12" height="6"/>
+<rect class="sv-b8" x="674" y="171" width="12" height="6"/>
+<text class="sv-tb" x="10" y="220">issued</text>
+<text class="sv-tm" x="112" y="220">0</text>
+<text class="sv-tm" x="124" y="220">1</text>
+<text class="sv-tm" x="136" y="220">2</text>
+<text class="sv-tm" x="148" y="220">3</text>
+<text class="sv-tm" x="352" y="220">0</text>
+<text class="sv-tm" x="364" y="220">1</text>
+<text class="sv-tm" x="376" y="220">2</text>
+<text class="sv-tm" x="388" y="220">3</text>
+<text class="sv-tm" x="400" y="220">0</text>
+<text class="sv-tm" x="412" y="220">1</text>
+<text class="sv-tm" x="424" y="220">2</text>
+<text class="sv-tm" x="436" y="220">3</text>
+<text class="sv-tm" x="448" y="220">0</text>
+<text class="sv-tm" x="460" y="220">1</text>
+<text class="sv-tm" x="472" y="220">2</text>
+<text class="sv-tm" x="484" y="220">3</text>
+<text class="sv-tm" x="496" y="220">0</text>
+<text class="sv-tm" x="508" y="220">1</text>
+<text class="sv-tm" x="520" y="220">2</text>
+<text class="sv-tm" x="532" y="220">3</text>
+<text class="sv-tm" x="544" y="220">0</text>
+<text class="sv-tm" x="556" y="220">1</text>
+<text class="sv-tm" x="568" y="220">2</text>
+<text class="sv-tm" x="580" y="220">3</text>
+<rect class="sv-b1" x="10" y="252" width="12" height="14"/><text class="sv-ts" x="28" y="264">issues a load (L)</text>
+<rect class="sv-b5" x="160" y="252" width="12" height="14"/><text class="sv-ts" x="178" y="264">issues compute (c)</text>
+<rect class="sv-b8" x="320" y="256" width="12" height="6"/><text class="sv-ts" x="338" y="264">stalled on memory (m)</text>
+<rect class="sv-b3" x="490" y="256" width="12" height="6"/><text class="sv-ts" x="508" y="264">stalled on compute (a)</text>
+<rect class="sv-box" x="640" y="253" width="10" height="12"/><text class="sv-ts" x="656" y="264">ready, not picked</text>
+<text class="sv-ts" x="10" y="292">cycles 0–3 and 20–39: some warp issues every cycle (switching between warps); cycles 4–19 and from 40: all four wait for memory, nothing issues</text>
+</svg></div><figcaption><b>Figure 1.</b> Warp execution timeline (guide 9.2), drawn from the model output R1, cycles 0–47 of <code>timeline_4_warps</code>. Switching fills the compute-latency gaps completely (cycles 20–39), but four warps are not enough to cover the 20-cycle memory latency: the issue slot is idle in cycles 4–19 and again from cycle 40. Over the whole run the model reports 55.6 % busy (R1). The scheduling idea is from D1 and D2; the numbers are the model's, not any GPU's. <sup class="src"><a href="#F1-60-src-R1">R1</a></sup> <sup class="src"><a href="#F1-60-src-D1">D1</a></sup> <sup class="src"><a href="#F1-60-src-D2">D2</a></sup></figcaption></figure>
+
+<figure id="F1-60-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 260" role="img" aria-labelledby="F1-60-f2t F1-60-f2d">
+<title id="F1-60-f2t">Figure 2: issue-slot use against the number of warps, with and without loading ahead</title>
+<desc id="F1-60-f2d">A bar chart from the model output with memory latency 100 cycles and 8 compute steps per load. Bars for 1, 2, 4, 8, 12, 16 and 24 warps without loading ahead: 7.0, 13.8, 27.3, 43.9, 55.1, 63.2 and 74.0 percent busy. A second group: 4 warps loading 1 ahead 52.7 percent, 4 warps loading 3 ahead 87.3 percent, 8 warps loading 1 ahead 83.2 percent. The point: four warps with three loads in flight each beat twenty-four warps with one load each.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="260"/>
+<line class="sv-line" x1="60" y1="210" x2="740" y2="210"/>
+<line class="sv-line" x1="60" y1="210" x2="60" y2="20"/>
+<text class="sv-ts" x="10" y="214">0 %</text><text class="sv-ts" x="10" y="34">100 %</text>
+<line class="sv-dash" x1="60" y1="30" x2="740" y2="30"/>
+<rect class="sv-b1" x="75" y="197.4" width="40" height="12.6"/><text class="sv-ts" x="78" y="192">7.0</text><text class="sv-ts" x="82" y="228">1</text>
+<rect class="sv-b1" x="125" y="185.2" width="40" height="24.8"/><text class="sv-ts" x="126" y="180">13.8</text><text class="sv-ts" x="132" y="228">2</text>
+<rect class="sv-b1" x="175" y="160.9" width="40" height="49.1"/><text class="sv-ts" x="176" y="155">27.3</text><text class="sv-ts" x="182" y="228">4</text>
+<rect class="sv-b1" x="225" y="131.0" width="40" height="79.0"/><text class="sv-ts" x="226" y="126">43.9</text><text class="sv-ts" x="232" y="228">8</text>
+<rect class="sv-b1" x="275" y="110.8" width="40" height="99.2"/><text class="sv-ts" x="276" y="105">55.1</text><text class="sv-ts" x="280" y="228">12</text>
+<rect class="sv-b1" x="325" y="96.2" width="40" height="113.8"/><text class="sv-ts" x="326" y="91">63.2</text><text class="sv-ts" x="330" y="228">16</text>
+<rect class="sv-b1" x="375" y="76.8" width="40" height="133.2"/><text class="sv-ts" x="376" y="72">74.0</text><text class="sv-ts" x="380" y="228">24</text>
+<text class="sv-ts" x="120" y="250">warps, loading 0 ahead</text>
+<rect class="sv-b5" x="470" y="115.1" width="50" height="94.9"/><text class="sv-ts" x="476" y="110">52.7</text><text class="sv-ts" x="470" y="228">4, 1 ahead</text>
+<rect class="sv-b5" x="560" y="52.9" width="50" height="157.1"/><text class="sv-ts" x="566" y="48">87.3</text><text class="sv-ts" x="560" y="228">4, 3 ahead</text>
+<rect class="sv-b5" x="650" y="60.2" width="50" height="149.8"/><text class="sv-ts" x="656" y="55">83.2</text><text class="sv-ts" x="650" y="228">8, 1 ahead</text>
+<text class="sv-ts" x="470" y="250">loads issued ahead (prefetch)</text>
+</svg></div><figcaption><b>Figure 2.</b> Share of cycles in which the model's scheduler issued an instruction (memory latency 100 cycles, 8 compute steps per load, 16 loads per warp), from R1. More warps help; more independent loads per warp help more per warp. <sup class="src"><a href="#F1-60-src-R1">R1</a></sup></figcaption></figure>
+
+<h2 id="F1-60-layer1">Layer 1 — the kid explanation</h2>
+<p>Fetching data from the GPU's big memory takes a long time, like waiting for a delivery. A GPU does not sit and wait. It keeps many groups of threads ready, and when one group is waiting for a delivery, it lets another group work.</p>
+<p>If there are enough groups with work to do, the GPU is always busy, and the waiting does not slow anything down: it is hidden. If there are too few groups, there are moments when everybody is waiting, and the GPU sits idle.</p>
+<p>There is a second trick: a single group can order several deliveries at once, before it needs the first one. Then, while it uses the first delivery, the next ones are already on their way.</p>
+
+<h2 id="F1-60-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F1-60-l2-sched">What the scheduler does each cycle</h3>
+<p>Each SM holds many resident warps (F1-58 computed how many). Every cycle, a scheduler looks at its warps, finds those whose next instruction can issue (its inputs are ready and its unit is free), picks one, and issues it. A warp whose next instruction needs data still on its way from memory is stalled; the scheduler skips it. <sup class="src"><a href="#F1-60-src-D1">D1</a></sup> <sup class="src"><a href="#F1-60-src-D3">D3</a></sup> Because each warp's registers stay in the register file, issuing from warp 3 right after warp 2 costs nothing extra. <sup class="src"><a href="#F1-60-src-D2">D2</a></sup></p>
+<p>Listing 1 models one scheduler: one instruction per cycle, warps picked round robin among the ready ones, loads that take <code>mem</code> cycles and dependent compute steps 4 cycles apart (an invented model latency). In Figure 1, the first four cycles issue one load from each warp; then all four are stalled on memory and the issue slot is empty until the data arrive; then the four warps' compute steps interleave perfectly, because each warp's 4-cycle compute latency is filled by the other three. <sup class="src"><a href="#F1-60-src-R1">R1</a></sup></p>
+<h3 id="F1-60-l2-little">How many warps are enough? Little's law</h3>
+<p>To keep one instruction issuing every cycle, there must always be a warp with an instruction ready. If each load takes <i>W</i> cycles and each warp has <i>c</i> instructions of independent work per load, a rough estimate is that about <i>W</i> / <i>c</i> warps are needed to cover the wait, plus the issue time of the work itself. With <i>W</i> = 100 and <i>c</i> = 9 (one load, eight compute steps), that is more than 11 warps. <sup class="src"><a href="#F1-60-src-D4">D4</a></sup> The model shows more: 16 warps reach only 63.2 % and 24 warps 74.0 % (R1). The reason is visible in the timelines: with round-robin issue, warps that start together stay together, so they all load at once, all wait at once and all compute at once. The waiting phases of different warps overlap instead of interleaving. Real schedulers and real programs break such convoys partly (different start times, different data); the model is a worst case, and a warning that "number of warps" alone is not the whole story. <sup class="src"><a href="#F1-60-src-R1">R1</a></sup></p>
+<h3 id="F1-60-l2-ilp">The other source: loads in flight per warp</h3>
+<p>A warp can issue its next load <em>before</em> it uses the previous one, if the loads are independent. With <code>ahead</code> = 3, each warp in the model keeps up to four loads in flight; four such warps reach 87.3 % busy, more than twenty-four warps that load one at a time (74.0 %). <sup class="src"><a href="#F1-60-src-R1">R1</a></sup> Compilers do this on their own when the code allows: in Listing 2's SASS the three loads (<code>LDG.E</code> at 00a0, 00c0, 00d0) are issued back to back and the multiply-add (<code>FFMA</code> at 00f0) comes after them; in Listing 3's gfx90a code the three <code>global_load_dword</code> instructions come first and a single <code>s_waitcnt vmcnt(0)</code> waits for all of them before <code>v_fmac_f32</code>. One wait covers three latencies. <sup class="src"><a href="#F1-60-src-R3">R3</a></sup> <sup class="src"><a href="#F1-60-src-R4">R4</a></sup></p>
+<div class="co note"><span class="lbl">Note</span><p><b>The model's numbers are invented.</b> Memory latency 100 cycles and compute latency 4 cycles are TG-1 model values chosen for readable arithmetic. They are not the latencies of any GPU; measuring real ones is the subject of microbenchmarks in F6-11.</p></div>
+
+<h2 id="F1-60-layer3">Layer 3 — the engineer's depth</h2>
+<p>The analogy in one line: the supervisor (hardware) chooses which row goes next, but the order of steps inside each row's recipe (the compiler) decides how early each row can ask for flour.</p>
+<h3 id="F1-60-l3-dep">Who tracks dependences</h3>
+<p>On AMD GCN and CDNA, dependence on memory is explicit in the instruction stream: memory instructions increment per-wavefront counters, and <code>s_waitcnt</code> stalls until a counter falls to a given value. <sup class="src"><a href="#F1-60-src-D6">D6</a></sup> Listing 3's assembly shows two kinds: <code>s_waitcnt lgkmcnt(0)</code> after the scalar loads of the kernel arguments (<code>s_load_dword</code>, <code>s_load_dwordx8</code>), and <code>s_waitcnt vmcnt(0)</code> after the three vector loads. <sup class="src"><a href="#F1-60-src-R4">R4</a></sup> A wavefront stalled at an <code>s_waitcnt</code> is exactly the "m" state of the model; the hardware then issues from other wavefronts. On NVIDIA, the SASS printed by <code>cuobjdump</code> shows no explicit wait instruction between the loads and the <code>FFMA</code> (R3); the dependence is tracked by scheduling information encoded with each instruction and by the hardware.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>How recent NVIDIA GPUs track load dependences (per-instruction control information with stall counts and dependency barriers, set by the compiler, versus a hardware scoreboard) is described here from memory; the disassembly printed by <code>cuobjdump</code> in this build does not show that control information. Also unverified: how many schedulers an SM or CU has, and how many instructions each can issue per cycle, on any named product. Check: the CUDA Binary Utilities documentation, the CUDA Programming Guide's hardware-multithreading section, the AMD Instinct MI200 ISA reference guide's chapter on data dependency resolution (<code>s_waitcnt</code>), and the named product's whitepaper (F1-63).</p></div>
+<h3 id="F1-60-l3-trade">The occupancy–ILP trade-off</h3>
+<p>Loading ahead needs registers: every load in flight needs a destination register that stays allocated until the data are used. Registers per thread limit warps per SM (F1-58). So the two sources of independent work compete for the same register file: many warps with few registers each, or fewer warps with more registers and more loads in flight each. <sup class="src"><a href="#F1-60-src-D1">D1</a></sup> Neither "maximise occupancy" nor "maximise ILP" is a rule; the requirement is enough independent work in flight, by Little's law, from either source. The forensic lab shows the consequence of reducing one source without adding the other.</p>
+<h3 id="F1-60-l3-other">Other stalls</h3>
+<p>Not every stall is memory. A warp waits at <code>__syncthreads</code> until its whole block arrives (F1-58); a long chain of dependent arithmetic stalls on arithmetic latency (the "a" state, F1-55's single chain); a busy special-function or memory unit stalls issue. Profilers report the fraction of each reason; the method is the same as here: find what the warps wait for, then supply more independent work of the right kind. <sup class="src"><a href="#F1-60-src-D3">D3</a></sup></p>
+
+<h2 id="F1-60-hardware">How the hardware actually does it</h2>
+<p>Each SM or CU is divided among one or more schedulers, each owning a set of resident warps. <sup class="src"><a href="#F1-60-src-D1">D1</a></sup> Every cycle a scheduler checks, for each of its warps, whether the next instruction's source registers are ready and its execution unit can accept it; among eligible warps it selects one by a policy the vendor does not fully document, and sends the instruction to the unit with the warp's register-file addresses. <sup class="src"><a href="#F1-60-src-D2">D2</a></sup> Loads leave the SM for the cache hierarchy and memory (F1-58, F1-59); the destination registers are marked pending until the data return. <sup class="src"><a href="#F1-60-src-D2">D2</a></sup> On AMD the pending state is visible to software through the counters that <code>s_waitcnt</code> tests (R4). <sup class="src"><a href="#F1-60-src-D6">D6</a></sup> <sup class="src"><a href="#F1-60-src-R4">R4</a></sup> Since all resident warps' registers are on-chip all the time, "switching" means choosing a different warp's instruction in the next cycle; this is fine-grained multithreading, the design described for GPUs in D2. <sup class="src"><a href="#F1-60-src-D2">D2</a></sup></p>
+
+<h2 id="F1-60-worked">Worked example</h2>
+<p><b>Task.</b> In the model (1 issue per cycle, memory latency 100 cycles, compute latency 4), a kernel's warps each do 16 iterations of one load and 8 dependent compute steps. (a) How many cycles does one iteration take for a single warp? (b) What busy fraction does one warp reach? (c) Using Little's law, how many loads must be in flight to keep the issue slot full?</p>
+<ol>
+<li>(a) Load issues at cycle 0; data at 100; first compute at 100; the other 7 compute steps 4 cycles apart: the last at 128; the next load at 129. One iteration ≈ 129 cycles. Check: the model reports 2,064 cycles for 16 iterations = 129 each (R1).</li>
+<li>(b) 9 instructions per 129 cycles ≈ 7.0 % (R1 prints 7.0 %).</li>
+<li>(c) The slot must issue 1 instruction per cycle; each load supports 9 instructions (itself and its 8 compute steps), so loads must start at 1/9 per cycle; each stays in flight 100 cycles: L = λW = (1/9) × 100 ≈ 11 loads in flight at all times. From one load per warp (ahead 0) that needs at least 11–12 warps that do <em>not</em> all wait at once; from loading 3 ahead, 3–4 warps can do it, which is what the 87.3 % of <code>w4_ahead3</code> reflects (the remainder is the start-up and drain). <sup class="src"><a href="#F1-60-src-D4">D4</a></sup> <sup class="src"><a href="#F1-60-src-R1">R1</a></sup></li>
+</ol>
+
+<h2 id="F1-60-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>latency_sim.cpp</code>: a model of one warp scheduler.</p>
+<pre class="listing" data-src="F1-60/latency_sim.cpp"></pre>
+<p><b>Build command</b> (the one actually used): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined latency_sim.cpp -o latency_sim</code>, then <code>./latency_sim &lt; latency_sim.in</code>. Legend: <code>L</code> issues a load, <code>c</code> issues compute, <code>m</code> stalled on memory, <code>a</code> stalled on compute latency, <code>r</code> ready but not picked; in the issue row, the digit is the warp that issued and <code>.</code> an idle cycle.</p>
+<pre class="output" data-run="F1-60/latency_sim"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>2–8</td><td>model rules</td><td>States every simplification.</td><td>A model must say what it ignores.</td></tr>
+<tr><td>15</td><td><code>ALU = 4</code></td><td>Compute latency of the model.</td><td>Invented, labelled.</td></tr>
+<tr><td>24–34</td><td><code>program</code></td><td>Builds one warp's instruction list: <code>ahead + 1</code> loads first, then each iteration's compute steps followed by the next load.</td><td><code>ahead</code> is the prefetch distance (ILP).</td></tr>
+<tr><td>52–58</td><td><code>readyAt</code></td><td>When can a warp's next instruction issue: in order; first compute waits for its load; other compute waits <code>ALU</code> cycles.</td><td>The dependence rules: what a scoreboard or <code>s_waitcnt</code> enforces.</td></tr>
+<tr><td>63–67</td><td>round robin</td><td>Picks the next ready warp after the last one issued.</td><td>Zero-cost switching: any ready warp can go.</td></tr>
+<tr><td>68–81</td><td>timeline letters</td><td>Records each warp's state per cycle.</td><td>The data of Figure 1.</td></tr>
+<tr><td>82–86</td><td>idle cycle</td><td>No ready warp: counts a memory or compute stall.</td><td>The cost latency hiding tries to remove.</td></tr>
+<tr><td>88–93</td><td>issue</td><td>Sets the load's arrival time; advances the warp.</td><td>One instruction per cycle.</td></tr>
+<tr><td>109–114</td><td>main loop</td><td>One line per input case: cycles, issued, busy %, idle cycles by cause.</td><td>Figure 2's bars.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>fma3.cu</code>: three independent loads and one fused multiply-add (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F1-60/fma3.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings fma3.cu -o fma3</code>, then <code>./fma3</code>.</p>
+<pre class="output" data-run="F1-60/fma3"></pre>
+<p><b>Listing 3</b> — <code>fma3_amd.hip</code>: the same kernel in HIP (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F1-60/fma3_amd.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a fma3_amd.hip -o fma3_amd</code>, then <code>./fma3_amd</code>.</p>
+<pre class="output" data-run="F1-60/fma3_amd"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listings 2 and 3 were built for real and stopped at the first allocation because the build container has no GPU. What matters in this chapter is their generated code, below, which needs no GPU.</p></div>
+<p>The SASS of Listing 2 for <code>sm_80</code> (NOP padding removed):</p>
+<pre class="output" data-run="F1-60/sass_loads"></pre>
+<p>The gfx90a assembly of Listing 3's kernel (comments removed):</p>
+<pre class="output" data-run="F1-60/amd_wait"></pre>
+<div class="tw"><table>
+<thead><tr><th>Where</th><th>Instructions</th><th>What they do</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>Listings 2–3, line 11 / 10</td><td><code>d[i] = a[i] * b[i] + c[i];</code></td><td>Three loads with no dependence on each other.</td><td>The compiler is free to issue them together.</td></tr>
+<tr><td>SASS 00a0–00d0</td><td>three <code>LDG.E</code></td><td>Issued back to back, addresses computed in between.</td><td>Three loads in flight from one warp.</td></tr>
+<tr><td>SASS 00f0</td><td><code>FFMA R11, R4, R3, R6</code></td><td>The first use of all three.</td><td>The warp stalls here, once.</td></tr>
+<tr><td>gfx90a</td><td><code>s_waitcnt lgkmcnt(0)</code></td><td>Waits for the scalar loads of kernel arguments.</td><td>Even pointers come from memory.</td></tr>
+<tr><td>gfx90a</td><td>three <code>global_load_dword</code>, then <code>s_waitcnt vmcnt(0)</code></td><td>All three loads issued; one wait until none is outstanding.</td><td>An explicit, visible latency-hiding decision.</td></tr>
+<tr><td>gfx90a</td><td><code>v_fmac_f32_e32 v2, v4, v5</code></td><td>Fused multiply-accumulate into <code>v2</code> (which holds <code>c[i]</code>).</td><td>The use after the wait.</td></tr>
+</tbody></table></div>
+
+<h2 id="F1-60-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The supervisor does not decide by fairness or by urgency.</b> The scheduler's policy is a hardware rule; vendors document it only partly. The model's round robin is one simple choice. <sup class="src"><a href="#F1-60-src-D2">D2</a></sup></li>
+<li><b>Rows cannot leave and come back.</b> Resident warps stay resident until they finish; the scheduler can only choose among the warps already on the SM, not bring in new ones to fill a gap.</li>
+<li><b>Flour does not get slower when everyone orders.</b> Real memory latency grows when many requests compete for bandwidth (F1-59); the model's fixed 100 cycles ignores this.</li>
+</ul>
+
+<h2 id="F1-60-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> a kernel slows down when work per thread is increased and the grid is shrunk. <b>Cause:</b> fewer resident warps and no extra independent loads per warp. <b>How to find it:</b> compare achieved occupancy and stall reasons before and after; or run the model (forensic lab). <b>Fix:</b> keep enough warps, or restructure the loop to issue several loads ahead.</li>
+<li><b>Symptom:</b> high occupancy, low throughput. <b>Cause:</b> all warps wait on the same thing (a barrier, a long dependent chain, or saturated bandwidth). <b>How to find it:</b> stall reasons in the profiler. <b>Fix:</b> depends on the reason: more ILP, fewer barriers, or fewer bytes.</li>
+<li><b>Symptom:</b> unrolling a loop made the kernel slower. <b>Cause:</b> more registers per thread reduced occupancy, or caused spills (F1-58). <b>How to find it:</b> <code>-Xptxas -v</code>, or the AMD metadata's <code>.vgpr_count</code>. <b>Fix:</b> a smaller unroll factor.</li>
+<li><b>Symptom:</b> a timing that ignores the first launch varies wildly. <b>Cause:</b> not a scheduler issue: launch and warm-up costs. <b>Fix:</b> warm up, repeat, report a spread (F6-11).</li>
+</ul>
+
+<div class="co transition" id="F1-60-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#HW202">HW202</a>'s pipelines, where a CPU hid latency inside one thread with out-of-order execution, and <a href="#F1-55">F1-55</a>'s single chain versus four chains. <b>What carries over:</b> dependences, latency, the idea of independent work, and Little's law. <b>What changes:</b> a GPU hides latency mainly by switching between many resident warps every cycle at no cost, plus the compiler's in-order scheduling of independent loads (one <code>s_waitcnt vmcnt(0)</code> for three loads in R4); it does not reorder each warp's instructions out of order the way the CPU of HW202 does. <sup class="src"><a href="#F1-60-src-R4">R4</a></sup> <sup class="src"><a href="#F1-60-src-D2">D2</a></sup> <b>What comes next:</b> <a href="#F1-61">F1-61</a> looks at the units that the scheduler feeds when the work is matrix multiplication: tensor and matrix cores.</p></div>
+
+<h2 id="F1-60-check">Check yourself</h2>
+<ol>
+<li>Why does switching between resident warps cost nothing, while a CPU context switch costs many cycles?</li>
+<li>In Figure 1, why does nothing issue in cycles 4–19?</li>
+<li>Which change raises the model's busy fraction most for 4 warps? (a) a shorter compute latency (b) loading 3 ahead (c) round-robin order reversed (d) more iterations</li>
+<li>Explain in your own words what <code>s_waitcnt vmcnt(0)</code> does in Listing 3's assembly and why there is only one.</li>
+<li>Apply Little's law: memory latency 400 cycles, each load supports 20 instructions, 1 issue per cycle. How many loads must be in flight?</li>
+<li>Why can loading ahead reduce occupancy?</li>
+<li>Predict, then run: add <code>w16_ahead1 16 1 8 100 16 0</code> to <code>latency_sim.in</code>. Higher or lower than 63.2 %?</li>
+<li>What does the model ignore that would change its numbers on real hardware? Name three things.</li>
+</ol>
+
+<h2 id="F1-60-lab">Lab</h2>
+<p><b>Goal.</b> Explore latency hiding in the scheduler model, connect it to Little's law, and read the compiler's latency-hiding decisions in machine code.</p>
+<p><b>Hardware and software needed.</b> g++, nvcc and cuobjdump (CUDA 12.0), hipcc (HIP 5.7). Folder <code>university/labs/F1-60</code>. A GPU only for the extension.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F1-60</code>. Compare the 4-warp timeline with Figure 1.</li>
+<li>Draw the timeline of <code>timeline_1_warp</code> by hand for cycles 0–40 and mark every idle issue slot.</li>
+<li>Add cases with 8 and 16 warps and timelines on (<code>… 1</code> as the last field), and find the first cycle at which no warp is ready.</li>
+<li>Find the number of warps at which <code>ahead 0</code> reaches 90 % busy, if any within 64 warps. Then the smallest <code>ahead</code> for 4 warps that reaches 90 %.</li>
+<li>Change Listing 3 to <code>d[i] = a[i] * b[i] + c[i] * e[i];</code> (a new pointer <code>e</code>), recompile with the <code>amd_wait</code> command from <code>run.sh</code>, and count the loads before the first <code>s_waitcnt vmcnt</code>.</li>
+<li>Do the forensic lab.</li>
+</ol>
+<p><b>Expected observations.</b> More warps and more loads ahead both raise the busy fraction, with diminishing returns; the compiler issues all independent loads before the first wait.</p>
+<p><b>Verification.</b> Your hand timeline matches the model's; your Little's-law estimates are within the range the model shows.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The timeline lines are cut at cycle 100 → by design (lines 80, 84, 87) → reduce <code>mem</code> to see a whole iteration.</li>
+<li>The model runs for a long time → very many warps × iterations with timelines on → turn timelines off for large cases.</li>
+<li>The AMD assembly shows <code>s_waitcnt vmcnt(1)</code> or similar → the compiler waits for only some loads before an early use → that is also correct; read which load is used first.</li>
+</ul>
+<p><b>Extension.</b> On a real GPU, time a kernel that loads <i>k</i> independent values per thread for <i>k</i> = 1, 2, 4, 8 and grid sizes from 1 block per SM to many, and compare the shape with Figure 2.</p>
+
+<h2 id="F1-60-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A team "simplified" a streaming kernel: instead of 16 warps per SM each processing 16 elements, it now launches 4 warps per SM each processing 64 elements, "to reduce launch overhead". The total work is identical. The kernel became more than twice as slow. A reviewer asks for an explanation from the hardware, before anyone touches the launch overhead.</p>
+<p><b>Evidence pack.</b> The scheduler model run on both configurations, and on a proposed fix (R2).</p>
+<pre class="output" data-run="F1-60/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare instructions issued, cycles and idle cycles for the three cases.</li>
+<li>Hypotheses: more instructions; fewer warps to switch between; launch overhead. Which numbers test each?</li>
+<li>Root cause: explain the slowdown with Little's law.</li>
+<li>Fix: why does <code>after_refactor_fixed</code> beat even the original? What did the code change to get there?</li>
+<li>Prevention: what should a reviewer ask before accepting a change in grid size or work per thread?</li>
+</ol>
+<p><b>Method hints.</b> Issued instructions tell you whether the work changed; idle-on-memory cycles tell you whether latency was hidden.</p>
+
+<h2 id="F1-60-project">Mini-project</h2>
+<p><b>A better scheduler model.</b> Extend Listing 1 with one realistic effect: (a) a memory latency that grows with the number of loads in flight (a queue in front of a fixed bandwidth), or (b) two schedulers per SM, each with its own warps, or (c) a "greedy then oldest" policy instead of round robin. Re-run the cases of Figure 2 and explain every change in the numbers.</p>
+<p><b>Rubric.</b> The new effect is implemented and documented in the model's rule comment (3). Results tabulated against the original model (3). Each difference explained in terms of in-flight work (2). Limits of the extended model stated honestly (2).</p>
+
+<h2 id="F1-60-summary">Summary</h2>
+<ul>
+<li>The warp scheduler issues, each cycle, from any resident warp that is ready; switching costs nothing because registers stay on-chip.</li>
+<li>Latency is hidden when enough independent work is in flight: Little's law, L = λW.</li>
+<li>Independent work comes from more warps (TLP) and from more loads in flight per warp (ILP); they compete for registers.</li>
+<li>In the model, 4 warps with 3 loads ahead (87.3 %) beat 24 warps with none (74.0 %).</li>
+<li>Compilers issue independent loads before the first use: three <code>LDG</code> before <code>FFMA</code>; one <code>s_waitcnt vmcnt(0)</code> for three <code>global_load</code>s.</li>
+<li>Fewer warps with more work each can be slower, unless each warp keeps more loads in flight.</li>
+</ul>
+
+<h2 id="F1-60-sources">Sources</h2>
+<ol>
+<li id="F1-60-src-D1">D1 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): compute architecture and scheduling (warp scheduling and latency tolerance; resource partitioning and occupancy). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F1-60-src-D2">D2 — John Hennessy, David Patterson, "Computer Architecture: A Quantitative Approach" (tier 3): multithreading (fine-grained multithreading) and the GPU section of the data-level-parallelism chapter. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-60-src-D3">D3 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): hardware multithreading; performance guidelines (maximise utilisation). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-60-src-D4">D4 — John D. C. Little, "A Proof for the Queuing Formula: L = λW" (Operations Research; tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-60-src-D6">D6 — AMD, "AMD Instinct MI200" Instruction Set Architecture reference guide (CDNA2) (tier 1): data dependency resolution, <code>s_waitcnt</code>, <code>vmcnt</code> and <code>lgkmcnt</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F1-60-src-R1">R1 — run of Listing 1 on <code>latency_sim.in</code> (<code>university/labs/F1-60/latency_sim.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0; model latencies invented.</li>
+<li id="F1-60-src-R2">R2 — run of Listing 1 on <code>forensic.in</code> (<code>forensic.log</code>), same toolchain, exit code 0.</li>
+<li id="F1-60-src-R3">R3 — SASS of Listing 2 for <code>sm_80</code> (<code>sass_loads.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>, compiled only.</li>
+<li id="F1-60-src-R4">R4 — gfx90a assembly of Listing 3 (<code>amd_wait.log</code>), Ubuntu clang 17.0.6 via hipcc (HIP 5.7), compiled only.</li>
+<li id="F1-60-src-R5">R5 — builds and runs of Listings 2 and 3 (<code>fma3.log</code>, <code>fma3_amd.log</code>); untested on hardware, exit code 1.</li>
+</ol>
+
+<h2 id="F1-60-glossary">Glossary links</h2>
+<p><a href="#gl-warp-scheduler">Warp scheduler</a> · <a href="#gl-latency-hiding">Latency hiding</a> · <a href="#gl-stall">Stall</a> · <a href="#gl-zero-cost-switching">Zero-cost switching</a> · <a href="#gl-little-s-law">Little's law</a> · <a href="#gl-s-waitcnt">s_waitcnt</a> · <a href="#gl-occupancy">Occupancy</a></p>
+
+<h2 id="F1-60-next">Next chapter</h2>
+<p>Next: <a href="#F1-61">F1-61 Tensor cores and matrix cores</a>. Previous: <a href="#F1-59">F1-59 HBM and GDDR memory</a>. Back to the course: <a href="#HW301">HW301</a>.</p>
+
+<h2 id="F1-60-answers">Answers to Check yourself</h2>
+<ol>
+<li>All resident warps keep their registers in the register file permanently, so the scheduler only selects a different warp's instruction; a CPU context switch saves and restores registers and other state in memory.</li>
+<li>All four warps have issued their loads and are waiting for data that arrive from cycle 20; no warp has a ready instruction.</li>
+<li>(b). The model shows 27.3 % for <code>w4</code> and 87.3 % for <code>w4_ahead3</code>. (a) affects only the short compute gaps; (c) does not change how many warps are ready; (d) spreads the same pattern over more time.</li>
+<li>It stalls the wavefront until no vector-memory load is outstanding; the compiler placed all three independent loads before it, so one wait covers all three, overlapping their latencies.</li>
+<li>Loads must start at 1/20 per cycle and each stays 400 cycles: L = 400/20 = 20 loads in flight.</li>
+<li>Each load in flight needs a destination register held until use; more registers per thread means fewer warps fit (F1-58).</li>
+<li>Higher: with one load ahead, each warp keeps two loads in flight, 32 in total, well above the Little estimate of about 11; the model prints 97.1 % for this line (Lab Engineer's check run; not in the recorded output).</li>
+<li>Any three: latency growing with load (bandwidth limits); several schedulers and issue widths; caches (some loads much faster); real scheduler policies; different warp start times; launch and tail effects; other stall reasons such as barriers.</li>
+</ol>
+<h3 id="F1-60-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> All three cases issue 2,304 instructions: the work is identical. Before: 3,648 cycles, 63.2 % busy, 1,344 idle cycles on memory. After: 8,448 cycles, 27.3 %, 6,144 idle on memory. Fixed: 2,388 cycles, 96.5 %, 84 idle.</p>
+<p><b>Root cause.</b> Latency is hidden by work in flight. Before, 16 warps each had one load in flight; after, only 4. With the same 100-cycle latency and the same work per load, Little's law needs about 11 loads in flight; 4 is far too few, so the issue slot sits idle on memory for most cycles (6,144 of 8,448). The number of instructions did not change, so "more work" is ruled out; launch overhead is not in the model at all, yet the model reproduces the slowdown.</p>
+<p><b>Fix.</b> Keep the 4 warps but restructure each warp's loop to issue loads 3 iterations ahead (prefetch into registers, or let the compiler do it by unrolling the loop with independent loads). Each warp then keeps 4 loads in flight: 16 in total, enough to cover the latency, which is why it beats the original 16 warps × 1 load in this model.</p>
+<p><b>How the evidence was produced.</b> The Lab Engineer ran Listing 1 on the three input lines of <code>forensic.in</code>. The team, kernel and slowdown are a scenario; the slowdown was not measured on a GPU. <b>Prevention:</b> for every change in grid size or work per thread, ask "how many independent loads are in flight per SM, before and after?", and check achieved occupancy and stall reasons in a profile.</p>
