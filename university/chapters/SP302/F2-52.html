@@ -1,0 +1,313 @@
+<!--meta
+id: F2-52
+title: Caches in practice
+course: SP302
+level: L3
+prereqs: F2-51; HW203 (F1-32, F1-33, F1-34, F1-36, F1-38); SP203 (F2-34)
+time: 6–10 hours including the lab
+hardware: a computer running Linux with g++ and valgrind (the build used g++ 13.3 and Valgrind 3.22.0 on a shared 4-CPU cloud virtual machine); no special hardware
+maps: Gregg "Systems Performance" (memory chapter, pending verification); HW203 lab "measure the cache hierarchy of your own CPU with a stride benchmark (results, not spec numbers)"; prepares the cache-blocking step of the SP302 SGEMM lab (F2-56) and CU302 tiling
+analogy: F1/F2 — the restaurant building and its kitchen (registered: caches = shelves near the stove, along the wall, in the back room; DRAM = the pantry down the corridor; cooks = threads); HW203 proposals reused: cache line = a tray, false sharing = two recipes printed on one sheet
+-->
+
+<h2 id="F2-52-hook">Story hook</h2>
+<p>Nadia is preparing a banquet: one hundred plates, and each plate needs one spoon of every sauce from a long rack of sauce jars in the pantry. The pantry runner never brings a single jar; he always brings a whole tray of sixteen neighbouring jars and puts it on the shelf next to the stove, because the corridor is long and one trip for one jar would be a waste.</p>
+<p>On the first evening Nadia works plate by plate: for plate one she needs jar 1 from tray 1, jar 1 from tray 2, jar 1 from tray 3… The shelf by the stove is small, so trays keep being sent back before she needs them again, and the runner walks the corridor for almost every spoon. On the second evening she works sauce by sauce: tray 1 arrives, she uses all sixteen jars on it for every plate, and only then asks for tray 2. The same plates, the same sauces, the same spoons. The second evening finishes long before the first.</p>
+<p>Nothing about the cooking changed; only the order in which Nadia touched the jars. In this chapter you measure exactly that effect on a real machine, count it with a cache simulator, and learn the three ways engineers use caches deliberately: walk memory in the order it is stored, keep the working set small (blocking), and keep threads from fighting over the same tray.</p>
+
+<h2 id="F2-52-able">What you will be able to do</h2>
+<ul>
+<li><b>Measure</b> the latency of a dependent load as a function of working-set size on your own machine and explain the steps in the curve.</li>
+<li><b>Predict</b> the number of cache-line misses of a loop from its access pattern, and check the prediction with Cachegrind.</li>
+<li><b>Restructure</b> a loop nest (interchange, tiling) so that it uses every byte of each cache line it fetches, and measure the gain.</li>
+<li><b>Diagnose</b> false sharing between threads from timings and data layout, and fix it with padding and alignment.</li>
+<li><b>Explain</b> which cache facts in this chapter are measured, which are reported by the operating system, and which are not verified.</li>
+</ul>
+
+<div class="co jargon" id="F2-52-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Cache line (recap)</dt><dd><b>Simple words:</b> the block of neighbouring bytes a cache always moves as one piece. <b>Analogy:</b> the tray of sixteen jars. <b>Precise:</b> the unit of transfer and allocation of a cache, defined in <a href="#F1-33">F1-33</a>; the build machine's kernel reports 64 bytes for the level-1 data cache (<code>LEVEL1_DCACHE_LINESIZE</code>), which is 16 floats. <sup class="src"><a href="#F2-52-src-R1">R1</a></sup> <sup class="src"><a href="#F2-52-src-D2">D2</a></sup></dd>
+<dt>Pointer chasing</dt><dd><b>Simple words:</b> following a chain where each step tells you where the next step is. <b>Analogy:</b> a treasure hunt in the pantry: each jar has a note with the shelf number of the next jar. <b>Precise:</b> a loop of the form <code>i = next[i]</code>, in which every load's address depends on the previous load's value; loads cannot overlap, so the time per step approximates the load latency of the level of the memory hierarchy that holds the working set. <sup class="src"><a href="#F2-52-src-D3">D3</a></sup> <sup class="src"><a href="#F2-52-src-R2">R2</a></sup></dd>
+<dt>Loop interchange</dt><dd><b>Simple words:</b> swapping which loop is inside and which is outside, so memory is visited in the order it is stored. <b>Analogy:</b> Nadia's switch from plate-by-plate to sauce-by-sauce. <b>Precise:</b> a legal reordering of a loop nest's loops (allowed when it does not change the result) chosen so that the innermost loop has unit stride over the array's storage order. <sup class="src"><a href="#F2-52-src-D3">D3</a></sup></dd>
+<dt>Loop tiling (cache blocking)</dt><dd><b>Simple words:</b> cutting a big job into small square pieces that fit on the shelf, and finishing each piece before starting the next. <b>Analogy:</b> working on one corner of the banquet table with the few trays that fit on the shelf. <b>Precise:</b> splitting the iteration space of a loop nest into blocks (tiles) whose data fits in a chosen cache level, so that lines brought in for one tile are reused before they are evicted. <sup class="src"><a href="#F2-52-src-D3">D3</a></sup> <sup class="src"><a href="#F2-52-src-R4">R4</a></sup></dd>
+<dt>Cachegrind</dt><dd><b>Simple words:</b> a tool that runs your program on a pretend computer and counts every cache hit and miss. <b>Analogy:</b> a clerk who writes down every trip of the pantry runner. <b>Precise:</b> a Valgrind tool that executes the program on a synthetic CPU, simulating the instruction cache, first-level data cache and last-level cache (with <code>--cache-sim=yes</code>) and attributing references and misses to functions and source lines; its counts are of its own cache model, not of the real hardware. <sup class="src"><a href="#F2-52-src-D4">D4</a></sup> <sup class="src"><a href="#F2-52-src-R3">R3</a></sup></dd>
+<dt>False sharing (recap)</dt><dd><b>Simple words:</b> two threads slow each other down because their separate variables sit on the same cache line. <b>Analogy:</b> two recipes printed on one sheet: two cooks keep taking the sheet from each other. <b>Precise:</b> defined in <a href="#F1-36">F1-36</a>: coherence traffic caused by writes to different data that share a cache line. <sup class="src"><a href="#F2-52-src-D2">D2</a></sup> <sup class="src"><a href="#F2-52-src-R5">R5</a></sup></dd>
+</dl></div>
+
+<h2 id="F2-52-pictures">The idea in pictures</h2>
+<p>Figure 1 is the kitchen's shelves (the memory hierarchy of <a href="#F1-32">F1-32</a>) with the program of this chapter that measures each shelf. Figure 2 shows why the order of a traversal matters: the matrix is stored row after row, and each tray (cache line) holds 16 neighbouring floats of one row.</p>
+<figure id="F2-52-fig1"><div class="svgbox">
+<svg viewBox="0 0 780 290" role="img" aria-labelledby="F2-52-f1t F2-52-f1d">
+<title id="F2-52-f1t">Figure 1: the memory hierarchy as shelves, and the working-set sweep that measures it</title>
+<desc id="F2-52-f1d">Five stacked shelves of increasing width from top to bottom: registers (the chef's hands), L1 data cache (shelf by the stove), L2 cache (shelf along the wall), L3 cache (back room), DRAM (pantry down the corridor). Each shelf is labelled with the size the build machine's kernel reported where there is one: L1d 48 KiB per core, L2 2 MiB per core, L3 260 MiB shared; registers and DRAM have no reported size. On the right, an arrow labelled working set grows points downward along the shelves, with the note: chase.cc doubles the working set from 4 KiB to 1 GiB; time per load rises each time the set no longer fits a shelf. A footnote says sizes reported by the kernel of a virtual machine, not a datasheet; not to scale.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="290"/>
+<rect class="sv-b5" x="250" y="14" width="120" height="34" rx="5"/><text class="sv-tb" x="262" y="36">registers</text>
+<rect class="sv-b3" x="210" y="58" width="200" height="34" rx="5"/><text class="sv-tb" x="222" y="80">L1 data cache</text><text class="sv-ts" x="420" y="80">48 KiB per core (reported)</text>
+<rect class="sv-b3" x="170" y="102" width="280" height="34" rx="5"/><text class="sv-tb" x="182" y="124">L2 cache</text><text class="sv-ts" x="460" y="124">2 MiB per core (reported)</text>
+<rect class="sv-b3" x="130" y="146" width="360" height="34" rx="5"/><text class="sv-tb" x="142" y="168">L3 cache</text><text class="sv-ts" x="500" y="168">260 MiB shared (reported)</text>
+<rect class="sv-b1" x="90" y="190" width="440" height="34" rx="5"/><text class="sv-tb" x="102" y="212">DRAM</text>
+<text class="sv-ts" x="10" y="36">the chef's hands</text>
+<text class="sv-ts" x="10" y="80">shelf by the stove</text>
+<text class="sv-ts" x="10" y="124">shelf along the wall</text>
+<text class="sv-ts" x="10" y="168">back room</text>
+<text class="sv-ts" x="10" y="212">pantry</text>
+<line class="sv-line2" x1="690" y1="30" x2="690" y2="215"/><polygon class="sv-head" points="684,215 690,226 696,215"/>
+<text class="sv-t" x="600" y="24">working set grows</text>
+<text class="sv-ts" x="560" y="250">chase.cc: 4 KiB, 8 KiB … 1 GiB; ns per load rises</text>
+<text class="sv-ts" x="560" y="266">when the set stops fitting a shelf</text>
+<text class="sv-ts" x="10" y="250">sizes: reported by the kernel of the build's virtual</text>
+<text class="sv-ts" x="10" y="266">machine (cacheinfo.out), not a datasheet; not to scale</text>
+</svg></div><figcaption><b>Figure 1.</b> Memory hierarchy as shelves (registered F1 analogy; <a href="#F1-32">F1-32</a>). Sizes are the values reported by <code>lscpu</code>/<code>getconf</code> in the build container <sup class="src"><a href="#F2-52-src-R1">R1</a></sup>; they are not checked against any datasheet. Not to scale.</figcaption></figure>
+
+<figure id="F2-52-fig2"><div class="svgbox">
+<svg viewBox="0 0 780 300" role="img" aria-labelledby="F2-52-f2t F2-52-f2d">
+<title id="F2-52-f2t">Figure 2: row-wise versus column-wise traversal of a row-major matrix</title>
+<desc id="F2-52-f2d">Two copies of the same grid of 4 rows by 32 columns of floats. In each row, two cache lines of 16 floats are outlined as long boxes. Left grid, titled sumRows: a solid arrow runs along row 0 from left to right, continuing to row 1; caption: 16 floats used per line fetched, 1 miss per 16 loads. Right grid, titled sumColumns: a solid arrow runs down column 0 through rows 0 to 3, then a dashed arrow jumps to the top of column 1; caption: 1 float used per line fetched before it is likely evicted (when n is large), up to 1 miss per load.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="300"/>
+<text class="sv-tb" x="20" y="22">sumRows: inner loop over c (unit stride)</text>
+<text class="sv-tb" x="410" y="22">sumColumns: inner loop over r (stride n floats)</text>
+<g>
+<rect class="sv-b3" x="20" y="40" width="168" height="26"/><rect class="sv-b3" x="190" y="40" width="168" height="26"/>
+<rect class="sv-box" x="20" y="70" width="168" height="26"/><rect class="sv-box" x="190" y="70" width="168" height="26"/>
+<rect class="sv-box" x="20" y="100" width="168" height="26"/><rect class="sv-box" x="190" y="100" width="168" height="26"/>
+<rect class="sv-box" x="20" y="130" width="168" height="26"/><rect class="sv-box" x="190" y="130" width="168" height="26"/>
+<text class="sv-ts" x="26" y="57">row 0: line A (16 floats)</text><text class="sv-ts" x="196" y="57">row 0: line B</text>
+<text class="sv-ts" x="26" y="87">row 1: line C</text><text class="sv-ts" x="196" y="87">row 1: line D</text>
+<text class="sv-ts" x="26" y="117">row 2: line E</text><text class="sv-ts" x="196" y="117">row 2: line F</text>
+<text class="sv-ts" x="26" y="147">row 3: line G</text><text class="sv-ts" x="196" y="147">row 3: line H</text>
+<line class="sv-line2" x1="22" y1="64" x2="350" y2="64"/><polygon class="sv-head" points="350,59 358,64 350,69"/>
+</g>
+<g>
+<rect class="sv-b1" x="410" y="40" width="168" height="26"/><rect class="sv-box" x="580" y="40" width="168" height="26"/>
+<rect class="sv-b1" x="410" y="70" width="168" height="26"/><rect class="sv-box" x="580" y="70" width="168" height="26"/>
+<rect class="sv-b1" x="410" y="100" width="168" height="26"/><rect class="sv-box" x="580" y="100" width="168" height="26"/>
+<rect class="sv-b1" x="410" y="130" width="168" height="26"/><rect class="sv-box" x="580" y="130" width="168" height="26"/>
+<text class="sv-ts" x="430" y="57">line A</text><text class="sv-ts" x="586" y="57">line B</text>
+<text class="sv-ts" x="430" y="87">line C</text><text class="sv-ts" x="586" y="87">line D</text>
+<text class="sv-ts" x="430" y="117">line E</text><text class="sv-ts" x="586" y="117">line F</text>
+<text class="sv-ts" x="430" y="147">line G</text><text class="sv-ts" x="586" y="147">line H</text>
+<line class="sv-line2" x1="418" y1="44" x2="418" y2="152"/><polygon class="sv-head" points="413,152 418,160 423,152"/>
+<line class="sv-dash" x1="418" y1="166" x2="432" y2="40"/><text class="sv-ts" x="440" y="182">then column 1: back to line A,</text><text class="sv-ts" x="440" y="196">which may already be evicted</text>
+</g>
+<text class="sv-t" x="20" y="200">each line fetched once, all 16 floats used:</text>
+<text class="sv-tb" x="20" y="220">about 1 miss per 16 loads</text>
+<text class="sv-t" x="410" y="230">each load touches a different line (n large):</text>
+<text class="sv-tb" x="410" y="250">up to 1 miss per load</text>
+<text class="sv-ts" x="20" y="280">drawn with 32 columns; the lab uses n = 4096 (64 MiB) for timing and n = 1024 (4 MiB) under Cachegrind</text>
+</svg></div><figcaption><b>Figure 2.</b> The same sum over a row-major matrix (<a href="#gl-row-major-order">row-major order</a>, <a href="#F1-34">F1-34</a>) in two loop orders. Miss ratios are the arithmetic of the worked example, confirmed by Cachegrind's simulated counts <sup class="src"><a href="#F2-52-src-R3">R3</a></sup>.</figcaption></figure>
+
+<h2 id="F2-52-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The CPU is the head chef; the shelves near the stove are the caches; the pantry down the corridor is DRAM. Things always come from the pantry a whole tray at a time (a cache line). If you use everything on a tray before asking for the next one, the runner walks rarely. If you take one jar from each tray and move on, the runner walks for almost every jar, and the shelf fills with trays you barely used. And if two cooks keep writing on two recipes that are printed on the same sheet, the sheet travels between them all evening even though they never need each other's recipe.</p></div>
+<p>So caches reward three habits: visit memory in the order it is stored, finish a small piece of work before starting the next, and give each thread its own trays. The rest of the chapter measures each habit.</p>
+
+<h2 id="F2-52-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F2-52-l2-know">Know your machine — measured, not assumed</h3>
+<p>Every number about the caches of a real processor comes from that processor's documentation (guide AH-21) or from your own measurement. In this build no datasheet could be opened, so the chapter uses two kinds of numbers only. First, what the operating system reports: <code>lscpu</code> and <code>getconf</code> print the cache geometry the kernel knows (Listing 1's output) <sup class="src"><a href="#F2-52-src-R1">R1</a></sup>. On a virtual machine those values come from what the hypervisor presents and need not describe the physical chip. Second, what your program measures: the working-set sweep of Listing 3 <sup class="src"><a href="#F2-52-src-R2">R2</a></sup>. When the two disagree, the measurement describes what your program experiences.</p>
+<h3 id="F2-52-l2-mountain">The working-set sweep</h3>
+<p>Listing 3 builds a single random cycle through an array of indices (Sattolo's algorithm visits every slot exactly once before returning to the start), then follows it: <code>i = next[i]</code>. Because each address depends on the previous load, the processor cannot overlap the loads, and because the order is random, the hardware <a href="#gl-prefetching">prefetcher</a> cannot guess the next address <sup class="src"><a href="#F2-52-src-D3">D3</a></sup>. The time per step is therefore close to the latency of whichever level holds the array. Doubling the array from 4 KiB to 1 GiB traces the curve: flat while the set fits the level-1 cache, then a series of rises. In the recorded run the time per load stayed near its minimum up to 32 KiB, rose gradually up to 1 MiB, rose steeply from 2 MiB, and reached more than a hundred times the minimum beyond 16 MiB <sup class="src"><a href="#F2-52-src-R2">R2</a></sup>. The first two transitions sit near the reported L1 and L2 sizes. The last one does not match the reported L3 size: see the unverified box in "How the hardware actually does it".</p>
+<h3 id="F2-52-l2-lines">Use every byte of every line</h3>
+<p>A 4096 × 4096 matrix of floats stored row by row occupies 64 MiB. Listing 2 sums it twice: row by row (inner loop over columns, consecutive addresses) and column by column (inner loop over rows, addresses 16 KiB apart). Each 64-byte line holds 16 floats <sup class="src"><a href="#F2-52-src-R1">R1</a></sup>. Row order uses all 16 floats of a line on consecutive steps; column order uses one float from a line and moves to a line 16 KiB away; by the time the walk returns for the neighbouring float, 4,096 other lines have been touched (256 KiB of lines, more than the reported L1d), so the line has probably been evicted. In the recorded run the column order took about nine times as long as the row order <sup class="src"><a href="#F2-52-src-R3">R3</a></sup>. Fixing it requires only <b>loop interchange</b>: put the loop over the contiguous index inside.</p>
+<h3 id="F2-52-l2-count">Count misses instead of guessing</h3>
+<p>Time tells you <i>that</i> something is slow; a miss count tells you <i>why</i>. The hardware counters that would count real misses are not available in the build container (<a href="#F2-55">F2-55</a> shows the evidence), so this course uses Cachegrind, which simulates a cache hierarchy while the program runs and attributes misses to functions <sup class="src"><a href="#F2-52-src-D4">D4</a></sup>. For a 1024 × 1024 matrix (1,048,576 floats) the worked example predicts 65,536 level-1 misses for row order and about 1,048,576 for column order; Cachegrind reported 65,538 and 1,048,577 <sup class="src"><a href="#F2-52-src-R3">R3</a></sup>. A simulator is still a model: it counts misses of its cache, configured from what the machine reported, not of the real one.</p>
+<h3 id="F2-52-l2-block">Keep the working set small: tiling</h3>
+<p>Some loops cannot be interchanged into perfect order. A matrix transpose reads <code>in</code> along rows and writes <code>out</code> down columns (or the reverse): one side always strides. Tiling solves it: process the matrix in b × b tiles. Inside a tile, the b lines of <code>in</code> and the b lines of <code>out</code> being touched fit in cache together, so each line fetched is fully used before it leaves <sup class="src"><a href="#F2-52-src-D3">D3</a></sup>. Listing 4 measures naive and tiled transposes for several tile sizes and checks every result against the naive one; in the recorded run every tiled version was correct and roughly three times faster than the naive version <sup class="src"><a href="#F2-52-src-R4">R4</a></sup>. The same idea, applied to matrix multiply, is step 3 of the SGEMM lab in <a href="#F2-56">F2-56</a>, and on the GPU it becomes the tiling of CU302.</p>
+<h3 id="F2-52-l2-share">Give each thread its own lines</h3>
+<p>Coherence (<a href="#F1-36">F1-36</a>) works on whole lines. When two cores write to different variables in the same line, each write must first take the line away from the other core <sup class="src"><a href="#F2-52-src-D2">D2</a></sup>. The forensic lab's program has four threads, each incrementing its own counter. Layout A packs the four counters next to each other (8 bytes apart, so in one or two 64-byte lines); layout B gives each counter its own 64-byte block with <code>alignas(64)</code>. No thread ever reads another thread's counter, so there is no data race and the results are identical; only the layout differs <sup class="src"><a href="#F2-52-src-R5">R5</a></sup>.</p>
+
+<h2 id="F2-52-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F2-52-l3-lat">Latency, bandwidth and the prefetcher</h3>
+<p>The pointer chase measures latency because it allows only one outstanding miss. A sequential sum (Listing 2, row order) has independent addresses that the hardware can predict, so the prefetcher can fetch lines ahead and several misses can be in flight at once (memory-level parallelism, <a href="#F1-32">F1-32</a>) <sup class="src"><a href="#F2-52-src-D2">D2</a></sup>. That is why the row-order sum of a 64 MiB matrix, which certainly does not fit the reported L1 or L2, costs about one nanosecond per element in the recorded run, while one random dependent load in a large working set costs hundreds <sup class="src"><a href="#F2-52-src-R2">R2</a></sup> <sup class="src"><a href="#F2-52-src-R3">R3</a></sup>. In fact the row-order sum is not limited by memory at all: its float additions form one dependent chain (each addition needs the previous sum), which <a href="#F2-53">F2-53</a> breaks with SIMD. Keep both effects apart when you read a timing.</p>
+<h3 id="F2-52-l3-tlb">Pages and the TLB</h3>
+<p>A strided or random walk also changes page often. With 4 KiB pages, the column walk of a 4096-wide float matrix touches a new page on every step (each step is 16 KiB), and the random chase over hundreds of MiB touches pages at random; both need address translations that miss in the TLB (<a href="#F1-38">F1-38</a>) <sup class="src"><a href="#F2-52-src-D2">D2</a></sup>. Part of the large-set latency in Listing 3 is therefore page-walk cost, not cache misses. Without hardware counters, this build cannot separate the two; huge pages (<a href="#F1-38">F1-38</a>) are the experiment that would.</p>
+<h3 id="F2-52-l3-tile">Choosing a tile size</h3>
+<p>The tile must be large enough that each line fetched is fully used (at least 16 floats wide for 64-byte lines) and small enough that all lines of one tile of <code>in</code> and <code>out</code> stay in the target cache together. For b = 32 that is 32 lines of each array, 2 × 32 × 64 B = 4 KiB, well inside the reported L1d; for b = 128 it is 16 KiB of data spread over 256 lines. In the recorded run all tile sizes from 8 to 128 helped; b = 16 was the slowest of them <sup class="src"><a href="#F2-52-src-R4">R4</a></sup>. Small differences between tile sizes are within the machine's spread (<a href="#F2-51">F2-51</a>); do not over-interpret them. Set associativity (<a href="#F1-33">F1-33</a>) adds a trap: a power-of-two row length (here 16 KiB) maps the lines of a column into few sets, so conflict misses can appear before capacity runs out.</p>
+<h3 id="F2-52-l3-share">Padding against false sharing, and its cost</h3>
+<p>Padding each hot per-thread variable to its own line removes the coherence traffic but multiplies the memory used by the variables (64 bytes for an 8-byte counter). C++17 added <code>std::hardware_destructive_interference_size</code> as a portable hint for this distance <sup class="src"><a href="#F2-52-src-D5">D5</a></sup>; this chapter's listing writes 64 because the kernel of the build machine reported a 64-byte line <sup class="src"><a href="#F2-52-src-R1">R1</a></sup>, and says so in a comment. The better fix, when possible, is not to share at all: let each thread accumulate in a local variable and combine at the end.</p>
+
+<h2 id="F2-52-hardware">How the hardware actually does it</h2>
+<p>Caches are filled and evicted by hardware, line by line, without any instruction from the program (the registered analogy's "the chef does not choose") <sup class="src"><a href="#F2-52-src-D2">D2</a></sup>. A load that misses in L1 asks the next level, which may ask the next, until DRAM; the line is installed on the way back. Hardware prefetchers watch the stream of miss addresses and fetch lines ahead when they detect a pattern such as a constant stride <sup class="src"><a href="#F2-52-src-D2">D2</a></sup> <sup class="src"><a href="#F2-52-src-D3">D3</a></sup>. Multicore coherence protocols such as MESI (<a href="#F1-36">F1-36</a>) keep one writable copy of a line at a time, which is why writes to a shared line serialise between cores.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>(1) The cache sizes in Figure 1 are what the virtual machine's kernel reported (<code>lscpu</code>: L1d 48 KiB per instance, L2 2 MiB per instance, L3 260 MiB, one instance); they were not checked against the processor's datasheet, and the CPU model string ("Intel(R) Xeon(R) Processor @ 2.10GHz") does not name a specific product. (2) In Listing 3 the latency rose steeply at 2–16 MiB, far below the reported 260 MiB L3. Possible explanations (the L3 is shared with other tenants, the virtual machine sees only part of it, TLB misses dominate, the reported value does not describe the cache this code uses) were not distinguished; doing so needs hardware counters or a huge-page experiment. (3) The prefetcher behaviour is described from textbooks (D2, D3), not from this processor's optimisation manual, which is the document to check (for Intel processors, the vendor's optimization reference manual, memory subsystem chapters).</p></div>
+
+<h2 id="F2-52-worked">Worked example</h2>
+<p>Predict the level-1 data-cache misses of <code>sumRows</code> and <code>sumColumns</code> for n = 1024, assuming 64-byte lines, a level-1 cache far smaller than the 4 MiB matrix, and that the matrix starts at the beginning of a line.</p>
+<ol>
+<li><b>Elements:</b> 1024 × 1024 = 1,048,576 floats of 4 bytes = 4 MiB.</li>
+<li><b>Floats per line:</b> 64 / 4 = 16.</li>
+<li><b>Row order:</b> each line is loaded once and its 16 floats are used on 16 consecutive steps. Misses = 1,048,576 / 16 = <b>65,536</b>.</li>
+<li><b>Column order:</b> consecutive steps are 1024 × 4 = 4,096 bytes apart, so each step touches a new line. Before the walk comes back to the same line (one column later), it has touched 1,024 other lines (64 KiB). If those do not all stay in L1 (they did not in Cachegrind's model of a 48 KiB cache; associativity also maps lines 4 KiB apart into few sets), every load misses: about <b>1,048,576</b>.</li>
+<li><b>Check against the tool:</b> Cachegrind reported D1 read misses of 65,538 for <code>sumRows</code> and 1,048,577 for <code>sumColumns</code> <sup class="src"><a href="#F2-52-src-R3">R3</a></sup>. The two extra misses in each function are the vector's header and stack data, not the matrix.</li>
+<li><b>Instructions:</b> the same tool counted about 2.6 million instructions for <code>sumRows</code> and about 6.3 million for <code>sumColumns</code>: the column version also does more index arithmetic per element. Both effects add up in the timing.</li>
+</ol>
+
+<h2 id="F2-52-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>cacheinfo.sh</code>: what the kernel reports about the caches.</p>
+<pre class="listing" data-src="F2-52/cacheinfo.sh"></pre>
+<pre class="output" data-run="F2-52/cacheinfo"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>3</td><td><code>lscpu | grep …</code></td><td>Prints the CPU model and the cache lines of <code>lscpu</code>'s summary.</td><td>The first thing to record about any benchmark machine.</td></tr>
+<tr><td>4–6</td><td><code>getconf LEVEL1_DCACHE_LINESIZE</code> and others</td><td>Asks the C library for the line size and cache sizes.</td><td>The 64-byte line used in this chapter's arithmetic comes from here.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>traverse.cc</code>: the same sum by rows and by columns.</p>
+<pre class="listing" data-src="F2-52/traverse.cc"></pre>
+<p><b>Build command</b> (actually used, by <code>run.sh</code>): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -O2 traverse.cc -o traverse</code>, then <code>./traverse</code>.</p>
+<pre class="output" data-run="F2-52/traverse"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–19</td><td><code>sumRows</code></td><td>Outer loop over rows, inner over columns: consecutive addresses.</td><td>Uses every float of each line.</td></tr>
+<tr><td>21–30</td><td><code>sumColumns</code></td><td>Outer loop over columns, inner over rows: steps of <code>n</code> floats.</td><td>Uses one float per line before moving on.</td></tr>
+<tr><td>34–35</td><td>arguments</td><td>Size and repetitions from the command line (defaults 4096 and 21).</td><td>The Cachegrind step reuses the same program with a small size and one run.</td></tr>
+<tr><td>37–38</td><td><code>bench::run</code>, <code>bench::keep</code></td><td>The F2-51 protocol; the sums are kept.</td><td>Otherwise the optimiser could delete the loops (F2-51).</td></tr>
+</tbody></table></div>
+<p>The same program under Cachegrind (n = 1024, one run; the program's own times are meaningless under the simulator, which slows it down):</p>
+<pre class="output" data-run="F2-52/traverse_cg"></pre>
+<p>In the per-function lines, the columns are, in order: instructions (<code>Ir</code>), level-1 and last-level instruction misses, data reads (<code>Dr</code>), level-1 and last-level data-read misses (<code>D1mr</code>, <code>DLmr</code>), then the same for writes <sup class="src"><a href="#F2-52-src-R3">R3</a></sup>. The "warning" lines are Cachegrind telling you which last-level cache it chose to simulate from what the machine reported.</p>
+
+<p><b>Listing 3</b> — <code>chase.cc</code>: latency against working-set size.</p>
+<pre class="listing" data-src="F2-52/chase.cc"></pre>
+<pre class="output" data-run="F2-52/chase"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–19</td><td><code>chase</code></td><td><code>i = next[i]</code> repeated <code>steps</code> times.</td><td>Each load waits for the previous one: pure latency.</td></tr>
+<tr><td>26</td><td>size loop</td><td>Doubles the working set from 4 KiB to 1 GiB.</td><td>One point per power of two traces the curve.</td></tr>
+<tr><td>29–33</td><td>Sattolo shuffle</td><td>Builds one random cycle through all slots.</td><td>Every slot is visited; no short loop stays in cache; the prefetcher sees no pattern.</td></tr>
+<tr><td>34</td><td><code>bench::run(…, 1, 7)</code></td><td>One warm-up, seven timed runs per size.</td><td>A deliberate deviation from 21 runs, to keep the 1 GiB sweep short; the spread at each size is part of the lab.</td></tr>
+<tr><td>35</td><td>ns per load</td><td>Median time divided by the number of steps.</td><td>Normalises across sizes.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>transpose.cc</code>: naive and tiled transpose, every result checked.</p>
+<pre class="listing" data-src="F2-52/transpose.cc"></pre>
+<pre class="output" data-run="F2-52/transpose"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–15</td><td><code>naive</code></td><td>Reads <code>in</code> along rows, writes <code>out</code> down columns.</td><td>One side always strides by a whole row.</td></tr>
+<tr><td>18–32</td><td><code>blocked</code></td><td>Visits b × b tiles; inside a tile, the same loop order as <code>naive</code>.</td><td>The lines of one tile stay in cache until fully used.</td></tr>
+<tr><td>23–24</td><td><code>std::min</code></td><td>Clips the last tile at the matrix edge.</td><td>Correct for sizes that are not multiples of b.</td></tr>
+<tr><td>41–42, 49</td><td><code>ref</code>, <code>out == ref</code></td><td>Compares every tiled result with the naive one.</td><td>A faster wrong answer is worthless.</td></tr>
+</tbody></table></div>
+
+<h2 id="F2-52-breaks">Where the analogy breaks</h2>
+<ul>
+<li>Nadia decides which trays to keep on the shelf. Caches decide by themselves, by a replacement policy, line by line; a program can only influence what stays by the order and amount of data it touches.</li>
+<li>The runner in the story brings one tray per trip and waits. Real memory systems keep many misses in flight and prefetch ahead on patterns, so a sequential walk is far faster than "one trip per tray" suggests (Layer 3).</li>
+<li>Shelves in a kitchen hold anything anywhere. A set-associative cache allows each line only in a few slots chosen by its address, so lines at power-of-two distances can push each other out while most of the cache is empty.</li>
+<li>Two cooks sharing a recipe sheet could photocopy it. Cores can share a line freely while they only read it; the cost appears when at least one of them writes.</li>
+</ul>
+
+<h2 id="F2-52-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>A loop over a 2-D array is many times slower than a similar loop elsewhere.</td><td>Inner loop over the non-contiguous index.</td><td>Compare the inner index with the storage order; Cachegrind's <code>D1mr</code> close to <code>Dr</code>.</td><td>Loop interchange.</td></tr>
+<tr><td>A "latency" benchmark gives the same small number for every size.</td><td>Sequential or predictable addresses: the prefetcher hides latency; or the cycle is short.</td><td>Check that the chain is one random cycle over the whole array.</td><td>Sattolo's algorithm, dependent loads.</td></tr>
+<tr><td>Adding threads that only update their own counters makes the program slower.</td><td>False sharing.</td><td>Print the counters' addresses; differences smaller than the line size.</td><td>Pad and align to the line size, or use thread-local accumulators.</td></tr>
+<tr><td>Tiled code is faster but wrong at the edges.</td><td>Last tile not clipped.</td><td>Test with n not a multiple of b.</td><td><code>std::min</code> on the tile bounds, and a comparison with a reference.</td></tr>
+<tr><td>Cachegrind's numbers do not match your timing ratios.</td><td>The simulator models its own caches, not prefetching or the real machine.</td><td>Read its warnings about the simulated configuration.</td><td>Use it for counts and patterns; use timings for speed.</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F2-52-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> HW203 explained lines, sets, locality, coherence and TLBs from the hardware side (<a href="#F1-33">F1-33</a>, <a href="#F1-34">F1-34</a>, <a href="#F1-36">F1-36</a>, <a href="#F1-38">F1-38</a>); <a href="#F2-51">F2-51</a> gave you a harness you can trust. <b>What carries over:</b> the vocabulary (line, set, way, miss types) and the measurement protocol. <b>What changes:</b> you now change code to suit the caches and prove the effect with a timing and a miss count; the machine is a shared virtual machine whose reported cache sizes may not describe what your code experiences <sup class="src"><a href="#F2-52-src-R2">R2</a></sup>. <b>What comes next:</b> <a href="#F2-53">F2-53</a> makes each instruction process 8 or 16 floats at once (SIMD), which only pays off when the data arrives fast enough: the reason this chapter came first.</p></div>
+
+<h2 id="F2-52-check">Check yourself</h2>
+<ol>
+<li>Why does Listing 3 use one random cycle through the whole array instead of walking it in order?</li>
+<li>A 2048 × 2048 matrix of doubles (8 bytes) is summed column by column. With 64-byte lines and a small L1, predict the number of L1 data misses, and the number for row order.</li>
+<li>Which statement about the build machine is supported by this chapter's evidence? (a) Its L3 cache is 260 MiB. (b) The kernel of the virtual machine reported an L3 of 260 MiB. (c) Its DRAM latency is the last number in <code>chase.out</code>. (d) Its L1 line size is 64 bytes on every Xeon.</li>
+<li>Explain in your own words why the tiled transpose is faster than the naive one, although both move exactly the same bytes.</li>
+<li>Apply to a new case: an image is stored as <code>pixels[y * width + x]</code> and a filter loops <code>for x … for y …</code>. What do you change, and what do you expect Cachegrind to show before and after?</li>
+<li>Predict, then run: change Listing 2 so that both functions use n = 4100 (not a power of two). Does the column/row ratio change? Run it and explain with set associativity.</li>
+<li>Four threads each sum their own quarter of an array into <code>results[t]</code>, a <code>std::vector&lt;double&gt;</code> of size 4. It scales badly. Give the cause and two fixes.</li>
+<li>Why is the row-order sum of Listing 2 not a measurement of memory bandwidth?</li>
+</ol>
+
+<h2 id="F2-52-lab">Lab</h2>
+<p><b>Goal.</b> Measure your machine's latency curve, prove a loop-order effect with timings and simulated miss counts, and speed up a transpose by tiling, with every result checked.</p>
+<p><b>Hardware and software.</b> Linux, g++ and valgrind (the build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> and <code>valgrind-3.22.0</code>). At least 1.5 GiB of free memory for the 1 GiB chase point (reduce the upper limit in Listing 3 otherwise). <b>Safety:</b> none beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F2-52</code> from the repository root (about two minutes on the build machine). Exit status 0 expected.</li>
+<li>Record your <code>cacheinfo.out</code>. Plot <code>chase.out</code> (size on a log axis, ns per load): mark where the curve rises and compare with the reported cache sizes.</li>
+<li>Run <code>traverse</code> under Cachegrind yourself (the command is in <code>traverse_cg.log</code>) for n = 512 and n = 2048. Do the D1 miss counts follow the worked example's formulas?</li>
+<li>In <code>transpose.cc</code> add a size that is not a multiple of any tile (for example n = 4000) and confirm "correct" for every b.</li>
+<li>Write a one-paragraph explanation of your fastest tile size, with the arithmetic of Layer 3.</li>
+</ol>
+<p><b>Expected observations</b> (measured on the build container; your numbers will differ): column order several times slower than row order <sup class="src"><a href="#F2-52-src-R3">R3</a></sup>; D1 misses 65,538 versus 1,048,577 in Cachegrind; a latency curve rising by more than a factor of 100 from 4 KiB to 1 GiB <sup class="src"><a href="#F2-52-src-R2">R2</a></sup>; tiled transposes about three times faster and all "correct" <sup class="src"><a href="#F2-52-src-R4">R4</a></sup>.</p>
+<p><b>Verification.</b> All tiled results print "correct"; your Cachegrind counts match the formulas within a few misses; your plot has its axes and units labelled and names the machine and date.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The chase run is killed or very slow at the largest sizes → not enough memory → lower the loop limit from 1 GiB.</li>
+<li>Cachegrind prints a warning about the LL cache → normal: it reports which cache it simulates → record the warning with your results.</li>
+<li>Row and column orders take the same time → the compiler interchanged the loops or the matrix fits in L1 → check n and the disassembly.</li>
+</ul>
+<p><b>Extension.</b> Add a third traversal that walks rows but with a stride of 2, 4, 8 and 16 floats (a "stride sweep"); predict and measure the time per element (HW203's memory mountain on your machine).</p>
+
+<h2 id="F2-52-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A statistics service counts events in four threads. Each thread increments its own counter, so the author expected "perfect scaling". Production shows it slower than expected, and a teammate's quick rewrite "with padding" is several times faster. Nobody can explain why, and a reviewer asks for evidence before accepting the rewrite.</p>
+<p><b>Evidence pack.</b> The two layouts and the timing of both, from one program run (source: <code>sharing.cc</code> in the lab folder):</p>
+<pre class="listing" data-src="F2-52/sharing.cc"></pre>
+<pre class="output" data-run="F2-52/sharing"></pre>
+<p>Also available: <code>cacheinfo.out</code> (Listing 1) with the line size.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>What do the printed address offsets tell you about where the four counters live, relative to the line size?</li>
+<li>List two hypotheses for the time difference (one about the data, one about something else) and the evidence for or against each.</li>
+<li>Explain the root cause in terms of the coherence protocol of <a href="#F1-36">F1-36</a>.</li>
+<li>Propose the best fix for production (not only padding) and how you would verify it.</li>
+<li>Is there a data race in layout A? Justify with the C++ memory model of SP203.</li>
+</ol>
+<p><b>Method hints.</b> Compare offsets with the line size from <code>cacheinfo.out</code>. Then ask: what is the only thing that differs between the two runs? Rule out "different work" by reading the loop.</p>
+
+<h2 id="F2-52-project">Mini-project</h2>
+<p>Write a small report "the memory of my machine": the reported cache geometry, your latency curve (with the machine, toolchain and date), the row/column experiment with Cachegrind counts, and a stride sweep (extension above). Explain each step of the curve with a cache level or with the TLB, and mark every explanation you could not prove as a hypothesis. <b>Rubric:</b> measurements with run records 35 %, correct arithmetic and miss predictions 25 %, honest separation of measured / reported / hypothesised 25 %, presentation 15 %.</p>
+
+<h2 id="F2-52-summary">Summary</h2>
+<ul>
+<li>Use only reported (kernel) or measured cache facts; on a virtual machine they may disagree, and the measurement describes what your code experiences.</li>
+<li>A dependent random walk measures latency; a sequential walk is helped by the prefetcher and many misses in flight.</li>
+<li>Caches move whole lines (64 bytes reported here): use every byte of a line before moving on. Loop interchange fixes most stride problems.</li>
+<li>Predict miss counts with arithmetic and confirm them with Cachegrind, remembering that it simulates a model.</li>
+<li>Tiling keeps the working set of a loop nest inside a cache when no loop order is perfect.</li>
+<li>Threads writing to different variables in one line slow each other down (false sharing); pad, align or, better, accumulate locally.</li>
+</ul>
+
+<h2 id="F2-52-sources">Sources</h2>
+<ol>
+<li id="F2-52-src-D1">D1 — Brendan Gregg, "Systems Performance: Enterprise and the Cloud" (tier 3; edition to be recorded): the chapters on CPUs (CPU caches) and memory. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F2-52-src-D2">D2 — John Hennessy, David Patterson, "Computer Architecture: A Quantitative Approach" (tier 3; edition to be recorded): the chapter on memory hierarchy design (cache organisation, prefetching, coherence and false sharing in the multiprocessor chapter, virtual memory and TLBs). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F2-52-src-D3">D3 — Randal Bryant, David O'Hallaron, "Computer Systems: A Programmer's Perspective" (tier 3; edition to be recorded): the chapter on the memory hierarchy (locality, the memory mountain, rearranging loops to increase spatial locality, blocking). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F2-52-src-D4">D4 — Valgrind developers, "Valgrind User Manual", chapter "Cachegrind: a high-precision tracing profiler" (tier 2; version 3.22.0 as installed). The HTML manual is not installed in the container (its folder held only images); the options used (<code>--cache-sim</code>, <code>--branch-sim</code>, <code>--cachegrind-out-file</code>) were checked against <code>valgrind --tool=cachegrind --help</code> printed in this build, and the event names against <code>cg_annotate</code>'s own header in R3. <i>Manual not opened (dossier gate G1 open).</i></li>
+<li id="F2-52-src-D5">D5 — ISO/IEC JTC1/SC22/WG21, working draft of the C++ standard (tier 1): header <code>&lt;new&gt;</code>, hardware interference size. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F2-52-src-R1">R1 — <code>university/labs/F2-52/cacheinfo.log</code>: Listing 1 run in the build container, exit code 0; values reported by the kernel of a virtual machine.</li>
+<li id="F2-52-src-R2">R2 — <code>chase.log</code>: Listing 3, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>-O2</code>, exit code 0; measurements of the build container (AH-23).</li>
+<li id="F2-52-src-R3">R3 — <code>traverse.log</code> (Listing 2, timing) and <code>traverse_cg.log</code> (Listing 2 under <code>valgrind-3.22.0</code> Cachegrind with <code>--cache-sim=yes</code>, then <code>cg_annotate</code>), exit code 0.</li>
+<li id="F2-52-src-R4">R4 — <code>transpose.log</code>: Listing 4, same toolchain, <code>-O2</code>, exit code 0.</li>
+<li id="F2-52-src-R5">R5 — <code>sharing.log</code>: forensic program, same toolchain, <code>-O2 -pthread</code>, exit code 0.</li>
+</ol>
+
+<h2 id="F2-52-glossary">Glossary links</h2>
+<p><a href="#gl-cache-line">Cache line</a> · <a href="#gl-pointer-chasing">Pointer chasing</a> · <a href="#gl-loop-interchange">Loop interchange</a> · <a href="#gl-loop-tiling-cache-blocking">Loop tiling (cache blocking)</a> · <a href="#gl-cachegrind">Cachegrind</a> · <a href="#gl-false-sharing">False sharing</a> · <a href="#gl-working-set">Working set</a> · <a href="#gl-spatial-locality">Spatial locality</a> · <a href="#gl-row-major-order">Row-major order</a> · <a href="#gl-prefetching">Prefetching</a> · <a href="#gl-memory-mountain">Memory mountain</a> · <a href="#gl-tlb">TLB</a></p>
+
+<h2 id="F2-52-next">Next chapter</h2>
+<p>Next: <a href="#F2-53">F2-53 SIMD and vectorisation</a>. Previous: <a href="#F2-51">F2-51 Measuring correctly</a>. Back to the course: <a href="#SP302">SP302</a>.</p>
+
+<h2 id="F2-52-answers">Answers to Check yourself</h2>
+<ol>
+<li>To measure latency: each load's address comes from the previous load, so loads cannot overlap; a random single cycle visits every slot (no short loop that stays in cache) and gives the prefetcher no pattern to follow.</li>
+<li>Elements: 2048 × 2048 = 4,194,304. Doubles per line: 64 / 8 = 8. Row order: 4,194,304 / 8 = 524,288 misses. Column order: every step is 16 KiB away and the walk touches 2,048 lines before returning, so about one miss per load: about 4,194,304.</li>
+<li>(b). (a) states a hardware fact that no datasheet in this build supports, and Listing 3 even suggests the code does not experience 260 MiB of fast cache. (c) is a measurement on a shared virtual machine that also includes TLB effects; it is a measurement, not "its DRAM latency". (d) generalises from one virtual machine to a product family.</li>
+<li>Both read and write every element once, but the naive transpose writes down columns: each write touches a different line, and by the time the neighbouring element is written the line has left the cache, so lines are fetched and written back many times. Inside a tile, the few lines involved stay in cache until all their elements are used, so each line is fetched about once.</li>
+<li>Swap the loops so that <code>x</code> (contiguous) is the inner loop. Before: D1 read misses close to the number of reads (one per pixel when the width is large); after: about one miss per 16 floats (or per 64 bytes of pixel data).</li>
+<li>With 4100 the 16 KiB power-of-two stride disappears, so the lines of one column fall into many different sets instead of a few; conflict misses fall and the ratio may drop. The magnitude is a measurement for your machine; the explanation is set-associative mapping (F1-33).</li>
+<li>False sharing: the four doubles occupy 32 consecutive bytes, one or two lines, and every thread writes its element in its inner loop. Fixes: accumulate in a local variable and write <code>results[t]</code> once at the end; or pad each element to its own line (<code>alignas(64)</code> struct).</li>
+<li>Its float additions form one dependent chain (each needs the previous sum), so the loop is limited by the latency of the addition, not by how fast memory delivers data; F2-53 breaks the chain into several and the same loop gets faster.</li>
+</ol>
+<h3 id="F2-52-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> In layout A the counters are 8 bytes apart (+0, +8, +16, +24): all four fit in 32 bytes, so they share one 64-byte line, or two if the array straddles a line boundary. In layout B they are 64 bytes apart: each has its own line. Layout A took several times as long as layout B in the recorded run (the printed ratio A / B).</p>
+<p><b>Hypotheses.</b> (1) The layouts make the threads share lines (false sharing). (2) The two runs did different amounts of work, or the machine was busier during run A. Against (2): the same <code>runThreads</code> function with the same iteration count is used for both; each result is a median of 11 runs; the difference is far larger than the spread measured in F2-51.</p>
+<p><b>Root cause.</b> Each increment is a write to the counter's line. Under a MESI-style protocol a core must hold the line exclusively to write it, so the four cores take the line from each other on almost every increment; the line moves between cores instead of staying in each core's L1. In layout B each core keeps its own line.</p>
+<p><b>Fix and verification.</b> Best: each thread increments a local variable and adds it to the shared total once at the end (no shared line in the loop). Alternatively pad to the line size as in layout B. Verify with the same program: the time for the fix should be close to layout B's, and the totals unchanged.</p>
+<p><b>Data race?</b> No: each counter is written by exactly one thread and read only after <code>join</code>, which synchronises; different objects in one line are different memory locations in the C++ memory model. False sharing is a performance problem, not a correctness one. <b>How the evidence was produced:</b> <code>sharing.cc</code> built with <code>-O2 -pthread</code> by <code>run.sh</code>; output unedited.</p>

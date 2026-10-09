@@ -1,0 +1,322 @@
+<!--meta
+id: F2-53
+title: SIMD and vectorisation
+course: SP302
+level: L3
+prereqs: F2-51; F2-52; HW202 (F1-29, F1-31); MA302 (floating point; may run in parallel)
+time: 6–10 hours including the lab
+hardware: a computer running Linux on x86-64 with g++; AVX2 and FMA for the intrinsics listings (checked at run time; the build machine reported both, and AVX-512); no other hardware
+maps: Gregg "Systems Performance" (CPU chapter, pending verification); prepares the vectorised micro-kernel of the SP302 SGEMM lab (F2-56) and the SIMT comparison of BR-03 and CU201
+analogy: F1/F2 — the restaurant building and its kitchen (registered: head chef = CPU core, hands and cutting board = registers, translator = compiler); proposed: SIMD = a wide ladle that fills a row of 8 cups in one pour (see SP302 NOTES.md)
+-->
+
+<h2 id="F2-53-hook">Story hook</h2>
+<p>Ji-woo serves soup at a school canteen. At first she fills cups with an ordinary ladle: dip, pour, next cup. One day the kitchen buys a long ladle with eight spouts. Lined up under it, eight cups are filled with one pour. When the cups are already waiting in a row on the counter, the line moves almost eight times faster.</p>
+<p>But the wide ladle has rules. The eight cups must stand in a row under the spouts. Every spout pours the same soup: it cannot give cup three a different dish. And it does not help when the soup pot is empty and Ji-woo is waiting for the next pot from the kitchen. Some jobs do not fit it at all: when a cup can only be filled after looking at what went into the previous cup, the eight spouts have nothing to do at the same time.</p>
+<p>Modern processors have exactly such ladles: instructions that do the same operation on 4, 8 or 16 numbers at once. This chapter shows when the compiler uses them for you, how to see whether it did, how to use them explicitly, and the three things that stop them: dependencies, the order of floating-point additions, and memory that cannot deliver data fast enough.</p>
+
+<h2 id="F2-53-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> SIMD execution: vector registers, lanes, and one instruction operating on all lanes, and relate it to the GPU's SIMT model.</li>
+<li><b>Read</b> the compiler's vectorisation report and its generated instructions, and tell real vector arithmetic from scalar code that only looks vectorised.</li>
+<li><b>Write</b> an explicitly vectorised loop with AVX2 and FMA intrinsics, with a run-time CPU check and a scalar remainder loop.</li>
+<li><b>Decide</b> whether reordering a floating-point reduction is acceptable, and break a dependency chain with several accumulators.</li>
+<li><b>Measure</b> SIMD speed-ups in cache and in DRAM, and explain why they differ.</li>
+</ul>
+
+<div class="co jargon" id="F2-53-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>SIMD (single instruction, multiple data)</dt><dd><b>Simple words:</b> one instruction that does the same thing to several numbers at once. <b>Analogy:</b> the eight-spout ladle. <b>Precise:</b> a form of data-level parallelism in which one instruction operates on all elements (lanes) of a vector register; on x86-64, the SSE, AVX/AVX2 and AVX-512 instruction families operate on 128-, 256- and 512-bit registers (4, 8 and 16 single-precision floats). <sup class="src"><a href="#F2-53-src-D1">D1</a></sup> <sup class="src"><a href="#F2-53-src-D5">D5</a></sup></dd>
+<dt>Vector register and lane</dt><dd><b>Simple words:</b> a wide register that holds several numbers side by side; each slot is a lane. <b>Analogy:</b> the row of cups under the spouts; each cup is a lane. <b>Precise:</b> an architectural register of 128 (xmm), 256 (ymm) or 512 (zmm) bits on x86-64; a lane is one element position. (HW301 uses "lane" for one thread of a GPU warp, <a href="#F1-57">F1-57</a>; the idea is related, the mechanism differs.) <sup class="src"><a href="#F2-53-src-D1">D1</a></sup></dd>
+<dt>Auto-vectorisation</dt><dd><b>Simple words:</b> the compiler rewriting your ordinary loop to use SIMD instructions. <b>Analogy:</b> the translator noticing that the recipe says "fill each cup" and writing "use the wide ladle". <b>Precise:</b> a compiler transformation (<a href="#gl-vectorisation">vectorisation</a>, <a href="#F1-31">F1-31</a>) that turns loop iterations into vector operations when it can prove this preserves the program's meaning; in GCC it is enabled at <code>-O3</code> and, in a cheaper form, at <code>-O2</code>, and reported with <code>-fopt-info-vec</code>. <sup class="src"><a href="#F2-53-src-D3">D3</a></sup> <sup class="src"><a href="#F2-53-src-R2">R2</a></sup></dd>
+<dt>Intrinsic</dt><dd><b>Simple words:</b> a function that the compiler turns into one particular machine instruction. <b>Analogy:</b> writing "wide ladle" in the recipe yourself instead of hoping the translator does it. <b>Precise:</b> a compiler-provided function, declared in a header such as <code>&lt;immintrin.h&gt;</code>, that maps to a specific instruction; in GCC 13, <code>_mm256_fmadd_ps</code> is defined in <code>fmaintrin.h</code> as a call to the built-in <code>__builtin_ia32_vfmaddps256</code>. <sup class="src"><a href="#F2-53-src-H1">H1</a></sup> <sup class="src"><a href="#F2-53-src-D2">D2</a></sup></dd>
+<dt>FMA (fused multiply-add)</dt><dd><b>Simple words:</b> one instruction that computes a × b + c. <b>Analogy:</b> stirring while pouring, in one movement. <b>Precise:</b> an operation computing a × b + c with a single rounding at the end (IEEE 754 fusedMultiplyAdd); x86-64 provides it in the FMA extension (<code>vfmadd…ps</code> instructions). It counts as two floating-point operations in FLOP rates. <sup class="src"><a href="#F2-53-src-D1">D1</a></sup> <sup class="src"><a href="#F2-53-src-D4">D4</a></sup></dd>
+<dt>Reduction</dt><dd><b>Simple words:</b> combining many numbers into one, such as a sum or a maximum. <b>Analogy:</b> pouring all the cups back into one pot. <b>Precise:</b> a loop that accumulates values with an associative operation into a single result; vectorising it means keeping several partial results (one per lane) and combining them at the end, which changes the order of operations. <sup class="src"><a href="#F2-53-src-D5">D5</a></sup></dd>
+<dt>Floating-point reassociation</dt><dd><b>Simple words:</b> adding the same float numbers in a different order, which can give a slightly different answer. <b>Analogy:</b> tipping sand and pebbles into a scale in a different order changes which grains the scale can still show. <b>Precise:</b> floating-point addition is commutative but not associative, because every addition rounds; (a + b) + c and a + (b + c) can differ. A compiler may reorder floating-point operations only when allowed (for example by <code>-ffast-math</code> or <code>-fassociative-math</code> in GCC). <sup class="src"><a href="#F2-53-src-D4">D4</a></sup> <sup class="src"><a href="#F2-53-src-D3">D3</a></sup> <sup class="src"><a href="#F2-53-src-R4">R4</a></sup></dd>
+</dl></div>
+
+<h2 id="F2-53-pictures">The idea in pictures</h2>
+<p>Figure 1 compares a scalar addition with one 256-bit SIMD addition. Figure 2 shows why a sum is the hard case: the loop's order is a single chain, and a SIMD sum must use a different order.</p>
+<figure id="F2-53-fig1"><div class="svgbox">
+<svg viewBox="0 0 780 270" role="img" aria-labelledby="F2-53-f1t F2-53-f1d">
+<title id="F2-53-f1t">Figure 1: one scalar add versus one 8-lane SIMD add</title>
+<desc id="F2-53-f1d">Left: two single boxes labelled x[i] and y[i] flow into an adder labelled vaddss (scalar), producing one box y[i]. One instruction, one result. Right: two rows of eight boxes, labelled x[i] to x[i+7] in a ymm register and y[i] to y[i+7] in another ymm register, flow lane by lane into a wide adder labelled vaddps ymm, producing a row of eight result boxes. One instruction, eight results. A note: each lane is independent; no lane can see another lane's value during the add.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="270"/>
+<text class="sv-tb" x="20" y="24">scalar: 1 instruction, 1 result</text>
+<rect class="sv-b3" x="40" y="44" width="70" height="30" rx="4"/><text class="sv-tm" x="52" y="64">x[i]</text>
+<rect class="sv-b3" x="130" y="44" width="70" height="30" rx="4"/><text class="sv-tm" x="142" y="64">y[i]</text>
+<line class="sv-line" x1="75" y1="74" x2="110" y2="112"/><line class="sv-line" x1="165" y1="74" x2="130" y2="112"/>
+<rect class="sv-b1" x="70" y="114" width="100" height="34" rx="6"/><text class="sv-tm" x="82" y="136">vaddss</text>
+<line class="sv-line" x1="120" y1="148" x2="120" y2="178"/><polygon class="sv-head" points="115,178 120,186 125,178"/>
+<rect class="sv-b5" x="85" y="188" width="70" height="30" rx="4"/><text class="sv-tm" x="97" y="208">y[i]</text>
+<text class="sv-tb" x="300" y="24">SIMD (AVX, 256-bit ymm): 1 instruction, 8 results</text>
+<g>
+<rect class="sv-b3" x="300" y="44" width="440" height="30" rx="4"/>
+<text class="sv-tm" x="306" y="64">x0  x1  x2  x3  x4  x5  x6  x7</text>
+<rect class="sv-b3" x="300" y="84" width="440" height="30" rx="4"/>
+<text class="sv-tm" x="306" y="104">y0  y1  y2  y3  y4  y5  y6  y7</text>
+<line class="sv-dash" x1="355" y1="44" x2="355" y2="114"/><line class="sv-dash" x1="410" y1="44" x2="410" y2="114"/><line class="sv-dash" x1="465" y1="44" x2="465" y2="114"/><line class="sv-dash" x1="520" y1="44" x2="520" y2="114"/><line class="sv-dash" x1="575" y1="44" x2="575" y2="114"/><line class="sv-dash" x1="630" y1="44" x2="630" y2="114"/><line class="sv-dash" x1="685" y1="44" x2="685" y2="114"/>
+<rect class="sv-b1" x="300" y="126" width="440" height="34" rx="6"/><text class="sv-tm" x="470" y="148">vaddps ymm</text>
+<line class="sv-line" x1="520" y1="160" x2="520" y2="178"/><polygon class="sv-head" points="515,178 520,186 525,178"/>
+<rect class="sv-b5" x="300" y="188" width="440" height="30" rx="4"/>
+<text class="sv-tm" x="306" y="208">r0  r1  r2  r3  r4  r5  r6  r7</text>
+</g>
+<text class="sv-ts" x="300" y="242">dashed lines: lane boundaries; lane k only combines x_k and y_k (r_k = x_k + y_k)</text>
+<text class="sv-ts" x="20" y="242">xmm = 128 bits, ymm = 256, zmm = 512</text>
+</svg></div><figcaption><b>Figure 1.</b> Scalar versus SIMD addition on x86-64 (instruction families after D1, pending verification <sup class="src"><a href="#F2-53-src-D1">D1</a></sup>; the mnemonics <code>vaddss</code> and <code>vaddps</code> appear in this build's real disassembly, R3 <sup class="src"><a href="#F2-53-src-R3">R3</a></sup>).</figcaption></figure>
+
+<figure id="F2-53-fig2"><div class="svgbox">
+<svg viewBox="0 0 780 260" role="img" aria-labelledby="F2-53-f2t F2-53-f2d">
+<title id="F2-53-f2t">Figure 2: the order of additions in a sum, one chain versus eight lanes</title>
+<desc id="F2-53-f2d">Top: a chain s = ((((s + x0) + x1) + x2) + x3) ... drawn as a row of adders, each feeding the next: every addition waits for the previous one. Bottom: eight lane accumulators p0 to p7; p0 receives x0, x8, x16..., p1 receives x1, x9, x17..., and so on; the eight lanes add in parallel; at the end a small tree combines p0..p7 into s. A note: different order of rounding, so the result can differ in the last digits; this is why GCC keeps the top order unless allowed to reassociate.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="260"/>
+<text class="sv-tb" x="20" y="24">the loop as written: one dependent chain</text>
+<rect class="sv-b1" x="20" y="40" width="80" height="30" rx="5"/><text class="sv-tm" x="34" y="60">s+x0</text>
+<rect class="sv-b1" x="130" y="40" width="80" height="30" rx="5"/><text class="sv-tm" x="144" y="60">+x1</text>
+<rect class="sv-b1" x="240" y="40" width="80" height="30" rx="5"/><text class="sv-tm" x="254" y="60">+x2</text>
+<rect class="sv-b1" x="350" y="40" width="80" height="30" rx="5"/><text class="sv-tm" x="364" y="60">+x3</text>
+<text class="sv-t" x="450" y="60">…  each add waits for the previous result</text>
+<line class="sv-line" x1="100" y1="55" x2="123" y2="55"/><polygon class="sv-head" points="123,50 130,55 123,60"/>
+<line class="sv-line" x1="210" y1="55" x2="233" y2="55"/><polygon class="sv-head" points="233,50 240,55 233,60"/>
+<line class="sv-line" x1="320" y1="55" x2="343" y2="55"/><polygon class="sv-head" points="343,50 350,55 343,60"/>
+<text class="sv-tb" x="20" y="104">vectorised: eight partial sums (one per lane), combined at the end</text>
+<rect class="sv-b3" x="20" y="118" width="80" height="28" rx="5"/><text class="sv-tm" x="30" y="137">p0:x0,x8</text>
+<rect class="sv-b3" x="110" y="118" width="80" height="28" rx="5"/><text class="sv-tm" x="120" y="137">p1:x1,x9</text>
+<rect class="sv-b3" x="200" y="118" width="80" height="28" rx="5"/><text class="sv-tm" x="208" y="137">p2:x2,x10</text>
+<rect class="sv-b3" x="290" y="118" width="80" height="28" rx="5"/><text class="sv-tm" x="298" y="137">p3:x3,x11</text>
+<text class="sv-t" x="385" y="137">…</text>
+<rect class="sv-b3" x="410" y="118" width="80" height="28" rx="5"/><text class="sv-tm" x="418" y="137">p7:x7,x15</text>
+<line class="sv-line" x1="60" y1="146" x2="230" y2="190"/><line class="sv-line" x1="150" y1="146" x2="235" y2="190"/><line class="sv-line" x1="240" y1="146" x2="245" y2="190"/><line class="sv-line" x1="330" y1="146" x2="255" y2="190"/><line class="sv-line" x1="450" y1="146" x2="265" y2="190"/>
+<rect class="sv-b5" x="200" y="192" width="110" height="30" rx="5"/><text class="sv-tm" x="214" y="212">tree → s</text>
+<text class="sv-ts" x="340" y="200">the eight lanes add in parallel; the rounding happens</text>
+<text class="sv-ts" x="340" y="216">in a different order, so s can differ in its last digits</text>
+<text class="sv-ts" x="20" y="248">GCC keeps the top order unless reassociation is allowed (-ffast-math, -fassociative-math), or you write the lanes yourself (sum8)</text>
+</svg></div><figcaption><b>Figure 2.</b> A sum as a chain and as eight lanes. The difference in results is real: Listing 4 prints both <sup class="src"><a href="#F2-53-src-R4">R4</a></sup>; the compiler's choice is visible in R3 <sup class="src"><a href="#F2-53-src-R3">R3</a></sup>.</figcaption></figure>
+
+<h2 id="F2-53-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>A SIMD instruction is a wide ladle with eight spouts. It fills eight cups in one pour, but only if the cups stand in a row (data next to each other in memory), only with the same soup for every cup (the same operation in every lane), and only if the pot is full (the data has arrived from memory). Mapping: ladle pour = one SIMD instruction; cups in a row = consecutive array elements in a vector register; same soup = same operation in every lane; empty pot = waiting for memory.</p></div>
+<p>The translator (the compiler) often switches to the wide ladle by itself. Your job is to check that it did, to write loops it can switch, and to know when the ladle cannot help.</p>
+
+<h2 id="F2-53-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F2-53-l2-what">What the machine offers</h3>
+<p>x86-64 processors have vector registers and instructions that treat a register as several lanes <sup class="src"><a href="#F2-53-src-D1">D1</a></sup>. Every x86-64 processor supports the 128-bit SSE2 instructions, so a compiler targeting plain "x86-64" can always use 4-float vectors. Wider vectors (AVX2: 256 bits, 8 floats; AVX-512: 512 bits, 16 floats) and FMA exist only on some processors, so the compiler uses them only if you tell it that the target has them (<code>-march=…</code>) or if the code asks for them per function and checks at run time <sup class="src"><a href="#F2-53-src-D3">D3</a></sup>. On the build machine, GCC reported that <code>-march=native</code> meant <code>sapphirerapids</code> with AVX2, FMA and AVX-512F enabled and a preferred vector width of 256 bits <sup class="src"><a href="#F2-53-src-R1">R1</a></sup>. That is GCC's reading of the virtual machine's CPU flags; it does not tell you which physical processor ran the code.</p>
+<h3 id="F2-53-l2-auto">Let the compiler do it, then check</h3>
+<p>GCC tells you what its vectoriser did when you add <code>-fopt-info-vec-optimized</code> (loops it vectorised) or <code>-fopt-info-vec-missed</code> (loops it did not, with a reason) <sup class="src"><a href="#F2-53-src-D3">D3</a></sup>. Listing 1 holds five small loops; its reports for the baseline target and for <code>-march=native</code> are below it <sup class="src"><a href="#F2-53-src-R2">R2</a></sup>. Read them line by line, with the loop's line number:</p>
+<ul>
+<li>Line 6, <code>saxpy</code>: vectorised, and "loop versioned for vectorization because of possible aliasing". The compiler cannot prove <code>y</code> and <code>x</code> do not overlap, so it emits a run-time check and two versions of the loop: a vector one for non-overlapping arrays and a fallback.</li>
+<li>Line 14, <code>sumInt</code>: vectorised. Integer addition is associative, so partial sums in lanes give the identical result.</li>
+<li>Line 23, <code>sumFloat</code>: reported as vectorised. Hold that thought: Layer 3 shows what that means.</li>
+<li>Line 31, <code>prefix</code>: not vectorised. Each element needs the previous element's new value: a true dependency between iterations.</li>
+<li>Line 38, <code>clampAll</code>: not vectorised for the baseline target ("control flow in loop"), but vectorised with <code>-march=native</code>. The <code>if</code> can be turned into a lane-wise select or a masked store when the target has the instructions for it.</li>
+</ul>
+<h3 id="F2-53-l2-asm">The instructions are the proof</h3>
+<p>A report is a claim; the disassembly is the evidence. Two things identify real SIMD arithmetic: the register name (<code>xmm</code> 128-bit, <code>ymm</code> 256-bit, <code>zmm</code> 512-bit) and the instruction suffix (<code>ps</code> = packed single precision, all lanes; <code>ss</code> = scalar single, lane 0 only) <sup class="src"><a href="#F2-53-src-D1">D1</a></sup>. The saxpy disassembly shows both versions the report announced: a scalar loop with <code>vfmadd213ss</code> on <code>xmm</code> registers and a vector loop with <code>vmovups</code>, <code>vfmadd213ps</code> and <code>vmovups</code> on <code>ymm</code> registers <sup class="src"><a href="#F2-53-src-R3">R3</a></sup>. The compiler fused the multiply and the add into one FMA instruction in this build.</p>
+<h3 id="F2-53-l2-explicit">Or say it yourself: intrinsics</h3>
+<p>Listing 2's <code>saxpyAvx2</code> writes the vector loop by hand. <code>_mm256_set1_ps(a)</code> puts <code>a</code> in all eight lanes; <code>_mm256_loadu_ps</code> loads eight consecutive floats (the <code>u</code> means the address need not be 32-byte aligned); <code>_mm256_fmadd_ps(va, vx, vy)</code> computes <code>va × vx + vy</code> per lane; <code>_mm256_storeu_ps</code> stores eight floats <sup class="src"><a href="#F2-53-src-H1">H1</a></sup> <sup class="src"><a href="#F2-53-src-D2">D2</a></sup>. Two engineering details matter more than the intrinsics. First, the function carries <code>[[gnu::target("avx2,fma")]]</code>, so only this function is compiled for AVX2, and <code>main</code> calls it only after <code>__builtin_cpu_supports("avx2")</code> and <code>("fma")</code> return true: the program still runs on a processor without AVX2 <sup class="src"><a href="#F2-53-src-D3">D3</a></sup>. Second, a remainder loop handles the last <code>n % 8</code> elements; without it the code reads and writes past the end of the arrays.</p>
+<h3 id="F2-53-l2-when">When SIMD pays, and when it does not</h3>
+<p>Listing 2 is built three ways: <code>-O2 -fno-tree-vectorize</code> (no auto-vectorisation), <code>-O3</code> (baseline target, 16-byte vectors) and <code>-O3 -march=native</code>. For arrays of 4,096 floats, which stay in the level-1 cache between repetitions, the recorded runs show the vectorised saxpy several times faster than the scalar one, and the explicit AVX2 version among the fastest <sup class="src"><a href="#F2-53-src-R5">R5</a></sup>. For arrays of 16 M floats (64 MiB each), every version runs at a similar, much lower rate, because each element costs 12 bytes of memory traffic and memory cannot deliver them as fast as the vector unit can use them <sup class="src"><a href="#F2-53-src-R5">R5</a></sup>. SIMD multiplies the arithmetic rate; it does not make DRAM faster. <a href="#F2-56">F2-56</a> turns this observation into the roofline model.</p>
+
+<h2 id="F2-53-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F2-53-l3-sum">The reduction that was "vectorised" but not faster</h3>
+<p>The report says <code>sumFloat</code> was vectorised with 32-byte vectors. The instructions say what that means (forensic evidence below): the main loop loads eight consecutive floats per iteration but adds them with eight <b>scalar</b> <code>vaddss</code> instructions into one accumulator, in the original order <sup class="src"><a href="#F2-53-src-R3">R3</a></sup>. The compiler has kept the exact sequence of roundings of the source, as the C++ and IEEE 754 rules require without permission to reassociate <sup class="src"><a href="#F2-53-src-D4">D4</a></sup>; it has only unrolled the loop. The time per element is set by the latency of one floating-point addition, exactly as in <a href="#F1-55">F1-55</a>'s single dependent chain. Built with <code>-ffast-math</code>, the same function uses <code>vaddps</code> on a <code>ymm</code> accumulator: eight partial sums, combined at the end <sup class="src"><a href="#F2-53-src-R3">R3</a></sup>.</p>
+<p>The timings confirm it: <code>sumPlain</code> costs about the same per element in all three builds, while <code>sum8</code>, which writes eight partial sums explicitly in ordinary C++, becomes several times faster as soon as the compiler may vectorise <sup class="src"><a href="#F2-53-src-R5">R5</a></sup>. Writing the accumulators yourself is the honest way to vectorise a reduction: you choose a new, deterministic order in the source, and every build computes the same result. <code>-ffast-math</code> instead allows many other transformations (it also assumes no NaNs or infinities occur, for example), which can change results elsewhere in the file; use it only with tests that would catch that <sup class="src"><a href="#F2-53-src-D3">D3</a></sup>.</p>
+<h3 id="F2-53-l3-order">How different are the results?</h3>
+<p>Listing 4 sums the same million floats 1/1, 1/2, …, 1/1,000,000 in two orders. The in-order float sum and the eight-lane float sum differ already in the second decimal place, and the eight-lane sum is closer to the double-precision reference <sup class="src"><a href="#F2-53-src-R4">R4</a></sup>. Neither order is "the right one": both are approximations with different rounding histories. What matters for engineering is that (1) the result is reproducible for a given build, (2) tests compare against a reference with a tolerance justified by the precision (MA302; the SGEMM check in <a href="#F2-56">F2-56</a> does this), and (3) changing the order is a decision, not an accident.</p>
+<h3 id="F2-53-l3-alias">Aliasing, alignment and the remainder</h3>
+<p>The saxpy loop was versioned because <code>float* y</code> and <code>float const* x</code> may point into the same array; if they overlap with a small offset, eight-lane loads and stores would read values the scalar loop would already have changed. When you know they never overlap, you can say so to the compiler (GCC and Clang accept the non-standard <code>__restrict__</code> qualifier), which removes the check <sup class="src"><a href="#F2-53-src-D3">D3</a></sup>. Unaligned loads (<code>loadu</code>) are used throughout this chapter; whether aligned data is faster on a given processor is a question for that processor's optimisation manual and for your measurement, not for this chapter. Every vector loop needs a plan for the last <code>n % width</code> elements: a scalar remainder (as here), masked operations (AVX-512 has mask registers), or padding the arrays.</p>
+<h3 id="F2-53-l3-width">Wider is not automatically faster</h3>
+<p>GCC's <code>-march=native</code> on the build machine preferred 256-bit vectors even though AVX-512 was enabled <sup class="src"><a href="#F2-53-src-R1">R1</a></sup>. In build 3 of Listing 2 the plain loop compiled with <code>-march=native</code> and the hand-written AVX2 loop gave different in-cache rates, and the hand-written loop was not the faster one in that run <sup class="src"><a href="#F2-53-src-R5">R5</a></sup>; repeat it on your machine before concluding anything (F2-51: the spread of a shared virtual machine is large). Reasons why wider vectors may not help include memory bandwidth (above) and processor-specific effects of 512-bit instructions documented in vendor optimisation manuals; this build did not investigate them (see the unverified box).</p>
+<h3 id="F2-53-l3-simt">SIMD on the CPU, SIMT on the GPU</h3>
+<p>On a CPU, you (or the compiler) write vector instructions explicitly: one thread, wide registers. On an NVIDIA or AMD GPU, you write scalar code for one thread, and the hardware executes groups of threads (warps of 32 or wavefronts of 64) in lock-step, lane by lane (<a href="#F1-57">F1-57</a>, BR-03). The same constraints reappear in another form: neighbouring lanes should access neighbouring data (coalescing), and lanes that take different branches cost time (divergence).</p>
+
+<h2 id="F2-53-hardware">How the hardware actually does it</h2>
+<p>A SIMD instruction is decoded once and executed by a functional unit that is as wide as the vector, or by several units over consecutive cycles; the register file holds the architectural vector registers <sup class="src"><a href="#F2-53-src-D5">D5</a></sup>. The cost of the instruction in decode, issue and scheduling (<a href="#F1-29">F1-29</a>) is paid once for all lanes, which is where the speed-up comes from. Loads and stores of a vector move 16, 32 or 64 contiguous bytes, which is why contiguous data (one or two cache lines per load, <a href="#F2-52">F2-52</a>) suits SIMD and scattered data does not.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The number of vector execution units per core, their width, the latency and throughput of <code>vaddps</code>, <code>vfmadd…ps</code> and their 512-bit forms, and any clock-frequency change caused by wide vector instructions are processor-specific facts. None was taken from a document in this build: the CPU model string of the build machine does not name a product. Check the processor vendor's optimization reference manual and the instruction tables it points to for your exact processor, and measure peak FMA throughput yourself (Listing <code>peak.cc</code> of <a href="#F2-56">F2-56</a>). The instruction-family facts in Figure 1 (register widths, the <code>ps</code>/<code>ss</code> suffixes) are from the Intel SDM (D1), title only and pending verification, and are consistent with the real disassembly in R3.</p></div>
+
+<h2 id="F2-53-worked">Worked example</h2>
+<p>How many instructions does the vector loop of <code>saxpyAvx2</code> execute for n = 4,100, and how many elements does the remainder loop handle?</p>
+<ol>
+<li><b>Vector iterations:</b> the loop runs while <code>i + 8 ≤ n</code>, stepping by 8: the last full block starts at i = 4,088 (4,088 + 8 = 4,096 ≤ 4,100; the next, 4,096 + 8 = 4,104, is too far). Iterations = 4,096 / 8 = <b>512</b>.</li>
+<li><b>Remainder:</b> i = 4,096 after the loop, so the scalar loop handles elements 4,096 to 4,099: <b>4</b> elements (4,100 mod 8 = 4).</li>
+<li><b>SIMD arithmetic instructions in the vector loop:</b> one FMA per iteration = 512, plus 2 loads and 1 store per iteration = 1,536 memory instructions. A scalar loop would need 4,096 FMAs (or 4,096 multiplies and 4,096 adds) and 3 × 4,096 = 12,288 memory instructions for the same elements.</li>
+<li><b>FLOPs:</b> saxpy does 2 floating-point operations per element (one multiply, one add, fused in one FMA): 2 × 4,100 = <b>8,200 FLOP</b>. This is the count Listing 2 uses for its GFLOP/s column (2 / ns per element).</li>
+<li><b>Bytes:</b> per element 4 (read x) + 4 (read y) + 4 (write y) = 12 bytes, so 49,200 bytes; the arithmetic intensity is 8,200 / 49,200 ≈ 0.17 FLOP per byte. Keep this number for <a href="#F2-56">F2-56</a>: it predicts that saxpy on large arrays is limited by memory, which the 64 MiB measurement shows.</li>
+</ol>
+
+<h2 id="F2-53-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>kernels.cc</code>: five loops for the vectoriser.</p>
+<pre class="listing" data-src="F2-53/kernels.cc"></pre>
+<p>What <code>-march=native</code> means on the build machine (GCC's own answer):</p>
+<pre class="output" data-run="F2-53/native"></pre>
+<p>Vectoriser reports, baseline target (<code>-O3</code>) and native target (<code>-O3 -march=native</code>):</p>
+<pre class="output" data-run="F2-53/vec_base"></pre>
+<pre class="output" data-run="F2-53/vec_native"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>4–9</td><td><code>saxpy</code></td><td>y = a·x + y.</td><td>Independent iterations; vectorised after an alias check.</td></tr>
+<tr><td>11–18</td><td><code>sumInt</code></td><td>Integer sum.</td><td>Associative: lanes give the exact same answer.</td></tr>
+<tr><td>20–27</td><td><code>sumFloat</code></td><td>Float sum.</td><td>Not associative: order must be preserved (Layer 3).</td></tr>
+<tr><td>29–34</td><td><code>prefix</code></td><td><code>x[i] = x[i-1] + x[i]</code>.</td><td>A loop-carried dependency: cannot be done lane by lane.</td></tr>
+<tr><td>36–45</td><td><code>clampAll</code></td><td>Clamps each value into [lo, hi].</td><td>Branches inside: needs select or masked stores, available with AVX-512.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>simd.cc</code>: saxpy and a float sum, scalar, auto-vectorised and explicit.</p>
+<pre class="listing" data-src="F2-53/simd.cc"></pre>
+<p><b>Build commands</b> (actually used, by <code>run.sh</code>; each followed by <code>./simd</code>): (1) <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -O2 -fno-tree-vectorize simd.cc -o simd</code>; (2) the same with <code>-O3</code>; (3) the same with <code>-O3 -march=native</code>.</p>
+<pre class="output" data-run="F2-53/simd_1"></pre>
+<pre class="output" data-run="F2-53/simd_2"></pre>
+<pre class="output" data-run="F2-53/simd_3"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>4</td><td><code>#include &lt;immintrin.h&gt;</code></td><td>Declares the x86 intrinsics.</td><td>GCC's header includes <code>avxintrin.h</code>, <code>fmaintrin.h</code> and others (H1).</td></tr>
+<tr><td>11–16</td><td><code>saxpyPlain</code></td><td>The plain loop.</td><td>What the compiler makes of it depends on the build flags.</td></tr>
+<tr><td>19–20</td><td><code>gnu::target("avx2,fma")</code></td><td>Compiles this one function for AVX2 and FMA.</td><td>The rest of the program stays portable.</td></tr>
+<tr><td>22</td><td><code>_mm256_set1_ps</code></td><td><code>a</code> in all 8 lanes.</td><td>Same operand for every lane.</td></tr>
+<tr><td>24–28</td><td>vector loop</td><td>Load 8 x, load 8 y, FMA, store 8 y.</td><td>Eight elements per iteration, one rounding per element.</td></tr>
+<tr><td>29–31</td><td>remainder</td><td>Scalar loop for the last <code>n % 8</code>.</td><td>No out-of-bounds access for any n.</td></tr>
+<tr><td>34–41</td><td><code>sumPlain</code></td><td>Float sum in source order.</td><td>Limited by the addition chain in every build (Layer 3).</td></tr>
+<tr><td>45–59</td><td><code>sum8</code></td><td>Eight partial sums, then a fixed combination tree.</td><td>A new, deterministic order chosen in the source; vectorisable.</td></tr>
+<tr><td>61–70</td><td><code>nsPerElement</code></td><td>Repeats the kernel <code>inner</code> times per timed run.</td><td>Small arrays: each timed run long enough for the clock (F2-51).</td></tr>
+<tr><td>81</td><td><code>__builtin_cpu_supports</code></td><td>Asks the running CPU for AVX2 and FMA.</td><td>Never execute an instruction the CPU lacks.</td></tr>
+<tr><td>94–98</td><td>difference check</td><td>Compares the plain and AVX2 results element by element.</td><td>Checks the explicit version computes the same thing.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — the instructions of <code>saxpyPlain</code> at <code>-O3 -march=native</code> (SIMD arithmetic and moves only; the filter also keeps lines whose jump target names the function):</p>
+<pre class="output" data-run="F2-53/saxpy_asm"></pre>
+
+<p><b>Listing 4</b> — <code>order.cpp</code>: the same floats summed in two orders (sanitizer build).</p>
+<pre class="listing" data-src="F2-53/order.cpp"></pre>
+<pre class="output" data-run="F2-53/order"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–12</td><td>data</td><td>x[i] = 1/(i+1): large values first, then many small ones.</td><td>Rounding differences become visible.</td></tr>
+<tr><td>13–16</td><td><code>inOrder</code></td><td>One accumulator, source order.</td><td>What <code>sumPlain</code> computes.</td></tr>
+<tr><td>17–24</td><td><code>lane[i % 8]</code></td><td>Eight accumulators, then combined.</td><td>What an 8-lane SIMD sum computes.</td></tr>
+<tr><td>25–28</td><td><code>reference</code></td><td>The same floats added in double.</td><td>A more accurate yardstick.</td></tr>
+</tbody></table></div>
+
+<h2 id="F2-53-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A real ladle with eight spouts pours the same amount into each cup. A SIMD instruction computes a different result in each lane (each lane has its own operands); what is shared is the operation, not the value.</li>
+<li>Ji-woo can lift the ladle over any eight cups on the counter. A vector load takes consecutive elements from memory; collecting scattered elements (a "gather") is a separate, slower operation, and many loops cannot be vectorised because their data is not consecutive.</li>
+<li>In the story, wider ladles are always better if the cups are ready. In processors, wider vectors can come with other costs (fewer units, frequency or power effects documented per processor), and a memory-bound loop gains nothing.</li>
+<li>Soup does not care about the order it is poured in. Floating-point sums do: changing the order changes the rounding (Listing 4).</li>
+</ul>
+
+<h2 id="F2-53-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>"Vectorized" in the report, no speed-up.</td><td>In-order reduction (scalar adds), or the loop is memory-bound.</td><td>Disassembly: <code>ss</code> instead of <code>ps</code>; or compare in-cache and large-array timings.</td><td>Explicit partial sums; or accept the memory bound (F2-56).</td></tr>
+<tr><td>Program dies with "Illegal instruction" on another machine.</td><td>Built with <code>-march=native</code> or AVX intrinsics without a CPU check.</td><td>Compare the build flags with the target CPU's flags.</td><td>Per-function <code>target</code> attribute plus <code>__builtin_cpu_supports</code>, or build for the oldest target.</td></tr>
+<tr><td>Results differ in the last digits between builds.</td><td><code>-ffast-math</code> or a different reduction order.</td><td>Compare with a double reference; check flags.</td><td>Choose the order in the source; test with a tolerance.</td></tr>
+<tr><td>Wrong results only for some n.</td><td>Missing or wrong remainder loop.</td><td>Test n = 0, 1, 7, 8, 9, 4,100.</td><td>Remainder loop or masks.</td></tr>
+<tr><td>Loop not vectorised: "possible aliasing" or versioned.</td><td>Pointers that may overlap.</td><td><code>-fopt-info-vec-missed</code>.</td><td><code>__restrict__</code> (when true), or let the compiler version it.</td></tr>
+<tr><td>Not vectorised: "control flow in loop".</td><td>An <code>if</code> the target cannot express per lane.</td><td>The missed report.</td><td>Rewrite as a select (<code>std::min</code>/<code>std::max</code>), or target a wider ISA.</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F2-53-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F2-52">F2-52</a> made the data arrive fast (lines used fully, working sets small); HW202 (<a href="#F1-29">F1-29</a>, <a href="#F1-31">F1-31</a>) showed instruction-level parallelism and how to read compiler output. <b>What carries over:</b> the harness and protocol of <a href="#F2-51">F2-51</a>, reading disassembly, contiguous access. <b>What changes:</b> one instruction now does 8 or 16 operations, so the order of floating-point operations becomes a design decision <sup class="src"><a href="#F2-53-src-D4">D4</a></sup>, the target CPU's instruction set must be checked at run time, and memory bandwidth, not arithmetic, becomes the limit for simple loops on large arrays <sup class="src"><a href="#F2-53-src-R5">R5</a></sup>. <b>What comes next:</b> <a href="#F2-54">F2-54</a> looks at the other enemy of fast loops, branches, and why a <code>select</code> sometimes beats an <code>if</code>.</p></div>
+
+<h2 id="F2-53-check">Check yourself</h2>
+<ol>
+<li>What do the suffixes <code>ps</code> and <code>ss</code> in <code>vaddps</code> and <code>vaddss</code> tell you, and why does it matter when you read a vectoriser report?</li>
+<li>How many single-precision floats fit in an <code>xmm</code>, a <code>ymm</code> and a <code>zmm</code> register?</li>
+<li>Which loop can the compiler vectorise without changing its result? (a) <code>s += x[i]</code> with <code>float s</code>; (b) <code>s += x[i]</code> with <code>int s</code>; (c) <code>x[i] = x[i-1] * 2</code>; (d) <code>y[i] = x[idx[i]]</code> with no gather instructions available.</li>
+<li>Explain in your own words why saxpy on 64 MiB arrays gains much less from SIMD than on 16 KiB arrays.</li>
+<li>Apply to a new case: a function computes the maximum of a <code>std::vector&lt;float&gt;</code>. Is reassociation a problem for the maximum, as it is for the sum? Would you expect GCC to vectorise it without <code>-ffast-math</code>? Justify, then check with <code>-fopt-info-vec</code>.</li>
+<li>For n = 1,000, how many iterations does <code>saxpyAvx2</code>'s vector loop run and how many elements does the remainder handle?</li>
+<li>Predict, then run: add <code>__restrict__</code> to <code>y</code> and <code>x</code> in <code>kernels.cc</code>'s <code>saxpy</code> and rebuild with the reports. Which report line should disappear?</li>
+<li>A colleague builds the release with <code>-march=native</code> on their workstation and ships the binary to customers. What can go wrong, and what do you recommend?</li>
+</ol>
+
+<h2 id="F2-53-lab">Lab</h2>
+<p><b>Goal.</b> See auto-vectorisation succeed and fail in the compiler's own words and instructions, write and validate an intrinsics loop, and measure SIMD in cache and in DRAM.</p>
+<p><b>Hardware and software.</b> Linux on x86-64, g++ (the build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> and GNU objdump 2.42). The intrinsics code runs only if the CPU reports AVX2 and FMA; the program checks and skips otherwise. <b>Safety:</b> none beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F2-53</code>. Exit status 0 expected.</li>
+<li>Read <code>native.out</code>, <code>vec_base.out</code> and <code>vec_native.out</code>. For each of the five loops write: vectorised or not, vector width, reason.</li>
+<li>Read <code>saxpy_asm.out</code> and the two <code>sumfloat_*.out</code> files. Mark every instruction that does arithmetic on more than one lane.</li>
+<li>Copy the three <code>simd_*.out</code> files into a table (build × size × kernel). Compute the speed-up of each build over build 1.</li>
+<li>Add a test to <code>simd.cc</code> that runs <code>saxpyAvx2</code> for n = 0, 1, 7, 8, 9 and 4,100 and compares with <code>saxpyPlain</code>; build it with the sanitizers (<code>-fsanitize=address,undefined</code>) once to prove there is no out-of-bounds access.</li>
+<li>Do question 7 and record the new report.</li>
+</ol>
+<p><b>Expected observations</b> (measured on the build container; not universal): the five-loop report as described in Layer 2 <sup class="src"><a href="#F2-53-src-R2">R2</a></sup>; <code>vfmadd213ps</code> on <code>ymm</code> registers in saxpy; scalar <code>vaddss</code> in the strict <code>sumFloat</code> and <code>vaddps</code> with <code>-ffast-math</code> <sup class="src"><a href="#F2-53-src-R3">R3</a></sup>; in cache, vectorised saxpy several times faster than scalar; on 64 MiB arrays, all versions within a small factor of each other <sup class="src"><a href="#F2-53-src-R5">R5</a></sup>.</p>
+<p><b>Verification.</b> Your sanitizer run of step 5 is clean and all comparisons pass; your table has the run records (machine, toolchain, flags, date).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"this CPU reports avx2+fma: no" → the processor (or virtual machine) does not expose AVX2 → the explicit lines are skipped; use the <code>-O3</code> builds only.</li>
+<li>The reports are empty → you compiled with <code>-O0</code> or <code>-O1</code> → vectorisation runs at <code>-O2</code> (cheap model) and <code>-O3</code>.</li>
+<li>Timings vary wildly between builds → shared machine noise → repeat the runs and compare spreads (F2-51) before drawing conclusions.</li>
+</ul>
+<p><b>Extension.</b> Write <code>saxpyAvx512</code> with <code>_mm512_fmadd_ps</code> under <code>gnu::target("avx512f")</code> and a run-time check, and handle the remainder with an AVX-512 mask instead of a scalar loop (look up the masked load and store intrinsics in your GCC's <code>avx512fintrin.h</code> and in the Intel Intrinsics Guide).</p>
+
+<h2 id="F2-53-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A data team enabled <code>-O3 -march=native</code> to speed up a statistics job whose hot spot is a float sum. The compiler's report proudly says "loop vectorized using 32 byte vectors" for the sum, yet the job is not faster. A teammate then added <code>-ffast-math</code>, and the job became faster but its totals changed in the third significant digit, which broke a regression test. Two engineers argue: "the compiler lied" versus "fast-math is broken".</p>
+<p><b>Evidence pack.</b> The report (<code>vec_native.out</code> above, line 23), and the instructions of <code>sumFloat</code> (Listing 1) as built without and with <code>-ffast-math</code> (first 40 lines of each):</p>
+<pre class="output" data-run="F2-53/sumfloat_strict"></pre>
+<pre class="output" data-run="F2-53/sumfloat_fast"></pre>
+<p>Also: Listing 4's output (the same data summed in two orders).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>In the strict build, how many floats does one iteration of the main loop process, and how many accumulators are there? Quote the instructions.</li>
+<li>What changed in the fast-math build's main loop?</li>
+<li>Did the compiler lie? Explain what "vectorized" meant here.</li>
+<li>Why did the totals change, and which total is "correct"?</li>
+<li>Propose a fix that is fast, reproducible and does not use <code>-ffast-math</code>, and a test that accepts it.</li>
+</ol>
+<p><b>Method hints.</b> Look for the backward jump to find the main loop. Count the adds per iteration and look at their suffix and registers. Then think about the order of roundings (Figure 2).</p>
+
+<h2 id="F2-53-project">Mini-project</h2>
+<p>Vectorise a dot product <code>float dot(x, y, n)</code> three ways: (1) plain loop with eight explicit partial sums; (2) AVX2 + FMA intrinsics with a run-time check; (3) the plain one-accumulator loop under <code>-O3 -march=native -ffast-math</code>. Test all three against a double-precision reference with a tolerance you derive (n × 2<sup>−24</sup> × Σ|x<sub>i</sub> y<sub>i</sub>| is a safe start; MA302), for n from 0 to 10,000 including odd sizes; then measure in cache and on 64 MiB arrays. <b>Rubric:</b> correctness and tests 35 %, measurement with protocol and run records 25 %, a clear explanation of the order of operations and the tolerance 25 %, code quality 15 %.</p>
+
+<h2 id="F2-53-summary">Summary</h2>
+<ul>
+<li>SIMD instructions apply one operation to 4, 8 or 16 floats in xmm, ymm or zmm registers; <code>ps</code> means all lanes, <code>ss</code> one lane.</li>
+<li>Let the compiler vectorise, then check its report (<code>-fopt-info-vec</code>) and, above all, the instructions.</li>
+<li>Dependencies between iterations, branches the target cannot predicate, possible aliasing and non-contiguous data stop or complicate vectorisation.</li>
+<li>Float reductions keep their source order unless you allow reassociation; write explicit partial sums to choose a new deterministic order.</li>
+<li>Intrinsics give control; protect them with a per-function target attribute, a run-time CPU check and a remainder loop.</li>
+<li>SIMD multiplies arithmetic throughput, not memory bandwidth: large-array loops with little arithmetic stay memory-bound (next stop: the roofline, F2-56).</li>
+</ul>
+
+<h2 id="F2-53-sources">Sources</h2>
+<ol>
+<li id="F2-53-src-D1">D1 — Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual" (tier 1; version to be recorded): volume 1 chapters on SSE, AVX, FMA and AVX-512 programming (register widths, packed versus scalar instructions); volume 2 instruction pages for ADDPS/ADDSS and VFMADD…PS. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F2-53-src-D2">D2 — Intel, "Intel Intrinsics Guide" (tier 1; version to be recorded): entries for <code>_mm256_set1_ps</code>, <code>_mm256_loadu_ps</code>, <code>_mm256_storeu_ps</code>, <code>_mm256_fmadd_ps</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F2-53-src-D3">D3 — GNU project, "Using the GNU Compiler Collection" (GCC 13 manual; tier 2): sections on optimize options (<code>-ftree-vectorize</code>, <code>-ffast-math</code>, <code>-fassociative-math</code>), developer options (<code>-fopt-info</code>), x86 options (<code>-march</code>), function attributes (<code>target</code>), other built-ins (<code>__builtin_cpu_supports</code>) and restricted pointers. <i>Title only — not opened during this build; the options themselves were checked against <code>g++ --help=optimizers</code> and <code>g++ -Q --help=target</code> printed in this build (R1) (dossier gate G1 open).</i></li>
+<li id="F2-53-src-D4">D4 — IEEE, "IEEE Standard for Floating-Point Arithmetic" (IEEE 754; tier 1; edition to be recorded): rounding of each operation, fusedMultiplyAdd; and David Goldberg, "What Every Computer Scientist Should Know About Floating-Point Arithmetic" (ACM Computing Surveys, 1991; tier 5) on non-associativity. <i>Titles only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F2-53-src-D5">D5 — John Hennessy, David Patterson, "Computer Architecture: A Quantitative Approach" (tier 3; edition to be recorded): the chapter on data-level parallelism in vector, SIMD and GPU architectures. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F2-53-src-H1">H1 — GCC 13 x86 intrinsic headers as installed in the build container (Ubuntu package libgcc-13-dev 13.3.0-6ubuntu2~24.04.1), read in this build: <code>avxintrin.h</code> (<code>_mm256_set1_ps</code>, <code>_mm256_loadu_ps</code>, <code>_mm256_storeu_ps</code>, <code>_mm256_add_ps</code>, <code>_mm256_broadcast_ss</code>), <code>fmaintrin.h</code> (<code>_mm256_fmadd_ps</code>, defined as <code>__builtin_ia32_vfmaddps256</code>), <code>avx512fintrin.h</code> (the <code>_mm512_</code> forms used in F2-56). Tier 2 (the compiler project's own header).</li>
+<li id="F2-53-src-R1">R1 — <code>university/labs/F2-53/native.log</code>: <code>g++ -Q --help=target -march=native</code>, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0.</li>
+<li id="F2-53-src-R2">R2 — <code>vec_base.log</code>, <code>vec_native.log</code>: vectoriser reports for Listing 1, same toolchain, exit code 0.</li>
+<li id="F2-53-src-R3">R3 — <code>saxpy_asm.log</code>, <code>sumfloat_strict.log</code>, <code>sumfloat_fast.log</code>: disassembly with GNU objdump (GNU Binutils for Ubuntu) 2.42 of the builds named in each log, exit code 0.</li>
+<li id="F2-53-src-R4">R4 — <code>order.log</code>: Listing 4, sanitizer build, exit code 0.</li>
+<li id="F2-53-src-R5">R5 — <code>simd_1.log</code>, <code>simd_2.log</code>, <code>simd_3.log</code>: Listing 2 in three builds, exit code 0; measurements of a shared cloud virtual machine (AH-23).</li>
+</ol>
+
+<h2 id="F2-53-glossary">Glossary links</h2>
+<p><a href="#gl-simd-single-instruction-multiple-data">SIMD</a> · <a href="#gl-vector-register-and-lane">Vector register and lane</a> · <a href="#gl-auto-vectorisation">Auto-vectorisation</a> · <a href="#gl-intrinsic">Intrinsic</a> · <a href="#gl-fma-fused-multiply-add">FMA</a> · <a href="#gl-reduction">Reduction</a> · <a href="#gl-floating-point-reassociation">Floating-point reassociation</a> · <a href="#gl-vectorisation">Vectorisation</a> · <a href="#gl-lane">Lane (GPU)</a> · <a href="#gl-dependency-chain">Dependency chain</a></p>
+
+<h2 id="F2-53-next">Next chapter</h2>
+<p>Next: <a href="#F2-54">F2-54 Branches and prediction</a>. Previous: <a href="#F2-52">F2-52 Caches in practice</a>. Back to the course: <a href="#SP302">SP302</a>.</p>
+
+<h2 id="F2-53-answers">Answers to Check yourself</h2>
+<ol>
+<li><code>ps</code> = packed single: the operation applies to every lane; <code>ss</code> = scalar single: only the lowest lane. A report can say "vectorized" while the arithmetic is still <code>ss</code> (the strict <code>sumFloat</code>, R3), so only the instructions prove SIMD arithmetic.</li>
+<li>4, 8 and 16 (128, 256 and 512 bits divided by 32 bits).</li>
+<li>(b). Integer addition is associative, so lane-wise partial sums give exactly the same result. (a) changes the rounding order, so it needs permission to reassociate (or keeps scalar adds, as seen). (c) has a loop-carried dependency. (d) needs a gather; without one the data is not contiguous.</li>
+<li>Good answers say: per element saxpy does 2 FLOP but moves 12 bytes. In cache, data arrives fast enough that the arithmetic rate matters and SIMD multiplies it. With 64 MiB arrays every byte comes from DRAM, whose rate is far below what even scalar code can consume per FLOP, so all versions wait for memory (R5; F2-56 quantifies it).</li>
+<li>The maximum of floats does not depend on the order of comparisons (for data without NaNs, max is associative and exact: no rounding), so in principle it can be vectorised without changing the result; in practice GCC's treatment of NaNs and signed zeros under its default rules decides whether it does so without <code>-ffast-math</code>. The report is the answer; run it.</li>
+<li>Iterations while i + 8 ≤ 1,000: the last block starts at 992, so 125 iterations (1,000 / 8 = 125 exactly); remainder 0.</li>
+<li>The line "loop versioned for vectorization because of possible aliasing" should disappear (the vectorised-loop line stays); the run-time overlap check and the second loop version are gone.</li>
+<li>The binary may use instructions (for example AVX2 or AVX-512) that customers' processors lack, and crash with an illegal-instruction error. Build releases for an agreed baseline target, and put wide-vector code in functions with a <code>target</code> attribute selected at run time after <code>__builtin_cpu_supports</code> (or use the compiler's function multi-versioning).</li>
+</ol>
+<h3 id="F2-53-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Strict build: the main loop (from the instruction after <code>nopl</code> to the backward <code>jne</code>) has eight <code>vaddss</code> instructions with memory operands at offsets 0, 4, 8 … 28 from the pointer, one <code>add $0x20</code> (32 bytes = 8 floats per iteration), and all eight add into the same register <code>%xmm0</code>: one accumulator, eight floats per iteration, scalar arithmetic. Fast-math build: the main loop is a single <code>vaddps (%rax),%ymm1,%ymm1</code> plus pointer update: eight lanes added in parallel into <code>%ymm1</code>; after the loop, <code>vextractf128</code>, <code>vmovhlps</code>, <code>vshufps</code> and further <code>vaddps</code> combine the eight partial sums.</p>
+<p><b>Did the compiler lie?</b> No. GCC transformed the loop to process a block of 8 floats per iteration (loads covering 32 bytes) but, without permission to reassociate, kept the additions in source order: an "in-order reduction". The report's "vectorized" describes the loop transformation, not lane-parallel arithmetic. The speed is set by the latency chain of scalar additions, so the job did not get faster.</p>
+<p><b>Why the totals changed.</b> With <code>-ffast-math</code> the additions are done in eight lanes and combined in a tree: a different rounding order (Figure 2). Listing 4 shows the size of such a change on comparable data. Neither total is exactly "correct"; both approximate the exact sum; the double-precision reference is closer to it.</p>
+<p><b>Fix and test.</b> Write the reduction with explicit partial sums (as <code>sum8</code>), which GCC vectorises without <code>-ffast-math</code> (R5 shows <code>sum8</code> several times faster than <code>sumPlain</code> in builds 2 and 3); the result is identical in every build because the order is in the source. Update the regression test to compare against a double-precision reference with a justified tolerance, rather than bit-equality with an old order. <b>How the evidence was produced:</b> <code>kernels.cc</code> compiled by <code>run.sh</code> with <code>-O3 -march=native</code> and with <code>-O3 -march=native -ffast-math</code>, disassembled with objdump; unedited, first 40 lines of the function.</p>
