@@ -1,0 +1,346 @@
+<!--meta
+id: F3-37
+title: Interrupts, timers and an I2C driver
+course: OS305
+level: L3
+prereqs: F3-36; HW204 (F1-42, F1-43, F1-47, F1-48); SP201; SP203 (F2-35) recommended
+time: 10–14 hours including the lab
+hardware: none required (clang++ 18.1.3, ld.lld 18.1.3, QEMU 8.2.2 mps2-an385 with QEMU's emulated tmp105 temperature sensor on an emulated I2C bus, g++ 13.3.0 for the host-side driver test); a real board, a real sensor and a logic analyser are optional and untested in this build
+maps: Curriculum Track H (17.2, 17.3), milestone H2 "Interrupts, timers and a bus driver" (sensor reading against a known value met in emulation; the logic-analyser timing check untested on hardware)
+analogy: F3 — the school (interrupt = the doorbell; the interrupt controller = the school office that decides which bell is answered first)
+-->
+
+<h2 id="F3-37-hook">Story hook</h2>
+<p>Amira, the caretaker, used to walk to the front door every few minutes to see whether anyone was waiting. She spent most of her day walking, and still made visitors wait. Now the school has doorbells: one at the front door, one at the delivery gate, one at the kitchen. When a bell rings, a light comes on in the office panel showing which door. She finishes the sentence she is writing, notes where she was, answers that door, switches the light off, and returns to her sentence.</p>
+<p>A microcontroller works the same way. Peripherals ring bells called interrupts; an interrupt controller lights the right lamp and decides which bell is answered first; the core saves its place, runs a short handler, and goes back. In this chapter you replace the polling loops of <a href="#F3-36">F3-36</a> with interrupts for a timer and a serial port, write an I2C driver, and read a temperature sensor whose value you set yourself, so you know what the right answer is. You will also see two classic interrupt bugs happen in front of you: a bell that rings forever because nobody switches its light off, and a visitor left outside because the light was switched off at the wrong moment.</p>
+
+<h2 id="F3-37-able">What you will be able to do</h2>
+<ul>
+<li><b>Trace</b> an interrupt from the device through the NVIC and the core to the handler and back, naming each enable, pending and acknowledge step.</li>
+<li><b>Measure</b> which interrupt line a peripheral uses, instead of trusting a table, and connect IRQ numbers to exception numbers and vector-table slots.</li>
+<li><b>Write</b> interrupt handlers that acknowledge the device in the right order, and share data with <code>main</code> safely through a single-producer, single-consumer ring buffer.</li>
+<li><b>Implement</b> an I2C controller driver (START, address, read/write bit, ACK, repeated START, STOP) and test it twice: against a simulated bus with a logic-analyser check, and against an emulated sensor.</li>
+<li><b>Verify</b> a sensor reading against a known value, and explain what a real logic-analyser timing check would add.</li>
+<li><b>Diagnose</b> an interrupt storm and a lost interrupt from traces and console output.</li>
+</ul>
+
+<div class="co jargon" id="F3-37-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>NVIC (Nested Vectored Interrupt Controller)</dt><dd><b>Simple words:</b> the interrupt controller built into every Cortex-M core. <b>Analogy:</b> the office panel of lamps, one per doorbell, with a rule for which lamp wins. <b>Precise:</b> the Armv7-M interrupt controller, memory-mapped from 0xE000E100, with per-line enable (ISER/ICER), pending (ISPR/ICPR), active and priority registers; it presents the highest-priority pending enabled interrupt to the core, which fetches the handler address from the vector table ("vectored") and may pre-empt a lower-priority handler ("nested"). <sup class="src"><a href="#F3-37-src-D1">D1</a></sup> <sup class="src"><a href="#F3-37-src-D2">D2</a></sup></dd>
+<dt>Exception number and IRQ number</dt><dd><b>Simple words:</b> two ways of counting the same interrupt. <b>Analogy:</b> room 24 on the school plan is "the eighth classroom". <b>Precise:</b> on Armv7-M, exception numbers 1–15 are the core's own (reset, faults, SVCall, PendSV, SysTick) and external interrupt n has exception number 16 + n, which is also its vector-table word index; the active exception number is readable in the IPSR register. <sup class="src"><a href="#F3-37-src-D1">D1</a></sup> <sup class="src"><a href="#F3-37-src-R1">R1</a></sup></dd>
+<dt>Acknowledge (clear at the source)</dt><dd><b>Simple words:</b> telling the device "I have seen your interrupt" so it stops asking. <b>Analogy:</b> switching off the doorbell's lamp after opening the door. <b>Precise:</b> a write to the peripheral's interrupt-clear register (often write-1-to-clear) that de-asserts its interrupt request; on a level-sensitive line, a handler that returns without it is entered again at once. <sup class="src"><a href="#F3-37-src-D2">D2</a></sup> <sup class="src"><a href="#F3-37-src-R3">R3</a></sup></dd>
+<dt>Interrupt storm</dt><dd><b>Simple words:</b> an interrupt that fires again and again so fast that nothing else runs. <b>Analogy:</b> a doorbell stuck down: the caretaker never gets back to her desk. <b>Precise:</b> a condition in which an interrupt source stays asserted (for example, never acknowledged) so the core re-enters its handler continuously and lower-priority code, including <code>main</code>, is starved. <sup class="src"><a href="#F3-37-src-R3">R3</a></sup></dd>
+<dt>Lost interrupt</dt><dd><b>Simple words:</b> an event that happened but whose interrupt never ran its handler. <b>Analogy:</b> the caretaker switches off the lamp after closing the door, at the very moment a second visitor rings: that ring is erased. <b>Precise:</b> a race in which a new event's pending flag is cleared by software that meant to clear an older one, or arrives while the source is masked and is not latched; the data waits, but no interrupt announces it. <sup class="src"><a href="#F3-37-src-R4">R4</a></sup></dd>
+<dt>Ring buffer (SPSC)</dt><dd><b>Simple words:</b> a circular queue between one writer and one reader. <b>Analogy:</b> a pigeon-hole rack by the door: the caretaker puts letters in, the teacher takes them out, each moving only their own marker. <b>Precise:</b> a fixed array with a head index written only by the producer (here the interrupt handler) and a tail index written only by the consumer (here <code>main</code>); with single-word index stores and correct ordering of data and index, it needs no lock on a single core. <sup class="src"><a href="#F3-37-src-D3">D3</a></sup> <sup class="src"><a href="#F3-37-src-D4">D4</a></sup></dd>
+<dt>I2C transaction</dt><dd><b>Simple words:</b> one conversation on the two-wire bus, from "start" to "stop". <b>Analogy:</b> knocking, saying the room number and "I want to tell you" or "I want to ask you", then talking, with a nod after every sentence. <b>Precise:</b> a START condition (SDA falls while SCL is high), a byte of 7-bit address plus R/W bit, an ACK bit from the addressed target, data bytes each followed by ACK or NACK, optionally a repeated START to change direction, and a STOP (SDA rises while SCL is high). <sup class="src"><a href="#F3-37-src-D5">D5</a></sup> <sup class="src"><a href="#F3-37-src-R2">R2</a></sup></dd>
+<dt>Repeated START</dt><dd><b>Simple words:</b> starting a new conversation without letting go of the bus. <b>Analogy:</b> "and now a question" without leaving the room. <b>Precise:</b> a START condition sent instead of a STOP, so that the controller keeps the bus while switching from writing a register pointer to reading that register. <sup class="src"><a href="#F3-37-src-D5">D5</a></sup></dd>
+<dt>Bit-banging</dt><dd><b>Simple words:</b> making a bus protocol by switching pins in software. <b>Analogy:</b> tapping Morse code by hand instead of using a telegraph machine. <b>Precise:</b> driving and sampling the lines of a serial protocol directly from software through GPIO-like registers, so timing is set by the code; the alternative is a dedicated controller peripheral that generates the waveform. <sup class="src"><a href="#F3-37-src-D3">D3</a></sup></dd>
+</dl></div>
+<p>From <a href="#HW204">HW204</a>, used without repeating: <a href="#gl-interrupt">interrupt</a>, <a href="#gl-interrupt-handler-isr">interrupt handler</a>, <a href="#gl-pending-masked-in-service">pending, masked, in service</a>, <a href="#gl-edge-triggered-and-level-triggered">edge- and level-triggered</a>, <a href="#gl-i2c">I2C</a>, <a href="#gl-open-drain-wired-and">open-drain</a>, <a href="#gl-ack-and-nack">ACK and NACK</a>, <a href="#gl-write-1-to-clear-w1c">write-1-to-clear</a>.</p>
+
+<h2 id="F3-37-pictures">The idea in pictures</h2>
+<p>Figure 1 is the interrupt flow, with the timer of this lab as the device. Every step has a register you can read in a debugger.</p>
+<figure id="F3-37-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F3-37-f1t F3-37-f1d">
+<title id="F3-37-f1t">Figure 1: interrupt flow from the timer to its handler and back</title>
+<desc id="F3-37-f1d">Five boxes left to right. Device: timer 0 counts down to zero and sets its interrupt flag, if its interrupt-enable bit is set. Interrupt controller: the NVIC marks IRQ 8 pending; if the line is enabled in ISER and its priority beats the current one, it signals the core. CPU: the core finishes the current instruction, pushes eight registers onto the stack, reads vector-table word 24 and jumps there. Handler: Irq8_Handler writes 1 to the timer's INTCLEAR register (acknowledge) and increments ticks. Return: the handler returns with the special EXC_RETURN value in LR; the core pops the eight registers and resumes main. A dashed arrow from the handler's acknowledge back to the device shows the flag being cleared; without it the line stays asserted and the cycle repeats.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<rect class="sv-b1" x="10" y="40" width="130" height="120" rx="6"/><text class="sv-tb" x="20" y="62">device</text><text class="sv-ts" x="20" y="82">timer 0 reaches 0</text><text class="sv-ts" x="20" y="98">sets its flag</text><text class="sv-ts" x="20" y="114">(if CTRL bit 3 set)</text><text class="sv-ts" x="20" y="140">request line high</text>
+<rect class="sv-b2" x="160" y="40" width="140" height="120" rx="6"/><text class="sv-tb" x="170" y="62">NVIC</text><text class="sv-ts" x="170" y="82">IRQ 8 pending</text><text class="sv-ts" x="170" y="98">enabled in ISER?</text><text class="sv-ts" x="170" y="114">priority wins?</text><text class="sv-ts" x="170" y="140">→ signal the core</text>
+<rect class="sv-b3" x="320" y="40" width="140" height="120" rx="6"/><text class="sv-tb" x="330" y="62">CPU</text><text class="sv-ts" x="330" y="82">finish instruction</text><text class="sv-ts" x="330" y="98">push 8 registers</text><text class="sv-ts" x="330" y="114">read vector 24</text><text class="sv-ts" x="330" y="140">IPSR = 24</text>
+<rect class="sv-b4" x="480" y="40" width="140" height="120" rx="6"/><text class="sv-tb" x="490" y="62">handler</text><text class="sv-ts" x="490" y="82">Irq8_Handler</text><text class="sv-ts" x="490" y="98">INTCLEAR = 1</text><text class="sv-ts" x="490" y="114">(acknowledge)</text><text class="sv-ts" x="490" y="140">ticks + 1</text>
+<rect class="sv-b5" x="640" y="40" width="110" height="120" rx="6"/><text class="sv-tb" x="650" y="62">return</text><text class="sv-ts" x="650" y="82">LR = EXC_RETURN</text><text class="sv-ts" x="650" y="98">pop 8 registers</text><text class="sv-ts" x="650" y="114">resume main</text>
+<line class="sv-line" x1="140" y1="100" x2="152" y2="100"/><polygon class="sv-head" points="160,100 152,95 152,105"/>
+<line class="sv-line" x1="300" y1="100" x2="312" y2="100"/><polygon class="sv-head" points="320,100 312,95 312,105"/>
+<line class="sv-line" x1="460" y1="100" x2="472" y2="100"/><polygon class="sv-head" points="480,100 472,95 472,105"/>
+<line class="sv-line" x1="620" y1="100" x2="632" y2="100"/><polygon class="sv-head" points="640,100 632,95 632,105"/>
+<line class="sv-dash" x1="550" y1="160" x2="550" y2="200"/><line class="sv-dash" x1="550" y1="200" x2="75" y2="200"/><line class="sv-dash" x1="75" y1="200" x2="75" y2="168"/><polygon class="sv-head" points="75,160 70,168 80,168"/>
+<text class="sv-ts" x="180" y="220">acknowledge clears the flag; the request line drops</text>
+<text class="sv-ts" x="20" y="255">school: doorbell → office lamp → caretaker notes her place → answers the door, switches the lamp off → back to her sentence</text>
+<text class="sv-ts" x="20" y="285">forensic lab: remove "INTCLEAR = 1" and the dashed path never happens</text>
+</svg></div><figcaption><b>Figure 1.</b> The interrupt flow (guide 9.2 required diagram), for this lab's timer. IRQ 8 and vector 24 were measured in this build (R1); the eight stacked registers and EXC_RETURN are from the Armv7-M manual (unverified box). <sup class="src"><a href="#F3-37-src-D1">D1</a></sup> <sup class="src"><a href="#F3-37-src-R1">R1</a></sup></figcaption></figure>
+
+<p>Figure 2 is one I2C read of the sensor's temperature register, bit by bit, as the driver of Listing 1 produces it.</p>
+<figure id="F3-37-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 200" role="img" aria-labelledby="F3-37-f2t F3-37-f2d">
+<title id="F3-37-f2t">Figure 2: an I2C register read, field by field</title>
+<desc id="F3-37-f2d">A row of fields from left to right. S (START). Address 1001000 (0x48) then W = 0, then A (ACK from the sensor). Pointer byte 0x00, then A from the sensor. Sr (repeated START). Address 1001000 then R = 1, then A from the sensor. Data byte 0x17 from the sensor, then A from the controller. Data byte 0x80 from the sensor, then N (NACK from the controller: last byte). P (STOP). Fields driven by the controller are drawn in one shade, fields driven by the sensor in another. Below: 9 clocks per byte, 5 bytes, 45 clocks plus one for the repeated START and one for the STOP: 47 SCL rising edges, as counted by the analyser in Listing 4.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="200"/>
+<rect class="sv-b1" x="10" y="40" width="26" height="40"/><text class="sv-t" x="17" y="65">S</text>
+<rect class="sv-b1" x="36" y="40" width="96" height="40"/><text class="sv-ts" x="40" y="58">1001000</text><text class="sv-ts" x="40" y="74">0x48</text>
+<rect class="sv-b1" x="132" y="40" width="22" height="40"/><text class="sv-ts" x="137" y="65">W</text>
+<rect class="sv-b4" x="154" y="40" width="22" height="40"/><text class="sv-ts" x="159" y="65">A</text>
+<rect class="sv-b1" x="176" y="40" width="70" height="40"/><text class="sv-ts" x="182" y="65">0x00</text>
+<rect class="sv-b4" x="246" y="40" width="22" height="40"/><text class="sv-ts" x="251" y="65">A</text>
+<rect class="sv-b1" x="268" y="40" width="28" height="40"/><text class="sv-ts" x="272" y="65">Sr</text>
+<rect class="sv-b1" x="296" y="40" width="96" height="40"/><text class="sv-ts" x="300" y="58">1001000</text><text class="sv-ts" x="300" y="74">0x48</text>
+<rect class="sv-b1" x="392" y="40" width="22" height="40"/><text class="sv-ts" x="398" y="65">R</text>
+<rect class="sv-b4" x="414" y="40" width="22" height="40"/><text class="sv-ts" x="419" y="65">A</text>
+<rect class="sv-b4" x="436" y="40" width="80" height="40"/><text class="sv-ts" x="446" y="65">0x17</text>
+<rect class="sv-b1" x="516" y="40" width="22" height="40"/><text class="sv-ts" x="521" y="65">A</text>
+<rect class="sv-b4" x="538" y="40" width="80" height="40"/><text class="sv-ts" x="548" y="65">0x80</text>
+<rect class="sv-b1" x="618" y="40" width="22" height="40"/><text class="sv-ts" x="623" y="65">N</text>
+<rect class="sv-b1" x="640" y="40" width="26" height="40"/><text class="sv-t" x="647" y="65">P</text>
+<rect class="sv-b1" x="10" y="110" width="20" height="16"/><text class="sv-ts" x="36" y="123">driven by the controller (our driver)</text>
+<rect class="sv-b4" x="300" y="110" width="20" height="16"/><text class="sv-ts" x="326" y="123">driven by the sensor (target)</text>
+<text class="sv-ts" x="10" y="155">5 bytes × 9 clocks = 45, + repeated START + STOP = 47 SCL rising edges (Listing 4, R2)</text>
+<text class="sv-ts" x="10" y="180">0x17 0x80 = 0x1780 = 6,016 → 6,016 / 256 = 23.50 °C</text>
+</svg></div><figcaption><b>Figure 2.</b> Write the register pointer, repeated START, read two bytes, NACK the last one, STOP. The byte values are those the emulated sensor returned in this build (R2, R3); the field order is the I2C specification's, unverified in this build. <sup class="src"><a href="#F3-37-src-D5">D5</a></sup> <sup class="src"><a href="#F3-37-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F3-37-layer1">Layer 1 — the kid explanation</h2>
+<p>Imagine waiting for a friend by looking out of the window every minute. You get nothing else done. A doorbell is better: you do your homework, and when it rings, you go to the door. An interrupt is a doorbell for the processor. A timer can ring it a hundred times a second, a serial port can ring it when a letter arrives.</p>
+<p>When the bell rings, the processor marks its place, runs a small piece of code called a handler, and goes back to what it was doing. The handler must do one important thing: tell the device "I heard you". If it forgets, the bell keeps ringing and the processor never gets back to its homework.</p>
+<p>I2C is a way for one chip to talk to many small chips over only two wires. Each small chip has a number, its address. The main chip says the number, asks a question ("what is the temperature?"), and the small chip answers, one bit at a time, while the main chip keeps the beat on the clock wire.</p>
+
+<h2 id="F3-37-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F3-37-l2-lines">Which bell is which: measuring the IRQ map</h3>
+<p>Every interrupt-capable peripheral is wired to one input of the NVIC, its IRQ number. The chip's reference manual has a table of them. This course measures them instead, because a wrong line in a table produces an interrupt that never arrives. Listing 2 enables all 16 lines, defines all 16 handlers as one shared function that reads the active exception number from the IPSR register, and then makes each peripheral raise its interrupt in turn. <sup class="src"><a href="#F3-37-src-D1">D1</a></sup></p>
+<pre class="output" data-run="F3-37/irqmap"></pre>
+<p>Timer 0 is IRQ 8 and the UART's receive interrupt is IRQ 0 on this emulated board. External interrupt n is exception 16 + n, so the timer's handler address sits in vector-table word 24 and the UART's in word 16: <code>Irq8_Handler</code> and <code>Irq0_Handler</code> in <a href="#F3-36">F3-36</a>'s start-up file. <sup class="src"><a href="#F3-37-src-R1">R1</a></sup></p>
+
+<h3 id="F3-37-l2-three">Three switches must all be on</h3>
+<p>An interrupt reaches its handler only if three enables agree: the peripheral's own interrupt-enable bit (the timer's CTRL bit 3, the UART's CTRL bit 3 for receive), the NVIC line's enable bit (a write of <code>1 &lt;&lt; n</code> to ISER0 at 0xE000E100), and the core's global mask (interrupts are enabled after reset unless software sets PRIMASK). <sup class="src"><a href="#F3-37-src-D1">D1</a></sup> <sup class="src"><a href="#F3-37-src-D6">D6</a></sup> "My interrupt never fires" means one of these three is off, or the handler's name does not match its vector (<a href="#F1-77">F1-77</a>). Listing 3, lines 119–124, turns on all three for both devices.</p>
+
+<h3 id="F3-37-l2-handlers">Two handlers and a buffer</h3>
+<p>The timer handler (lines 97–101) acknowledges the timer by writing 1 to its INTCLEAR register, then increments <code>ticks</code>. <code>main</code> uses <code>ticks</code> to wait: "wait until <code>ticks</code> has grown by 10", sleeping with <code>wfi</code> between interrupts so the core does nothing while it waits.</p>
+<p>The UART receive handler (lines 103–112) clears the UART's receive-interrupt flag, then moves every waiting byte into a 16-byte ring buffer. <code>main</code> takes bytes out and executes them as commands: <code>s</code> scans the I2C bus, <code>r</code> reads the temperature, <code>c</code> sets 12-bit resolution, <code>w</code> waits ten ticks, <code>t</code> prints the tick count, <code>q</code> quits. The handler never prints and never talks to I2C: it does the minimum and leaves the slow work to <code>main</code>. <sup class="src"><a href="#F3-37-src-D3">D3</a></sup></p>
+<p>The ring buffer is safe without a lock because each index has one writer: only the handler writes <code>head_</code>, only <code>main</code> writes <code>tail_</code>, and each is a single aligned 32-bit store, which the core performs in one access. The data byte is written before the index that publishes it; the empty <code>asm volatile("" ::: "memory")</code> statements stop the compiler from moving the plain buffer accesses across the <code>volatile</code> index accesses, which <code>volatile</code> alone does not forbid. <sup class="src"><a href="#F3-37-src-D4">D4</a></sup> <sup class="src"><a href="#F3-37-src-D3">D3</a></sup> On a single core with no data cache, that is enough; with two cores you need atomics with acquire and release ordering (<a href="#F2-38">F2-38</a>).</p>
+
+<h3 id="F3-37-l2-i2c">The I2C driver</h3>
+<p>I2C has two lines, SCL (clock) and SDA (data), both open-drain with pull-up resistors: any device can pull a line low, nobody drives it high (<a href="#F1-47">F1-47</a>). Data may change only while SCL is low; a change of SDA while SCL is high is a control signal, START when SDA falls and STOP when it rises. <sup class="src"><a href="#F3-37-src-D5">D5</a></sup> Listing 1 implements a controller (master) as a C++ template over a <code>Pins</code> type that can release or pull each line and read SDA. The same driver code is used twice:</p>
+<ul>
+<li>in the firmware, with pins mapped to the emulated board's two-wire interface register (write to offset 0 releases a line, write to offset 4 pulls it low, bit 0 is SCL, bit 1 is SDA), behind which QEMU attached a model of a TMP105 temperature sensor at address 0x48; <sup class="src"><a href="#F3-37-src-D7">D7</a></sup></li>
+<li>on the host, in Listing 4, with pins that simulate the wired-AND lines, a simulated sensor written for this course, and a text logic analyser that records every change of the lines and checks the START/STOP rule.</li>
+</ul>
+<p>The driver's <code>transfer</code> function covers every pattern a register-based sensor needs: write some bytes; or write a register pointer, then a repeated START, then read bytes, ACKing all but the last. Figure 2 shows the read of the temperature register.</p>
+
+<h3 id="F3-37-l2-known">Checking against a known value</h3>
+<p>H2 asks that "sensor readings are correct against a known value". <sup class="src"><a href="#F3-37-src-C1">C1</a></sup> With a real sensor, a known value needs a reference thermometer or a controlled environment. In the emulator you can set it: the lab script starts QEMU paused, sets the sensor model's temperature to 23,750 millidegrees through QEMU's monitor, reads it back, and only then lets the firmware run:</p>
+<pre class="output" data-run="F3-37/monitor"></pre>
+<p>Then the console commands of <code>app.in</code> (<code>srcrwtq</code>) produce:</p>
+<pre class="output" data-run="F3-37/app"></pre>
+<p>The scan finds one device, 0x48. The first read gives 23.50 °C, not 23.75: after reset the sensor model converts with fewer bits, and 23.75 is rounded down to the nearest step of 0.5. After <code>c</code> writes 0x60 to the configuration register (12-bit resolution), the reading is 23.75 °C, the value set. That difference is itself a check: it proves the configuration write reached the device. <sup class="src"><a href="#F3-37-src-R3">R3</a></sup> The tick count printed by <code>t</code> changes from run to run, because the emulator's timer advances with the host's clock while the commands are arriving.</p>
+<p>QEMU can also log every I2C event its bus model sees. The first twelve events are the scan's probe of 0x48 (start, finish) and the first <code>r</code> command: start, send 0x00, a repeated start for reading, two received bytes, the controller's NACK, finish. <sup class="src"><a href="#F3-37-src-R3">R3</a></sup></p>
+<pre class="output" data-run="F3-37/i2c_trace"></pre>
+<p>The host test of the same driver, with its analyser, reads the same two bytes from the simulated sensor, counts 2 STARTs (one repeated), 1 STOP and 47 SCL rising edges, and draws the first 40 half-periods of the waveform: <sup class="src"><a href="#F3-37-src-R2">R2</a></sup></p>
+<pre class="output" data-run="F3-37/i2c_sim"></pre>
+
+<h2 id="F3-37-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-37-l3-entry">What the core does on entry and return</h3>
+<p>On Armv7-M, interrupt entry is done by hardware: the core pushes r0–r3, r12, LR, PC and xPSR onto the current stack (the registers a C function may change), loads the handler address from the vector table, writes a special EXC_RETURN value into LR, and starts the handler. <sup class="src"><a href="#F3-37-src-D1">D1</a></sup> <sup class="src"><a href="#F3-37-src-D2">D2</a></sup> That is why a handler can be a plain C++ function with no special attribute: the procedure-call standard's caller-saved registers are already saved, and the function's own prologue saves the rest if it uses them. When the handler returns by branching to EXC_RETURN, the core recognises the value, pops the eight registers and resumes. If another interrupt is pending at that moment, the core can go straight to its handler without popping and pushing again (tail-chaining). <sup class="src"><a href="#F3-37-src-D2">D2</a></sup> <a href="#F1-77">F1-77</a> showed these values inside a SysTick handler in a debugger.</p>
+
+<h3 id="F3-37-l3-prio">Priorities and nesting</h3>
+<p>Each interrupt has a priority; on Cortex-M a smaller number means more urgent. A pending interrupt pre-empts the running handler only if its priority is strictly more urgent; equal priorities wait their turn, which makes handlers of equal priority mutually exclusive. <sup class="src"><a href="#F3-37-src-D1">D1</a></sup> How many priority bits exist is chosen by the chip designer (the unused low bits read as zero), so code should use the CMSIS-style "shift into the top bits" convention rather than raw small numbers. <sup class="src"><a href="#F3-37-src-D2">D2</a></sup> <sup class="src"><a href="#F3-37-src-D6">D6</a></sup> This chapter leaves all priorities at their reset value 0. <a href="#F3-39">F3-39</a> sets SysTick and PendSV priorities on purpose; there the order matters.</p>
+
+<h3 id="F3-37-l3-order">Acknowledge order and the lost interrupt</h3>
+<p>The first version of this lab's UART handler drained the receive buffer and then cleared the receive-interrupt flag. It worked in most runs. In some, the console stopped answering in the middle of the command string. The evidence (<code>app_race.cc</code>, run many times in a row):</p>
+<pre class="output" data-run="F3-37/race"></pre>
+<p>The sequence is: the handler reads the last waiting byte; the loop finds the buffer empty; a new byte arrives and sets the flag; the handler then clears the flag, erasing the new byte's announcement. The byte sits in the UART, no interrupt will ever report it, and because this UART holds one byte, the next byte cannot arrive either. <code>main</code> sleeps in <code>wfi</code> forever. (The "0.00 C" in that output is not part of the bug: the race runs do not set the sensor's temperature.) <sup class="src"><a href="#F3-37-src-R4">R4</a></sup> The fix in Listing 3 is the order: clear the flag first, then drain. A byte arriving after the clear sets the flag again and the handler runs once more; a byte arriving before the clear is found by the drain loop. The rule generalises: <b>acknowledge, then service, then re-check</b>. During development of this lab, batches of 20 runs of the old handler stopped between 0 and 8 times. Races hide; run a suspected race many times and count. <sup class="src"><a href="#F3-37-src-R4">R4</a></sup></p>
+<div class="co warning"><span class="lbl">Watch out</span><p>On a real chip the write that clears a device's flag travels through the bus and may complete after the handler has already returned, so the core sees the old request still asserted and enters the handler a second time. The common remedy is a data synchronisation barrier (<code>dsb</code>) after the clearing write, or a read-back of the register. The emulator completes writes at once, so this effect cannot be seen here. Check your chip's documentation before relying on either remedy. <sup class="src"><a href="#F3-37-src-D2">D2</a></sup></p></div>
+
+<h3 id="F3-37-l3-shared">Sharing anything bigger than one word</h3>
+<p><code>ticks = ticks + 1</code> in a handler is safe because only the handler writes <code>ticks</code>. If <code>main</code> also wrote it, its load–add–store could be interrupted between the load and the store, and the handler's increment would be lost (the lost update of <a href="#F2-35">F2-35</a>, with an interrupt in place of a second thread). The tools are: disable interrupts around the critical section (<code>cpsid i</code> / <code>cpsie i</code>, or better, save and restore PRIMASK so the code nests); Armv7-M's exclusive load/store instructions, which <code>std::atomic</code> uses; or a design with one writer per variable, as in the ring buffer. <sup class="src"><a href="#F3-37-src-D1">D1</a></sup> <sup class="src"><a href="#F3-37-src-D4">D4</a></sup> Disabling interrupts adds latency to every interrupt in the system, so keep such sections to a few instructions.</p>
+
+<h3 id="F3-37-l3-i2cdetail">What the bit-banged driver leaves out</h3>
+<p>Listing 1 is correct for the emulated bus, which has no timing. A real bus adds four things the driver does not handle yet. Timing: each half-period must respect the minimum high and low times and the set-up and hold times for the chosen speed (the <code>wait()</code> hook is where they go). Clock stretching: a target may hold SCL low to make the controller wait, so after releasing SCL the controller must wait until SCL really is high. Arbitration: with two controllers, one may lose the bus. Bus recovery: a target reset in the middle of a byte can hold SDA low forever; the usual cure is clocking SCL until SDA is released, then sending STOP. <sup class="src"><a href="#F3-37-src-D5">D5</a></sup> Most microcontrollers also have an I2C controller peripheral that generates the waveform in hardware and raises interrupts per byte; a driver for it is a state machine driven by those interrupts. <sup class="src"><a href="#F3-37-src-D3">D3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From the author's memory, not checked in this build: the NVIC register addresses other than ISER0 and ICPR0 (both used and working in the runs), the Armv7-M stacking order, EXC_RETURN and tail-chaining (check: Armv7-M Architecture Reference Manual, exception model; Cortex-M3 Technical Reference Manual); priority-bit implementation and the CMSIS convention (check: CMSIS-Core documentation); the I2C bus rules, timing parameters, clock stretching and bus recovery (check: NXP UM10204, "I2C-bus specification and user manual"); the TMP105 register map, data format, power-on resolution and the meaning of configuration value 0x60 (check: the sensor's datasheet; here they agree with QEMU's model as observed: 23.50 before and 23.75 after the write); the CMSDK timer and UART register layouts (check: Arm CMSDK Technical Reference Manual); the late-acknowledge effect and the <code>dsb</code> remedy (check: Arm application notes on Cortex-M interrupt handling and the chip's documentation).</p></div>
+
+<h2 id="F3-37-hardware">How the hardware actually does it</h2>
+<p>A peripheral's interrupt output is a wire into the NVIC. The NVIC samples each line every core clock; on Cortex-M a line held high keeps its interrupt pending, and a short pulse also sets the pending bit, which stays set until the handler starts or software clears it. <sup class="src"><a href="#F3-37-src-D1">D1</a></sup> A priority comparator picks the most urgent pending enabled line and compares it with the current execution priority; if it wins, the core's exception logic stacks registers on the bus while fetching the vector in parallel, so the handler's first instruction runs a small, fixed number of cycles after the request, given in the core's technical reference manual. <sup class="src"><a href="#F3-37-src-D2">D2</a></sup> On the I2C side, each line is a wire with a pull-up resistor; a device "outputs 0" by turning on a transistor to ground and "outputs 1" by turning it off. Rise time therefore depends on the resistor and the wire's capacitance, which is why a bus that works on the bench fails with a long cable, and why the specification bounds the bus capacitance. <sup class="src"><a href="#F3-37-src-D5">D5</a></sup> In the emulator the NVIC is a C model, the I2C bus is a function call per byte, and the "wires" have no capacitance at all.</p>
+
+<h2 id="F3-37-worked">Worked example</h2>
+<p><b>Task.</b> Decode the bytes in the I2C trace into a temperature, predict the reading after the configuration write, and count the SCL clocks of the read.</p>
+<ol>
+<li><b>Address bytes.</b> The 7-bit address 0x48 = 1001000. Shifted left with R/W = 0: 1001 0000 = 0x90 (write); with R/W = 1: 0x91 (read). Datasheets sometimes print 0x90 as "the address"; Listing 1 takes the 7-bit form.</li>
+<li><b>Data.</b> The sensor sent 0x17 then 0x80, most significant byte first: 0x1780 = 1 × 4,096 + 7 × 256 + 8 × 16 + 0 = 6,016. In the format used by the driver (1/256 °C per bit), 6,016 / 256 = 23.5 °C. The driver computes 6,016 × 100 / 256 = 2,350 hundredths, printed as 23.50. <sup class="src"><a href="#F3-37-src-R3">R3</a></sup></li>
+<li><b>Prediction at 12-bit resolution.</b> The value set was 23.750 °C = 23.75 × 256 = 6,080 = 0x17C0. Expected bytes 0x17 0xC0; expected print 6,080 × 100 / 256 = 2,375 → 23.75. The run printed 23.75 °C. <sup class="src"><a href="#F3-37-src-R3">R3</a></sup></li>
+<li><b>Why 23.50 first.</b> At the coarser power-on resolution the low bits are zero: 0x1780 has its last set bit at 0x80 = 128/256 = 0.5 °C, so the step is 0.5 °C and 23.75 truncates to 23.50.</li>
+<li><b>Clocks.</b> Five bytes go over the bus (address+W, pointer, address+R, two data bytes), each 8 data clocks plus 1 ACK clock: 45. The driver's repeated START and STOP each raise SCL once more: 47. Listing 4's analyser counted 47. <sup class="src"><a href="#F3-37-src-R2">R2</a></sup></li>
+<li><b>Negative temperatures.</b> −0.5 °C = −128/256 → 16-bit two's complement 0xFF80. The cast to <code>int16_t</code> in line 78 keeps the sign; −128 × 100 / 256 = −50 → "-0.50". Check this case in the lab.</li>
+</ol>
+
+<h2 id="F3-37-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>i2c_bitbang.h</code>: an I2C controller over any pins.</p>
+<pre class="listing" data-src="F3-37/i2c_bitbang.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–12</td><td><code>template &lt;typename Pins&gt;</code></td><td>The driver needs only four pin operations.</td><td>One driver, two worlds: the emulated board and the host simulation.</td></tr>
+<tr><td>18–39</td><td><code>transfer</code></td><td>Write phase, repeated START, read phase, STOP; returns false on any NACK.</td><td>Covers "write register", "read register" and "probe".</td></tr>
+<tr><td>23, 32</td><td><code>addr7 &lt;&lt; 1</code>, <code>| 1u</code></td><td>Builds the address byte with the R/W bit.</td><td>The 7-bit versus 8-bit address mistake lives here.</td></tr>
+<tr><td>44–57</td><td><code>start</code>, <code>stop</code></td><td>SDA falls / rises while SCL is high.</td><td>The only legal SDA changes during SCL high.</td></tr>
+<tr><td>59–72</td><td><code>writeByte</code></td><td>Eight bits MSB first, then releases SDA and samples the ACK on the ninth clock.</td><td>ACK = the target pulls SDA low.</td></tr>
+<tr><td>74–89</td><td><code>readByte</code></td><td>Releases SDA, samples eight bits, then drives ACK or NACK.</td><td>NACK on the last byte tells the target to stop sending.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>irqmap.cc</code>: measuring the IRQ lines.</p>
+<pre class="listing" data-src="F3-37/irqmap.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–15</td><td><code>mrs %0, ipsr</code></td><td>Reads the active exception number.</td><td>The core tells you which vector it took.</td></tr>
+<tr><td>17–25</td><td><code>anyIrq</code></td><td>Counts the IRQ, clears the timer, disables the line in ICER0.</td><td>Disabling the line stops a storm from an unknown source.</td></tr>
+<tr><td>29–32</td><td><code>OS305_IRQ(n)</code></td><td>Defines all 16 handlers, overriding the weak defaults.</td><td>Any line that fires is caught.</td></tr>
+<tr><td>40–49</td><td>timer phase</td><td>Starts timer 0 with its interrupt enabled, waits, reports.</td><td>Result: IRQ 8.</td></tr>
+<tr><td>50–57</td><td>UART phase</td><td>Clears pending lines in ICPR0, re-enables, turns on RX interrupts, waits for a byte.</td><td>Without clearing pending state, the timer's last request would be reported again.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>app.cc</code>: the interrupt-driven application (built with <code>startup.cc</code>, <code>board.h</code> and <code>os305.ld</code> from F3-36).</p>
+<pre class="listing" data-src="F3-37/app.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–45</td><td><code>RingBuffer&lt;16&gt;</code></td><td>Lock-free queue: handler pushes, <code>main</code> pops; free-running indices, size a power of two.</td><td><code>h - tail_ == N</code> detects "full" correctly even when the indices wrap.</td></tr>
+<tr><td>25, 35, 37</td><td><code>asm volatile("" ::: "memory")</code></td><td>Compiler barriers between data and index accesses.</td><td><code>volatile</code> orders only volatile accesses; the buffer itself is not volatile.</td></tr>
+<tr><td>51–54</td><td>constants</td><td>Timer base, measured IRQ numbers, NVIC ISER0.</td><td>IRQ numbers come from Listing 2's run, not from memory.</td></tr>
+<tr><td>57–63</td><td><code>SbconPins</code></td><td>Maps the driver's pin operations to the board's two-wire register.</td><td>The only board-specific part of the I2C driver.</td></tr>
+<tr><td>71–81</td><td><code>readTemperature</code></td><td>Pointer 0, repeated START, two bytes, sign-extend, scale to hundredths.</td><td>Integer arithmetic only.</td></tr>
+<tr><td>97–101</td><td><code>Irq8_Handler</code></td><td>Acknowledge, then count.</td><td>The forensic lab removes line 99.</td></tr>
+<tr><td>103–112</td><td><code>Irq0_Handler</code></td><td>Clear the RX flag, then drain all waiting bytes.</td><td>The order that avoids the lost interrupt.</td></tr>
+<tr><td>119–124</td><td>enables</td><td>Timer reload and enable, UART RX interrupt, NVIC lines 8 and 0.</td><td>All three switches for both devices.</td></tr>
+<tr><td>126–163</td><td>command loop</td><td>Sleep when the buffer is empty; otherwise execute a command.</td><td>Slow work (printing, I2C) stays out of handlers.</td></tr>
+</tbody></table></div>
+<p><b>Build and run</b> (from <code>app.log</code>): the F3-36 compiler flags; <code>ld.lld -T os305.ld --gc-sections</code>; QEMU with <code>-device tmp105,address=0x48,id=sensor</code>, started paused with a monitor socket, the temperature set through the monitor, then <code>cont</code>; input from <code>app.in</code>. Size of the image:</p>
+<pre class="output" data-run="F3-37/size"></pre>
+
+<p><b>Listing 4</b> — <code>i2c_sim.cpp</code>: the host test with a simulated bus and analyser.</p>
+<pre class="listing" data-src="F3-37/i2c_sim.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–35</td><td><code>SimSensor::onEdge</code></td><td>Detects START and STOP, samples on SCL rising, prepares the next bit on SCL falling.</td><td>The target's view of the same rules the driver follows.</td></tr>
+<tr><td>74–96</td><td><code>byteDone</code>, <code>nextReadBit</code></td><td>Address match and ACK, pointer and config registers, bits of the read data.</td><td>A NACK for any other address.</td></tr>
+<tr><td>115–136</td><td><code>SimPins</code></td><td>A line is low if either side pulls it (wired-AND); records every change.</td><td>Open-drain behaviour in four lines of code.</td></tr>
+<tr><td>150–160</td><td><code>analyse</code></td><td>Counts STARTs, STOPs and SCL rising edges in the recorded events.</td><td>An illegal SDA change during SCL high would appear as an extra START or STOP.</td></tr>
+<tr><td>171–187</td><td>test 1</td><td>Reads the temperature and checks the counts.</td><td>Protocol order checked; timing not modelled.</td></tr>
+<tr><td>189–193</td><td>test 2</td><td>Sends the 8-bit form 0x90 truncated to 7 bits.</td><td>Shows the NACK you get for the classic address mistake.</td></tr>
+<tr><td>195–206</td><td>test 3, verdict</td><td>Writes config 0x60, reads it back; all checks must pass for exit code 0.</td><td>The program is its own test.</td></tr>
+</tbody></table></div>
+<p><b>Build</b> (from <code>i2c_sim.log</code>): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined i2c_sim.cpp -o i2c_sim</code>.</p>
+
+<h2 id="F3-37-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A caretaker hears a doorbell once; a level-sensitive interrupt "rings" as long as the device's flag is set.</b> Acknowledging is not courtesy, it is what stops the ringing (forensic lab). <sup class="src"><a href="#F3-37-src-D1">D1</a></sup></li>
+<li><b>The caretaker decides calmly which door to answer; the NVIC decides in hardware within cycles, by number only.</b> It knows nothing about which job matters more today; you encode that once in priority registers.</li>
+<li><b>A visitor who is not answered rings again; a lost interrupt does not.</b> If the flag is cleared at the wrong moment, the device waits silently forever (Layer 3). <sup class="src"><a href="#F3-37-src-R4">R4</a></sup></li>
+</ul>
+
+<h2 id="F3-37-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> the interrupt never fires. <b>Cause:</b> one of the three enables is off, the IRQ number is wrong, or the handler's name does not match the vector. <b>Check:</b> read the peripheral's flag (it should be set), the NVIC pending register (set?) and enable register, and the vector-table word 16 + n in the debugger.</li>
+<li><b>Symptom:</b> <code>main</code> stops making progress as soon as interrupts are on. <b>Cause:</b> a handler that does not acknowledge its device. <b>Check:</b> break in the handler; if it hits again immediately after returning, it is a storm (forensic lab).</li>
+<li><b>Symptom:</b> received characters go missing or the console freezes under load. <b>Cause:</b> clearing the flag after draining (lost interrupt), a buffer that is too small, or a handler that does slow work. <b>Check:</b> count dropped bytes, as Listing 3 does; run the test many times.</li>
+<li><b>Symptom:</b> every I2C transfer NACKs. <b>Cause:</b> the 8-bit address passed as 7-bit, missing pull-ups on a real board, wrong pins. <b>Check:</b> scan the bus; on hardware, measure that idle SCL and SDA are high.</li>
+<li><b>Symptom:</b> the temperature is plausible but steps in 0.5 °C. <b>Cause:</b> the sensor's power-on resolution. <b>Fix:</b> configure it, and verify by reading back the configuration register.</li>
+<li><b>Symptom:</b> a variable shared with a handler "never changes" in <code>main</code>. <b>Cause:</b> not <code>volatile</code> (or not atomic), so the compiler kept it in a register.</li>
+</ul>
+
+<div class="co transition" id="F3-37-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F3-36">F3-36</a> ran one loop that polled the UART and the timer; <a href="#HW204">HW204</a> (<a href="#F1-42">F1-42</a>, <a href="#F1-43">F1-43</a>) explained interrupts and interrupt controllers in general, and <a href="#F1-47">F1-47</a> the I2C bus. <b>What carries over:</b> memory-mapped registers through <code>volatile</code>, the vector table and weak handlers, the budget discipline, the emulator and debugger. The SP203 ideas of data races and lost updates apply exactly, with a handler in place of a second thread. <b>What changes:</b> code now runs at moments you do not choose; every variable shared with a handler needs a stated rule; handlers must acknowledge their devices in the right order; and a driver is tested against a known value, not by "it printed something". <b>What comes next:</b> <a href="#F3-38">F3-38</a> builds a USB device, whose stack is driven entirely by interrupts and requests from the host. After it, bridge <a href="#BR-05">BR-05</a> turns the "handler fills a buffer, <code>main</code> polls it" pattern into tasks and queues under an RTOS (<a href="#F3-39">F3-39</a>).</p></div>
+
+<h2 id="F3-37-check">Check yourself</h2>
+<ol>
+<li>Name the three enables that must be on for timer 0's interrupt to reach <code>Irq8_Handler</code>, with the register for each.</li>
+<li>External interrupt 8 is exception number ____ and vector-table word ____. Why are they equal?</li>
+<li>Explain in your own words why clearing the UART's receive flag after draining the buffer can freeze the console, and why clearing it first cannot.</li>
+<li>Why is the ring buffer correct without disabling interrupts, and what would break if <code>main</code> also wrote <code>head_</code>?</li>
+<li>Apply it to a new case: a pressure sensor at 7-bit address 0x76 has a 24-bit result register at pointer 0xF7, MSB first. Write the sequence of bytes on the bus for one read (address bytes in hex, R/W, who ACKs/NACKs), and count the SCL rising edges with Listing 1's driver.</li>
+<li>The sensor returns 0xFE 0x40. What does Listing 3 print? Show the arithmetic.</li>
+<li>Predict, then run: in <code>app.in</code>, put <code>r</code> before <code>c</code> twice (<code>srrcrq</code>). What do the three temperature lines show and why?</li>
+<li>Which of these does H2 ask for that this build did <em>not</em> verify, and what equipment would verify it?</li>
+</ol>
+
+<h2 id="F3-37-lab">Lab</h2>
+<p><b>Goal.</b> Milestone H2 in emulation: an interrupt-driven UART, a timer tick, and an I2C driver that reads a sensor correctly against a known value; plus a protocol check of the driver on a simulated bus.</p>
+<p><b>Hardware and software needed.</b> No hardware. clang 18.1.3, LLD 18.1.3, QEMU 8.2.2, g++ 13.3.0, Python 3 for the monitor helper <code>hmp.py</code> (versions in the logs). Lab folder <code>university/labs/F3-37</code>; run <code>university/labs/run_lab.sh university/labs/F3-37</code>. It builds and runs <code>i2c_sim.cpp</code> on the host, then <code>run.sh</code> runs the IRQ map, the application with the sensor set to 23.75 °C, the I2C trace, the forensic storm and the race experiment. Optional: a development board, an I2C temperature sensor breakout and a logic analyser (unverified box below).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>Emulator: no risk. Real board: power off before wiring; check that the sensor's supply voltage and the board's I/O voltage match before connecting (the values are in the two datasheets; do not guess); never connect the bus to a supply rail directly; pull-up resistors go to the I/O voltage. Use a board you are allowed to reflash and keep its recovery path, as in <a href="#F3-36">F3-36</a>. <a href="#safety">Safety rules</a>.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Confirm IRQ numbers, the two temperature readings and the 47 clocks. Set the sensor to another value by editing the <code>qom-set</code> line in <code>run.sh</code> (millidegrees) and predict both readings before running.</li>
+<li>Set a negative temperature (−5,250). Predict the bytes and the printed value; run; fix the driver if it disagrees.</li>
+<li>Add a command <code>h</code> that reads the configuration register (pointer 1) and prints it, so that the effect of <code>c</code> can be seen directly.</li>
+<li>Implement <code>wait()</code> in <code>SimPins</code> as a counter of half-periods, and make the analyser report the shortest high and low time of SCL in half-periods. This is the shape of the timing check a logic analyser does.</li>
+<li>Add a 16-byte <code>txBuffer</code> and a UART transmit interrupt so that <code>print</code> no longer waits for the UART. Measure (with a counter in <code>main</code>) how many loop iterations <code>main</code> now gets while a long line is sent.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: bytes 0xFA 0xC0 at 12-bit resolution, printed "-5.25 C"; before the configuration write, the coarser step gives "-5.50 C" (dropping low bits of a two's-complement number rounds towards minus infinity). A trial run during this build, with the commands <code>rcrq</code>, printed exactly these two lines; it is not one of the recorded lab outputs. Step 4: with one <code>wait()</code> per half period, every high and low time is 1. Step 5: your number; record it.</p>
+<p><b>Verification: H2.</b> The acceptance test, verbatim: "Sensor readings are correct against a known value; a logic analyser trace of the I2C bus matches the specification's timing for the chosen speed." <sup class="src"><a href="#F3-37-src-C1">C1</a></sup> First item: met in emulation (23.75 set, 23.75 read at 12-bit resolution, <code>app.out</code>). Second item: <b>not met</b>; the emulator's bus has no timing, and the host analyser checks protocol order only. The emulated sensor is QEMU's model, not a part with its own errors.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware. Decision for the owner: sensor, board and analyser.</b> To complete H2 you need: the board's I2C pins and its I2C controller chapter (or GPIO pins for bit-banging, with <code>wait()</code> implemented); a temperature sensor chosen by the owner and its datasheet (address, register map, resolution, conversion time); a reference for the known value (a calibrated thermometer, or a sensor with a documented test mode); a logic analyser with I2C decoding, and the timing table of UM10204 for the chosen speed. Record: the analyser capture of one read, the measured SCL high and low times against the table's minimums, and the sensor reading next to the reference value.</p></div>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"temperature = 0.00 C" → the monitor did not set the value before <code>cont</code> → check <code>monitor.out</code>.</li>
+<li><code>app.out</code> ends after the banner → handler storm or missing enable → read <code>forensic_nvic.out</code> as a model of what to look for.</li>
+<li>Scan finds nothing → the sensor is on another bus instance → use QEMU's <code>info qtree</code> to see where it is attached.</li>
+</ul>
+<p><b>Extension.</b> Drive the I2C transfer from the timer interrupt: one half-period per tick, as a state machine, so that <code>main</code> never waits for the bus.</p>
+
+<h2 id="F3-37-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Kofi ran a linter over the firmware. It flagged "write to a register that is never read" in the timer handler, and he removed the line in a clean-up commit. Everything compiled. On the next test, the device printed its banner and then ignored every command. Kofi suspects the UART, because "the timer has nothing to do with the console".</p>
+<p><b>Evidence pack.</b> The clean-up commit, as <code>diff app.cc app_v2.cc</code> shows it (first line: the file's comment header):</p>
+<pre class="output" data-run="F3-37/forensic_diff"></pre>
+<p>The console output, with the same input as the working version and a 2-second limit:</p>
+<pre class="output" data-run="F3-37/forensic_uart"></pre>
+<p>QEMU's NVIC trace for the same 2 seconds:</p>
+<pre class="output" data-run="F3-37/forensic_nvic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which exception numbers appear in the trace, which IRQs are they, and in what proportion?</li>
+<li>Hypotheses: (a) the UART interrupt is broken; (b) the I2C scan hangs; (c) the timer interrupt starves <code>main</code>. What does the evidence say about each?</li>
+<li>Root cause: explain the mechanism from the removed line to "ignores every command", using Figure 1.</li>
+<li>Why did the linter think the write did nothing? What kind of register defeats that rule?</li>
+<li>Fix and prevention: the one-line fix, a comment that would stop the next clean-up, and a test that would catch a storm automatically.</li>
+</ol>
+<p><b>Method hints.</b> Exception number − 16 = IRQ number. Compare the count of exception 16 with the number of characters in <code>app.in</code>.</p>
+
+<h2 id="F3-37-project">Mini-project</h2>
+<p><b>A sensor logger with a fixed rate.</b> Read the temperature every 20 timer ticks from <code>main</code> (not from the handler), keep the last 32 readings in a buffer, and print minimum, maximum and mean on command <code>m</code>. Measure the interrupt latency budget: record, in the timer handler, the timer's current value at entry (how far it has counted since reloading), and report the largest value seen while the console is busy. Change the sensor value through the monitor during the run and show that the statistics follow.</p>
+<p><b>Rubric.</b> Correct statistics against values you set (3). Handlers stay short; no I2C or printing in handlers (2). Latency measurement explained, with its limits in an emulator (2). Hardware steps marked untested with named documents (2). Clean build with the course flags (1).</p>
+
+<h2 id="F3-37-summary">Summary</h2>
+<ul>
+<li>An interrupt flows device → NVIC → core → handler → acknowledge → return; three enables (peripheral, NVIC line, core mask) must all be on.</li>
+<li>IRQ n is exception 16 + n and vector-table word 16 + n; on this emulated board, timer 0 is IRQ 8 and UART 0 receive is IRQ 0 (measured).</li>
+<li>Acknowledge at the source, and in the right order: clear, then service, then re-check. A missing acknowledge causes a storm; a late one can lose an interrupt.</li>
+<li>Share data between a handler and <code>main</code> with one writer per variable, <code>volatile</code> plus compiler barriers on a single core, or atomics and short critical sections.</li>
+<li>An I2C read: START, address+W, pointer, repeated START, address+R, data with ACKs, NACK, STOP; the driver was tested on a simulated bus (47 clocks) and against an emulated sensor set to 23.75 °C.</li>
+<li>H2: the known-value check passed in emulation; the logic-analyser timing check is untested on hardware.</li>
+</ul>
+
+<h2 id="F3-37-sources">Sources</h2>
+<ol>
+<li id="F3-37-src-D1">Arm, "Armv7-M Architecture Reference Manual" (tier 1). Used for: exception numbers, IPSR, NVIC registers, priorities, PRIMASK, stacking, EXC_RETURN, exclusive load/store. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-37-src-D2">Joseph Yiu, "The Definitive Guide to ARM Cortex-M3 and Cortex-M4 Processors" (tier 3), and Arm, "Cortex-M3 Technical Reference Manual" (tier 1). Used for: interrupt entry and tail-chaining, latency, priority-bit implementation, late acknowledge. <i>Titles only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-37-src-D3">Elecia White, "Making Embedded Systems" (tier 3). Used for: short handlers, ring buffers between handlers and the main loop, bit-banging versus controller peripherals. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-37-src-D4">ISO/IEC 14882:2020, Programming languages — C++ (tier 1): <code>volatile</code> semantics, data races, atomics. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-37-src-D5">NXP Semiconductors, UM10204, "I2C-bus specification and user manual" (tier 1). Used for: START/STOP, addressing, ACK/NACK, repeated START, clock stretching, arbitration, bus capacitance, bus recovery. <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F3-37-src-D6">Arm, CMSIS-Core documentation (tier 2): NVIC access functions and the priority convention. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F3-37-src-D7">Texas Instruments, TMP105 datasheet (tier 1), and Arm, "Cortex-M System Design Kit Technical Reference Manual" (APB timer and UART) (tier 1). <i>Titles only — not opened during this build; only QEMU's models of these parts were exercised (dossier gate G1 open).</i></li>
+<li id="F3-37-src-C1">Systems Curriculum (this project), sections 17.2–17.3, milestone H2 (acceptance test quoted verbatim). A map, not a source (AH-4).</li>
+<li id="F3-37-src-R1">R1 — lab run of Listing 2 (<code>irqmap.log</code>, exit code 0); clang 18.1.3, LLD 18.1.3, QEMU 8.2.2 <code>mps2-an385</code>. Untested on hardware.</li>
+<li id="F3-37-src-R2">R2 — lab run of Listing 4 (<code>i2c_sim.log</code>); g++ 13.3.0 with AddressSanitizer and UBSan; exit code 0. The sensor in it is our own model.</li>
+<li id="F3-37-src-R3">R3 — lab runs of Listing 3 with QEMU's tmp105 model set to 23,750 millidegrees: <code>monitor.log</code>, <code>app.log</code> (exit code 0), <code>i2c_trace.log</code>; and the forensic storm runs <code>forensic_uart.log</code> (exit code 124, expected) and <code>forensic_nvic.log</code>. Untested on hardware.</li>
+<li id="F3-37-src-R4">R4 — the race experiment with the first UART handler (<code>race.log</code>): repeated runs, number of stopped runs varies between executions. Untested on hardware.</li>
+</ol>
+
+<h2 id="F3-37-glossary">Glossary links</h2>
+<p><a href="#gl-nvic-nested-vectored-interrupt-controller">NVIC</a> · <a href="#gl-exception-number-and-irq-number">Exception number and IRQ number</a> · <a href="#gl-acknowledge-clear-at-the-source">Acknowledge (clear at the source)</a> · <a href="#gl-interrupt-storm">Interrupt storm</a> · <a href="#gl-lost-interrupt">Lost interrupt</a> · <a href="#gl-ring-buffer-spsc">Ring buffer (SPSC)</a> · <a href="#gl-i2c-transaction">I2C transaction</a> · <a href="#gl-repeated-start">Repeated START</a> · <a href="#gl-bit-banging">Bit-banging</a> · <a href="#gl-interrupt-latency">Interrupt latency</a> · <a href="#gl-open-drain-wired-and">Open-drain</a></p>
+
+<h2 id="F3-37-next">Next chapter</h2>
+<p>Next: <a href="#F3-38">F3-38 A USB device</a>. Previous: <a href="#F3-36">F3-36 Bare metal on a microcontroller</a>. Back to the course: <a href="#OS305">OS305</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackH">Track H</a>.</p>
+
+<h2 id="F3-37-answers">Answers to Check yourself</h2>
+<ol>
+<li>The timer's own interrupt enable (CTRL bit 3 at 0x40000000), the NVIC line enable (bit 8 of ISER0 at 0xE000E100), and the core's global mask (PRIMASK clear, the reset state).</li>
+<li>24 and 24. The first 16 vector-table words belong to the initial stack pointer and the core's 15 exceptions, so external interrupt n follows at 16 + n, and the exception number is defined to match the vector index.</li>
+<li>If a byte arrives after the drain loop found the UART empty but before the flag is cleared, clearing erases its only announcement; the byte waits unread, and this one-byte UART cannot receive the next byte, so no interrupt ever comes again. Clearing first means any byte arriving later sets the flag again (another interrupt), and any byte that arrived earlier is found by the drain loop.</li>
+<li>Each index has exactly one writer and is a single 32-bit store; the data is stored before the index that publishes it. If <code>main</code> also wrote <code>head_</code>, a handler could interrupt <code>main</code>'s read–modify–write of it and one of the two updates would be lost, overwriting or losing a byte.</li>
+<li>START; 0xEC (0x76 &lt;&lt; 1, W) ACK by sensor; 0xF7 ACK by sensor; repeated START; 0xED (R) ACK by sensor; byte 1 ACK by controller; byte 2 ACK by controller; byte 3 NACK by controller; STOP. Six bytes × 9 = 54 clocks + 1 (repeated START) + 1 (STOP) = 56. Common error: counting the 8-bit address 0xEC as the address.</li>
+<li>0xFE40 as <code>int16_t</code> = 0xFE40 − 0x10000 = 65,088 − 65,536 = −448. −448 × 100 / 256 = −175 (C++ integer division truncates towards zero), printed "-1.75 C". −448 / 256 = −1.75 exactly, so no rounding question arises here.</li>
+<li>Both reads before <code>c</code> show 23.50 (coarse resolution); after <code>c</code>, 23.75. Reading does not change the resolution; only the configuration write does.</li>
+<li>The logic-analyser trace matching the specification's timing for the chosen speed. It needs a real bus (board and sensor), a logic analyser with enough sample rate for the bus speed, and UM10204's timing table. (The known-value check was done in emulation; on hardware it also needs a reference thermometer.)</li>
+</ol>
+<h3 id="F3-37-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Exception 24 (IRQ 8, timer 0) is acknowledged several hundred thousand times in 2 s (the exact count differs per run); exception 16 (IRQ 0, UART receive) only a handful of times. The console printed only the banner and was stopped by the time limit (exit code 124).</p>
+<p><b>Root cause.</b> The removed line wrote 1 to the timer's INTCLEAR register: the acknowledge step of Figure 1. Without it, the timer's interrupt flag stays set, the request line stays asserted, and the moment <code>Irq8_Handler</code> returns, the NVIC finds IRQ 8 pending again and the core re-enters the handler (with tail-chaining, possibly without ever returning to <code>main</code>). <code>main</code> gets almost no instructions, so it never takes the bytes out of the ring buffer and never answers a command. The few UART interrupts still occur (both have priority 0; the core takes the lower-numbered exception when both are pending) and fill the ring buffer, but nothing consumes it.</p>
+<p><b>Hypotheses.</b> (a) UART broken: no, exception 16 is taken; the bytes arrive. (b) I2C scan hangs: the scan never starts; no "scan:" line, and the trace shows the processor busy in exception 24. (c) Starvation by the timer: yes.</p>
+<p><b>Why the linter was wrong.</b> It treats a write that is never read back as dead. Device registers have side effects; a write-1-to-clear register is the extreme case: its whole purpose is the side effect. Such writes must go through <code>volatile</code>, and tools that do not understand that must be told.</p>
+<p><b>Fix and prevention.</b> Restore <code>reg(kTimer0 + 0x0C) = 1;</code> at the start of the handler with the comment "acknowledge: W1C, side effect only, do not remove". Test: a CI run in the emulator with a time limit that fails if the console does not answer within the limit (exactly how this evidence was produced), or a counter of handler entries per tick that must equal 1.</p>
+<p><b>How the evidence was made.</b> <code>app_v2.cc</code> is <code>app.cc</code> with the one line removed; <code>run.sh</code> built it and ran QEMU for 2 s with NVIC tracing. Nothing was edited by hand.</p>
