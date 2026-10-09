@@ -1,0 +1,308 @@
+<!--meta
+id: F4-26
+title: ARM64 SMP through PSCI
+course: DR402
+level: L4
+prereqs: F4-25; OS303 B11 (SMP on x86-64: INIT-SIPI-SIPI, per-CPU data, spinlocks); DR301 F4-05 (virtio over PCI)
+time: 10–12 hours including the lab
+hardware: none (QEMU 8.2.2 aarch64 virt, 1–8 vCPUs, TCG). Real hardware: untested in this build.
+maps: Curriculum Track D, milestone D3 (SMP, PSCI, virtio-mmio); course forensic "Works on x86, corrupts on ARM"
+analogy: F4 — the school (and its visitors): the caretaker opens the other classrooms; notes that arrive out of order
+-->
+
+<h2 id="F4-26-hook">Story hook</h2>
+<p>Ana's block driver had run for months on the x86 test machines. Ported to an Arm server, it passed every test at first. Then, under load, one in a few thousand reads returned the wrong sector's data. Never the same sector twice, never on x86, never with the debugger attached. The driver code was arch-neutral C++: the same lines, compiled for another CPU. What changed was not the code but the rules of the machine underneath it: on x86-64 other observers see a CPU's stores in the order the program made them, and on AArch64 they are not required to.</p>
+<p>This chapter does three things on QEMU's virt machine. It asks the firmware to start every other CPU (PSCI <code>CPU_ON</code>), gives each CPU its own data through a system register, and proves a lock with all of them hammering on it at once. It moves the virtio block driver of DR301 from PCI to the virtio-mmio transport the Arm virt machine offers. And it meets Ana's bug: the course forensic, "Works on x86, corrupts on ARM", read from a log of reordered descriptor writes.</p>
+
+<h2 id="F4-26-able">What you will be able to do</h2>
+<ul>
+<li><b>Start</b> secondary CPUs through PSCI <code>CPU_ON</code> and explain what state each one starts in.</li>
+<li><b>Give</b> each CPU its own data through <code>TPIDR_EL1</code>, and its own stack, MMU setup and GIC redistributor.</li>
+<li><b>Write</b> a lock and a publish step whose ordering is correct on x86-64, AArch64 and RISC-V, and read the instructions each CPU gets.</li>
+<li><b>Choose</b> the right barrier for CPU-to-CPU ordering and for CPU-to-device ordering.</li>
+<li><b>Drive</b> a virtio-blk device through the virtio-mmio transport, and refuse the legacy transport clearly.</li>
+<li><b>Diagnose</b> a missing barrier from a trace of store visibility.</li>
+</ul>
+
+<div class="co jargon" id="F4-26-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>PSCI CPU_ON</dt><dd><b>Simple words:</b> a firmware call that switches on another CPU and starts it at an address you give. <b>Analogy:</b> asking the caretaker to unlock another classroom and send a teacher to a given page of the plan. <b>Precise:</b> PSCI function 0xC4000003 (64-bit), arguments target MPIDR affinity, entry point address, context ID; the target starts at the entry point with the MMU and caches off and the context ID in x0. <sup class="src"><a href="#F4-26-src-D1">D1</a></sup></dd>
+<dt>MPIDR (multiprocessor affinity register)</dt><dd><b>Simple words:</b> each CPU's own address, as a set of up to four numbers. <b>Analogy:</b> building, floor, corridor, room. <b>Precise:</b> <code>MPIDR_EL1</code>'s Aff3–Aff0 fields; the devicetree's <code>cpu</code> nodes give each CPU's affinity value in <code>reg</code>, and PSCI and the GIC use it to name a CPU. <sup class="src"><a href="#F4-26-src-D2">D2</a></sup></dd>
+<dt>Per-CPU data</dt><dd><b>Simple words:</b> variables of which every CPU has its own copy. <b>Analogy:</b> each teacher's own register book on their own desk. <b>Precise:</b> a structure per CPU, found through a register only that CPU sees: <code>TPIDR_EL1</code> on AArch64 (like GS base on x86-64, <code>tp</code> or <code>sscratch</code> on RISC-V). <sup class="src"><a href="#F4-26-src-D2">D2</a></sup></dd>
+<dt>Memory model (weak, TSO)</dt><dd><b>Simple words:</b> the rules for the order in which other observers see one CPU's memory accesses. <b>Analogy:</b> notes sent by internal post: on one school's post every note arrives in the order written; on another, notes to different rooms may overtake each other. <b>Precise:</b> x86-64 is total store order (stores are seen in program order; only a later load may pass an earlier store); AArch64 and RISC-V are weakly ordered (accesses to different addresses may be observed in any order unless a barrier, acquire or release orders them). <sup class="src"><a href="#F4-26-src-D2">D2</a></sup> <sup class="src"><a href="#F4-26-src-D5">D5</a></sup></dd>
+<dt>Barrier (DMB, DSB)</dt><dd><b>Simple words:</b> an instruction that stops the CPU from letting some accesses overtake others. <b>Analogy:</b> "post everything above before anything below". <b>Precise:</b> <code>dmb</code> orders memory accesses before it against those after it, for a given domain (ish: inner shareable, osh: outer shareable, sy: full system) and type (ld, st, or both); <code>dsb</code> additionally waits until they complete; acquire loads (<code>ldar</code>) and release stores (<code>stlr</code>) order one access. <sup class="src"><a href="#F4-26-src-D2">D2</a></sup></dd>
+<dt>virtio-mmio</dt><dd><b>Simple words:</b> virtio devices found at fixed memory addresses instead of on a PCI bus. <b>Analogy:</b> the same delivery truck, parked at a numbered bay instead of booked through the bus office. <b>Precise:</b> a virtio transport with a register block per device (magic "virt", version, device ID, features, queue addresses, notify, status); version 2 is the modern transport, version 1 the legacy one; the devicetree lists each slot with compatible <code>virtio,mmio</code>. <sup class="src"><a href="#F4-26-src-D3">D3</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-26-pictures">The idea in pictures</h2>
+<p>Figure 1 is the bring-up of one secondary CPU as this lab does it. Figure 2 is the course forensic in one picture: the same four stores, seen by the device in program order (x86-64) and in another order (AArch64 without a barrier).</p>
+<figure id="F4-26-fig1"><div class="svgbox">
+<svg viewBox="0 0 860 300" role="img" aria-labelledby="F4-26-f1t F4-26-f1d">
+<title id="F4-26-f1t">Figure 1: starting a secondary CPU through PSCI</title>
+<desc id="F4-26-f1d">Three columns: boot CPU 0, firmware (PSCI, implemented by QEMU on the virt machine), and CPU n. CPU 0 reads cpu nodes from the devicetree and calls CPU_ON with target MPIDR n, entry secondary_entry at 0x40082c18, context n, through HVC or SMC. Firmware returns 0 (success) to CPU 0 and powers on CPU n at secondary_entry with MMU and caches off and x0 = n. CPU n drops from EL2 to EL1 if needed, sets its stack (top minus n times 16 KiB), sets VBAR_EL1, enables the MMU with the shared tables, writes TPIDR_EL1 = address of g_cpu[n], finds its redistributor and enables its CPU interface, then increments the online counter with a release store. CPU 0 waits for the counter with acquire loads. A second CPU_ON to the same CPU returns -4.</desc>
+<rect class="sv-bg" x="0" y="0" width="860" height="300"/>
+<rect class="sv-b1" x="20" y="20" width="230" height="260" rx="4"/><text class="sv-tb" x="30" y="42">boot CPU 0</text>
+<text class="sv-ts" x="30" y="66">read cpu nodes (reg = MPIDR)</text><text class="sv-ts" x="30" y="90">CPU_ON(n, entry, ctx n)</text><text class="sv-ts" x="30" y="114">  via hvc or smc</text><text class="sv-ts" x="30" y="150">wait: online == ncpus</text><text class="sv-ts" x="30" y="170">  (acquire loads)</text><text class="sv-ts" x="30" y="206">CPU_ON again → -4</text><text class="sv-ts" x="30" y="230">AFFINITY_INFO → 0 (on)</text>
+<rect class="sv-b8" x="315" y="60" width="200" height="110" rx="4"/><text class="sv-tb" x="325" y="82">firmware (PSCI)</text><text class="sv-ts" x="325" y="106">QEMU on virt;</text><text class="sv-ts" x="325" y="126">TF-A on many boards</text><text class="sv-ts" x="325" y="150">returns 0 = success</text>
+<rect class="sv-b3" x="580" y="20" width="260" height="260" rx="4"/><text class="sv-tb" x="590" y="42">CPU n (MMU off, x0 = n)</text>
+<text class="sv-ts" x="590" y="66">1 EL2 → EL1 if entered at EL2</text><text class="sv-ts" x="590" y="88">2 sp = top − n × 16 KiB</text><text class="sv-ts" x="590" y="110">3 VBAR_EL1 = vector_table</text><text class="sv-ts" x="590" y="132">4 MMU on (shared tables)</text><text class="sv-ts" x="590" y="154">5 TPIDR_EL1 = &amp;g_cpu[n]</text><text class="sv-ts" x="590" y="176">6 own redistributor, ICC on</text><text class="sv-ts" x="590" y="198">7 online += 1 (release)</text><text class="sv-ts" x="590" y="220">8 lock test, then wfi</text>
+<line class="sv-line" x1="250" y1="90" x2="311" y2="100"/><polygon class="sv-head" points="301,94 303,106 315,101"/>
+<line class="sv-line" x1="515" y1="110" x2="576" y2="66"/><polygon class="sv-head" points="564,66 570,76 580,63"/>
+<line class="sv-dash" x1="315" y1="150" x2="254" y2="150"/>
+<line class="sv-dash" x1="580" y1="198" x2="254" y2="160"/>
+<text class="sv-ts" x="330" y="200">power on at secondary_entry</text><text class="sv-ts" x="330" y="216">0x40082c18 (R1)</text>
+</svg></div><figcaption><b>Figure 1.</b> Secondary-CPU bring-up through PSCI on QEMU virt (R2–R5). Function semantics after the PSCI specification (unverified box in Layer 3). <sup class="src"><a href="#F4-26-src-D1">D1</a></sup> <sup class="src"><a href="#F4-26-src-R4">R4</a></sup></figcaption></figure>
+
+<figure id="F4-26-fig2"><div class="svgbox">
+<svg viewBox="0 0 860 260" role="img" aria-labelledby="F4-26-f2t F4-26-f2d">
+<title id="F4-26-f2t">Figure 2: the same four stores, two visibility orders</title>
+<desc id="F4-26-f2d">The driver's program order is: desc.addr, desc.len, ring entry, ring index. Top row, total store order (x86-64): the device sees addr, len, ring, idx in that order, so when it sees the new index the descriptor is complete. Bottom row, weak order without a barrier (AArch64, RISC-V): the device may see len, ring, idx and only then addr; at the moment it sees idx it reads the old address, and the DMA goes to the wrong buffer. With a release barrier before the idx store, idx can become visible only after the three others, which restores the top row's guarantee.</desc>
+<rect class="sv-bg" x="0" y="0" width="860" height="260"/>
+<text class="sv-tb" x="20" y="30">program order: desc.addr, desc.len, ring[i], idx</text>
+<text class="sv-ts" x="20" y="64">TSO (x86-64)</text>
+<rect class="sv-b2" x="160" y="46" width="120" height="32" rx="3"/><text class="sv-ts" x="172" y="67">addr</text>
+<rect class="sv-b2" x="290" y="46" width="120" height="32" rx="3"/><text class="sv-ts" x="302" y="67">len</text>
+<rect class="sv-b2" x="420" y="46" width="120" height="32" rx="3"/><text class="sv-ts" x="432" y="67">ring</text>
+<rect class="sv-b4" x="550" y="46" width="120" height="32" rx="3"/><text class="sv-ts" x="562" y="67">idx</text>
+<text class="sv-ts" x="684" y="67">device: complete</text>
+<text class="sv-ts" x="20" y="134">weak, no barrier</text>
+<rect class="sv-b2" x="160" y="116" width="120" height="32" rx="3"/><text class="sv-ts" x="172" y="137">len</text>
+<rect class="sv-b2" x="290" y="116" width="120" height="32" rx="3"/><text class="sv-ts" x="302" y="137">ring</text>
+<rect class="sv-b4" x="420" y="116" width="120" height="32" rx="3"/><text class="sv-ts" x="432" y="137">idx</text>
+<rect class="sv-b6" x="550" y="116" width="120" height="32" rx="3"/><text class="sv-ts" x="562" y="137">addr (late)</text>
+<text class="sv-ts" x="684" y="137">device: old addr!</text>
+<line class="sv-line2" x1="480" y1="150" x2="480" y2="176"/>
+<text class="sv-ts" x="400" y="194">device reads the ring here: idx new, addr stale</text>
+<text class="sv-ts" x="20" y="228">weak + release before idx: idx may move only after addr, len and ring are visible (R6 and R7: 645 bad of 1000 → 0)</text>
+</svg></div><figcaption><b>Figure 2.</b> Store visibility seen by a device that polls the ring index. The bottom row is one of the orders the lab's model produced (R6, request 1). Memory-model statements after the architecture manuals (unverified box in Layer 3). <sup class="src"><a href="#F4-26-src-D2">D2</a></sup> <sup class="src"><a href="#F4-26-src-R6">R6</a></sup></figcaption></figure>
+
+<h2 id="F4-26-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>In the morning only one classroom is open. The principal (OS) asks the caretaker (firmware) to unlock the other classrooms one by one and send a teacher in with a page number of the day's plan. Each teacher gets their own register book, so nobody writes in somebody else's. Notes travel by the school's internal post. In the old school every note from one teacher arrived in the order it was written. In the new school, notes to different rooms may overtake each other, unless the teacher writes "deliver everything before this first" on the envelope.</p></div>
+<p>Mapping: unlocking a classroom = PSCI <code>CPU_ON</code>; the page number = the entry address; the teacher's register book = per-CPU data; notes overtaking each other = weak memory ordering; "deliver everything before this first" = a barrier or release store.</p>
+
+<h2 id="F4-26-layer2">Layer 2 — the student explanation</h2>
+<p>On x86-64 (B11) the boot CPU woke the others by sending INIT and startup interrupts through its local APIC, and each started in 16-bit real mode. On AArch64 machines that follow Arm's conventions, the kernel asks firmware instead: one PSCI call, <code>CPU_ON</code>, with the target CPU's affinity, an entry address and a value for x0. The target starts at that address at the boot CPU's exception level, with the MMU and caches off. QEMU's virt machine implements PSCI itself; on real boards it is usually Arm Trusted Firmware. The devicetree's <code>cpu</code> nodes list each CPU's affinity in <code>reg</code>, and the <code>/psci</code> node says whether to call with HVC or SMC (F4-23's checklist rows 2 and 3). <sup class="src"><a href="#F4-26-src-D1">D1</a></sup></p>
+<p>Each new CPU needs its own stack, its own vector-table setting, the MMU switched on with the same tables, a way to find its own data, and its own GIC redistributor. For its own data the kernel stores a pointer in <code>TPIDR_EL1</code>, a register each CPU has privately: <code>this_cpu()</code> reads it. Then the CPU tells the boot CPU it is online.</p>
+<p>With several CPUs running, memory ordering matters. The ticket lock from B11 is written with <code>std::atomic</code> and explicit memory orders, so the same source is correct everywhere: the compiler emits each CPU's instructions. But code that shares data through plain variables and relied on x86's order without saying so becomes wrong on Arm. The lab shows both: a lock that keeps an exact count with eight CPUs, and a deliberately racy counter that loses updates.</p>
+<p>The disk moves too. On the PC, DR301's virtio-blk driver found its device on PCI. The Arm virt machine also offers 32 virtio-mmio slots at fixed addresses; this chapter adds a virtio-mmio transport and reads a known sector through it. The ordering of the driver's writes to the ring, and to the device's doorbell, is exactly where Ana's bug lives.</p>
+
+<h2 id="F4-26-layer3">Layer 3 — the engineer's depth</h2>
+<h3>PSCI CPU_ON in detail</h3>
+<p>The boot CPU calls <code>CPU_ON</code> (function ID 0xC4000003, the 64-bit variant) with x1 = the target's MPIDR affinity value from the devicetree, x2 = the physical address of <code>secondary_entry</code>, x3 = a context ID, here the CPU's index. Return 0 means success. The lab also checks two errors: <code>CPU_ON</code> for a CPU that is already on returns −4 (ALREADY_ON), and <code>AFFINITY_INFO</code> for each CPU returns 0 (ON) once all are up (R4). The order in which CPUs report online differs from the order they were started (R4: 1, 3, 2; R5: 1, 2, 3, 7, 6, 5, 4; the order changes from run to run): each is a separate thread on the host and runs when the host schedules it. <sup class="src"><a href="#F4-26-src-D1">D1</a></sup> <sup class="src"><a href="#F4-26-src-R4">R4</a></sup> <sup class="src"><a href="#F4-26-src-R5">R5</a></sup></p>
+<p>The entry address must be a physical address, because the new CPU's MMU is off; with this lab's identity map it equals the virtual address. A kernel that runs in the upper half (F4-24's mini-project) must pass the physical address of a small identity-mapped entry stub. The context ID is the only data that reaches the new CPU in a register; everything else must be in memory that the new CPU reads with its MMU and caches off. <sup class="src"><a href="#F4-26-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The PSCI function IDs (0xC4000003 CPU_ON, 0xC4000004 AFFINITY_INFO, 0x84000008 SYSTEM_OFF), the error code −4 meaning ALREADY_ON, AFFINITY_INFO's 0 meaning ON, and the entry state of a CPU started by CPU_ON (MMU and caches off, same EL as the caller, context ID in x0) are recalled from the Arm Power State Coordination Interface specification (D1), not opened in this build. The runs show QEMU's PSCI behaving this way at EL1 (hvc) and EL2 (smc, R3); firmware on real boards was not tested.</p></div>
+
+<h3>Caches off at entry: what the new CPU can see</h3>
+<p>A CPU that starts with its data cache off reads memory directly. Data the boot CPU wrote may still sit in the boot CPU's cache. On systems where caches are coherent for non-cacheable accesses this is harmless; on others the new CPU may read stale memory. This lab's secondary path reads only values fixed at link time (<code>__stack_top</code>, <code>vector_table</code>) before it enables its MMU and caches, and reads shared data only afterwards: that is why <code>secondary_main</code> calls <code>mmu::enable_this_cpu()</code> first (line 103), with the comment "before touching shared data". F4-27's spin-table boot has to do the opposite as well: the boot CPU cleans the release address to memory (<code>dc civac</code>) because the waiting CPU reads it with its cache off. <sup class="src"><a href="#F4-26-src-D2">D2</a></sup></p>
+
+<h3>Per-CPU data and stacks</h3>
+<p><code>smp.S</code> gives CPU n the stack <code>__stack_top − n × 16 KiB</code>; the linker script reserves room for eight. <code>cpu_setup</code> writes <code>TPIDR_EL1</code> = <code>&amp;g_cpu[n]</code>; <code>this_cpu()</code> reads it back. R2–R5 print "TPIDR_EL1 -> g_cpu[n]" from the value read back, and the SGI test increments a counter through <code>this_cpu()</code> in the interrupt handler, which is only correct if each CPU finds its own. <code>TPIDR_EL1</code> is not accessible at EL0, unlike <code>TPIDR_EL0</code> which user programs use for thread-local storage; a kernel that saves the user's <code>TPIDR_EL0</code> on context switch keeps the two apart. <sup class="src"><a href="#F4-26-src-D2">D2</a></sup> <sup class="src"><a href="#F4-26-src-R4">R4</a></sup></p>
+
+<h3>The memory model: what changes from x86-64</h3>
+<p>On x86-64, other CPUs see a CPU's stores in program order, and loads are not reordered with older loads; the only visible reordering is a later load passing an earlier store to a different address (store buffering). That is total store order (TSO). On AArch64 and RISC-V (RVWMO), loads and stores to different addresses may be observed out of order in all four combinations, unless a dependency, a barrier or an acquire/release access orders them. Accesses to the same address are always seen in order by every observer (coherence). <sup class="src"><a href="#F4-26-src-D2">D2</a></sup> <sup class="src"><a href="#F4-26-src-D5">D5</a></sup></p>
+<p>C++'s memory orders are the portable way to say what you need. R8 shows the same three publish functions compiled for three CPUs. With plain stores (<code>publish_plain</code>) all three compilers emit plain stores. With a release fence, x86-64 gets no instruction at all (TSO already provides the order; the fence only stops the compiler from moving stores), AArch64 gets <code>dmb ish</code> and RISC-V gets <code>fence rw,w</code>. With a release store of the index, x86-64 again gets a plain <code>mov</code>, AArch64 <code>stlrh</code> and RISC-V <code>fence rw,w</code> before <code>sh</code>. The x86 binary is identical for plain and release: that is exactly why a missing release goes unnoticed on x86 and shows up on Arm. <sup class="src"><a href="#F4-26-src-R8">R8</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The descriptions of TSO (x86-64), the AArch64 memory model and RVWMO, the barrier domain and type options (ish, osh, sy; ld, st), and the claim that ordering for a device requires the outer-shareable or system domain while CPU-to-CPU ordering needs inner-shareable are recalled from the Arm Architecture Reference Manual (D2), the Intel SDM's memory-ordering chapter (D4), the RISC-V unprivileged specification's RVWMO chapter (D5) and the Linux kernel's memory-barriers document (D6), none opened in this build. The instruction sequences in R8 are measured (GCC 13.3.0, <code>-O2</code>); what they guarantee on hardware is recalled. QEMU's TCG on an x86-64 host did not show reordering in this lab's real-kernel runs, so the barriers in <code>virtio_mmio.cc</code> are argued, not demonstrated on hardware.</p></div>
+
+<h3>CPU-to-CPU versus CPU-to-device ordering</h3>
+<p>A lock orders memory between CPUs: <code>dmb ish</code> or acquire/release in the inner-shareable domain is enough. A DMA device is a different observer. To make descriptor writes visible to a device before the index, the driver needs a barrier whose domain includes the device; to make all of that complete before the MMIO write that rings the doorbell, it needs a barrier that waits (<code>dsb</code>), because the doorbell is a write to Device memory that can otherwise reach the device first. <code>virtio_mmio.cc</code> lines 52–58 name the three barriers the driver uses: <code>dmb oshst</code> (publish), <code>dsb st</code> (doorbell) and <code>dmb oshld</code> (consume: read the used index before the data). These choices follow the Linux kernel's mapping for its DMA barriers as recalled, and are the most conservative of the arguments in this chapter that the lab cannot test. <sup class="src"><a href="#F4-26-src-D6">D6</a></sup></p>
+<p>Under QEMU the "device" is host code that reads guest memory: with TCG on an x86-64 host the guest's stores reach host memory in program order regardless of barriers, so the lab cannot show the device-side bug in the kernel. That is why the forensic lab uses a model, <code>reorder_sim.cpp</code>, labelled as a model in its first line of output. <sup class="src"><a href="#F4-26-src-R6">R6</a></sup></p>
+
+<h3>The ticket lock and the racy counter</h3>
+<p><code>spinlock.h</code>'s ticket lock takes a ticket with a relaxed <code>fetch_add</code>, waits with acquire loads until its number is served, and releases with a release store. The acquire pairs with the release: the next owner sees every write the previous owner made inside the lock. On AArch64 the waiting loop uses <code>wfe</code>, and the unlock sends <code>sev</code> after a <code>dsb ishst</code> (F4-24's <code>arch.h</code>), so waiting CPUs sleep instead of spinning. R5: eight CPUs × 1000 rounds give the locked counter exactly 8000; the racy counter, updated with a separate load and store, ends at 7806: 194 increments lost. R3 and R4 lose 1298 of 400000 and 17008 of 800000. The losses differ on every run; only their presence with more than one CPU is the finding. The lock is correct; the racy counter shows why it is needed. <sup class="src"><a href="#F4-26-src-R5">R5</a></sup> <sup class="src"><a href="#F4-26-src-R3">R3</a></sup> <sup class="src"><a href="#F4-26-src-R4">R4</a></sup></p>
+<p>Fairness has a price under emulation. With eight vCPUs on a four-CPU host, the CPU whose ticket is next may not be running, and everyone else waits for it. How much that costs depends on what else the host is doing. R5 (1000 rounds) took 87 ms of wall time in the final run. R9 (4000 rounds) took 278 ms in the final run, while two earlier runs of the same configuration in this build, with other work loading the host, took about 23 seconds and did not finish within 30 seconds. Variation of two orders of magnitude for the same code and input is the signature of a fair lock whose next owner is descheduled: a known problem for ticket locks in virtual machines on overcommitted hosts, not a correctness bug. The numbers are host-dependent and the chapter claims none of them for hardware. R9's racy counter shows no lost updates in the final run (32000): another reminder that a race that does not show proves nothing. <sup class="src"><a href="#F4-26-src-R5">R5</a></sup> <sup class="src"><a href="#F4-26-src-R9">R9</a></sup></p>
+
+<h3>virtio-mmio: version 2, and the legacy default</h3>
+<p>The virtio-mmio register block starts with the magic value 0x74726976 ("virt" read as a little-endian 32-bit word), a version, a device ID (2 = block) and a vendor ID (R2: 0x554d4551, "QEMU"). Initialisation follows the virtio sequence of DR301: reset, ACKNOWLEDGE, DRIVER, feature negotiation (VERSION_1 is feature bit 32, selected through the features-select register), FEATURES_OK, queue setup, DRIVER_OK. The queue's three areas are given to the device as 64-bit addresses split into low and high registers, instead of PCI capability structures. <sup class="src"><a href="#F4-26-src-D3">D3</a></sup> <sup class="src"><a href="#F4-26-src-R2">R2</a></sup></p>
+<p>QEMU 8.2.2's virt machine presents version 1 (legacy) virtio-mmio by default. The legacy interface uses a different queue setup (a page-frame number and alignment) and does not use VERSION_1. This driver supports only version 2, so <code>run.sh</code> passes <code>-global virtio-mmio.force-legacy=false</code>; without it the driver says "version 1 (legacy): unsupported, this driver needs version 2" and D3 fails (R10). The same principle as F4-25's GICv2 refusal: detect, say so, stop. <sup class="src"><a href="#F4-26-src-D7">D7</a></sup> <sup class="src"><a href="#F4-26-src-R10">R10</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The virtio-mmio register offsets in <code>virtio_mmio.cc</code> lines 8–13, the status bits, the virtio-blk request layout and the meaning of version 1 versus 2 are recalled from the OASIS "Virtual I/O Device (VIRTIO)" specification, section "Virtio Over MMIO" (D3), and QEMU's <code>force-legacy</code> property and its default from QEMU's behaviour (D7); none opened. The run reading the known sentence back from sector 0 (R2–R5) checks the offsets against QEMU's implementation, not against the specification.</p></div>
+
+<h3>"Shared, not copied": the transport boundary</h3>
+<p>Milestone D3 asks that "your C4 virtio-blk driver code is shared, not copied". DR301's virtio code (F4-05) mixes the transport into the device layer: <code>vio::init</code> takes a PCI address, enables bus mastering and walks PCI capabilities. It cannot be reused over virtio-mmio as written. The lab's <code>virtio_mmio.cc</code> is therefore a separate, smaller driver, which the acceptance test does not allow for your own kernel. The fix is a transport interface below the device drivers: read and write device configuration, get and set features, set up queue n at given addresses, notify queue n, read and write status. PCI and MMIO each implement it; virtio-blk and virtio-net use only it. This is recorded as a decision for the course owner (DR301's code would change), and it is the mini-project. <sup class="src"><a href="#F4-26-src-D8">D8</a></sup></p>
+
+<h2 id="F4-26-hardware">How the hardware actually does it</h2>
+<p>On a real Arm system, PSCI is implemented by firmware running at EL3 (often Trusted Firmware-A). <code>CPU_ON</code> powers up the target core through the SoC's power controller, the core comes out of reset in EL3, and firmware drops it to the requested entry at EL2 or EL1. Between "returns 0" and the core executing your first instruction there can be a power-up delay; the kernel must not assume the new CPU is running when the call returns, which is why the lab waits for the online counter. <sup class="src"><a href="#F4-26-src-D1">D1</a></sup></p>
+<p>Weak ordering is not a theoretical permission: out-of-order cores with store buffers and multiple paths to memory make stores visible out of order, and interconnects between cores and devices can reorder further. Coherent DMA on Arm servers makes device reads see CPU caches, but does not order the CPU's stores; non-coherent DMA (common on small SoCs) additionally needs cache cleaning before the device reads and invalidation before the CPU reads what the device wrote. QEMU's virtio devices are coherent by construction. <sup class="src"><a href="#F4-26-src-D2">D2</a></sup> <sup class="src"><a href="#F4-26-src-D6">D6</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The EL3 firmware path for CPU_ON, the power-up behaviour, and the statements about coherent and non-coherent DMA on real SoCs are recalled. Untested on hardware: no Arm server or board ran this lab. F4-27 starts CPUs on a Raspberry Pi model in QEMU with the spin-table method instead of PSCI, which is what that board's firmware offers.</p></div>
+
+<h2 id="F4-26-worked">Worked example</h2>
+<p><b>Task.</b> Read R6's first trace events and explain request 1 in terms of Figure 2; then compute how many stores the driver issues for 1000 requests and what fraction of requests were corrupted.</p>
+<p><b>Request 1.</b> At t = 5 the CPU issues desc[1].addr = 0x40201000, desc[1].len = 1024, ring[1] = 1, idx = 2. The model makes one store visible per step: t = 5 len[1], t = 6 ring[1], t = 7 idx = 2. At t = 7 the device sees idx 2, reads ring[1] = 1, then desc[1]: len is 1024 (new), addr is 0x0, the value from before any request used slot 1. The device performs a DMA to address 0 with 1024 bytes: "not what the driver wrote for this request". The addr store becomes visible only at t = 20. <sup class="src"><a href="#F4-26-src-R6">R6</a></sup></p>
+<p><b>Request 2.</b> At t = 8 the idx = 3 store becomes visible first: ring[2] still holds 0 (from the initial memory), so the device uses slot 0 and DMAs to request 0's buffer at 0x40200000. A stale ring entry is as harmful as a stale descriptor.</p>
+<p><b>Totals.</b> Four stores per request, 4000 stores for 1000 requests. The weak model without a fence: 645 of 1000 requests used a stale or wrong descriptor (64.5 %). In-order: 0. Weak with a fence before idx: 0, and the store buffer never held more than 4 stores (one request), against 9 without the fence. The fence costs some overlap and buys correctness. These rates are the model's, under its seeded random choice; a real CPU's rate is unknown and is usually far lower, which is what makes the real bug rare. <sup class="src"><a href="#F4-26-src-R6">R6</a></sup> <sup class="src"><a href="#F4-26-src-R7">R7</a></sup></p>
+
+<h2 id="F4-26-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F4-26/</code>. The kernel reuses F4-24's boot, vectors, traps, UART and PSCI and F4-25's MMU and GIC.</p>
+<p><b>Listing 1</b> — <code>smp.S</code></p>
+<pre class="listing" data-src="F4-26/smp.S"></pre>
+<p>Lines 8–23: keep the index, drop from EL2 if needed (the same sequence as <code>boot.S</code>). Lines 24–31: interrupts masked, a stack 16 KiB below the previous CPU's, the vector table. Line 34: <code>secondary_main(index, entry_el)</code>. The build places <code>secondary_entry</code> at 0x40082c18 (R1).</p>
+<pre class="output" data-run="F4-26/build"></pre>
+<p><b>Listing 2</b> — <code>spinlock.h</code></p>
+<pre class="listing" data-src="F4-26/spinlock.h"></pre>
+<p>Line 13 takes the ticket (relaxed: the ticket's value is all that matters); line 14 waits with acquire; lines 20–22 release. <code>spin_wait</code> and <code>spin_wake</code> are the arch layer's hooks: <code>wfe</code>/<code>sev</code> on AArch64, a pause hint on x86-64.</p>
+<p><b>Listing 3</b> — <code>virtio_mmio.h</code>, <code>virtio_mmio.cc</code></p>
+<pre class="listing" data-src="F4-26/virtio_mmio.h"></pre>
+<pre class="listing" data-src="F4-26/virtio_mmio.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–17</td><td>constants</td><td>Register offsets, magic, status bits, queue size 8.</td><td>The whole transport in one table, checkable against the specification.</td></tr>
+<tr><td>19–47</td><td>ring structures</td><td>Descriptor table, available ring, used ring, one request.</td><td>The same split-virtqueue layout as DR301; only the transport differs.</td></tr>
+<tr><td>52–58</td><td>three barriers</td><td>Publish, doorbell, consume.</td><td>The places where x86-64 needed nothing and AArch64 needs instructions.</td></tr>
+<tr><td>76–101</td><td><code>scan</code></td><td>Every <code>virtio,mmio</code> slot: magic, version, device ID.</td><td>32 slots, 1 used (R2): the devicetree lists slots, not devices.</td></tr>
+<tr><td>103–149</td><td><code>blk_init</code></td><td>Refuse version 1; reset; negotiate VERSION_1; queue 0; DRIVER_OK.</td><td>The legacy refusal is the clear failure of R10.</td></tr>
+<tr><td>156–174</td><td><code>blk_read</code></td><td>Three-descriptor chain; ring entry; barrier; index; barrier; notify; poll; barrier.</td><td>Lines 165–171 are the course forensic's subject, done right.</td></tr>
+</tbody></table></div>
+<p><b>Listing 4</b> — <code>d3_main.cc</code></p>
+<pre class="listing" data-src="F4-26/d3_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>25–40</td><td><code>PerCpu</code>, <code>this_cpu</code></td><td>Per-CPU structure found through TPIDR_EL1.</td><td>Per-CPU data without a CPU-number lookup.</td></tr>
+<tr><td>43–62</td><td><code>parse_bootargs</code></td><td>"rounds=N" from <code>/chosen/bootargs</code>.</td><td>The test size changes without rebuilding.</td></tr>
+<tr><td>75–88</td><td><code>lock_test</code></td><td>All CPUs released together; locked and racy counters.</td><td>The lock is proven against a control that fails.</td></tr>
+<tr><td>90–97</td><td><code>cpu_setup</code></td><td>TPIDR_EL1, GIC per CPU, SGI 1 enabled, interrupts on.</td><td>Run on every CPU, including CPU 0.</td></tr>
+<tr><td>101–114</td><td><code>secondary_main</code></td><td>MMU first, set-up, report online with release, lock test, <code>wfi</code>.</td><td>Line 103: no shared data before the caches are on.</td></tr>
+<tr><td>139–173</td><td>CPU discovery and CPU_ON</td><td>CPUs from the devicetree; CPU_ON each; wait; ALREADY_ON; AFFINITY_INFO.</td><td>Milestone D3's PSCI client.</td></tr>
+<tr><td>186–197</td><td>SGI test</td><td>One SGI to each other CPU; each must count exactly one.</td><td>Inter-processor interrupts for B11's scheduler.</td></tr>
+<tr><td>199–215</td><td>disk and verdict</td><td>Scan, init, read sector 0; D3 ok; PSCI SYSTEM_OFF.</td><td>"PSCI SYSTEM_OFF ends the QEMU run cleanly."</td></tr>
+</tbody></table></div>
+<p><b>Listing 5</b> — <code>run.sh</code></p>
+<pre class="listing" data-src="F4-26/run.sh"></pre>
+<p>One CPU (R2), two CPUs entered at EL2 with PSCI through SMC (R3), four (R4), eight (R5):</p>
+<pre class="output" data-run="F4-26/smp1"></pre>
+<pre class="output" data-run="F4-26/smp2_el2"></pre>
+<pre class="output" data-run="F4-26/smp4"></pre>
+<pre class="output" data-run="F4-26/smp8"></pre>
+<p>The legacy transport refused (R10), and the observation run with 4000 rounds on eight vCPUs (R9):</p>
+<pre class="output" data-run="F4-26/legacy"></pre>
+<pre class="output" data-run="F4-26/smp8_slow"></pre>
+<p><b>Listing 6</b> — <code>publish.cc</code>, compiled for three CPUs (R8)</p>
+<pre class="listing" data-src="F4-26/publish.cc"></pre>
+<pre class="output" data-run="F4-26/publish"></pre>
+
+<h2 id="F4-26-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Notes do not overtake each other on their way; the order is decided at the source and in between.</b> The post analogy suggests a delivery race. In hardware the reordering happens in the CPU (store buffers, out-of-order execution) and in the interconnect, and it is a permission the architecture grants, not a race any one note loses.</li>
+<li><b>A single room always sees its own notes in order.</b> The analogy lacks coherence: every observer sees writes to one location in the same order. The model honours it (R6: stores to the same field never pass each other), and so does the ticket lock, which relies on it.</li>
+<li><b>The caretaker does not stay.</b> In the analogy the caretaker could be asked again at any time. PSCI is indeed callable at any time, but on boards without it (F4-27's spin table) the firmware is gone once the kernel runs, and the kernel can never ask again.</li>
+</ul>
+
+<h2 id="F4-26-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Enabling the device's legacy default by accident.</b> QEMU's virt machine gives legacy virtio-mmio unless told otherwise. Symptom without a version check: queue setup writes go to registers that mean something else, and the first read hangs. Fix: check the version register and refuse clearly (R10).</li>
+<li><b>Reading shared data before the MMU and caches are on.</b> Works on QEMU, can read stale values on hardware. Fix: link-time constants only until <code>enable_this_cpu()</code>.</li>
+<li><b>Using a CPU index as an MPIDR.</b> On virt they happen to be equal in Aff0; on many SoCs clusters put CPUs at 0x0, 0x1, 0x100, 0x101. Fix: take <code>reg</code> from the devicetree's <code>cpu</code> nodes (line 143).</li>
+<li><b>Assuming CPU_ON's return means the CPU runs.</b> Fix: wait for the CPU to say so (online counter with release and acquire).</li>
+<li><b>Plain variables shared between CPUs.</b> The racy counter (R3–R5) is the visible symptom; the invisible one is the course forensic. Fix: <code>std::atomic</code> with the order you mean, or the lock.</li>
+<li><b><code>dmb ish</code> for device ordering.</b> <code>std::atomic_thread_fence(release)</code> gives <code>dmb ish</code> (R8), which orders for other CPUs in the inner-shareable domain, not necessarily for a device. Fix: the driver's own barriers (lines 52–58), named after what they order.</li>
+<li><b>Testing ticket locks with more vCPUs than host CPUs and calling the slowness a hang.</b> R9 and its earlier runs show it can be very slow, not stuck, depending on host load; keep the round count small in CI or use a host with enough CPUs.</li>
+</ul>
+
+<div class="co transition" id="F4-26-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> OS303 B11 on x86-64: INIT-SIPI-SIPI through the local APIC, a 16-bit trampoline below 1 MiB, per-CPU data through GS base, a ticket lock, IPIs through the APIC; DR301's virtio-blk over PCI. <b>What carries over:</b> the ticket lock source (unchanged, because it uses <code>std::atomic</code>); the per-CPU structure; the virtqueue layout and the virtio initialisation sequence; the boot-CPU-waits-for-online-counter pattern. <b>What changes:</b> one firmware call replaces the APIC sequence and the trampoline; the CPU starts in 64-bit mode at your address; per-CPU data through <code>TPIDR_EL1</code>; IPIs are GIC SGIs; the memory model is weak, so every unstated ordering assumption must become an explicit acquire, release or barrier; the virtio transport is MMIO registers. <b>What comes next:</b> F4-27 takes the kernel to a Raspberry Pi model (milestone D4): a board-specific devicetree, the spin-table boot method instead of PSCI, and a recovery-friendly setup for real hardware.</p></div>
+
+<h2 id="F4-26-check">Check yourself</h2>
+<ol>
+<li>Name the three arguments of <code>CPU_ON</code> and the state the target CPU starts in.</li>
+<li>Why does the lab enable the MMU on a secondary CPU before it touches shared data?</li>
+<li>What is <code>TPIDR_EL1</code> used for here, and why not <code>TPIDR_EL0</code>?</li>
+<li>Explain TSO in two sentences, and name one reordering x86-64 does allow.</li>
+<li>In R8, why are <code>publish_plain</code> and <code>publish_release</code> identical on x86-64 but different on AArch64?</li>
+<li>Why is the racy counter in R5 below 8000, and why is it exact (200000) in R2?</li>
+<li>Apply to a new case: a CPU's devicetree <code>reg</code> is 0x100. What do you pass to <code>CPU_ON</code>, and which stack does the lab's <code>smp.S</code> give it if its context ID is 4?</li>
+<li>Predict, then run: remove <code>-global virtio-mmio.force-legacy=false</code> from the smp4 run. Which line changes, and what is the verdict?</li>
+<li>Why can the lab not demonstrate the device-ordering bug with the real kernel on QEMU?</li>
+</ol>
+
+<h2 id="F4-26-lab">Lab</h2>
+<p><b>Goal.</b> Milestone D3: "All cores online through PSCI CPU_ON; root file system on virtio storage." Build: "PSCI client, secondary-core entry path, per-CPU data through the thread-ID system register; virtio-mmio transport added below your existing virtio drivers." <b>Accept:</b> "B11 tests pass with 1–8 CPUs. B15/B16 file-system tests pass on virtio storage on ARM64; your C4 virtio-blk driver code is shared, not copied. PSCI SYSTEM_OFF ends the QEMU run cleanly." <sup class="src"><a href="#F4-26-src-D8">D8</a></sup></p>
+<p><b>What this lab covers and what remains.</b> The lab shows CPU_ON, per-CPU data, a lock and SGIs with 1, 2, 4 and 8 CPUs, a sector read over virtio-mmio, and SYSTEM_OFF. Your part: run your B11 tests on this bring-up, put your C4 driver behind a transport interface (mini-project) and run the B15/B16 file-system tests on virtio-mmio storage.</p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2, the AArch64 cross toolchain, a host C++ compiler. Run <code>university/labs/run_lab.sh university/labs/F4-26</code> from the repository root (about a minute; the observation run may take up to 30 seconds).</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In R4 and R5, note the order of the "online" lines and explain why it differs from the CPU_ON order.</li>
+<li>Change <code>kIpiSgi</code> to 15 and rerun. Then to 16: what happens and why?</li>
+<li>Remove the acquire in <code>TicketLock::lock</code> (make it relaxed). Does the locked counter change on QEMU? Explain why the answer does not prove the code correct.</li>
+<li>Add a second sector read and print the used ring's <code>len</code> field for each.</li>
+<li>Run <code>g++ -std=c++20 -O2 -S</code> on <code>spinlock.h</code> wrapped in a test function for all three CPUs and find the acquire and release in each.</li>
+<li>Write the transport interface of the mini-project and port DR301's virtio-blk onto it.</li>
+</ol>
+<p><b>Expected observations.</b> R2–R5: D3 ok with 1, 2, 4 and 8 CPUs; locked counter exact; racy counter short when there is more than one CPU; SGI taken exactly once per CPU; "DR402 F4-26: sector 0, read through virtio-mmio"; "PSCI SYSTEM_OFF through hvc" (smc in R3). R10: legacy refused, D3 FAILED. R8: the instruction table discussed in Layer 3. <sup class="src"><a href="#F4-26-src-R2">R2</a></sup> <sup class="src"><a href="#F4-26-src-R8">R8</a></sup></p>
+
+<h2 id="F4-26-forensic">Forensic lab</h2>
+<p><b>Scenario: "Works on x86, corrupts on ARM".</b> Ana's block driver passes all tests on x86-64. On an Arm server, roughly one read in a few thousand under load returns another request's data or fails with a DMA error at a low address. The submission code (as she wrote it) is <code>publish_plain</code> in Listing 6: descriptor address, length, ring entry, index, then the doorbell. To understand the failure without an Arm server or a bus analyser, the team built a model of a weakly ordered CPU and a polling device and logged every store as it became visible to the device.</p>
+<p><b>Evidence pack.</b> The model's log (R6; the model is labelled as such: it is not a CPU trace), and R8, the compiler output for the three publish variants.</p>
+<pre class="output" data-run="F4-26/reorder_sim"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: in the trace, for each request marked "not what the driver wrote", which store had not yet become visible when the device read the index?</li>
+<li>Why does the same submission code never fail on x86-64? Use R8 and the TSO rule.</li>
+<li>Form two hypotheses (for example "the device is slow and reads the descriptor late" and "the CPU makes the index visible before the descriptor") and use the trace to decide.</li>
+<li>Which line of the summary shows that a single ordering point fixes the problem, and where in Listing 6 is that point?</li>
+<li>For the real driver, which barrier or barriers are needed, and why is <code>std::atomic_thread_fence(release)</code> alone arguably not enough when the observer is a DMA device?</li>
+<li>Prevention: how would you catch this class of bug before the code reaches an Arm machine?</li>
+</ol>
+<p><b>Method hints.</b> Follow request 1 and request 2 from issue to device read. Compare the "up to N stores waiting" values. Remember that the device uses the index as the signal that everything before it is ready.</p>
+
+<h2 id="F4-26-project">Mini-project</h2>
+<p><b>One virtio-blk driver, two transports.</b> Define a <code>virtio::Transport</code> interface (configuration read and write, feature get and set, queue setup, notify, status) and implement it for DR301's PCI transport and this chapter's MMIO transport. Move the virtio-blk driver above it so the same object code runs on x86-64 (PCI) and AArch64 (MMIO), and run your B15 FAT32 test on both.</p>
+<p><b>Rubric</b> (10 points): one virtio-blk source file used unchanged by both kernels (3); the same file-system test passes on both (3); the barriers live in the transport or in arch-named helpers, each with a comment saying what it orders against what (2); a written list of every change to DR301's code, classified as bug fix or design change (2).</p>
+
+<h2 id="F4-26-summary">Summary</h2>
+<ul>
+<li>PSCI <code>CPU_ON</code> starts a CPU at a physical entry address with the MMU and caches off and a context ID in x0; the target's affinity comes from the devicetree.</li>
+<li>Each CPU needs its own stack, VBAR, MMU enable, redistributor and per-CPU pointer in <code>TPIDR_EL1</code>.</li>
+<li>x86-64 is TSO; AArch64 and RISC-V are weakly ordered. Code that relied on TSO without saying so breaks on Arm.</li>
+<li><code>std::atomic</code> orders compile to nothing extra on x86-64 and to <code>dmb</code>, <code>stlr</code> or <code>fence</code> elsewhere; device ordering needs barriers that cover the device and complete before the doorbell.</li>
+<li>virtio-mmio version 2 is the modern transport; QEMU's virt default is legacy, which the driver refuses clearly.</li>
+<li>"Shared, not copied" needs a transport interface below the virtio device drivers.</li>
+</ul>
+
+<h2 id="F4-26-sources">Sources</h2>
+<ol>
+<li id="F4-26-src-D1">Arm, "Arm Power State Coordination Interface Platform Design Document" (DEN0022): CPU_ON, AFFINITY_INFO, SYSTEM_OFF, return codes, entry state. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-26-src-D2">Arm, "Arm Architecture Reference Manual for A-profile architecture": memory model, barriers (DMB, DSB), acquire/release instructions, MPIDR_EL1, TPIDR_EL1, cache maintenance. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-26-src-D3">OASIS, "Virtual I/O Device (VIRTIO) Version 1.x", sections on the split virtqueue, virtio-blk and "Virtio Over MMIO". <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F4-26-src-D4">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3, memory-ordering chapter. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-26-src-D5">RISC-V International, "The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA", RVWMO memory-model chapter. <i>Title only — not opened during this build; the Source Researcher must confirm the version and section (dossier gate G1 open).</i></li>
+<li id="F4-26-src-D6">The Linux kernel's "Linux Kernel Memory Barriers" document (Documentation/memory-barriers.txt) and its arm64 barrier definitions. <i>Title only — not opened during this build; the Source Researcher must confirm the version (dossier gate G1 open).</i></li>
+<li id="F4-26-src-D7">QEMU documentation: the Arm <code>virt</code> board, virtio-mmio and the <code>force-legacy</code> property. <i>Title only — not opened during this build; the Source Researcher must confirm the version and pages (dossier gate G1 open).</i> The default was observed in R10.</li>
+<li id="F4-26-src-D8">This project's Systems Curriculum, milestone D3, and DR301 F4-05's <code>virtio.cc</code>. Opened in this build (the project's own files).</li>
+<li id="F4-26-src-R1">R1 — lab run, step <code>build</code> (symbol addresses of the D3 kernel).</li>
+<li id="F4-26-src-R2">R2 — lab run, step <code>smp1</code> (QEMU 8.2.2, <code>-M virt,gic-version=3 -smp 1</code>, virtio-mmio version 2).</li>
+<li id="F4-26-src-R3">R3 — lab run, step <code>smp2_el2</code> (<code>virtualization=on -smp 2</code>: EL2 entry, PSCI through SMC).</li>
+<li id="F4-26-src-R4">R4 — lab run, step <code>smp4</code>.</li>
+<li id="F4-26-src-R5">R5 — lab run, step <code>smp8</code> (<code>-append rounds=1000</code>; wall time in the run record).</li>
+<li id="F4-26-src-R6">R6 — lab run, <code>reorder_sim</code> (a model, seed 402; built with AddressSanitizer and UBSan by <code>run_lab.sh</code>).</li>
+<li id="F4-26-src-R7">R7 — the summary lines of the same run (in-order, weak, weak+fence).</li>
+<li id="F4-26-src-R8">R8 — lab run, step <code>publish</code> (GCC 13.3.0 for x86-64, AArch64 and RISC-V; compiled, not run).</li>
+<li id="F4-26-src-R9">R9 — lab run, step <code>smp8_slow</code> (observation, not a pass: <code>rounds=4000</code>, stopped after 30 s if not finished).</li>
+<li id="F4-26-src-R10">R10 — lab run, step <code>legacy</code> (QEMU's default legacy transport; D3 FAILED expected).</li>
+</ol>
+
+<h2 id="F4-26-glossary">Glossary links</h2>
+<p><a href="#gl-psci-cpu-on">PSCI CPU_ON</a> · <a href="#gl-psci">PSCI</a> · <a href="#gl-mpidr-multiprocessor-affinity-register">MPIDR</a> · <a href="#gl-per-cpu-data">Per-CPU data</a> · <a href="#gl-memory-model-weak-tso">Memory model</a> · <a href="#gl-barrier-dmb-dsb">Barrier (DMB, DSB)</a> · <a href="#gl-virtio-mmio">virtio-mmio</a></p>
+
+<h2 id="F4-26-next">Next chapter</h2>
+<p>Next: <a href="#F4-27">F4-27 Raspberry Pi bring-up</a>. Previous: <a href="#F4-25">F4-25 ARM64 MMU, GIC and generic timer</a>. Back to the course: <a href="#DR402">DR402</a>. Related: <a href="#F4-05">F4-05</a> (virtio over PCI in DR301), <a href="#F4-29">F4-29</a> (RISC-V harts through SBI HSM), <a href="#F4-30">F4-30</a> (atomics on ten CPUs). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackD">Track D</a> (milestone D3).</p>
+
+<h2 id="F4-26-answers">Answers to Check yourself</h2>
+<ol>
+<li>Target MPIDR affinity, entry point (physical address), context ID. The target starts at the entry point, at the caller's exception level, with the MMU and caches off and the context ID in x0.</li>
+<li>With caches off it reads memory directly and may see stale values of data the boot CPU wrote into its cache; with the MMU off, memory is also treated as Device memory, which forbids unaligned accesses. After <code>enable_this_cpu()</code> it uses the same coherent, cacheable view as the others.</li>
+<li>A pointer to this CPU's <code>PerCpu</code>. <code>TPIDR_EL0</code> is writable by user programs (thread-local storage), so the kernel cannot trust it; <code>TPIDR_EL1</code> is accessible only at EL1 and above.</li>
+<li>Stores become visible to others in program order, and loads are not reordered with older loads or stores, except that a later load may complete before an earlier store to a different address is visible (store buffering). That store-to-load reordering is the one x86-64 allows.</li>
+<li>On x86-64 a plain store already has release semantics under TSO, so the compiler needs no instruction; on AArch64 it must use <code>stlrh</code> (or a <code>dmb</code>) to order the index after the earlier stores.</li>
+<li>With several CPUs, two can load the same value and both store value + 1: one increment is lost. With one CPU there is nobody to interleave with.</li>
+<li>0x100 as the target (the affinity value itself, not 1). The stack: <code>__stack_top − 4 × 16 KiB</code>: the context ID, not the MPIDR, picks the stack. (Check <code>g_cpu</code> is sized for the index, not the MPIDR.)</li>
+<li>The slot line says "version 1", the driver prints "version 1 (legacy): unsupported", the sector line disappears and the verdict is D3 FAILED, exit code 0x11 through SYSTEM_OFF, as in R10.</li>
+<li>The device is QEMU host code; with TCG on an x86-64 host, guest stores reach memory in program order, so the window in which the device could see the index before the descriptor never opens. A model or real weakly ordered hardware is needed.</li>
+</ol>
+<h3 id="F4-26-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Request 1: <code>addr[1]</code> (visible only at t = 20). Request 2: <code>ring[2]</code>, so the device used slot 0 (and slot 2's descriptor stores were also late). Request 3: <code>ring[3]</code> (visible at t = 14) and <code>addr[3]</code>/<code>len[3]</code>. Request 4: <code>addr[0]</code>'s new value (0x40204000, visible at t = 16) and <code>len[0]</code>; <code>ring[0]</code> held the right slot by coincidence (0 from request 0), so the device used request 0's buffer and length. Request 5: <code>addr[1]</code> (request 1's store became visible at t = 20, request 5's at t = 21) and <code>len[1]</code>.</li>
+<li>Under TSO stores become visible in program order: by the time the index store is visible, the descriptor and ring stores are too. R8 shows the compiler emits plain <code>mov</code>s for all three variants on x86-64: nothing in the code expressed the ordering, and the x86 hardware provided it anyway.</li>
+<li>"The device reads late": a late read would see more of the new values, not fewer; the trace shows the device reading right after the idx store becomes visible, with older stores still waiting. "The CPU makes the index visible before the descriptor": every bad request shows idx visible while an older store to the descriptor or ring is not. The second is proven.</li>
+<li>"weak+fence: 1000 requests, 0 used a stale or wrong descriptor". The ordering point is between the ring store and the index store: <code>publish_fence</code> line 32, or the release store of <code>publish_release</code> line 43.</li>
+<li>A barrier that orders the descriptor and ring stores before the index store for the device's domain (<code>dmb oshst</code> or stronger), and one that makes everything complete before the MMIO doorbell write (<code>dsb st</code>), plus a read-side barrier after seeing the used index (<code>dmb oshld</code>): <code>virtio_mmio.cc</code> lines 165–171. <code>std::atomic_thread_fence(release)</code> compiles to <code>dmb ish</code> (R8), whose domain is inner shareable: enough for other CPUs and for a hypervisor's device emulated on other CPUs, not guaranteed for a device outside that domain (recalled; unverified box).</li>
+<li>Write every cross-agent publication with explicit release/acquire or named barriers, never plain stores; review for "flag after data" patterns; test on a weakly ordered machine or with a memory-model checker or model (like <code>reorder_sim</code>); run the same tests on AArch64 hardware in CI. Wrong answers: "add a delay before the doorbell" (hides the window, does not close it), "make the variables <code>volatile</code>" (stops compiler reordering only; R8's plain stores are already in order in the binary, and the CPU reorders them).</li>
+</ol>
