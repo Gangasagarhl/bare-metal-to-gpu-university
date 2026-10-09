@@ -125,7 +125,7 @@ of guide 10.2:
 ```
 
 Glossary anchors in the page are `gl-<term in lower case, non-letters replaced by ->`,
-for example `#gl-bit`, `#gl-kernel-gpu-`. Link terms in "Glossary links" this way.
+for example `#gl-bit`, `#gl-kernel-gpu` (no trailing dash). Link terms in "Glossary links" this way.
 
 ## 8. Links
 
