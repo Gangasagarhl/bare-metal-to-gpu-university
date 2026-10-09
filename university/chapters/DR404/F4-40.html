@@ -1,0 +1,340 @@
+<!--meta
+id: F4-40
+title: A tiny hypervisor
+course: DR404
+level: L4
+prereqs: F4-38, F4-39; OS303 (B12); OS302 (F3-21 paging, F3-24 interrupts)
+time: 14–18 hours including the lab
+hardware: none (a hypervisor kernel for AMD SVM, run under QEMU 8.2.2's software emulation of SVM; untested on real AMD or Intel hardware)
+maps: Curriculum section 12.2 (hardware support), milestone V2 (A tiny hypervisor, the course project)
+analogy: F4 — the school (and its visitors): a school inside a school, with the real principal above
+-->
+
+<h2 id="F4-40-hook">Story hook</h2>
+<p>So far you have been the guest principal. Now you are the real one. You hand the small school a written agreement: "You may teach, mark, open your own cupboards. Call me when you touch the building's bell, the boiler, or the front door; call me if you fall ill; call me when you want to leave." Then you let them work and wait at your desk. Every time they call, you note why in a ledger, handle it, and let them continue exactly where they stopped.</p>
+<p>That agreement is a page of memory called the <b>VMCB</b>; the moment they call is a <b>VM exit</b>; and the ledger, counts of exits by reason, is the most useful debugging tool a hypervisor writer has. In this chapter your kernel becomes a hypervisor: it enables AMD's SVM extension, builds one virtual CPU, runs a small 64-bit guest that prints through an emulated UART, survives a guest's triple fault, and reports invalid guest states with the documented error code. At the end, the ledger catches a guest that wastes two seconds polling a timer: between 180,000 and 215,000 exits across this build's runs, against 268 for a guest that halts.</p>
+
+<h2 id="F4-40-able">What you will be able to do</h2>
+<ul>
+<li><b>Implement</b> SVM enablement, a VMCB with guest and host state, and a run loop that enters a guest and handles every exit.</li>
+<li><b>Implement</b> exit handlers for port I/O (with a 16550 output model and an 8254 model), CPUID, HLT, a hypercall and triple fault.</li>
+<li><b>Explain</b> a VM-entry failure from its documented error code, on AMD SVM and on Intel VMX.</li>
+<li><b>Diagnose</b> a slow guest from exit counts by reason and by port.</li>
+<li><b>Evaluate</b> what a run under QEMU's emulated SVM proves about real hardware, and what it does not.</li>
+</ul>
+
+<div class="co jargon" id="F4-40-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>SVM (AMD-V)</dt><dd><b>Simple words:</b> AMD's processor extension for running virtual machines. <b>Analogy:</b> the building's rule book that lets a second school run inside it. <b>Precise:</b> Secure Virtual Machine: enabled by EFER.SVME; adds VMRUN, VMLOAD, VMSAVE, VMMCALL, STGI, CLGI and the VMCB; guest-mode execution ends in #VMEXIT with an exit code. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup> <sup class="src"><a href="#F4-40-src-C1">C1</a></sup></dd>
+<dt>VMX (VT-x)</dt><dd><b>Simple words:</b> Intel's extension for the same purpose. <b>Analogy:</b> another building's rule book, with different forms. <b>Precise:</b> Virtual Machine Extensions: VMXON enters root operation; VMLAUNCH and VMRESUME enter non-root operation with a VMCS selected by VMPTRLD and accessed by VMREAD and VMWRITE. <sup class="src"><a href="#F4-40-src-D2">D2</a></sup> <sup class="src"><a href="#F4-40-src-C1">C1</a></sup></dd>
+<dt>VMCB</dt><dd><b>Simple words:</b> one page of memory that describes a virtual CPU to the processor. <b>Analogy:</b> the written agreement and the small school's state, on one sheet. <b>Precise:</b> virtual machine control block: a 4 KiB, page-aligned structure with a control area (intercepts, I/O and MSR bitmap addresses, ASID, exit code and information, event injection, nested paging) and a state-save area (segments, control registers, EFER, RIP, RSP, RAX and more). <sup class="src"><a href="#F4-40-src-D1">D1</a></sup></dd>
+<dt>VMCS</dt><dd><b>Simple words:</b> Intel's counterpart of the VMCB. <b>Analogy:</b> the same agreement on the other building's forms, which only the clerk may read and write. <b>Precise:</b> virtual machine control structure, accessed only through VMREAD and VMWRITE with field encodings; its layout in memory is not architectural. <sup class="src"><a href="#F4-40-src-D2">D2</a></sup></dd>
+<dt>Intercept</dt><dd><b>Simple words:</b> a rule saying "this event must stop the guest and call the hypervisor". <b>Analogy:</b> "call me when you touch the bell". <b>Precise:</b> a control bit in the VMCB (or an execution control in the VMCS) that turns an instruction, register access, exception or interrupt in guest mode into a VM exit. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup> <sup class="src"><a href="#F4-40-src-D2">D2</a></sup></dd>
+<dt>I/O permission map (IOPM)</dt><dd><b>Simple words:</b> a table with one bit per I/O port, saying which ports the guest may not touch directly. <b>Analogy:</b> the list of doors with an alarm. <b>Precise:</b> on SVM, a physically contiguous bitmap whose address is in the VMCB; a set bit makes IN or OUT to that port exit with code IOIO when the IOIO intercept is on. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup></dd>
+<dt>Exit code and exit information</dt><dd><b>Simple words:</b> the number that says why the guest stopped, and the details that go with it. <b>Analogy:</b> the line in the ledger: "rang the bell, east wing, 10:42". <b>Precise:</b> on SVM, EXITCODE in the VMCB (names from <code>SVM_EXIT_*</code>: 0x7B IOIO, 0x72 CPUID, 0x78 HLT, 0x7F SHUTDOWN, 0x81 VMMCALL, 0x400 NPF, −1 ERR) with EXITINFO1 and EXITINFO2; on VMX, the exit reason (basic reason in bits 15:0) and the exit qualification. <sup class="src"><a href="#F4-40-src-D3">D3</a></sup> <sup class="src"><a href="#F4-40-src-R6">R6</a></sup></dd>
+<dt>VM-entry failure</dt><dd><b>Simple words:</b> the processor refuses to start the guest because its described state breaks a rule. <b>Analogy:</b> the agreement is not signed properly, so the small school is not let in. <b>Precise:</b> on SVM, VMRUN performs consistency checks and on failure exits immediately with EXITCODE = −1 (<code>SVM_EXIT_ERR</code>, "invalid_guest_state" in Linux's table); on VMX, VMLAUNCH/VMRESUME either fail as an instruction (with a VM-instruction error number) or the entry fails after loading and exits with bit 31 of the exit reason set (basic reason 33 for invalid guest state). <sup class="src"><a href="#F4-40-src-D3">D3</a></sup> <sup class="src"><a href="#F4-40-src-D2">D2</a></sup> <sup class="src"><a href="#F4-40-src-R3">R3</a></sup></dd>
+<dt>ASID</dt><dd><b>Simple words:</b> a number tagging the guest's TLB entries so they are not mixed with the host's. <b>Analogy:</b> a coloured sticker on every key copy, one colour per school. <b>Precise:</b> address space identifier in the VMCB; ASID 0 belongs to the host, and VMRUN rejects it for a guest. Intel's equivalent is the VPID. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup> <sup class="src"><a href="#F4-40-src-R3">R3</a></sup></dd>
+<dt>Global interrupt flag (GIF)</dt><dd><b>Simple words:</b> an extra on/off switch for interrupts, above the usual one, used while switching between host and guest. <b>Analogy:</b> the real principal's "do not disturb" sign during the hand-over. <b>Precise:</b> an SVM flag cleared by CLGI and set by STGI; while it is clear, interrupts are held pending, so the hypervisor can enter and leave the guest atomically. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-40-pictures">The idea in pictures</h2>
+<figure id="F4-40-fig1"><div class="svgbox">
+<svg viewBox="0 0 900 360" role="img" aria-labelledby="F4-40-f1t F4-40-f1d">
+<title id="F4-40-f1t">Figure 1: the hypervisor's run loop on AMD SVM</title>
+<desc id="F4-40-f1d">A loop. On the left, host mode: the hypervisor's vcpu_run loop. It calls svm_run, which loads the guest's general registers, executes CLGI, STI and VMRUN with RAX holding the VMCB's physical address. The processor saves host state to the host-save area, loads guest state from the VMCB and runs the guest on the right, in guest mode. An intercepted event, such as OUT to port 0x3F8, causes #VMEXIT: the processor writes the guest state and the exit code, EXITINFO1 and EXITINFO2 into the VMCB and restores host state. Back on the left, svm_run saves the guest registers and executes STGI; vcpu_run reads EXITCODE, counts it by reason, dispatches to a handler (IOIO, CPUID, HLT, VMMCALL, SHUTDOWN, or the failure code -1), updates the guest's RIP, and loops. The VMCB sits between the two sides as one 4 KiB page with a control area and a state-save area.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="360"/>
+<rect class="sv-b8" x="20" y="20" width="300" height="320" rx="8"/>
+<text class="sv-tb" x="34" y="44">host mode: the hypervisor</text>
+<rect class="sv-box" x="36" y="60" width="268" height="62" rx="6"/><text class="sv-t" x="48" y="82">svm_run: load GPRs, CLGI, STI,</text><text class="sv-t" x="48" y="102">VMRUN rax = VMCB address</text>
+<rect class="sv-box" x="36" y="170" width="268" height="54" rx="6"/><text class="sv-t" x="48" y="192">save GPRs, STGI (host IRQ</text><text class="sv-t" x="48" y="210">taken here), CLI</text>
+<rect class="sv-box" x="36" y="240" width="268" height="86" rx="6"/><text class="sv-t" x="48" y="262">count EXITCODE by reason;</text><text class="sv-t" x="48" y="280">IOIO / CPUID / HLT / VMMCALL /</text><text class="sv-t" x="48" y="298">SHUTDOWN / −1 failure;</text><text class="sv-t" x="48" y="316">advance guest RIP; loop</text>
+<line class="sv-line" x1="170" y1="224" x2="170" y2="234"/><polygon class="sv-head" points="164,232 170,240 176,232"/>
+<rect class="sv-b4" x="370" y="110" width="160" height="140" rx="6"/>
+<text class="sv-tb" x="382" y="132">VMCB (4 KiB)</text>
+<rect class="sv-box" x="382" y="142" width="136" height="44"/><text class="sv-ts" x="390" y="160">control area</text><text class="sv-ts" x="390" y="176">intercepts, EXITCODE</text>
+<rect class="sv-box" x="382" y="194" width="136" height="44"/><text class="sv-ts" x="390" y="212">state-save area</text><text class="sv-ts" x="390" y="228">CS, CR0, RIP, RSP, RAX</text>
+<rect class="sv-b2" x="580" y="20" width="300" height="320" rx="8"/>
+<text class="sv-tb" x="594" y="44">guest mode: the guest</text>
+<rect class="sv-box" x="596" y="60" width="268" height="62" rx="6"/><text class="sv-t" x="608" y="82">runs directly on the CPU:</text><text class="sv-t" x="608" y="102">mov, add, call, its own ring 0</text>
+<rect class="sv-box" x="596" y="170" width="268" height="54" rx="6"/><text class="sv-t" x="608" y="192">out %al, $0x3f8 → intercepted</text><text class="sv-t" x="608" y="210">(IOPM bit set)</text>
+<line class="sv-line" x1="304" y1="90" x2="590" y2="90"/><polygon class="sv-head" points="586,84 596,90 586,96"/>
+<text class="sv-ts" x="330" y="80">VMRUN: host state saved, guest state loaded</text>
+<line class="sv-line" x1="596" y1="198" x2="310" y2="198"/><polygon class="sv-head" points="314,192 304,198 314,204"/>
+<text class="sv-ts" x="330" y="272">#VMEXIT: guest state + EXITCODE,</text><text class="sv-ts" x="330" y="288">EXITINFO1/2 written to the VMCB</text>
+<line class="sv-dash" x1="170" y1="326" x2="170" y2="346"/><line class="sv-dash" x1="170" y1="346" x2="10" y2="346"/><line class="sv-dash" x1="10" y1="346" x2="10" y2="91"/><line class="sv-dash" x1="10" y1="91" x2="30" y2="91"/><polygon class="sv-head" points="26,85 36,91 26,97"/>
+</svg></div><figcaption><b>Figure 1.</b> One iteration of the run loop: Listing 2 (<code>svm_run</code>) and Listing 3 (<code>vcpu_run</code>). The VMCB is shared between hypervisor and processor. Exit codes are from Linux's <code>&lt;asm/svm.h&gt;</code>; the instruction sequence was run under QEMU's SVM model (R1). <sup class="src"><a href="#F4-40-src-D1">D1</a></sup> <sup class="src"><a href="#F4-40-src-D3">D3</a></sup> <sup class="src"><a href="#F4-40-src-R1">R1</a></sup></figcaption></figure>
+
+<figure id="F4-40-fig2"><div class="svgbox">
+<svg viewBox="0 0 900 280" role="img" aria-labelledby="F4-40-f2t F4-40-f2d">
+<title id="F4-40-f2t">Figure 2: decoding one IOIO exit</title>
+<desc id="F4-40-f2d">The 32-bit EXITINFO1 value 0x03F80010 of an IOIO exit shown as fields. Bits 31 to 16 hold the port, 0x03F8. Bits 6 to 4 hold the operand size; bit 4 is set, meaning 8 bits. Bit 2, string, is 0. Bit 0, type, is 0, meaning OUT. EXITINFO2 holds the address of the next instruction, which the hypervisor copies into the guest's RIP after emulating the write. The value comes from exit 2 in R1, where the guest writes 'h', 0x68, held in RAX.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="280"/>
+<text class="sv-tb" x="20" y="30">EXITINFO1 = 0x03F80010 (R1, exit 2)</text>
+<rect class="sv-b1" x="20" y="50" width="420" height="56"/><text class="sv-t" x="34" y="76">bits 31–16: port</text><text class="sv-tb" x="34" y="96">0x03F8 (COM1 transmit)</text>
+<rect class="sv-box" x="440" y="50" width="120" height="56"/><text class="sv-ts" x="450" y="76">15–7</text><text class="sv-ts" x="450" y="94">other</text>
+<rect class="sv-b3" x="560" y="50" width="120" height="56"/><text class="sv-t" x="570" y="76">6–4: size</text><text class="sv-tb" x="570" y="96">001 = 8 bit</text>
+<rect class="sv-box" x="680" y="50" width="60" height="56"/><text class="sv-ts" x="688" y="76">3</text>
+<rect class="sv-b5" x="740" y="50" width="70" height="56"/><text class="sv-ts" x="748" y="76">2: string</text><text class="sv-tb" x="748" y="96">0</text>
+<rect class="sv-box" x="810" y="50" width="30" height="56"/><text class="sv-ts" x="816" y="76">1</text>
+<rect class="sv-b6" x="840" y="50" width="50" height="56"/><text class="sv-ts" x="846" y="76">0: IN?</text><text class="sv-tb" x="846" y="96">0</text>
+<text class="sv-t" x="20" y="146">→ the guest executed OUT, one byte, to port 0x3F8; the byte is in the guest's RAX: 0x68 = 'h'.</text>
+<text class="sv-t" x="20" y="176">EXITINFO2 = 0x101BE5: the address of the next guest instruction.</text>
+<text class="sv-t" x="20" y="206">The handler appends 'h' to the guest's output line, then sets guest RIP = EXITINFO2 and loops.</text>
+<text class="sv-ts" x="20" y="250">Field layout from memory of the AMD APM (see the unverified box); the values are R1's.</text>
+</svg></div><figcaption><b>Figure 2.</b> The fields of one IOIO exit, as Listing 3's <code>handle_ioio</code> and Listing 6's decoder read them. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup> <sup class="src"><a href="#F4-40-src-R1">R1</a></sup> <sup class="src"><a href="#F4-40-src-R6">R6</a></sup></figcaption></figure>
+
+<h2 id="F4-40-layer1">Layer 1 — the kid explanation</h2>
+<p>A hypervisor is a program that lets another operating system run on the processor almost by itself, but stops it whenever it does something important. Before starting the guest, the hypervisor fills in a form: "stop the guest if it talks to a device, if it asks the processor who it is, if it goes to sleep, or if it crashes." Then it says "go".</p>
+<p>When the guest does one of those things, the processor freezes it, writes down why on the form, and wakes the hypervisor. The hypervisor does the job (for example, prints the letter the guest wanted to print), notes it in a tally, and says "go" again. The guest never notices it was stopped.</p>
+
+<h2 id="F4-40-layer2">Layer 2 — the student explanation</h2>
+<h3>Enabling SVM</h3>
+<p>The hypervisor first checks that the processor has SVM (CPUID 0x80000001, ECX bit 2) and that firmware has not locked it off (the SVMDIS bit of the VM_CR MSR). It then sets EFER.SVME, which makes the SVM instructions legal, and writes the physical address of a 4 KiB host-save area to the VM_HSAVE_PA MSR: VMRUN stores part of the host's state there. CPUID 0x8000000A describes the SVM implementation; QEMU's model reports revision 1, 16 ASIDs, and with <code>+npt</code> the nested-paging feature bit (R1). <sup class="src"><a href="#F4-40-src-D1">D1</a></sup> <sup class="src"><a href="#F4-40-src-R1">R1</a></sup></p>
+<h3>Describing the guest</h3>
+<p>The VMCB's state-save area gets a complete processor state: segment registers with their hidden attributes (a 64-bit code segment, flat data segments, a busy TSS), GDTR, IDTR, CR0, CR3, CR4, EFER, RFLAGS, RIP, RSP. The lab's first guests share the host's page tables (identity map of the first 4 GiB with 2 MiB pages) and run in long mode from the start, so the guest state is mostly a copy of the host's. The guest has no IDT on purpose: any exception becomes a triple fault, which is the cleanest way to test the triple-fault path. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup></p>
+<p>The control area says what to intercept: external interrupts (so that the host keeps its timer), CPUID, HLT, I/O instructions, shutdown (triple fault), VMRUN and VMMCALL. It points to an I/O permission map with every bit set, so every port access exits. It gives the guest ASID 1. And it sets V_INTR_MASKING, which makes the host's interrupt flag, not the guest's, decide whether a physical interrupt stops the guest. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup></p>
+<h3>Running and handling exits</h3>
+<p>One VMRUN runs the guest until the next intercepted event. VMRUN saves and loads RAX, RSP and RIP through the VMCB but not the other general registers, so a small assembly routine loads them from a <code>GuestRegs</code> structure before VMRUN and stores them back after. The run loop then reads EXITCODE and dispatches:</p>
+<ul>
+<li><b>IOIO (0x7B):</b> decode port, direction and size from EXITINFO1 (Figure 2), emulate the device, write the result into the guest's RAX for an <code>IN</code>, and set the guest's RIP to EXITINFO2, which holds the address of the next instruction.</li>
+<li><b>CPUID (0x72):</b> execute CPUID on the host, edit the result (set the hypervisor-present bit, hide SVM, answer the 0x40000000 range with "DR404-tinyHV"), and advance RIP by 2.</li>
+<li><b>HLT (0x78):</b> advance RIP by 1 and wait, on the host, until the guest's next virtual timer tick.</li>
+<li><b>VMMCALL (0x81):</b> the hypercall. The DR404 interface has one call: RAX = 0 means "exit with the code in RBX". Advance RIP by 3.</li>
+<li><b>SHUTDOWN (0x7F):</b> the guest triple-faulted. Report it, destroy the guest, carry on.</li>
+<li><b>−1 (SVM_EXIT_ERR):</b> VMRUN refused the state. Report and stop.</li>
+</ul>
+<p>Each handler is a few lines; R1 traces the first six exits of the "hello" guest, alternating a read of the UART's line-status register (port 0x3FD) and a write of a character to port 0x3F8. <sup class="src"><a href="#F4-40-src-R1">R1</a></sup> <sup class="src"><a href="#F4-40-src-D3">D3</a></sup></p>
+<h3>Device models</h3>
+<p>The UART model is only what the guest uses: transmit (collect characters into a line, print the line on the host console prefixed with <code>guest|</code>) and line status (always "transmitter empty"). The PIT model implements channel 0 in mode 2: writes to port 0x43 and 0x40 set a reload value and start time, a latch command freezes the current count, and reads of port 0x40 return the count, low byte then high. The count is computed from the host's TSC, so the virtual PIT runs at real speed even though no real PIT is involved. <sup class="src"><a href="#F4-40-src-R4">R4</a></sup> <sup class="src"><a href="#F4-40-src-R5">R5</a></sup></p>
+
+<h2 id="F4-40-layer3">Layer 3 — the engineer's depth</h2>
+<h3>Interrupts and the hand-over</h3>
+<p>The hypervisor's own 100 Hz timer must keep working while a guest runs. <code>svm_run</code> executes CLGI (global interrupt flag off: interrupts held pending), STI (host IF on), then VMRUN. In guest mode, with V_INTR_MASKING set and the INTR intercept on, a physical interrupt causes a #VMEXIT with code INTR. After the exit, STGI re-enables the global flag, the pending interrupt is taken by the host's own handler right there, and the loop continues. Without CLGI, an interrupt arriving between STI and VMRUN would be taken in the wrong place; without STGI the host would never take one. In the busy run, the report shows a handful of INTR exits for about 200 host ticks; our reading, not verified, is that most ticks arrive while the hypervisor is handling an I/O exit and are taken at STGI without an exit of their own. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup> <sup class="src"><a href="#F4-40-src-R5">R5</a></sup></p>
+<h3>Halting without spinning</h3>
+<p>A HLT exit must not spin the host. <code>handle_hlt</code> computes the TSC value of the guest's next virtual PIT tick and halts the host CPU (<code>sti; hlt; cli</code>) until the host's own timer moves past it. If the guest halted with interrupts disabled or without programming the timer, nothing can ever wake it: the hypervisor stops it as "halted forever" instead of waiting eternally. F4-40's guests have no interrupt handlers, so a woken guest continues after its HLT; F4-41 adds real interrupt injection. <sup class="src"><a href="#F4-40-src-R4">R4</a></sup></p>
+<h3>VM-entry failure: the documented error code</h3>
+<p>VMRUN checks the guest state before entering it, and refuses illegal combinations. On SVM, a refusal looks like an immediate exit with EXITCODE = −1, which Linux's header names <code>SVM_EXIT_ERR</code> and its table "invalid_guest_state". SVM gives no further code: the hypervisor must find which rule it broke by checking the state against the list of consistency checks in the APM. R3 breaks four rules on purpose (VMRUN intercept clear, ASID 0, EFER.SVME clear, CR0.NW set with CR0.CD clear) and QEMU's model refuses each one; then the same guest with a valid state runs normally, proving the host survived. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup> <sup class="src"><a href="#F4-40-src-D3">D3</a></sup> <sup class="src"><a href="#F4-40-src-R3">R3</a></sup></p>
+<p>A finding of this build: QEMU 8.2.2 stores the failure code as 0x00000000FFFFFFFF, only the low 32 bits of −1. A hypervisor that compared the 64-bit field with −1 would not recognise the failure under QEMU; Listing 3 compares the low 32 bits. Whether real processors write all 64 bits has not been checked. <sup class="src"><a href="#F4-40-src-R3">R3</a></sup></p>
+<p>On Intel VMX the documentation is richer. A VMLAUNCH or VMRESUME can fail in two ways. If the checks on the VMX controls or the host-state area fail, the instruction itself fails ("VMfailValid") and the VM-instruction error field of the VMCS holds a number that the SDM lists with its meaning. If the checks on the guest state fail, or loading MSRs fails, the processor reports a "VM-entry failure" as a VM exit whose exit reason has bit 31 set: basic reason 33 means invalid guest state, 34 means MSR loading failed. Listing 6 decodes 0x80000021 and 0x80000022 with Linux's own table. <sup class="src"><a href="#F4-40-src-D2">D2</a></sup> <sup class="src"><a href="#F4-40-src-D3">D3</a></sup> <sup class="src"><a href="#F4-40-src-R6">R6</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Not opened in this build: the AMD APM Vol. 2 (VMCB layout appendix, the list of VMRUN consistency checks, the IOIO EXITINFO1 format, the MSR numbers EFER 0xC0000080, VM_CR 0xC0010114 and VM_HSAVE_PA 0xC0010117, the intercept-bit order, the segment attribute format) and the Intel SDM Vol. 3 (the VMfailValid/VM-entry-failure distinction and the VM-instruction error numbers). Every VMCB offset and bit in Listing 1 and Listing 3 was written from memory; the runs prove only that QEMU 8.2.2's SVM model agrees with them. The exit-code and exit-reason numbers and names are verified against <code>&lt;asm/svm.h&gt;</code> and <code>&lt;asm/vmx.h&gt;</code>. Before running on hardware, check every offset against the APM's VMCB appendix, and check that real processors enforce the four checks R3 shows.</p></div>
+<h3>What the counts tell you</h3>
+<p>The hello guest causes 134 exits to print 66 characters: two per character (status, then data) plus one CPUID and one hypercall. A real 16550 driver that checks the status register before each byte costs twice what a paravirtual console would (one notification per line). The busy guest's report says more in three lines than any profiler: almost all exits are IOIO, on ports 0x43 and 0x40, in a ratio of 1 to 2: a latch command and two reads, repeated. That pattern is "polling the PIT". <sup class="src"><a href="#F4-40-src-R1">R1</a></sup> <sup class="src"><a href="#F4-40-src-R5">R5</a></sup></p>
+
+<h2 id="F4-40-hardware">How the hardware actually does it</h2>
+<p>On an AMD processor, VMRUN is a single instruction that does what Figure 1 shows: it saves host state to the host-save area, loads the guest state from the VMCB, applies the control area (intercepts, ASID, event injection), and starts executing the guest. A #VMEXIT does the reverse, writing exit information into the control area. The VMCB is ordinary memory that the hypervisor reads and writes with normal instructions, but the processor may cache parts of it ("VMCB clean bits" let the hypervisor say which parts it has not changed). On Intel, the VMCS is opaque: its fields have encodings and are accessed with VMREAD and VMWRITE, and the processor may keep the active VMCS inside the CPU. <sup class="src"><a href="#F4-40-src-D1">D1</a></sup> <sup class="src"><a href="#F4-40-src-D2">D2</a></sup></p>
+<p>Under QEMU TCG none of this is hardware. QEMU's CPU emulator implements SVM in software: VMRUN and #VMEXIT are emulated, and the guest's instructions are translated like any others. The <i>logic</i> the lab tests (which events exit, with which codes and information, which states VMRUN refuses) follows QEMU's model of the APM. The <i>timings</i> (milliseconds per run, CPU percentages) are properties of the emulator and say nothing about exit costs on silicon. <sup class="src"><a href="#F4-40-src-R1">R1</a></sup></p>
+<div class="co warning"><span class="lbl">Untested on hardware</span><p>The hypervisor has run only under QEMU 8.2.2 TCG with <code>-cpu qemu64,+svm,+npt</code>. It has not run on an AMD processor, and there is no Intel VMX version: QEMU's TCG does not emulate VMX, and the build container has no KVM to nest under. The curriculum's milestone V2 says to "develop under nested virtualization on a Linux KVM host"; do that before claiming V2 on real hardware, and expect differences in the consistency checks and in fields QEMU does not model (for example the VMCB clean bits).</p></div>
+<div class="co safety"><span class="lbl">Safety</span><p>A hypervisor runs at the highest privilege the machine has. A bug in a VMCB or in the host-save area set-up can crash or hang the computer, and an IOPM that lets a guest touch real ports can reprogram real devices. Develop in QEMU or under nested virtualization; on real hardware, use a spare machine with nothing on its disks you need, and keep the IOPM fully set unless you deliberately pass a port through.</p></div>
+
+<h2 id="F4-40-worked">Worked example</h2>
+<p><b>1. A VM-entry failure, explained from its code (the exam's question P).</b> The hypervisor prints: <code>VMRUN refused the guest state: exit code ffffffff (SVM_EXIT_ERR, -1)</code>. Step 1, identify the code: EXITCODE is a 64-bit field; the low 32 bits are all ones, which is −1 as QEMU stores it (Listing 6 decodes it as "invalid_guest_state"). Step 2, the meaning: VMRUN's consistency checks failed; the guest never ran a single instruction (R3 shows 1 exit, 0 ms). Step 3, find the rule: SVM gives no detail, so compare the VMCB with the APM's list of checks; the hypervisor's own log line says which field was broken on purpose (ASID 0 in the second case: ASID 0 is the host's). Step 4, confirm the host survived: the last guest in R3, with a valid state, prints its message. On Intel the same situation reads differently: exit reason 0x80000021 = bit 31 (entry failure) + basic reason 33 (invalid guest state), and the SDM's chapter on VM entries lists the guest-state checks to compare against. <sup class="src"><a href="#F4-40-src-R3">R3</a></sup> <sup class="src"><a href="#F4-40-src-R6">R6</a></sup> <sup class="src"><a href="#F4-40-src-D3">D3</a></sup></p>
+<p><b>2. Counting the hello guest's exits.</b> The guest prints "hello from a 64-bit guest\n" (26 characters), "my hypervisor says it is \"" (26), "DR404-tinyHV" (12) and "\"\n" (2): 66 characters. For each, <code>puts</code> reads port 0x3FD once (the model always says "ready") and writes port 0x3F8 once: 132 IOIO exits, 66 per port. Plus one CPUID (the signature) and one VMMCALL (the exit): 134, as R1 reports. <sup class="src"><a href="#F4-40-src-R1">R1</a></sup></p>
+<p><b>3. Counting the busy guest's PIT exits.</b> <code>guest_busy</code> programs the PIT (one write to 0x43, two to 0x40), reads it once before the loop, then once per poll; each read is one write to 0x43 and two reads of 0x40. With N polls (the guest prints N), port 0x43 sees 1 + (N + 1) = N + 2 exits and port 0x40 sees 2 + 2(N + 1) = 2N + 4. Check this against R5: the counts in the output satisfy both formulas exactly, whatever N was in the run. <sup class="src"><a href="#F4-40-src-R5">R5</a></sup></p>
+<p><b>4. The triple-fault guest.</b> It prints a 33-character line (66 IOIO exits) and executes <code>ud2</code>. The processor raises #UD; with IDTR limit 0 it cannot deliver it, which raises #DF; that cannot be delivered either, so the processor shuts down: on SVM, a SHUTDOWN exit (code 0x7F). R2: 66 IOIO + 1 SHUTDOWN = 67 exits; the next guest then runs normally. <sup class="src"><a href="#F4-40-src-R2">R2</a></sup></p>
+
+<h2 id="F4-40-code">Code walk-through</h2>
+<p>The hypervisor kernel reuses F4-39's boot code, console and interrupt code (<code>university/labs/F4-39/</code>) and adds the files in <code>university/labs/F4-40/</code>. It is built with the same freestanding g++ 13.3 flags and booted by QEMU 8.2.2 with <code>-cpu qemu64,+svm,+npt</code>.</p>
+<p><b>Listing 1</b> — <code>vmcb.h</code>, the VMCB as offsets</p>
+<pre class="listing" data-src="F4-40/vmcb.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9</td><td><code>#include &lt;asm/svm.h&gt;</code></td><td>Exit codes from Linux's header.</td><td>The only verified numbers in this file.</td></tr>
+<tr><td>13–28</td><td>control area</td><td>Intercept words, bitmap addresses, ASID, exit fields, nested paging, event injection.</td><td>The "agreement" of the story hook.</td></tr>
+<tr><td>30–37</td><td>state-save area</td><td>Segments (16 bytes each), control registers, RIP, RSP, RAX.</td><td>The guest's processor state while it is not running.</td></tr>
+<tr><td>42–43</td><td><code>w3_bit</code>, <code>w4_bit</code></td><td>Turn an exit code into its intercept bit.</td><td>Relies on the intercept bits being in exit-code order (unverified box).</td></tr>
+<tr><td>45–58</td><td><code>struct Vmcb</code></td><td>One aligned page with typed accessors.</td><td>VMRUN requires a page-aligned physical address.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>vmrun.S</code>, entering the guest once</p>
+<pre class="listing" data-src="F4-40/vmrun.S"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–17</td><td>pushes</td><td>Saves the host's callee-saved registers and the <code>GuestRegs</code> pointer.</td><td>VMRUN does not save them; the C++ caller expects them intact.</td></tr>
+<tr><td>18–32</td><td>loads</td><td>RAX = VMCB address; other GPRs from <code>GuestRegs</code>, RSI last.</td><td>The guest sees its registers as it left them.</td></tr>
+<tr><td>33–35</td><td><code>clgi; sti; vmrun</code></td><td>Holds interrupts, sets the host IF that guards guest mode, enters.</td><td>The atomic hand-over of Layer 3.</td></tr>
+<tr><td>36–38</td><td><code>stgi; nop; cli</code></td><td>Lets a pending host interrupt be taken, then disables interrupts.</td><td>The host's timer keeps ticking while guests run.</td></tr>
+<tr><td>39–54</td><td>stores</td><td>Saves the guest's GPRs back.</td><td>Handlers read and write them (CPUID results, hypercall arguments).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>hv.cc</code>, enablement, set-up, run loop and handlers</p>
+<pre class="listing" data-src="F4-40/hv.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–19</td><td>constants, pages</td><td>MSR numbers, the host-save page, the 12 KiB I/O permission map.</td><td>From memory of the APM; see the unverified box.</td></tr>
+<tr><td>30–45</td><td><code>count_exit</code>, <code>count_port</code></td><td>Tally exits by reason and IOIO exits by port.</td><td>The ledger. The forensic lab needs nothing else.</td></tr>
+<tr><td>70–108</td><td><code>emulate_io</code></td><td>UART transmit and status, PIT command, counter and latch, the exit port.</td><td>Device models: the guest's "hardware".</td></tr>
+<tr><td>110–132</td><td><code>handle_ioio</code></td><td>Decodes EXITINFO1, emulates, merges the result into RAX, RIP = EXITINFO2.</td><td>Figure 2 in code.</td></tr>
+<tr><td>134–156</td><td><code>handle_cpuid</code></td><td>Real CPUID, edited: hypervisor bit on, SVM hidden, our signature.</td><td>The guest of F4-39 detects "DR404-tinyHV" through this (F4-41).</td></tr>
+<tr><td>158–169</td><td><code>handle_hlt</code></td><td>Sleeps until the guest's next tick, or stops a guest that can never wake.</td><td>Why the halting guest costs the host almost nothing.</td></tr>
+<tr><td>207–225</td><td><code>svm_enable</code></td><td>CPUID check, VM_CR check, EFER.SVME, host-save area, IOPM all ones.</td><td>V2's "feature detection and enablement".</td></tr>
+<tr><td>228–262</td><td><code>vcpu_init_long_mode</code></td><td>Intercepts, ASID 1, V_INTR_MASKING, segments, control registers.</td><td>V2's "VMCB set-up with guest and host state".</td></tr>
+<tr><td>264–310</td><td><code>vcpu_run</code></td><td>Enter, trace, count, dispatch; the −1 check on the low 32 bits.</td><td>Every exit is handled or stops the guest with a reason.</td></tr>
+<tr><td>312–332</td><td><code>vcpu_report</code></td><td>Stop reason, exits by reason, IOIO exits by port.</td><td>V2's acceptance: "a count of exits by reason".</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F4-40/hello"></pre>
+
+<p><b>Listing 4</b> — <code>guests.cc</code>, the guests</p>
+<pre class="listing" data-src="F4-40/guests.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–22</td><td><code>puts</code></td><td>A 16550 polled-output driver: status, then data.</td><td>Two exits per character (Worked example 2).</td></tr>
+<tr><td>31–36</td><td><code>hv_exit</code></td><td>Hypercall 0 with the code in RBX.</td><td>The guest asks to stop, like F4-38's <code>HCALL</code>.</td></tr>
+<tr><td>52–68</td><td><code>guest_hello</code></td><td>Prints, asks CPUID for the signature, exits.</td><td>V2's first acceptance test.</td></tr>
+<tr><td>70–75</td><td><code>guest_triple</code></td><td><code>ud2</code> with no IDT.</td><td>V2's second acceptance test.</td></tr>
+<tr><td>78–94</td><td><code>guest_busy</code></td><td>Waits 200 ticks by polling the PIT.</td><td>The forensic guest.</td></tr>
+<tr><td>97–106</td><td><code>guest_hlt</code></td><td>Waits 200 ticks with HLT.</td><td>The reference.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F4-40/triple"></pre>
+<pre class="output" data-run="F4-40/hlt"></pre>
+
+<p><b>Listing 5</b> — <code>f440_main.cc</code>, the tests</p>
+<pre class="listing" data-src="F4-40/f440_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>19–41</td><td><code>Break</code></td><td>Four ways to make the guest state invalid.</td><td>V2's third acceptance test.</td></tr>
+<tr><td>58–62</td><td>host timer</td><td>Calibrates the host TSC with the PIT, then disables interrupts.</td><td>The virtual PIT and HLT handling are timed by the TSC.</td></tr>
+<tr><td>68–78</td><td>triple, invalid</td><td>After a failure, start another guest.</td><td>"The host kernel keeps running and can start a new guest."</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F4-40/invalid"></pre>
+
+<p><b>Listing 6</b> — <code>exitdecode.cpp</code>, decoding exit codes with Linux's tables</p>
+<pre class="listing" data-src="F4-40/exitdecode.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>4–6</td><td>includes</td><td>The SVM and VMX exit tables of Linux's UAPI headers.</td><td>Names from a source opened in this build, for both vendors.</td></tr>
+<tr><td>13–14</td><td><code>SVM_EXIT_REASONS</code>, <code>VMX_EXIT_REASONS</code></td><td>Macros that expand to {code, name} pairs.</td><td>The same tables Linux's tracing uses to print exit names.</td></tr>
+<tr><td>34–41</td><td>svm</td><td>Recognises QEMU's 32-bit −1.</td><td>The R3 finding, made explicit.</td></tr>
+<tr><td>42–47</td><td>vmx</td><td>Basic reason in bits 15:0; bit 31 marks an entry failure.</td><td>How to read 0x80000021.</td></tr>
+<tr><td>48–53</td><td>ioio</td><td>Decodes EXITINFO1.</td><td>Figure 2, from the command line.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F4-40/exitdecode"></pre>
+
+<h2 id="F4-40-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The guest is frozen, not interrupted.</b> A principal who calls the head teacher waits on the line and remembers the call. A guest at a VM exit is stopped between two instructions and does not know it was stopped; only time has passed.</li>
+<li><b>The agreement is enforced by hardware, not trust.</b> In a school, an agreement can be broken. In guest mode, an intercepted event always exits; the guest cannot opt out.</li>
+<li><b>The real principal does the job by pretending.</b> The head teacher really rings the bell. The hypervisor usually does not touch real hardware at all: the guest's "UART" and "PIT" exist only as a few variables in the hypervisor.</li>
+</ul>
+
+<h2 id="F4-40-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Forgetting to advance RIP.</b> Symptom: the same exit repeats forever (the run reaches "too many exits"). Fix: IOIO uses EXITINFO2; CPUID +2, HLT +1, VMMCALL +3 (when the processor provides no next-RIP field, as here).</li>
+<li><b>Losing general registers.</b> Symptom: the guest misbehaves after its first exit. Cause: VMRUN saves only RAX, RSP, RIP and a few others. Fix: Listing 2.</li>
+<li><b>Comparing the failure code as 64-bit −1.</b> Symptom under QEMU: "unhandled exit ffffffff". Fix: compare the low 32 bits (Listing 3, line 293), and test on hardware before relying on either.</li>
+<li><b>VMRUN intercept clear.</b> Symptom: VMRUN fails with −1 (R3, first case). The APM requires it set. Fix: always intercept VMRUN.</li>
+<li><b>An IOPM with holes.</b> Symptom: the guest reprograms the host's real PIT or PIC; the host's timer stops. Fix: start with every bit set (Listing 3, line 223) and open ports one by one, on purpose.</li>
+<li><b>Waiting in HLT with interrupts off.</b> Symptom: a guest that halts with IF = 0 hangs the host. Fix: detect it ("halted forever") and stop the guest.</li>
+<li><b>Debugging blind.</b> Print the raw fields of the first few exits (<code>trace=6</code> in R1) and compare them with what you expect, before reading any more code.</li>
+</ul>
+
+<div class="co transition" id="F4-40-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F4-39, where your kernel was the guest; F4-38's concepts; your own boot code, IDT, PIC and PIT. <sup class="src"><a href="#F4-40-src-C1">C1</a></sup> <b>What carries over:</b> the boot path, console and interrupt code are reused unchanged; CPUID, port I/O and the PIT are the same devices seen from the other side. <b>What changes:</b> your kernel now owns a second processor state in a VMCB, every guest device access is a function call in your kernel, and "it crashed" becomes an exit code you can count. <b>What comes next:</b> F4-41 gives the guest its own memory through nested paging, injects real timer interrupts, and boots F4-39's kernel, unchanged, as the guest.</p></div>
+
+<h2 id="F4-40-check">Check yourself</h2>
+<ol>
+<li>List the five things <code>svm_enable</code> does, in order, and say what goes wrong if the host-save area is not set.</li>
+<li>Decode EXITINFO1 = 0x00400011 of an IOIO exit by hand: direction, size, port. Which device is it on a PC?</li>
+<li>Why must <code>svm_run</code> execute CLGI before STI and VMRUN?</li>
+<li>A hypervisor log shows exit code 0x7F after 66 IOIO exits. What happened in the guest, and what must the hypervisor do next?</li>
+<li>Exam question P: a VMX hypervisor reports exit reason 0x80000021 after VMLAUNCH. Explain what it means, what did not happen, and where you would look next.</li>
+<li>Predict the exit counts of a guest that prints "ok\n" with Listing 4's <code>puts</code> and then makes hypercall 0.</li>
+<li>Why does the busy guest's report show port 0x40 exactly twice as often as 0x43, plus two?</li>
+<li>What does R3 prove about AMD processors? What does it not prove?</li>
+<li>Apply: a guest uses <code>rep outsb</code> to print a string. What does Listing 3 do, and what would you add?</li>
+</ol>
+
+<h2 id="F4-40-lab">Lab</h2>
+<p><b>Goal.</b> Build and run the tiny hypervisor (milestone V2, the course project), and pass V2's three acceptance tests under QEMU's SVM model.</p>
+<p><b>Milestone V2, as the curriculum states it.</b> Goal: "Your kernel enters VMX root operation (or enables SVM), creates one virtual CPU and runs a small guest that writes to a serial port, with every VM exit handled and counted." Build: "Feature detection and enablement; VMCS (or VMCB) set-up with guest and host state; an exit handler for I/O instructions, CPUID, HLT, control-register accesses and triple fault; a 16550 UART model for guest port I/O. Develop under nested virtualization on a Linux KVM host." Accept: "A guest in long mode prints a message through the emulated UART; your kernel shows it on its own console with a count of exits by reason." "A guest that triple-faults is reported and destroyed; the host kernel keeps running and can start a new guest." "Entering with a deliberately invalid guest state is caught by the VM-entry checks and reported with the documented error code, not a host crash." <sup class="src"><a href="#F4-40-src-C1">C1</a></sup></p>
+<p><b>Status in this build.</b> Under QEMU TCG: acceptance test 1 passes (R1), 2 passes (R2), 3 passes for four broken states (R3). Not done: control-register access exits (the guests do not change control registers; add the intercept as a lab step), the VMX version, nested virtualization on KVM, real hardware.</p>
+<p><b>Hardware and software needed.</b> Linux with g++ 13, binutils, QEMU with SVM emulation (8.2.2 was used). Run <code>university/labs/run_lab.sh university/labs/F4-40</code> from the repository root (about 20 s). For hardware: an AMD machine with SVM enabled in firmware, or a Linux KVM host with nested SVM.</p>
+<div class="co safety"><span class="lbl">Safety</span><p>QEMU first. On real hardware, a spare machine only (see the safety box above): a hypervisor bug can hang or reset the machine and an IOPM mistake can reprogram real devices.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In R1, decode exits 1 and 2 by hand with Figure 2, and check them with <code>exitdecode</code>.</li>
+<li>Verify Worked example 2's arithmetic against R1, and Worked example 3's formulas against R5.</li>
+<li>Add a fifth invalid state of your choice from the APM's VMRUN checks (for example an illegal EFER or CR4 combination). Does QEMU refuse it? Record the result either way.</li>
+<li>Add CR intercepts: intercept writes to CR0 and CR3 (control area offset 0x000, from the APM), and write a guest that loads CR3 with its own value. Handle the exit (emulate the move; on SVM with decode assists, EXITINFO1 tells you the register; without them, decode the instruction) and count it.</li>
+<li>Replace the guest's polled UART output by a paravirtual console: one hypercall per line with the string's address. Compare the exit counts.</li>
+<li>If you have a KVM host with nested SVM (or VMX, after porting): boot <code>hv32.elf</code> there with <code>-accel kvm</code>, and compare R3's four cases.</li>
+</ol>
+<p><b>Expected observations.</b> R1: 134 exits (132 IOIO, 1 CPUID, 1 VMMCALL). R2: SHUTDOWN reported, then a new guest prints. R3: four refusals with code ffffffff, then a normal run. R4: 200 HLT exits.</p>
+<p><b>Verification.</b> Each run's log ends with QEMU exit status 1 (PASS); the reports list every exit with a known reason (no "unhandled").</p>
+<p><b>Troubleshooting.</b> "this CPU has no SVM": QEMU needs <code>-cpu qemu64,+svm</code>. An immediate −1 on a valid state: compare your segment attributes with Listing 3 lines 245–251 and your EFER with the host's. The guest prints nothing: the IOIO handler's port decode, or RIP not advanced. Host hangs in HLT handling: the host's timer must be running (Listing 5, lines 58–62).</p>
+<p><b>Extension.</b> Port the hypervisor to Intel VMX under a KVM host with nested VMX: VMXON region, VMCS with VMWRITE, the same handlers. Check every field against the SDM's VMCS appendix.</p>
+
+<h2 id="F4-40-forensic">Forensic lab</h2>
+<p><b>Scenario: "The guest that runs slowly".</b> Jun's appliance guest boots fine on bare metal, but on the team's hypervisor a two-second wait in its start-up makes the whole host sluggish, and other guests miss deadlines. Jun says the guest "is only sleeping".</p>
+<p><b>Evidence pack.</b> The hypervisor's exit report and host CPU time for the guest's wait (R5), and for a reference guest that waits the same time with HLT (R4).</p>
+<pre class="output" data-run="F4-40/forensic_busy"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare total exits, exits by reason and host CPU between R4 and R5.</li>
+<li>Hypotheses: (a) the guest takes many interrupts; (b) the guest prints a lot; (c) the guest polls a device. Which lines of R5 support or rule out each?</li>
+<li>Root cause: which device, which access pattern, and what code would produce exactly these per-port counts?</li>
+<li>Fix: what should the guest do instead? What would the report look like after the fix?</li>
+<li>Prevention: what could the hypervisor do to make such guests visible (or cheaper) automatically?</li>
+</ol>
+<p><b>Method hints.</b> Divide the port 0x40 count by the port 0x43 count. Compare the number of INTR exits with the number of HLT exits in R4.</p>
+
+<h2 id="F4-40-project">Mini-project</h2>
+<p><b>Course project: milestone V2.</b> Take this chapter's hypervisor to the full V2 build list in your own kernel: feature detection for both SVM and VMX (one may be untested if you lack the hardware, and say so), control-register intercepts, a 16550 model that also handles input from the host console, and a per-guest exit report printed on demand. Develop under nested virtualization on a KVM host if you have one.</p>
+<p><b>Rubric</b> (20 points): the three V2 acceptance tests, each with a saved log (3 × 4 = 12); control-register exits handled and counted with a test guest (3); a written explanation of one VM-entry failure from its documented code, citing the manual section you used (3); honest notes on what was tested where (QEMU TCG, nested KVM, hardware) (2).</p>
+
+<h2 id="F4-40-summary">Summary</h2>
+<ul>
+<li>SVM is enabled by EFER.SVME after checking CPUID and VM_CR; VMRUN needs a host-save area.</li>
+<li>One VMCB page describes a virtual CPU: what to intercept, and the guest's processor state.</li>
+<li>The run loop is: load registers, CLGI, STI, VMRUN, STGI, save registers, count the exit code, handle it, repeat.</li>
+<li>Handlers for IOIO, CPUID, HLT, VMMCALL and SHUTDOWN are short; device models (UART, PIT) live in the hypervisor.</li>
+<li>A VM-entry failure on SVM is exit code −1 (QEMU stores 32 bits of it); on VMX, exit reason bit 31 plus a basic reason, or a VM-instruction error number.</li>
+<li>Exit counts by reason and by port diagnose a slow guest: 180,000 to 215,000 PIT exits for a polled two-second wait, 268 exits for a halted one.</li>
+<li>Everything here ran on QEMU's software model of SVM; untested on hardware.</li>
+</ul>
+
+<h2 id="F4-40-sources">Sources</h2>
+<ol>
+<li id="F4-40-src-D1">AMD, "AMD64 Architecture Programmer's Manual, Volume 2: System Programming", chapter "Secure Virtual Machine" and appendix "Layout of VMCB" (tier 1; curriculum item 11). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-40-src-D2">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3, chapters on VMX, the VMCS, VM entries and VM exits, and the appendix of VM-instruction error numbers (tier 1; curriculum item 10). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-40-src-D3">Linux UAPI headers <code>&lt;asm/svm.h&gt;</code> (<code>SVM_EXIT_*</code>, <code>SVM_EXIT_REASONS</code>) and <code>&lt;asm/vmx.h&gt;</code> (<code>EXIT_REASON_*</code>, <code>VMX_EXIT_REASONS</code>, <code>VMX_EXIT_REASONS_FAILED_VMENTRY</code>), package linux-libc-dev 6.8.0-146 (tier 4). Opened and compiled against in this build.</li>
+<li id="F4-40-src-D4">SimpleVisor (a minimal Intel VT-x hypervisor) and the kvm-unit-tests project, named in milestone V2's reading list (tier 4; curriculum item 163). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-40-src-C1">C1 — "Systems Curriculum", section 12.2 and milestone V2 in 12.5. A map, not a technical source (AH-4).</li>
+<li id="F4-40-src-R1">R1 — <code>F4-40/hello.out</code>, <code>hello.log</code>: hypervisor under QEMU 8.2.2 TCG, <code>-cpu qemu64,+svm,+npt</code>, first six exits traced.</li>
+<li id="F4-40-src-R2">R2 — <code>F4-40/triple.out</code>, <code>triple.log</code>: a guest triple-faults, then a new guest runs.</li>
+<li id="F4-40-src-R3">R3 — <code>F4-40/invalid.out</code>, <code>invalid.log</code>: four invalid guest states, then a valid one.</li>
+<li id="F4-40-src-R4">R4 — <code>F4-40/hlt.out</code>, <code>hlt.log</code>: a guest waits 200 ticks with HLT; host CPU measured.</li>
+<li id="F4-40-src-R5">R5 — <code>F4-40/forensic_busy.out</code>, <code>forensic_busy.log</code>: the same wait by polling the PIT; host CPU measured.</li>
+<li id="F4-40-src-R6">R6 — <code>F4-40/exitdecode.out</code>, <code>exitdecode.log</code>: Listing 6 with <code>exitdecode.in</code>.</li>
+</ol>
+
+<h2 id="F4-40-glossary">Glossary links</h2>
+<p><a href="#gl-svm-amd-v">SVM (AMD-V)</a> · <a href="#gl-vmx-vt-x">VMX (VT-x)</a> · <a href="#gl-vmcb">VMCB</a> · <a href="#gl-vmcs">VMCS</a> · <a href="#gl-intercept">Intercept</a> · <a href="#gl-i-o-permission-map-iopm">I/O permission map (IOPM)</a> · <a href="#gl-exit-code-and-exit-information">Exit code and exit information</a> · <a href="#gl-vm-entry-failure">VM-entry failure</a> · <a href="#gl-asid">ASID</a> · <a href="#gl-global-interrupt-flag-gif">Global interrupt flag (GIF)</a> · <a href="#gl-vm-exit-and-vm-entry">VM exit and VM entry</a> · <a href="#gl-hypercall">Hypercall</a> · <a href="#gl-triple-fault">Triple fault</a> · <a href="#gl-model-specific-register-msr">Model-specific register (MSR)</a> · <a href="#gl-pit-8254">PIT (8254)</a></p>
+
+<h2 id="F4-40-next">Next chapter</h2>
+<p>Next: <a href="#F4-41">F4-41 Nested paging and a real guest</a>. Previous: <a href="#F4-39">F4-39 Being a good guest</a>. Course: <a href="#DR404">DR404</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#virt">section 12, Virtualization</a>.</p>
+
+<h2 id="F4-40-answers">Answers to Check yourself</h2>
+<ol>
+<li>Check CPUID 0x80000001 ECX bit 2; check VM_CR.SVMDIS; read CPUID 0x8000000A; set EFER.SVME; write the host-save area's address to VM_HSAVE_PA (and fill the IOPM). Without a host-save area VMRUN has nowhere valid to save the host state; what the processor then does is defined in the APM's VMRUN description (not checked in this build), so never rely on it: set VM_HSAVE_PA first.</li>
+<li>Bit 0 = 1: IN; bit 4: 8-bit; port 0x0040: PIT channel 0 counter.</li>
+<li>So that no interrupt is taken between STI and VMRUN in host context; with GIF clear, the interrupt waits and either causes an INTR exit in guest mode or is taken at STGI.</li>
+<li>The guest triple-faulted (SHUTDOWN), here after printing a 33-character line. The hypervisor reports it, destroys the guest (never re-enters it) and continues, ready to start another (R2).</li>
+<li>Bit 31: the VM entry failed; basic reason 33: invalid guest state. The guest did not execute any instruction; the processor reported the failure after the host state was loaded back. Next: the SDM's chapter on VM entries, "checks on the guest-state area", compared field by field with your VMCS (and the exit qualification, which the SDM documents for this case). Not to be confused with VMfailValid, where the VM-instruction error field holds the number.</li>
+<li>"ok\n" is 3 characters: 6 IOIO exits (3 on 0x3FD, 3 on 0x3F8) + 1 VMMCALL = 7 exits.</li>
+<li>Each poll is one latch command (0x43) and two byte reads (0x40); set-up adds one 0x43 write and two 0x40 writes. Hence 0x43: N + 2 and 0x40: 2N + 4 = 2 × (N + 2).</li>
+<li>That QEMU 8.2.2's SVM model refuses those four states with −1 (in 32 bits) and that our hypervisor reports them and survives. Nothing about AMD processors: their checks, and how they store −1, must be tested on hardware or read in the APM.</li>
+<li>Bit 2 (string) is set, so Listing 3 prints "string I/O not supported" and stops the guest (Unhandled). Add: decode the segment and address size, read the bytes from guest memory at RSI (through the guest's page tables), emulate each, update RSI and RCX, honour the REP prefix.</li>
+</ol>
+<h3 id="F4-40-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>R4: 268 exits (200 HLT, 67 IOIO, 1 VMMCALL), a few per cent of one host CPU. R5: around 180,000 to 215,000 exits (depending on the run) in the same two seconds, almost all IOIO, and most of one host CPU.</li>
+<li>(a) Ruled out: only a handful of INTR exits (host interrupts) and no HLT. (b) Ruled out: UART ports 0x3F8/0x3FD account for only 47 exits each. (c) Confirmed: ports 0x43 and 0x40 account for nearly all exits.</li>
+<li>The PIT, channel 0: one latch command and two counter reads per iteration, in a tight loop (0x40 count = 2 × (0x43 count)): <code>guest_busy</code>'s <code>pit_read</code> loop.</li>
+<li>Halt between timer interrupts, as <code>guest_hlt</code>: about 200 HLT exits and a few IOIO exits for set-up and output, and a host CPU of a few per cent (R4).</li>
+<li>Report exit rates per guest and per reason and alarm above a threshold; rate-limit or deschedule a vCPU that exits on the same port at a high rate; offer a paravirtual clock and a timer the guest can wait on (F4-39), and document that PIT polling is unsupported.</li>
+</ol>

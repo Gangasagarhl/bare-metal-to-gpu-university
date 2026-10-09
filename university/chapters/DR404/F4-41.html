@@ -1,0 +1,308 @@
+<!--meta
+id: F4-41
+title: Nested paging and a real guest
+course: DR404
+level: L4
+prereqs: F4-40; F4-38 (two-dimensional walk); OS302 (F3-21 paging); OS303 (B12)
+time: 14–18 hours including the lab
+hardware: none (the F4-40 hypervisor with nested paging, under QEMU 8.2.2's software emulation of SVM; untested on real hardware)
+maps: Curriculum section 12.1 (memory virtualization), 12.2; milestone V3 (Nested paging and a real guest, the course's stretch project; partly)
+analogy: F4 — the school (and its visitors): a school inside a school, with the real principal above
+-->
+
+<h2 id="F4-41-hook">Story hook</h2>
+<p>Until now the small school borrowed the main school's floor plan: its "room 12" was the building's room 12. That was fine while the small school was a single class run by the real principal's own staff. Now a whole school moves in, with its own floor plan numbered from room 1, and the main school must keep using its own rooms. The building needs a second plan, its own, that says where each of the guest school's rooms really is: "their room 1 is our room 600, their room 2 is our room 601, and their room 3000 does not exist: if they try to go there, call me."</p>
+<p>That second plan is the <b>nested page table</b>. In this chapter the hypervisor of F4-40 gets one, plus a virtual interrupt controller and a timer that can wake a sleeping guest, and then it boots a real kernel: F4-39's good-guest kernel, built unchanged. The guest detects "DR404-tinyHV", calibrates its clock, idles with HLT, keeps a monotonic clock over 10 million reads, and, when told to read an address that its hypervisor never gave it, is stopped cleanly with a report of the nested page fault. The chapter also tells the story of a first attempt that crashed the host, and why.</p>
+
+<h2 id="F4-41-able">What you will be able to do</h2>
+<ul>
+<li><b>Implement</b> nested page tables that give a guest its own guest-physical address space, and load a kernel ELF file into it.</li>
+<li><b>Implement</b> a virtual interrupt controller and timer interrupt injection through the VMCB's event-injection field, and wake a halted guest.</li>
+<li><b>Interpret</b> a nested page fault report: the faulting guest-physical address and the error code.</li>
+<li><b>Diagnose</b> a host crash caused by a guest whose addresses were not translated, from QEMU's log, symbol tables and a probe.</li>
+<li><b>Evaluate</b> how virtual timer injection distorts a guest's view of time, using the guest's own calibration as evidence.</li>
+</ul>
+
+<div class="co jargon" id="F4-41-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Nested page table (NPT) and nested CR3</dt><dd><b>Simple words:</b> the hypervisor's page table that says where each guest "physical" page really is. <b>Analogy:</b> the building's master plan for the guest school's rooms. <b>Precise:</b> on AMD SVM, enabled by the VMCB's NP_ENABLE bit; its root is N_CR3, a host-physical address; entries use the long-mode page-table format and translate guest-physical to host-physical addresses for every guest memory access, including the guest's own page-table reads. Intel's equivalent is EPT, rooted at the EPT pointer. <sup class="src"><a href="#F4-41-src-D1">D1</a></sup> <sup class="src"><a href="#F4-41-src-D2">D2</a></sup></dd>
+<dt>Nested page fault (NPF) and EPT violation</dt><dd><b>Simple words:</b> the exit that happens when the guest touches guest-physical memory the hypervisor's table does not allow. <b>Analogy:</b> the guest school walks to "room 3000", which does not exist on the building's plan, and the real principal is called. <b>Precise:</b> SVM exit code 0x400 (<code>SVM_EXIT_NPF</code>) with the guest-physical address in EXITINFO2 and an error code in EXITINFO1; on VMX, basic exit reason 48 (EPT violation) with the address in a VMCS field and the access type in the exit qualification. <sup class="src"><a href="#F4-41-src-D3">D3</a></sup> <sup class="src"><a href="#F4-41-src-R5">R5</a></sup></dd>
+<dt>Event injection</dt><dd><b>Simple words:</b> the hypervisor makes the guest receive an interrupt or exception as if hardware had raised it. <b>Analogy:</b> the real principal rings the small school's bell for them. <b>Precise:</b> on SVM, writing a vector, a type (external interrupt, exception, software interrupt) and a valid bit into the VMCB's EVENTINJ field; the processor delivers the event through the guest's IDT at the next VMRUN. VMX uses the VM-entry interruption-information field. <sup class="src"><a href="#F4-41-src-D1">D1</a></sup> <sup class="src"><a href="#F4-41-src-R2">R2</a></sup></dd>
+<dt>Virtual interrupt controller</dt><dd><b>Simple words:</b> the hypervisor's imitation of the chip that hands interrupts to the processor. <b>Analogy:</b> the small school's own bell board, run by the real principal. <b>Precise:</b> a software model of an interrupt controller (here, the 8259 PIC's initialisation words, mask and end-of-interrupt) that decides when an injected interrupt is allowed; hardware assistance (APIC virtualization, AVIC, GICv4) moves part of this into the processor. <sup class="src"><a href="#F4-41-src-C1">C1</a></sup></dd>
+<dt>Guest-physical memory</dt><dd><b>Simple words:</b> the memory the guest believes is its RAM, starting at address 0. <b>Analogy:</b> the guest school's rooms, numbered from 1 on its own plan. <b>Precise:</b> the address space produced by the guest's page tables and translated by the nested table; in the lab, guest-physical 0–32 MiB is one host buffer at host-physical 0x600000. <sup class="src"><a href="#F4-41-src-R1">R1</a></sup></dd>
+<dt>Lost ticks</dt><dd><b>Simple words:</b> timer interrupts the guest should have received but did not, because it was not running at the time. <b>Analogy:</b> bells that rang while the small school's staff were out of the building. <b>Precise:</b> when a periodic virtual timer comes due while the vCPU is not running or cannot take interrupts, the hypervisor must either deliver the missed ticks later (catch-up) or drop them; either choice distorts a guest that counts ticks to measure time. <sup class="src"><a href="#F4-41-src-D4">D4</a></sup> <sup class="src"><a href="#F4-41-src-R3">R3</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-41-pictures">The idea in pictures</h2>
+<figure id="F4-41-fig1"><div class="svgbox">
+<svg viewBox="0 0 900 380" role="img" aria-labelledby="F4-41-f1t F4-41-f1d">
+<title id="F4-41-f1t">Figure 1: the guest's memory, the nested page table and a nested page fault</title>
+<desc id="F4-41-f1d">Left column: guest-physical address space as the guest sees it, from 0 to 4 GiB. Its first 32 MiB hold the Multiboot information at 0x9000, the guest page tables at 0x10000, and the kernel at 0x100000. Above 32 MiB, nothing is mapped; the address 0x40000000 (1 GiB) is marked as the target of the lab's touch test. Middle: the nested page table at host 0x402000: one PML4 entry, one PDPT entry and 16 page-directory entries of 2 MiB each. Right column: host-physical memory: the hypervisor's own kernel at 0x100000, its nested tables, and the guest's RAM, one 32 MiB buffer starting at host 0x600000, so guest 0x100000 is host 0x700000. Arrows: guest 0 to 32 MiB through the 16 entries to host 0x600000 to 0x25FFFFF; the guest access to 0x40000000 meets a not-present entry and produces exit code 0x400, a nested page fault, with EXITINFO2 = 0x40000000 and EXITINFO1 = 0x100000004.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="380"/>
+<text class="sv-tb" x="20" y="26">guest-physical (what the guest sees)</text>
+<rect class="sv-box" x="20" y="40" width="230" height="300"/>
+<rect class="sv-b3" x="20" y="250" width="230" height="90"/>
+<text class="sv-t" x="30" y="272">0–32 MiB: guest RAM</text><text class="sv-ts" x="30" y="290">0x9000 Multiboot info</text><text class="sv-ts" x="30" y="306">0x10000 guest page tables</text><text class="sv-ts" x="30" y="322">0x100000 the F4-39 kernel</text>
+<rect class="sv-b6" x="20" y="120" width="230" height="24"/><text class="sv-ts" x="30" y="137">0x40000000: touch test (R5)</text>
+<text class="sv-ts" x="30" y="70">32 MiB – 4 GiB: not mapped</text>
+<text class="sv-ts" x="30" y="360">0</text>
+<text class="sv-tb" x="330" y="26">nested page table</text>
+<rect class="sv-b4" x="320" y="70" width="210" height="190" rx="6"/>
+<text class="sv-t" x="332" y="94">N_CR3 = host 0x402000</text>
+<text class="sv-ts" x="332" y="118">PML4[0] → PDPT</text>
+<text class="sv-ts" x="332" y="138">PDPT[0] → PD</text>
+<text class="sv-ts" x="332" y="158">PD[0..15]: 2 MiB pages,</text>
+<text class="sv-ts" x="332" y="174">host 0x600000 + i × 2 MiB</text>
+<text class="sv-ts" x="332" y="198">everything else:</text>
+<text class="sv-ts" x="332" y="214">not present → NPF</text>
+<text class="sv-ts" x="332" y="240">bits: P, RW, US, PS</text>
+<text class="sv-tb" x="630" y="26">host-physical</text>
+<rect class="sv-box" x="620" y="40" width="260" height="300"/>
+<rect class="sv-b8" x="620" y="280" width="260" height="60"/><text class="sv-t" x="630" y="302">0x100000: the hypervisor</text><text class="sv-ts" x="630" y="320">(its own kernel, IDT, VMCB)</text>
+<rect class="sv-b4" x="620" y="250" width="260" height="26"/><text class="sv-ts" x="630" y="268">0x402000: nested tables</text>
+<rect class="sv-b3" x="620" y="120" width="260" height="120"/><text class="sv-t" x="630" y="144">0x600000–0x25FFFFF:</text><text class="sv-t" x="630" y="164">guest RAM buffer</text><text class="sv-ts" x="630" y="186">guest 0x100000 = host 0x700000</text>
+<line class="sv-line" x1="250" y1="295" x2="314" y2="200"/><polygon class="sv-head" points="309,198 318,192 316,204"/>
+<line class="sv-line" x1="530" y1="170" x2="614" y2="170"/><polygon class="sv-head" points="610,164 620,170 610,176"/>
+<line class="sv-dash" x1="250" y1="132" x2="314" y2="210"/><polygon class="sv-head" points="306,208 318,214 314,202"/>
+<rect class="sv-b6" x="320" y="290" width="270" height="60" rx="6"/><text class="sv-t" x="330" y="312">exit 0x400 NPF: EXITINFO2 = 0x40000000</text><text class="sv-ts" x="330" y="332">EXITINFO1 = 0x100000004 (R5)</text>
+<line class="sv-dash" x1="425" y1="260" x2="425" y2="284"/><polygon class="sv-head" points="419,280 425,290 431,280"/>
+</svg></div><figcaption><b>Figure 1.</b> The lab's memory layout. Addresses are those printed in R1 and R5 and fixed by Listing 1. Every guest access, including its own page-table walk, goes through the nested table (Figure 2 of F4-38 shows the walk). <sup class="src"><a href="#F4-41-src-R1">R1</a></sup> <sup class="src"><a href="#F4-41-src-R5">R5</a></sup> <sup class="src"><a href="#F4-41-src-D1">D1</a></sup></figcaption></figure>
+
+<figure id="F4-41-fig2"><div class="svgbox">
+<svg viewBox="0 0 900 300" role="img" aria-labelledby="F4-41-f2t F4-41-f2d">
+<title id="F4-41-f2t">Figure 2: timer interrupt injection and a sleeping guest</title>
+<desc id="F4-41-f2d">A sequence with time running left to right. The guest executes HLT; the hypervisor gets a HLT exit, advances the guest's RIP and halts the host CPU until the TSC passes the guest's next virtual tick. Before the next VMRUN, the entry hook sees that the tick is due, the guest's IF is 1, IRQ 0 is unmasked in the virtual PIC and no interrupt is in service, so it writes EVENTINJ = vector 32 + type 0 (external interrupt) + valid bit 31. VMRUN delivers vector 32 through the guest's IDT; the guest's handler counts the tick and writes the end-of-interrupt command 0x20 to port 0x20, which exits as IOIO; the virtual PIC clears in-service. The guest returns to its loop and halts again.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="300"/>
+<text class="sv-tb" x="20" y="28">guest</text><text class="sv-tb" x="20" y="198">hypervisor</text>
+<line class="sv-line2" x1="100" y1="60" x2="880" y2="60"/><line class="sv-line2" x1="100" y1="230" x2="880" y2="230"/>
+<rect class="sv-b2" x="110" y="40" width="70" height="40" rx="4"/><text class="sv-t" x="124" y="66">HLT</text>
+<line class="sv-line" x1="160" y1="80" x2="160" y2="204"/><polygon class="sv-head" points="154,200 160,210 166,200"/>
+<rect class="sv-b8" x="120" y="210" width="190" height="40" rx="4"/><text class="sv-ts" x="128" y="234">HLT exit: RIP+1, host halts</text>
+<rect class="sv-b8" x="320" y="210" width="230" height="40" rx="4"/><text class="sv-ts" x="328" y="228">tick due, IF=1, unmasked,</text><text class="sv-ts" x="328" y="244">not in service → EVENTINJ</text>
+<line class="sv-line" x1="540" y1="210" x2="540" y2="86"/><polygon class="sv-head" points="534,90 540,80 546,90"/>
+<text class="sv-ts" x="548" y="150">VMRUN delivers vector 32</text>
+<rect class="sv-b3" x="500" y="40" width="200" height="40" rx="4"/><text class="sv-ts" x="508" y="58">handler: ticks++,</text><text class="sv-ts" x="508" y="74">out 0x20 → port 0x20 (EOI)</text>
+<line class="sv-line" x1="690" y1="80" x2="690" y2="204"/><polygon class="sv-head" points="684,200 690,210 696,200"/>
+<rect class="sv-b8" x="620" y="210" width="200" height="40" rx="4"/><text class="sv-ts" x="628" y="234">IOIO exit: PIC in-service off</text>
+<rect class="sv-b2" x="760" y="40" width="110" height="40" rx="4"/><text class="sv-ts" x="768" y="66">IRET, HLT again</text>
+<text class="sv-ts" x="20" y="285">Per tick: 1 HLT exit + 1 IOIO exit (EOI) + 1 injected interrupt. R2: 221 HLT exits; injected ticks and EOIs about the same.</text>
+</svg></div><figcaption><b>Figure 2.</b> One virtual timer tick for a halting guest, as Listing 2 implements it. The EVENTINJ format is from memory of the APM (unverified box); R2 shows QEMU's model accepts it. <sup class="src"><a href="#F4-41-src-R2">R2</a></sup> <sup class="src"><a href="#F4-41-src-D1">D1</a></sup></figcaption></figure>
+
+<h2 id="F4-41-layer1">Layer 1 — the kid explanation</h2>
+<p>A guest operating system thinks its memory starts at 0. The real memory at 0 belongs to the hypervisor. So the hypervisor keeps a second map that turns every guest address into a real one. The processor reads both maps by itself: first the guest's own map, then the hypervisor's. If the guest asks for an address the hypervisor never gave it, the processor stops it and tells the hypervisor exactly which address it wanted.</p>
+<p>A real operating system also needs a clock that ticks. The hypervisor keeps an imaginary clock for the guest, and when it is time for a tick, it slips an interrupt into the guest right before letting it run again.</p>
+
+<h2 id="F4-41-layer2">Layer 2 — the student explanation</h2>
+<h3>Giving the guest its own memory</h3>
+<p>F4-40's guests used the host's own page tables, so every guest address was a host address: no isolation at all. Listing 1 gives the guest a 32 MiB buffer of host memory (2 MiB aligned, at host-physical 0x600000) and builds a nested page table that maps guest-physical 0–32 MiB onto it with sixteen 2 MiB pages. Every other guest-physical address is not present. Then it sets NP_ENABLE and N_CR3 in the VMCB. From now on, the guest's CR3 holds a guest-physical address, the guest's page-table entries hold guest-physical addresses, and the processor translates all of them through the nested table. <sup class="src"><a href="#F4-41-src-D1">D1</a></sup> <sup class="src"><a href="#F4-41-src-R1">R1</a></sup></p>
+<h3>Playing the boot loader</h3>
+<p>QEMU loaded F4-39's kernel with its Multiboot loader. Now the hypervisor must do that job. Listing 1's <code>load_guest_elf</code> copies the kernel's loadable segments to their physical addresses in guest RAM, zeroes their <code>.bss</code>, and looks up four symbols in the ELF symbol table. <code>vcpu_init_guest_kernel</code> writes a Multiboot information block with the guest's command line at guest-physical 0x9000, fills in the kernel's <code>boot_magic</code> and <code>boot_info</code> variables, builds an identity map of the guest's first 4 GiB in guest memory at 0x10000, and enters the kernel at its 64-bit entry point <code>long_mode</code>, in long mode with paging on. The next section explains why not at its 32-bit Multiboot entry. R1 shows the guest's own boot log, printed through the hypervisor's UART model: the F4-39 kernel finds "DR404-tinyHV". <sup class="src"><a href="#F4-41-src-R1">R1</a></sup></p>
+<h3>Interrupts for the guest</h3>
+<p>F4-39's kernel programs the PIC and PIT, enables interrupts and calibrates its TSC by halting through 20 ticks. A hypervisor that only resumes the guest after HLT (as F4-40 did) never delivers the interrupt the guest is waiting for. Listing 2 adds three pieces: a virtual 8259 that follows the guest's initialisation words (to learn its vector base, 32) and its mask, and sees end-of-interrupt commands; an <i>entry hook</i>, run before every VMRUN, that injects IRQ 0 when a tick is due and the guest can take it; and a <i>halt hook</i> that sleeps on the host until the next tick. R2 shows the result: 221 HLT exits, about as many injected interrupts (221 or 222 in this build's runs: once in a while a tick falls due while the guest is running rather than halted), and one write to port 0x20 per injected interrupt plus one initialisation word. <sup class="src"><a href="#F4-41-src-R2">R2</a></sup></p>
+<h3>Nested page faults</h3>
+<p>With the guest kernel's <code>test=touch addr=1073741824</code>, the guest reads one byte at guest-physical 1 GiB. Its own page tables map it (they identity-map 4 GiB), but the nested table does not. The processor stops the guest with exit code 0x400; EXITINFO2 is the guest-physical address, 0x40000000, and EXITINFO1 is the error code 0x100000004. The hypervisor reports both and stops the guest: V3's second acceptance test. <sup class="src"><a href="#F4-41-src-R5">R5</a></sup> <sup class="src"><a href="#F4-41-src-C1">C1</a></sup></p>
+
+<h2 id="F4-41-layer3">Layer 3 — the engineer's depth</h2>
+<h3>Reading the nested-page-fault error code</h3>
+<p>The low bits of EXITINFO1 follow the format of an ordinary page-fault error code: bit 0 set means the page was present (a protection violation), clear means not present; bit 1 set means a write; bit 2 set means a user-mode access. Bits above 31 add nested-paging information: one says the fault happened while the processor was translating the final guest-physical address, another that it happened while reading the guest's own page tables. R5's 0x100000004 decodes as: not present, read, user (nested walks are treated as user accesses), during the final translation. A fault with the "during the guest's page-table walk" bit would mean the guest's page tables themselves are outside guest RAM, a hypervisor bug rather than a guest bug. <sup class="src"><a href="#F4-41-src-D1">D1</a></sup> <sup class="src"><a href="#F4-41-src-R5">R5</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory of the AMD APM Vol. 2 ("Nested Paging" and the VMCB appendix), not opened in this build: the NPF error-code bits (bit 32 for a fault on the final translation, bit 33 for a fault during the guest's table walk; Listing 2 prints only bit 33), the rule that nested walks are user accesses (so every nested entry needs U/S), the EVENTINJ format (vector bits 7–0, type bits 10–8, valid bit 31), the NP_ENABLE and N_CR3 offsets, and the CPUID bit for nested paging (Fn8000_000A EDX bit 0). The exit code 0x400 is verified (<code>&lt;asm/svm.h&gt;</code>). The runs prove only that QEMU 8.2.2 behaves as these assumptions predict.</p></div>
+<h3>Why the guest is entered in long mode: a finding about QEMU</h3>
+<p>The natural design is to enter the kernel exactly as a Multiboot loader does: at <code>_start</code>, in 32-bit protected mode with paging off, EAX = 0x2BADB002, EBX = the information address. With paging off, every guest address is guest-physical and the nested table should translate it. Under QEMU 8.2.2 it did not. Listing 4 is a probe: a nested table with a 2 MiB hole at 48 MiB, and a guest that reads the hole twice. With guest paging on, the read causes a nested page fault, as expected. With guest paging off, the read <i>succeeds</i>: QEMU used the guest-physical address as a host-physical address. <sup class="src"><a href="#F4-41-src-R6">R6</a></sup></p>
+<p>The consequence for the 32-bit entry is drastic, and the forensic lab examines it: the guest's first instructions are fetched from host-physical 0x10000C, which is the <i>hypervisor's</i> own <code>_start</code>, and it clears the hypervisor's <code>.bss</code>. The workaround in Listing 1 is to enter the guest at <code>long_mode</code> with paging already on and page tables built by the hypervisor in guest memory; from then on every guest access is translated. The F4-39 kernel has this second entry point for exactly this purpose, so it still runs unchanged. <sup class="src"><a href="#F4-41-src-R7">R7</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>"Nested paging applies to every guest access, including when guest paging is disabled" is this course's reading of the AMD APM from memory; the APM was not opened in this build. R6 shows that QEMU 8.2.2's TCG model does not do it. Whether this is a QEMU limitation (our belief), a configuration QEMU does not support, or a misreading of the APM has not been settled. The Source Researcher should check the APM's nested-paging chapter, and the course owner may want to check a newer QEMU and real AMD hardware. Until then, enter guests with paging on, as Listing 1 does.</p></div>
+<h3>What the virtual timer does to the guest's clock</h3>
+<p>The guest calibrates its TSC exactly as on QEMU without a hypervisor: count TSC ticks over 20 PIT ticks. In this chapter's runs the result ranged from about 2.10 GHz to 2.48 GHz, while the hypervisor measured the same TSC at about 2.05 to 2.10 GHz. The guest is not lying; its ticks are late. Listing 2 injects a tick only at a VM entry after it is due, and when ticks were missed, it drops them and schedules the next one from "now". Every late or dropped tick lengthens the guest's 0.2 s window, so the guest overestimates the TSC rate: by up to about 10 % in most of this build's runs and by about 20 % in one (2.48 GHz). Compare the calibrated value in each output below with the host's. A guest that keeps time by counting ticks would run slow by the same amount. This is the "lost ticks" problem of virtual timekeeping, and the reason good guests use a paravirtual clock instead of calibrating (F4-39). <sup class="src"><a href="#F4-41-src-R1">R1</a></sup> <sup class="src"><a href="#F4-41-src-R2">R2</a></sup> <sup class="src"><a href="#F4-41-src-R3">R3</a></sup> <sup class="src"><a href="#F4-41-src-R4">R4</a></sup></p>
+<h3>From here to milestone V3</h3>
+<p>V3 asks for more than this lab built: your full B-track kernel as the guest, passing B1–B9 and B15's FAT32 tests on a virtio-blk device that the hypervisor emulates; CPUID and MSR filtering; a virtual local APIC timer. The pieces you would add are a virtio-blk device model (the device side of DR301's driver, served from a disk image), an MSR permission map with handlers, and either APIC emulation (exits on the APIC page through a nested page fault, then emulate the access) or x2APIC MSR exits. The structure of this chapter's hypervisor (hooks for I/O, entry, halt and exits) is designed to take them. <sup class="src"><a href="#F4-41-src-C1">C1</a></sup></p>
+
+<h2 id="F4-41-hardware">How the hardware actually does it</h2>
+<p>With nested paging on, the processor's page walker performs the two-dimensional walk of F4-38: each guest page-table reference is a guest-physical address translated through the nested table, and the final guest-physical address is translated again. TLB entries then cache the combined guest-virtual to host-physical translation, tagged with the guest's ASID, so a guest's TLB contents survive VM exits. The lab uses 2 MiB pages in both dimensions (the guest's identity map and the nested map), which shortens both dimensions of the walk by one level: by the formula of F4-38, (3 + 1)(3 + 1) − 1 = 15 reads instead of 24 on a miss with nothing cached. On Intel, EPT plays the same role, with its own entry format (read, write and execute bits, memory type) and its own exit (EPT violation, plus "EPT misconfiguration" for illegal entries). <sup class="src"><a href="#F4-41-src-D1">D1</a></sup> <sup class="src"><a href="#F4-41-src-D2">D2</a></sup> <sup class="src"><a href="#F4-41-src-D5">D5</a></sup></p>
+<p>Event injection is a processor feature: at VMRUN, after loading the guest state, the processor delivers the event in EVENTINJ through the guest's IDT exactly as if it had happened in the guest, then clears the valid bit. If delivery itself causes an exit (for example a nested page fault while pushing the interrupt frame), EXITINTINFO reports the event so that the hypervisor can re-inject it. <sup class="src"><a href="#F4-41-src-D1">D1</a></sup></p>
+<div class="co warning"><span class="lbl">Untested on hardware</span><p>All runs are under QEMU 8.2.2 TCG with <code>-cpu qemu64,+svm,+npt</code>. No AMD or Intel hardware, no nested virtualization under KVM, no EPT version. The timing numbers (milliseconds, CPU percentages, calibrated TSC rates) are properties of the emulator. The QEMU behaviour in R6 may differ from hardware.</p></div>
+<div class="co safety"><span class="lbl">Safety</span><p>The forensic run in this chapter crashes its (emulated) host: a guest overwrites the hypervisor's memory. On real hardware the same bug could corrupt anything the host kernel owns, including disk buffers. Develop in QEMU or nested under KVM; on hardware, a spare machine with nothing you need on its disks.</p></div>
+
+<h2 id="F4-41-worked">Worked example</h2>
+<p><b>1. Where does guest-physical 0x1011EB live?</b> R5's faulting instruction is at guest RIP 0x1011EB (the guest's page tables are an identity map, so that is also its guest-physical address). The nested PD entry is 0x1011EB &gt;&gt; 21 = 0, which maps guest 0–2 MiB to host 0x600000; the offset within the 2 MiB page is 0x1011EB. Host-physical = 0x600000 + 0x1011EB = 0x7011EB. The faulting <i>data</i> address 0x40000000 has PD index 0x40000000 &gt;&gt; 21 = 512: past the 512 entries of the only PD (indices 0–511), so the walk stops at PDPT index 1, which is not present. <sup class="src"><a href="#F4-41-src-R5">R5</a></sup></p>
+<p><b>2. Counting a halting guest's exits.</b> R2 waits 200 ticks after a calibration that waits 20 ticks plus one to align: 221 HLT exits. Each wake-up is an injected interrupt whose handler sends one EOI to port 0x20; with the one ICW1 write at initialisation, port 0x20's count is the injected count plus one (check it in R2: 221 or 222 injected, 222 or 223 writes). Ports 0x21 and 0xA1 see the four initialisation and mask writes each; port 0x43 once and 0x40 twice (programming the PIT). The rest are UART output, two exits per character: about 445 characters in R2's run. Total about 1,350 exits for two seconds of idling, against roughly 140,000 to 175,000 for the polling guest of R4 (the count depends on the run). <sup class="src"><a href="#F4-41-src-R2">R2</a></sup> <sup class="src"><a href="#F4-41-src-R4">R4</a></sup></p>
+<p><b>3. Decoding R5's error code.</b> 0x100000004 = bit 32 + bit 2. Bit 0 = 0: not present. Bit 1 = 0: read. Bit 2 = 1: user access (nested walks count as user). Bit 32 = 1: fault on the final guest-physical address (unverified bit meaning, see the box). Bit 33 = 0: not during the guest's page-table walk. Conclusion: the guest read a guest-physical address the hypervisor never mapped; the guest's own tables are fine. <sup class="src"><a href="#F4-41-src-R5">R5</a></sup></p>
+
+<h2 id="F4-41-code">Code walk-through</h2>
+<p>The files are in <code>university/labs/F4-41/</code>; the hypervisor core is F4-40's <code>hv.cc</code> and <code>vmrun.S</code>, unchanged, and the guest is F4-39's kernel, built from the same sources and embedded in the hypervisor's image by <code>guest_image.S</code> (<code>.incbin</code>).</p>
+<p><b>Listing 1</b> — <code>npt.cc</code>, nested tables, the ELF loader and the entry state</p>
+<pre class="listing" data-src="F4-41/npt.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–15</td><td>guest RAM, tables</td><td>A 32 MiB, 2 MiB-aligned buffer; three nested table pages; fixed guest addresses.</td><td>The guest's whole "physical" world.</td></tr>
+<tr><td>30–49</td><td><code>find_symbol</code></td><td>Searches the ELF symbol table for a name.</td><td>The hypervisor needs <code>long_mode</code>, <code>boot_magic</code>, <code>boot_info</code>, <code>gdt64_ptr</code>.</td></tr>
+<tr><td>54–65</td><td><code>npt_build</code></td><td>Sixteen 2 MiB nested entries; PDPT and PML4 above them.</td><td>Unmapped means not present: any other access is an NPF.</td></tr>
+<tr><td>67–96</td><td><code>load_guest_elf</code></td><td>Copies PT_LOAD segments, zeroes <code>.bss</code>, checks bounds.</td><td>The boot loader's job, with a bounds check a guest image cannot bypass.</td></tr>
+<tr><td>101–108</td><td>Multiboot block</td><td>Flags, command line, magic and address written into the guest.</td><td>The guest's <code>kmain</code> sees what QEMU's loader would have given it.</td></tr>
+<tr><td>111–119</td><td>guest page tables</td><td>Identity map of 4 GiB in guest memory, entries holding guest-physical addresses.</td><td>The guest needs paging on at entry (Layer 3).</td></tr>
+<tr><td>121–132</td><td>VMCB</td><td>F4-40's set-up, then NP_ENABLE, N_CR3, the kernel's own GDT, long-mode CR0, CR4, CR3, EFER, PAT.</td><td>Note CR3 = 0x10000: a guest-physical address.</td></tr>
+<tr><td>133–147</td><td><code>F441_ENTRY32</code></td><td>The forensic variant: 32-bit entry at <code>_start</code>, paging off.</td><td>R7: the host crashes.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F4-41/guest_detect"></pre>
+
+<p><b>Listing 2</b> — <code>vintr.cc</code>, the virtual PIC, injection, sleeping, and NPF reports</p>
+<pre class="listing" data-src="F4-41/vintr.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–15</td><td><code>VirtualPic</code></td><td>Vector base, mask, initialisation step, in-service flag.</td><td>Only the state the guest's code depends on.</td></tr>
+<tr><td>20–41</td><td><code>pic_io</code></td><td>ICW1–ICW4 to learn the base; OCW1 mask; EOI clears in-service.</td><td>Without EOI tracking, a slow handler would be re-entered.</td></tr>
+<tr><td>48–61</td><td><code>inject_if_due</code></td><td>Before each VMRUN: if due, IF = 1, unmasked, not in service, write EVENTINJ.</td><td>Line 60 drops missed ticks: the source of the calibration error.</td></tr>
+<tr><td>63–74</td><td><code>sleep_until_tick</code></td><td>On HLT, host halts until the next tick.</td><td>A halting guest costs the host little (R2 against R4).</td></tr>
+<tr><td>76–90</td><td><code>npf</code></td><td>Prints the guest-physical address and error code, stops the guest.</td><td>V3's second acceptance test.</td></tr>
+<tr><td>93–102</td><td><code>vintr_attach</code></td><td>Installs the four hooks into F4-40's <code>Vcpu</code>.</td><td>The core hypervisor did not change.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F4-41/guest_hlt"></pre>
+<pre class="output" data-run="F4-41/guest_mono"></pre>
+<pre class="output" data-run="F4-41/guest_npf"></pre>
+
+<p><b>Listing 3</b> — <code>f441_main.cc</code>, putting it together</p>
+<pre class="listing" data-src="F4-41/f441_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>16–23</td><td><code>guest_cmdline</code></td><td>Everything after "guest:" becomes the guest's command line.</td><td>One hypervisor image runs every F4-39 test.</td></tr>
+<tr><td>40–43</td><td>NP check</td><td>CPUID 0x8000000A EDX bit 0.</td><td>Nested paging is optional; QEMU offers it only with <code>+npt</code>.</td></tr>
+<tr><td>44–57</td><td>set-up and run</td><td>Build NPT, load ELF, init vCPU, attach interrupts, run.</td><td>The whole V3 path in fourteen lines.</td></tr>
+<tr><td>60–61</td><td>verdict</td><td>PASS if the guest exited with 0, or if an NPF was expected and happened.</td><td>The NPF test passes by being stopped cleanly.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>npt_probe.cc</code>, is the nested table used when guest paging is off?</p>
+<pre class="listing" data-src="F4-41/npt_probe.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–17</td><td>guest code</td><td>Seventeen bytes: read the hole, hypercall exit.</td><td>The smallest possible test of one question.</td></tr>
+<tr><td>28–48</td><td><code>probe</code></td><td>32-bit guest, nested paging on, guest paging off or on.</td><td>Only one variable changes between the two runs.</td></tr>
+<tr><td>62–69</td><td>nested map</td><td>Identity map of 4 GiB except a 2 MiB hole at 48 MiB.</td><td>If translated, the read must fault.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F4-41/npt_probe"></pre>
+
+<h2 id="F4-41-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The building's plan is consulted for every step, not once.</b> A school consults the master plan once to find a room. The processor consults the nested table for every guest table read, so the guest's own map lookup becomes many lookups (F4-38's two-dimensional walk).</li>
+<li><b>The bell is rung only when someone is in.</b> A real bell rings on time whether or not anybody hears it. A virtual tick can only be delivered when the guest runs and can accept it; late and lost ticks have no counterpart in the school.</li>
+<li><b>"Room 3000 does not exist" is a policy, not a fact.</b> The hypervisor could map it lazily on the first fault (as hypervisors do for memory they allocate on demand), or treat it as a device (MMIO emulation). The analogy suggests an error; the NPF is a general mechanism.</li>
+</ul>
+
+<h2 id="F4-41-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Guest page tables holding host addresses.</b> Symptom: NPFs at strange guest-physical addresses, or the "during the guest's walk" bit set. Fix: everything the guest sees (CR3, its table entries, GDTR base) holds guest-physical addresses.</li>
+<li><b>Nested entries without U/S.</b> Symptom: NPF with bit 0 set (present) on every access. Cause: nested walks are user accesses (unverified box). Fix: set U/S at every level (Listing 1, lines 60–63).</li>
+<li><b>Injecting with the guest's IF clear, or while an interrupt is in service.</b> Symptom: the guest takes an interrupt inside a critical section or recursively. Fix: check IF and the virtual PIC's state before every injection (Listing 2, line 54).</li>
+<li><b>Never injecting.</b> Symptom: the guest hangs in HLT during calibration. Fix: an entry hook, and a halt handler that sleeps until the next tick.</li>
+<li><b>Trusting the guest's calibrated clock.</b> Symptom: the guest's sense of time is off by tens of per cent. Fix: give the guest a paravirtual clock, or deliver missed ticks.</li>
+<li><b>Entering a guest with paging off under QEMU 8.2.2 TCG.</b> Symptom: the host crashes as soon as the guest runs. Fix: Listing 1's long-mode entry (Layer 3, R7).</li>
+</ul>
+
+<div class="co transition" id="F4-41-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F4-40's hypervisor, where guest and host shared one address space; F4-38's two-dimensional walk; F4-39's kernel, which is now the guest. <sup class="src"><a href="#F4-41-src-C1">C1</a></sup> <b>What carries over:</b> the run loop, the exit handlers and the device models, extended by hooks; the guest kernel unchanged. <b>What changes:</b> the guest has its own physical address space and its own interrupts; a bad guest access is a reported fault, not host corruption; time inside the guest is only as good as the hypervisor's timer. <b>What comes next:</b> the rest of milestone V3 (virtio-blk device model, MSR filtering, your full kernel passing its tests as a guest), and the other tracks' systems: drivers that will one day run inside VMs like this one.</p></div>
+
+<h2 id="F4-41-check">Check yourself</h2>
+<ol>
+<li>Name the two VMCB fields that turn nested paging on, and what kind of address each of them holds.</li>
+<li>Which addresses in Listing 1's VMCB set-up are guest-physical, and which are host-physical? Give three of each.</li>
+<li>Compute the host-physical address of guest-physical 0x1F00000. Then say what happens on a guest access to 0x2000000.</li>
+<li>Explain why the guest's calibrated TSC rate is higher than the host's. Predict the effect of delivering missed ticks immediately instead of dropping them.</li>
+<li>What three conditions does <code>inject_if_due</code> check besides "a tick is due", and what goes wrong without each?</li>
+<li>Decode an NPF error code 0x200000007 with the bit meanings of Layer 3. What kind of bug would you look for?</li>
+<li>Apply: you want to give the guest a device whose registers live at guest-physical 0xFEC00000. How can nested paging help you emulate it?</li>
+<li>Why does the 2 MiB nested mapping reduce the cost of a nested walk? Use F4-38's formula.</li>
+<li>Which of V3's acceptance tests does this lab pass, and what is missing for the others?</li>
+</ol>
+
+<h2 id="F4-41-lab">Lab</h2>
+<p><b>Goal.</b> Run a real kernel as a guest with nested paging and injected interrupts (milestone V3, the course's stretch project, partly).</p>
+<p><b>Milestone V3, as the curriculum states it.</b> Goal: "Run your B-track kernel as a guest of your hypervisor: guest physical memory through EPT (or NPT), timer and interrupt injection, and a virtio-blk device model in your hypervisor." Build: "EPT/NPT page tables for guest memory; interrupt injection and a virtual local APIC timer (or exits on the APIC page at first); CPUID and MSR filtering; a virtio-blk back end serving a disk image file from your host file system." Accept: "Your own kernel boots as a guest of your hypervisor and passes B1–B9 and the B15 FAT32 tests on the virtio-blk device you emulate." "A guest access to an unmapped guest-physical address produces a reported EPT (or NPT) violation with the faulting address, and the guest is stopped cleanly." "Optional: the same on AArch64 at EL2 under QEMU's virt machine, or with the RISC-V H extension." <sup class="src"><a href="#F4-41-src-C1">C1</a></sup></p>
+<p><b>Status in this build.</b> Done under QEMU TCG: NPT for guest memory; timer injection with a virtual PIC (not a local APIC); CPUID filtering (from F4-40); a kernel (F4-39's, not a full B-track kernel) booting as a guest and passing its own tests (R1–R4); acceptance test 2 (R5). Not done: virtio-blk back end, MSR filtering, B1–B9 and B15 as a guest, the optional AArch64 and RISC-V versions, hardware.</p>
+<p><b>Hardware and software needed.</b> As F4-40. Run <code>university/labs/run_lab.sh university/labs/F4-41</code> from the repository root (about 30 s).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>QEMU first; the forensic run crashes its emulated host on purpose. On hardware, a spare machine only.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In R1, find the loaded segments, the symbols, and the guest's own detection lines.</li>
+<li>Compare R2 and R4: total exits, exits by port, injected interrupts, host CPU. Verify Worked example 2's counts against R2.</li>
+<li>Change Listing 2 line 60 to deliver missed ticks (advance <code>g_next_tick</code> by one period instead of recomputing from now). Rerun and compare the guest's calibrated TSC with the host's.</li>
+<li>Shrink guest RAM to 8 MiB and run <code>guest:test=touch addr=10485760</code>. Explain the report.</li>
+<li>Add an MSR permission map that intercepts all MSRs, and handle the PAT and EFER MSRs (read-only emulation). Count MSR exits for each test.</li>
+<li>Stretch (V3): write a virtio-blk device model behind a legacy PCI or MMIO transport, serving a disk image embedded like the guest kernel, and boot your B-track kernel with it.</li>
+</ol>
+<p><b>Expected observations.</b> R1: "DR404-tinyHV", PASS. R2: injected interrupts equal to the HLT exits, or one more. R5: NPF at 0x40000000, guest stopped, PASS. R6: paging off "NOT translated", paging on "nested page fault".</p>
+<p><b>Verification.</b> Each log shows QEMU exit status 1 (PASS), except the forensic run (0, reset, expected).</p>
+<p><b>Troubleshooting.</b> Guest hangs during calibration: no injection; check the virtual PIC learned base 32 (print it). Immediate NPF with bit 33: the guest's tables are outside guest RAM. VMRUN fails with −1: check EFER (LME and LMA both set with paging on) and CR4.PAE.</p>
+<p><b>Extension.</b> Implement lazy guest memory: start with an empty nested table and map 2 MiB on each NPF inside guest RAM; count the faults during boot.</p>
+
+<h2 id="F4-41-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Priya's first version of the hypervisor entered the guest kernel exactly as a Multiboot loader does: 32-bit protected mode, paging off, at <code>_start</code>. The machine reset as soon as the guest started; no guest output appeared, and the hypervisor printed nothing after "starting the F4-39 kernel".</p>
+<p><b>Evidence pack.</b> The serial console, QEMU's own log of the first blocks it translated after the first VMRUN (decoded with objdump), the VM-exit and exception lines of that log, the symbols and first instructions of both kernels; and the probe R6.</p>
+<pre class="output" data-run="F4-41/forensic_entry32"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: at what guest RIP did the guest start, and what instructions did QEMU execute there? Compare them with the first instructions of each kernel. Whose code is it?</li>
+<li>Hypotheses: (a) the guest kernel image was loaded wrongly; (b) the guest ran its own code but crashed; (c) the guest's addresses were not translated by the nested table. Which evidence decides?</li>
+<li>Root cause: what memory did the guest overwrite, and why does that crash the host rather than the guest?</li>
+<li>Fix: give two ways to avoid the problem, and say which one Listing 1 uses.</li>
+<li>Prevention: what test would have caught this before the first real guest, and what does it cost to run?</li>
+</ol>
+<p><b>Method hints.</b> Compare the immediate operands of the <code>mov $…,%edi</code> and <code>mov $…,%ecx</code> instructions in the log with the <code>__bss_start</code> and <code>__bss_end</code> of each kernel. Then look at R6.</p>
+
+<h2 id="F4-41-project">Mini-project</h2>
+<p><b>V3 stretch: a block device for the guest.</b> Implement a virtio-blk device model in the hypervisor (legacy virtio over port I/O is the shortest path, as the PIT and UART are port I/O already; modern MMIO is the alternative), serving a disk image from memory. Boot your B-track kernel (or the F4-39 kernel extended with DR301's virtio-blk driver) and read a FAT32 file from the image.</p>
+<p><b>Rubric</b> (20 points): device discovery and feature negotiation from the guest's side (4); correct handling of the virtqueue (descriptor chains, used ring, notification) with exit counts reported (6); a FAT32 read test passing in the guest (5); NPF test still passing and an honest note of what was tested where (5).</p>
+
+<h2 id="F4-41-summary">Summary</h2>
+<ul>
+<li>Nested paging (NP_ENABLE, N_CR3) translates every guest-physical address through a hypervisor-owned table; the guest owns its CR3 and tables.</li>
+<li>The hypervisor plays the boot loader: ELF segments, Multiboot information, guest page tables, entry state.</li>
+<li>Timer interrupts are injected through EVENTINJ at VM entry when the guest can take them; a virtual PIC tracks base, mask and EOI.</li>
+<li>An unmapped guest-physical access is a nested page fault (exit 0x400) with the address in EXITINFO2: report it and stop the guest.</li>
+<li>QEMU 8.2.2 TCG did not apply nested paging with guest paging off (R6); a guest entered that way overwrote the hypervisor (R7). Enter guests with paging on.</li>
+<li>Late and dropped virtual ticks made the guest overestimate its TSC rate by up to about 20 %: guests need paravirtual clocks.</li>
+<li>Untested on hardware; V3's virtio-blk, MSR filtering and B-track tests remain to be done.</li>
+</ul>
+
+<h2 id="F4-41-sources">Sources</h2>
+<ol>
+<li id="F4-41-src-D1">AMD, "AMD64 Architecture Programmer's Manual, Volume 2: System Programming", chapters "Secure Virtual Machine" (nested paging, event injection) and the VMCB appendix (tier 1; curriculum item 11). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-41-src-D2">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3, "VMX Support for Address Translation" (EPT, EPT violations, INVEPT) (tier 1; curriculum item 10). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-41-src-D3">Linux UAPI headers <code>&lt;asm/svm.h&gt;</code> (<code>SVM_EXIT_NPF</code> = 0x400) and <code>&lt;asm/vmx.h&gt;</code> (<code>EXIT_REASON_EPT_VIOLATION</code> = 48), linux-libc-dev 6.8.0-146 (tier 4). Opened and compiled against in this build.</li>
+<li id="F4-41-src-D4">Edouard Bugnion, Jason Nieh, Dan Tsafrir, "Hardware and Software Support for Virtualization" (tier 3; curriculum item 157): interrupt and timer virtualization. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-41-src-D5">Ravi Bhargava et al., "Accelerating Two-Dimensional Page Walks for Virtualized Systems", ASPLOS 2008 (tier 5; curriculum item 160). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-41-src-C1">C1 — "Systems Curriculum", sections 12.1 and 12.2, and milestone V3 in 12.5. A map, not a technical source (AH-4).</li>
+<li id="F4-41-src-R1">R1 — <code>F4-41/guest_detect.out</code>, <code>guest_detect.log</code>: the F4-39 kernel as a guest, <code>test=detect</code>.</li>
+<li id="F4-41-src-R2">R2 — <code>F4-41/guest_hlt.out</code>, <code>guest_hlt.log</code>: the guest idles 2 s with HLT; host CPU measured.</li>
+<li id="F4-41-src-R3">R3 — <code>F4-41/guest_mono.out</code>, <code>guest_mono.log</code>: 10 million clock reads in the guest.</li>
+<li id="F4-41-src-R4">R4 — <code>F4-41/guest_poll.out</code>, <code>guest_poll.log</code>: the guest idles 2 s by polling the PIT; host CPU measured.</li>
+<li id="F4-41-src-R5">R5 — <code>F4-41/guest_npf.out</code>, <code>guest_npf.log</code>: the guest reads guest-physical 1 GiB.</li>
+<li id="F4-41-src-R6">R6 — <code>F4-41/npt_probe.out</code>, <code>npt_probe.log</code>: Listing 4.</li>
+<li id="F4-41-src-R7">R7 — <code>F4-41/forensic_entry32.out</code>, <code>forensic_entry32.log</code>: the 32-bit entry build with QEMU's <code>-d in_asm,int,nochain</code> log, objdump 2.42 and nm.</li>
+</ol>
+
+<h2 id="F4-41-glossary">Glossary links</h2>
+<p><a href="#gl-nested-page-table-npt-and-nested-cr3">Nested page table (NPT) and nested CR3</a> · <a href="#gl-nested-page-fault-npf-and-ept-violation">Nested page fault (NPF) and EPT violation</a> · <a href="#gl-event-injection">Event injection</a> · <a href="#gl-virtual-interrupt-controller">Virtual interrupt controller</a> · <a href="#gl-guest-physical-memory">Guest-physical memory</a> · <a href="#gl-lost-ticks">Lost ticks</a> · <a href="#gl-nested-paging-ept-npt-stage-2-g-stage">Nested paging (EPT, NPT, stage-2, G-stage)</a> · <a href="#gl-vmcb">VMCB</a> · <a href="#gl-8259-pic">8259 PIC</a> · <a href="#gl-eoi-end-of-interrupt">EOI (end of interrupt)</a> · <a href="#gl-elf-loader">ELF loader</a> · <a href="#gl-page-table">Page table</a> · <a href="#gl-triple-fault">Triple fault</a></p>
+
+<h2 id="F4-41-next">Next chapter</h2>
+<p>This is the last chapter of <a href="#DR404">DR404</a>. Previous: <a href="#F4-40">F4-40 A tiny hypervisor</a>. Back to the start: <a href="#F4-38">F4-38 Virtualization concepts</a>. Related: <a href="#F4-05">F4-05 virtio block and network</a> (the driver side of V3's device). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#virt">section 12, Virtualization</a>.</p>
+
+<h2 id="F4-41-answers">Answers to Check yourself</h2>
+<ol>
+<li>NP_ENABLE (a flag, bit 0 = on) and N_CR3, which holds the host-physical address of the nested PML4.</li>
+<li>Guest-physical: CR3 (0x10000), GDTR base (the kernel's <code>gdt64</code>), RIP (<code>long_mode</code>, 0x1000C0), the Multiboot address in <code>boot_info</code> (0x9000). Host-physical: N_CR3 (0x402000), the IOPM address, the host-save area (and the VMCB address given to VMRUN).</li>
+<li>0x1F00000 &gt;&gt; 21 = 15, the last mapped entry: host 0x600000 + 0x1F00000 = 0x2500000. 0x2000000 is index 16, not present: a nested page fault at guest-physical 0x2000000.</li>
+<li>Ticks are injected late or dropped, so 20 guest ticks take longer than 0.2 s of host time; the guest counts more TSC ticks per "second". Delivering missed ticks immediately would shorten the window back toward 0.2 s on average, but bursts of back-to-back ticks would make individual intervals wrong; check by experiment (lab step 3).</li>
+<li>Guest IF = 1 (else the interrupt would arrive while the guest disabled interrupts), IRQ 0 unmasked in the virtual PIC (else the guest asked not to get it), not in service (else the handler would be re-entered before its EOI).</li>
+<li>Bits 0, 1, 2 and 33: present, write, user, during the guest's page-table walk. The processor was writing a guest page-table entry (for example the accessed or dirty bit) at a guest-physical address mapped read-only in the nested table: look at how the hypervisor maps the guest's page-table pages.</li>
+<li>Leave that range not present (or mapped read-only) in the nested table: every guest access then exits with an NPF carrying the address; decode the instruction (or use the exit information) and emulate the register access: MMIO emulation.</li>
+<li>With 2 MiB nested pages the nested walk has 3 levels instead of 4: (4 + 1)(3 + 1) − 1 = 19 reads instead of 24 for a 4-level guest; with 2 MiB guest pages too, (3 + 1)(3 + 1) − 1 = 15.</li>
+<li>Test 2 (NPF reported with the address, guest stopped cleanly): passed (R5). Test 1: a kernel boots as a guest and passes its own tests, but not the B-track kernel with B1–B9 and B15, and no virtio-blk model exists. Optional test: not attempted.</li>
+</ol>
+<h3 id="F4-41-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>The guest started at 0x10000C. The decoded block shows <code>mov $0x200000,%edi</code> and <code>mov $0x2602000,%ecx</code>: the hypervisor's own <code>__bss_start</code> and <code>__bss_end</code>, matching the hypervisor's <code>_start</code>, not the guest's (whose constants are 0x104000 and 0x113128). The guest is executing the hypervisor's code.</li>
+<li>(a) Ruled out: the loader's lines show the segments copied into guest RAM, and with the 64-bit entry the same image runs (R1). (b) Ruled out: the instructions are not the guest's. (c) Confirmed: guest-physical 0x10000C was used as host-physical 0x10000C, where the hypervisor itself is loaded; R6 shows QEMU does not translate when guest paging is off.</li>
+<li>The guest's <code>rep stosb</code> zeroes host-physical 0x200000–0x2602000: the hypervisor's whole <code>.bss</code>, including its page tables, IDT, VMCB and the guest RAM buffer. The guest also stores the magic into the hypervisor's <code>boot_magic</code>. An INTR exit (rip 0x100026, inside the <code>rep stosb</code>) returns to a host whose memory is gone: the host takes a cascade of exceptions (the <code>check_exception</code> lines) and triple-faults; QEMU resets (status 0).</li>
+<li>Enter the guest with paging on, through tables in guest memory, so that all accesses are translated (Listing 1); or avoid the overlap so that untranslated accesses cannot reach host memory (for example, load the hypervisor at an address the guest never uses), which only hides the problem. Both should be combined with checking QEMU's or the hardware's behaviour first.</li>
+<li>A probe like Listing 4 run before the first real guest: a nested table with a hole, read once with guest paging off and once on. It costs one boot of a 17-byte guest and settles the question for the platform being used.</li>
+</ol>
