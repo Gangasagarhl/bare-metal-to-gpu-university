@@ -1,0 +1,340 @@
+<!--meta
+id: F5-09
+title: Remote procedure calls
+course: DS301
+level: L3
+prereqs: F5-08; DS201 (F5-04 TCP, F5-05 sockets in C++); SP201 (serialisation, byte order); SP203 (std::thread)
+time: 8–10 hours including the RPC library lab
+hardware: none: one Linux computer with g++; client and server run as two threads of one program over the loopback interface (the build used g++ 13.3 in a cloud container)
+maps: van Steen and Tanenbaum "Distributed Systems" (communication: remote procedure call; pending verification); Kleppmann "Designing Data-Intensive Applications" (encoding and dataflow through services; pending verification); POSIX sockets (pending verification); course lab "An RPC library over TCP"
+analogy: F5 — friends in different towns (registered: RPC = phoning a friend and asking them to do something; where it breaks: if the line drops you do not know whether they did it)
+-->
+
+<h2 id="F5-09-hook">Story hook</h2>
+<p>Bao phones Amara: "Please add my ten books to the club's list." Amara says "Sure, writing it now", and the line goes dead. Did she write it? Bao cannot know. If he phones again and asks again, and she had already written it, the list now says twenty books. If he does not phone again, and the line dropped before she heard him, the books are not on the list at all.</p>
+<p>The next time, Bao is smarter. He says: "This is request number 7 from Bao: add my ten books." Amara writes "done: Bao #7" in the margin. When the line drops and Bao calls back with "request number 7 from Bao", Amara looks at the margin, sees it is done, and says "already done". Now calling back is safe.</p>
+<p>A phone call that asks a friend to do something is the registered analogy for a <b>remote procedure call</b>. This chapter builds one over TCP, and then meets the dropped line in all its forms.</p>
+
+<h2 id="F5-09-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what an RPC system does: stubs, marshalling, framing over a byte stream, request ids, and how replies find their requests.</li>
+<li><b>Build</b> a small RPC library over TCP in C++ and add a procedure to it, with a defined wire format in network byte order.</li>
+<li><b>Explain</b> why an RPC is not a local call: latency, partial failure, no shared memory, and the meaning of a timeout.</li>
+<li><b>Choose</b> between at-most-once and at-least-once semantics, and make a non-idempotent operation safe to retry with duplicate detection.</li>
+<li><b>Diagnose</b> a duplicated operation from client and server logs and identify which part of the retry design failed.</li>
+</ul>
+
+<div class="co jargon" id="F5-09-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Remote procedure call (RPC)</dt><dd><b>Simple words:</b> asking a program on another computer to run a function for you and send back the answer. <b>Analogy:</b> phoning a friend and asking her to do something (registered F5 mapping). <b>Precise:</b> a communication pattern in which a client invokes a named procedure with arguments on a server by sending a request message and waiting for a reply message carrying the result or an error; libraries make it look like a local function call. <sup class="src"><a href="#F5-09-src-D2">D2</a></sup> <sup class="src"><a href="#F5-09-src-D1">D1</a></sup></dd>
+<dt>Stub</dt><dd><b>Simple words:</b> a small function that looks like the real one but actually sends a message. <b>Analogy:</b> the note Bao reads from when he phones, so every call is asked the same way. <b>Precise:</b> the client-side function (client stub) that marshals arguments into a request, sends it and unmarshals the reply; the server-side counterpart (server stub or skeleton) unmarshals the request and calls the implementation. Often generated from an interface description. <sup class="src"><a href="#F5-09-src-D2">D2</a></sup></dd>
+<dt>Marshalling</dt><dd><b>Simple words:</b> turning the function's arguments into bytes that can travel, and back. <b>Analogy:</b> spelling a name letter by letter on the phone so it arrives exactly. <b>Precise:</b> encoding typed values into a defined byte representation (field order, sizes, byte order) for a message, and decoding them on the other side; the RPC form of <a href="#gl-serialisation">serialisation</a> (SP201). <sup class="src"><a href="#F5-09-src-D2">D2</a></sup> <sup class="src"><a href="#F5-09-src-D1">D1</a></sup></dd>
+<dt>Framing</dt><dd><b>Simple words:</b> marking where one message ends and the next begins in a stream of bytes. <b>Analogy:</b> saying "end of message" at the end of each request on the phone. <b>Precise:</b> a convention that delimits messages within a byte stream such as a TCP connection, here a 4-byte big-endian length before each message; needed because TCP preserves the order of bytes but not message boundaries (<a href="#F5-04">F5-04</a>). <sup class="src"><a href="#F5-09-src-D4">D4</a></sup> <sup class="src"><a href="#F5-09-src-R1">R1</a></sup></dd>
+<dt>Request id</dt><dd><b>Simple words:</b> a number on every request so its answer and any repeat can be recognised. <b>Analogy:</b> "this is request number 7 from Bao". <b>Precise:</b> an identifier chosen by the client, unique per client, carried in the request and echoed in the reply; the pair (client id, request id) identifies one logical operation across retries. <sup class="src"><a href="#F5-09-src-D2">D2</a></sup></dd>
+<dt>Idempotent operation</dt><dd><b>Simple words:</b> an operation that has the same effect whether you do it once or several times. <b>Analogy:</b> "set my count to ten books" (safe to repeat) versus "add ten books" (not safe). <b>Precise:</b> an operation f with f(f(state)) = f(state) for the same arguments; repeating it after an unknown outcome cannot change the result. <sup class="src"><a href="#F5-09-src-D2">D2</a></sup> <sup class="src"><a href="#F5-09-src-D1">D1</a></sup></dd>
+<dt>At-least-once and at-most-once</dt><dd><b>Simple words:</b> either "keep asking until you get an answer, even if it happens twice" or "ask once, even if it may not happen". <b>Analogy:</b> phoning back after a dropped line versus never phoning back. <b>Precise:</b> RPC semantics under failure: at-least-once retries until a reply arrives, so the procedure may execute more than once; at-most-once never executes a request twice, either by not retrying or by detecting duplicates at the server; "exactly-once" effects are obtained by at-least-once delivery plus duplicate detection or idempotence. <sup class="src"><a href="#F5-09-src-D2">D2</a></sup></dd>
+<dt>Timeout (RPC)</dt><dd><b>Simple words:</b> how long the caller waits for an answer before deciding something went wrong. <b>Analogy:</b> how long Bao listens to silence before hanging up. <b>Precise:</b> a bound after which the client stops waiting for a reply; it tells the client only that no reply arrived in time, not whether the server executed the request. <sup class="src"><a href="#F5-09-src-D1">D1</a></sup> <sup class="src"><a href="#F5-09-src-R2">R2</a></sup></dd>
+</dl></div>
+
+<h2 id="F5-09-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the path of one call through the library you will build. Figure 2 shows what happens when the reply is late: the timeout, the retry and the duplicate execution of scenario B, and how a reply cache stops it (scenario C).</p>
+<figure id="F5-09-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 290" role="img" aria-labelledby="F5-09-f1t F5-09-f1d">
+<title id="F5-09-f1t">Figure 1: the path of one remote procedure call</title>
+<desc id="F5-09-f1d">Left column, client process: the application calls add(2, 40); the client stub marshals the arguments into a request with client id, request id, method name "add" and two 64-bit integers; the framing layer puts a 4-byte length in front; the TCP socket sends the bytes. An arrow crosses to the right column, server process: the TCP socket receives bytes; the framing layer reads the length and then exactly that many bytes; the server stub unmarshals client, id and method, looks up the handler "add" and calls it; the handler returns 42. The reply, with the same request id, status 0 and the result, travels back along the same layers in reverse, and the client stub returns 42 to the application.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="290"/>
+<text class="sv-tb" x="20" y="25">client process</text>
+<text class="sv-tb" x="520" y="25">server process</text>
+<rect class="sv-b1" x="20" y="40" width="220" height="40" rx="6"/><text class="sv-t" x="32" y="65">application: add(2, 40)</text>
+<rect class="sv-b2" x="20" y="92" width="220" height="40" rx="6"/><text class="sv-t" x="32" y="110">client stub: marshal</text><text class="sv-ts" x="32" y="125">client, id, "add", 2, 40</text>
+<rect class="sv-b3" x="20" y="144" width="220" height="40" rx="6"/><text class="sv-t" x="32" y="169">framing: u32 length + bytes</text>
+<rect class="sv-b4" x="20" y="196" width="220" height="40" rx="6"/><text class="sv-t" x="32" y="221">TCP socket (send / recv)</text>
+<rect class="sv-b1" x="520" y="40" width="220" height="40" rx="6"/><text class="sv-t" x="532" y="65">handler "add": returns 42</text>
+<rect class="sv-b2" x="520" y="92" width="220" height="40" rx="6"/><text class="sv-t" x="532" y="110">server stub: unmarshal,</text><text class="sv-ts" x="532" y="125">look up method, call</text>
+<rect class="sv-b3" x="520" y="144" width="220" height="40" rx="6"/><text class="sv-t" x="532" y="169">framing: read length, body</text>
+<rect class="sv-b4" x="520" y="196" width="220" height="40" rx="6"/><text class="sv-t" x="532" y="221">TCP socket (accept / recv)</text>
+<line class="sv-line" x1="130" y1="80" x2="130" y2="92"/><line class="sv-line" x1="130" y1="132" x2="130" y2="144"/><line class="sv-line" x1="130" y1="184" x2="130" y2="196"/>
+<line class="sv-line" x1="630" y1="80" x2="630" y2="92"/><line class="sv-line" x1="630" y1="132" x2="630" y2="144"/><line class="sv-line" x1="630" y1="184" x2="630" y2="196"/>
+<line class="sv-line2" x1="240" y1="210" x2="512" y2="210"/><polygon class="sv-head" points="512,205 520,210 512,215"/>
+<text class="sv-ts" x="290" y="202">request: client 1, id 1, "add", 2, 40</text>
+<line class="sv-line2" x1="520" y1="228" x2="248" y2="228"/><polygon class="sv-head" points="248,223 240,228 248,233"/>
+<text class="sv-ts" x="290" y="246">reply: id 1, status 0 (ok), 42</text>
+<text class="sv-ts" x="20" y="270">Down the left column and up the right for the request; the reverse for the reply. The network in between may delay or lose either message.</text>
+</svg></div><figcaption><b>Figure 1.</b> The layers of the RPC library of Listing 1 (<code>rpc.hpp</code>). Stub, marshalling and the request-reply pattern after D2 (pending verification) <sup class="src"><a href="#F5-09-src-D2">D2</a></sup>; socket calls from D4 <sup class="src"><a href="#F5-09-src-D4">D4</a></sup>; the bytes of this exact request are printed in the lab run <sup class="src"><a href="#F5-09-src-R1">R1</a></sup>.</figcaption></figure>
+
+<figure id="F5-09-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F5-09-f2t F5-09-f2d">
+<title id="F5-09-f2t">Figure 2: a slow reply, a timeout and a retry, without and with duplicate detection</title>
+<desc id="F5-09-f2d">A message sequence diagram with time running downwards. Left lifeline: client 7. Right lifeline: server. At time 0 the client sends deposit(100) with id 1. The server executes it (balance 100) but takes 300 ms. At 200 ms the client's timeout fires and it sends the same request, id 1, again. At 300 ms the server's reply to the first request (balance 100) arrives and the client accepts it, believing the operation is done. Then the server reads the retried request. Without duplicate detection (scenario B) it executes again: balance 200, and the second reply is dropped by the client as a late duplicate. With duplicate detection (scenario C) the server finds (7, 1) in its reply cache, sends the saved reply again and does not execute: balance stays 100.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="60" y="25">client 7</text><text class="sv-tb" x="430" y="25">server</text>
+<line class="sv-dash" x1="90" y1="35" x2="90" y2="315"/><line class="sv-dash" x1="460" y1="35" x2="460" y2="315"/>
+<text class="sv-ts" x="10" y="55">0 ms</text>
+<line class="sv-line2" x1="90" y1="50" x2="452" y2="70"/><polygon class="sv-head" points="451,64 460,70 451,76"/>
+<text class="sv-ts" x="150" y="52">deposit(100), id 1</text>
+<rect class="sv-b6" x="465" y="66" width="270" height="34" rx="5"/><text class="sv-ts" x="473" y="80">executes: balance 100</text><text class="sv-ts" x="473" y="94">(injected: 300 ms before replying)</text>
+<text class="sv-ts" x="10" y="125">200 ms</text>
+<rect class="sv-b8" x="96" y="110" width="140" height="22" rx="5"/><text class="sv-ts" x="104" y="125">timeout: no reply</text>
+<line class="sv-line2" x1="90" y1="140" x2="452" y2="160"/><polygon class="sv-head" points="451,154 460,160 451,166"/>
+<text class="sv-ts" x="150" y="142">retry: deposit(100), id 1</text>
+<text class="sv-ts" x="10" y="185">300 ms</text>
+<line class="sv-line" x1="460" y1="170" x2="98" y2="190"/><polygon class="sv-head" points="99,184 90,190 99,196"/>
+<text class="sv-ts" x="240" y="174">reply id 1: balance 100</text>
+<text class="sv-ts" x="96" y="210">client: "done, balance 100"</text>
+<rect class="sv-b8" x="465" y="196" width="270" height="44" rx="5"/><text class="sv-tb" x="473" y="213">B: no duplicate detection</text><text class="sv-ts" x="473" y="230">executes AGAIN: balance 200</text>
+<rect class="sv-b5" x="465" y="250" width="270" height="44" rx="5"/><text class="sv-tb" x="473" y="267">C: reply cache (client, id)</text><text class="sv-ts" x="473" y="284">(7, 1) seen: resend saved reply, balance 100</text>
+<line class="sv-line" x1="460" y1="300" x2="98" y2="300"/><polygon class="sv-head" points="99,295 90,300 99,305"/>
+<text class="sv-ts" x="150" y="294">second reply id 1: client drops it as late</text>
+</svg></div><figcaption><b>Figure 2.</b> Scenarios B and C of Listing 3, as recorded in <code>retry.out</code> <sup class="src"><a href="#F5-09-src-R2">R2</a></sup>. Times are the injected delay (300 ms) and the client timeout (200 ms), not measurements. The semantics names follow D2 (pending verification) <sup class="src"><a href="#F5-09-src-D2">D2</a></sup>.</figcaption></figure>
+
+<h2 id="F5-09-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>A remote procedure call is a phone call that asks a friend to do something and waits for her answer. Mapping: the caller = client; the friend = server; the request "please add ten books" = the request message; "done" = the reply; the agreed way to spell names and numbers = marshalling; "this is request number 7 from Bao" = the request id; listening to silence and hanging up = the timeout. The registered warning: if the line drops, you do not know whether she did it.</p></div>
+<p>When you call a function in your own program, it always runs and always returns (or the whole program stops). When you call a function on another computer, three new things can happen: the request can be lost, the answer can be lost, or the other computer can be slow or broken. From the caller's side, all three look the same: silence. Most of this chapter is about what to do with that silence.</p>
+
+<h2 id="F5-09-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F5-09-l2-parts">The parts of an RPC system</h3>
+<p>An RPC system makes a call to another process look like a local function call <sup class="src"><a href="#F5-09-src-D2">D2</a></sup>. The pieces, all present in Listing 1 (<code>rpc.hpp</code>):</p>
+<ul>
+<li><b>Client stub.</b> A function with the procedure's signature, for example <code>add(client, a, b)</code> in Listing 2. It marshals the arguments, sends the request, waits for the reply and unmarshals the result <sup class="src"><a href="#F5-09-src-D2">D2</a></sup>.</li>
+<li><b>Marshalling.</b> <code>Writer</code> and <code>Reader</code> encode 8-bit, 32-bit and 64-bit integers and length-prefixed strings in big-endian order ("network byte order"), independent of how the machine stores them in memory (<a href="#gl-endianness-byte-order">endianness</a>, <a href="#gl-serialisation">serialisation</a>, SP201). The request for <code>add(2, 40)</code> is 31 bytes: client id 1, request id 1, the string "add" (length 3, then the bytes 61 64 64), then the two 64-bit integers 2 and 40 (0x28) <sup class="src"><a href="#F5-09-src-R1">R1</a></sup>.</li>
+<li><b>Framing.</b> TCP delivers a stream of bytes, not messages: one <code>recv</code> may return part of a message or parts of two <sup class="src"><a href="#F5-09-src-D4">D4</a></sup> (<a href="#F5-04">F5-04</a>, <a href="#F5-05">F5-05</a>). Each message is therefore preceded by its length in 4 bytes, and <code>readFrame</code> reads exactly that many bytes, looping over <code>recv</code>. The 1 MiB argument in Listing 2 arrives in many pieces and the checksum still matches <sup class="src"><a href="#F5-09-src-R1">R1</a></sup>.</li>
+<li><b>Server stub and dispatch.</b> The server reads a frame, unmarshals the client id, request id and method name, looks up the handler in a table, runs it, and marshals a reply with the same request id, a status byte and the result. An unknown method produces an error reply, not a crash: "no such method: multiply" <sup class="src"><a href="#F5-09-src-R1">R1</a></sup>.</li>
+<li><b>Matching replies to requests.</b> The client keeps waiting until a reply with <i>its</i> request id arrives; replies with other ids are late answers to abandoned requests and are dropped (<code>stale_</code> in <code>Client::call</code>).</li>
+</ul>
+<h3 id="F5-09-l2-notlocal">Why a remote call is not a local call</h3>
+<p>The library hides the network, but four differences remain, and each must be visible in the calling code <sup class="src"><a href="#F5-09-src-D1">D1</a></sup> <sup class="src"><a href="#F5-09-src-D2">D2</a></sup>:</p>
+<ol>
+<li><b>Latency.</b> A local call costs nanoseconds; a remote one costs at least a network round trip (<a href="#F5-07">F5-07</a>) plus marshalling. A loop that makes one RPC per item is a design error that a local call would hide.</li>
+<li><b>Partial failure.</b> The call can fail in ways a local call cannot: the server may be down, the connection may break, or no reply may come. The stub must report these as errors that the caller handles.</li>
+<li><b>No shared memory.</b> Arguments are copied into the message. Pointers and references mean nothing on the other machine; a "pass by reference" must become "send the value, and send back the new value".</li>
+<li><b>Independent evolution.</b> Client and server are often built and deployed separately; the message format must be readable by older and newer versions (Layer 3).</li>
+</ol>
+<h3 id="F5-09-l2-timeout">What a timeout tells you</h3>
+<p>A timeout says only one thing: no reply arrived within the time you chose. It does not say whether the request was lost, whether the server executed it and the reply was lost, or whether the server is still working on it <sup class="src"><a href="#F5-09-src-D1">D1</a></sup>. Scenario A of Listing 3 shows this: the client gives up after 200 ms and must report "the deposit MAY OR MAY NOT have happened"; in fact it did, and the late reply arrives later and is dropped <sup class="src"><a href="#F5-09-src-R2">R2</a></sup>.</p>
+<h3 id="F5-09-l2-semantics">At-most-once, at-least-once, and making retries safe</h3>
+<p>After a timeout the client has two choices <sup class="src"><a href="#F5-09-src-D2">D2</a></sup>:</p>
+<ul>
+<li><b>Do not retry</b> (at-most-once by giving up): the operation runs zero or one times; the caller must cope with not knowing which.</li>
+<li><b>Retry</b> (at-least-once): send the request again until a reply arrives; the operation runs one or more times.</li>
+</ul>
+<p>Retrying is harmless if the operation is <b>idempotent</b>: "set the balance to 100" or "read the balance" can run twice with the same effect. "Add 100 to the balance" is not: scenario B retried once and the balance became 200 although one deposit was intended. Worse, the client received a reply saying "balance 100" (the late reply to its first attempt), so the client's view and the server's state now disagree <sup class="src"><a href="#F5-09-src-R2">R2</a></sup>.</p>
+<p>The remedy is to make each logical operation recognisable: the client sends the same (client id, request id) on every retry, and the server keeps a <b>reply cache</b> from that pair to the reply it already sent. A duplicate is answered from the cache without executing. Scenario C: "duplicate, saved reply sent again, NOT executed", balance 100 <sup class="src"><a href="#F5-09-src-R2">R2</a></sup>. At-least-once delivery plus duplicate detection gives the effect of exactly-once execution, as long as the reply cache itself survives as long as retries can arrive. That last condition is what the forensic lab is about.</p>
+
+<h2 id="F5-09-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F5-09-l3-cache">The reply cache is state, and state has a lifetime</h3>
+<p>Duplicate detection only works if the server still remembers the request when the duplicate arrives. Three design questions follow <sup class="src"><a href="#F5-09-src-D2">D2</a></sup>:</p>
+<ul>
+<li><b>Scope.</b> Keyed by what? If the cache is tied to a connection, a client that reconnects before retrying (a common retry policy) gets a fresh, empty cache. Key it by a client identity that outlives connections.</li>
+<li><b>Lifetime.</b> How long is an entry kept? Forever is a memory leak. A common rule is that the client promises not to retry requests older than some id or time (for example by sending "I have received all replies up to id n" with each request), and the server discards entries below that.</li>
+<li><b>Durability.</b> If the server crashes and restarts, an in-memory cache is gone, and a retry after the restart executes again. If exactly-once effects must survive crashes, the cache entry must be stored atomically with the effect (in the same transaction, or in the same replicated log, DS302).</li>
+</ul>
+<h3 id="F5-09-l3-timeouts">Choosing timeouts, and retrying without making things worse</h3>
+<p>A timeout shorter than the server's normal slow case turns slowness into duplicate work; one far longer makes the client wait for a dead server. The value should come from the measured latency distribution of the call (its p99 or p99.9, <a href="#F5-07">F5-07</a>, <a href="#F5-08">F5-08</a>), not from a guess <sup class="src"><a href="#F5-09-src-D1">D1</a></sup>. Retries add load exactly when a server is already slow, so a retry policy needs a limit on attempts, a growing delay between attempts with some randomness (so that many clients do not retry in lock-step), and, ideally, a deadline that travels with the request so that servers can drop work whose caller has already given up. <a href="#F5-11">F5-11</a> returns to timeouts as failure detectors.</p>
+<h3 id="F5-09-l3-evolution">Interface definitions and evolving message formats</h3>
+<p>Our stubs are written by hand and the format is implicit in their code. Production RPC frameworks generate stubs from an interface description written in an interface definition language (IDL), and their encodings tag each field so that a newer server can read an older client's message (ignoring unknown fields, using defaults for missing ones) and the reverse <sup class="src"><a href="#F5-09-src-D1">D1</a></sup> <sup class="src"><a href="#F5-09-src-D2">D2</a></sup>. Our format has no version and no field tags: adding a third argument to <code>add</code> would break every deployed client. The lab's extension adds a version field.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>This chapter names no production RPC framework, IDL or encoding, and states nothing about their wire formats, generated APIs, timeout defaults or retry behaviour: none of their documentation was opened in this build. If a lab or project uses one, its version and documentation (the framework's own guide and the encoding's specification) must be recorded in the dossier first. The concepts above (stubs, IDL, field tags, schema evolution) are cited to D1 and D2, pending verification.</p></div>
+<h3 id="F5-09-l3-design">Design choices in Listing 1, and their limits</h3>
+<ul>
+<li>The server handles one connection at a time (<code>serve</code>). A real server would use one thread per connection, a thread pool (SP203), or <code>poll</code> over many sockets (as <a href="#F5-05">F5-05</a> does). With one thread, a slow procedure blocks every other client: in scenario B the retried request waited behind the slow first one.</li>
+<li>A frame length above 64 MiB is rejected (<code>readFrame</code>), so a corrupted or hostile length cannot make the server allocate gigabytes.</li>
+<li><code>send</code> uses <code>MSG_NOSIGNAL</code> so that writing to a connection the client has closed produces an error instead of the <code>SIGPIPE</code> signal that would terminate the process <sup class="src"><a href="#F5-09-src-D4">D4</a></sup>; the server then ends that connection and continues.</li>
+<li>Errors raised by a handler are caught and sent as error replies: a bad request must not take down the server for everyone.</li>
+</ul>
+
+<h2 id="F5-09-hardware">How the hardware actually does it</h2>
+<p>In this lab client and server are threads of one process on one machine, talking through the loopback interface: the kernel's TCP implementation moves the bytes from one socket's send buffer to the other's receive buffer without any network card (<a href="#F5-05">F5-05</a>). Between machines, the same bytes are cut into segments, wrapped in IP packets and Ethernet frames, and handed to the network interface controller, which moves them by DMA between memory and the link (<a href="#HW205">HW205</a>, <a href="#F5-03">F5-03</a>). Marshalling to big-endian exists because processors store multi-byte integers in different orders (<a href="#gl-endianness-byte-order">endianness</a>); the build machine is x86-64, which is little-endian, so <code>Writer::u32</code> really does reverse the byte order in memory.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on real hardware:</b> every run in this chapter used the loopback interface of one cloud container; no packet crossed a physical network, and no message was lost by the network (loss and delay were injected by the program). The behaviour of the library across two machines, under real packet loss, and with a peer that disappears without closing the connection (power loss) was not tested. A peer that vanishes silently leaves the client waiting until its own timeout; how long TCP itself waits before reporting a broken connection depends on kernel settings documented in the Linux <code>tcp(7)</code> manual page, which was not opened in this build. To test: two machines or two virtual machines, and a tool that drops packets (DS201 used a private network namespace for this, <a href="#F5-04">F5-04</a>).</p></div>
+
+<h2 id="F5-09-worked">Worked example</h2>
+<p><b>Decode the request bytes printed by Listing 2 by hand, then predict the server's actions for scenario B.</b></p>
+<p>The bytes (after the 4-byte frame length, which is 00 00 00 1f = 31) are <sup class="src"><a href="#F5-09-src-R1">R1</a></sup>:</p>
+<pre><code>00 00 00 01   client id = 1
+00 00 00 01   request id = 1
+00 00 00 03   method name length = 3
+61 64 64      "a" "d" "d"   (ASCII 0x61 0x64 0x64)
+00 00 00 00 00 00 00 02   first argument  = 2
+00 00 00 00 00 00 00 28   second argument = 0x28 = 2 × 16 + 8 = 40</code></pre>
+<p>4 + 4 + 4 + 3 + 8 + 8 = 31 bytes. The reply is 4 (id) + 1 (status) + 8 (result) = 13 bytes; its result field is 00 … 00 2a = 42.</p>
+<p><b>Scenario B, step by step</b> (timeout 200 ms, injected server delay 300 ms on the first deposit):</p>
+<ol>
+<li>t = 0: the client sends deposit(100), id 1. The server executes it (balance 100), then sleeps 300 ms before replying.</li>
+<li>t = 200 ms: no reply; the client retries with the same id 1. The bytes wait in the server's receive buffer (the server is single-threaded and still sleeping).</li>
+<li>t ≈ 300 ms: the server sends the reply to the first request (balance 100). The client is waiting for id 1, so it accepts it: "attempt 2 -> reply, balance 100".</li>
+<li>The server reads the retried request. Without a reply cache it executes again: balance 200, and sends a second reply with id 1.</li>
+<li>The client's next call (balance, id 2) first receives that second reply for id 1, drops it as late, then receives id 2: balance 200.</li>
+</ol>
+<p>Compare with <code>retry.out</code>: the recorded lines match each step <sup class="src"><a href="#F5-09-src-R2">R2</a></sup>. Note step 3: the reply the client accepted was not the reply to the request it had sent last. With identical ids that is harmless for an idempotent call and misleading for this one.</p>
+
+<h2 id="F5-09-code">Code walk-through</h2>
+<p>Built by <code>university/labs/run_lab.sh university/labs/F5-09</code> with <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined</code>. The socket functions (<code>socket</code>, <code>bind</code>, <code>listen</code>, <code>getsockname</code>, <code>accept</code>, <code>connect</code>, <code>send</code>, <code>recv</code>, <code>poll</code>, <code>close</code>, <code>htonl</code>, <code>htons</code>, <code>ntohs</code>) are the POSIX interfaces of D4, used as in <a href="#F5-05">F5-05</a>; <code>MSG_NOSIGNAL</code> is a flag that the Linux build accepted <sup class="src"><a href="#F5-09-src-D4">D4</a></sup> <sup class="src"><a href="#F5-09-src-R1">R1</a></sup>.</p>
+<p><b>Listing 1</b> — <code>rpc.hpp</code>: the library (marshalling, framing, server with optional reply cache and fault injection, client).</p>
+<pre class="listing" data-src="F5-09/rpc.hpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>1–8</td><td>header comment</td><td>States the wire format.</td><td>A protocol is a document first; the code implements it.</td></tr>
+<tr><td>33–60</td><td><code>class Fd</code></td><td>Owns a file descriptor; closes it in the destructor; movable, not copyable.</td><td>RAII (SP201): no leaked sockets on any error path.</td></tr>
+<tr><td>68–94</td><td><code>Writer</code></td><td><code>u32</code> writes the most significant byte first; <code>i64</code> writes two u32 halves of the two's-complement bits; <code>str</code> writes a length then the bytes.</td><td>A byte order defined by the protocol, not by the CPU.</td></tr>
+<tr><td>96–143</td><td><code>Reader</code></td><td>The inverse; <code>need</code> throws if the message is too short.</td><td>A malformed message becomes an error reply, never a read past the end.</td></tr>
+<tr><td>146–160</td><td><code>sendAll</code></td><td>Loops until every byte is sent; retries on <code>EINTR</code>; <code>MSG_NOSIGNAL</code>.</td><td><code>send</code> may send fewer bytes than asked (D4); a vanished peer gives an error, not a signal.</td></tr>
+<tr><td>163–183</td><td><code>recvAll</code></td><td>Loops until exactly n bytes have arrived; returns false on a clean end of stream before the first byte.</td><td>Distinguishes "the peer closed between messages" from "the peer closed in the middle of one".</td></tr>
+<tr><td>185–209</td><td><code>writeFrame</code>, <code>readFrame</code></td><td>Length prefix; 64 MiB limit.</td><td>Message boundaries on a byte stream.</td></tr>
+<tr><td>212–225</td><td><code>waitReadable</code></td><td><code>poll</code> on one socket with a timeout.</td><td>The only place where a timeout is implemented.</td></tr>
+<tr><td>228</td><td><code>enum class Dedup</code></td><td>No reply cache, one per connection, or one for the server's lifetime.</td><td>The three designs compared in this chapter and its forensic lab.</td></tr>
+<tr><td>242–263</td><td><code>Server</code> constructor</td><td>Socket bound to 127.0.0.1 with port 0, then <code>getsockname</code> to learn the port the kernel chose.</td><td>No fixed port: runs cannot collide with other programs.</td></tr>
+<tr><td>269–273</td><td><code>slowFirstCall</code></td><td>Fault injection: the first execution of one method replies late.</td><td>Makes the "reply after the timeout" case reproducible.</td></tr>
+<tr><td>276–296</td><td><code>serve</code></td><td>Accepts connections one after another; reads frames and writes replies until the client closes; a broken connection ends only that connection.</td><td>One misbehaving client cannot stop the server.</td></tr>
+<tr><td>303–346</td><td><code>handle</code></td><td>Unmarshals client, id, method; checks the reply cache; dispatches; catches handler exceptions; stores the reply.</td><td>The server stub; lines 312–317 are duplicate detection.</td></tr>
+<tr><td>359–437</td><td><code>Client</code></td><td><code>reconnect</code>, <code>newId</code>, and <code>call</code>, which sends one request and waits for the reply with the same id, dropping others.</td><td><code>call</code> returns "no value" on timeout: it never pretends to know the outcome.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>rpc_demo.cpp</code>: three procedures, two client stubs, the wire bytes, an error reply and a 1 MiB argument.</p>
+<pre class="listing" data-src="F5-09/rpc_demo.cpp"></pre>
+<pre class="output" data-run="F5-09/rpc_demo"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–26</td><td><code>add</code> stub</td><td>Marshals two <code>int64</code>, calls with a 2 s timeout, throws on timeout or remote error, unmarshals the result.</td><td>The caller sees a function; failures surface as exceptions it must handle.</td></tr>
+<tr><td>28–38</td><td><code>upper</code> stub</td><td>Same pattern for a string.</td><td>Strings are length-prefixed: no terminating zero on the wire.</td></tr>
+<tr><td>53–75</td><td>handlers</td><td>Server-side implementations registered by name.</td><td>The dispatch table of the server stub.</td></tr>
+<tr><td>66–75</td><td><code>checksum</code></td><td>Returns the length and a 32-bit FNV-1a hash of a string.</td><td>Proves that a 1 MiB argument arrived complete and in order.</td></tr>
+<tr><td>76</td><td><code>std::thread serverThread</code></td><td>Runs the server in a second thread (SP203).</td><td>Client and server in one program, so the lab needs no second terminal.</td></tr>
+<tr><td>80–86</td><td>wire bytes</td><td>Builds the request for add(2, 40) and prints it in hexadecimal.</td><td>The worked example decodes these bytes.</td></tr>
+<tr><td>91–94</td><td><code>multiply</code></td><td>Calls a method the server does not have.</td><td>Errors travel as replies; the connection stays usable.</td></tr>
+<tr><td>112–118</td><td>end</td><td>Closing the client ends the connection; the server returns; its journal is printed after <code>join</code>.</td><td>Printing after the join keeps the output order deterministic.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>retry.cpp</code>: a slow first deposit, a 200 ms timeout, and three client and server designs.</p>
+<pre class="listing" data-src="F5-09/retry.cpp"></pre>
+<pre class="output" data-run="F5-09/retry"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–25</td><td><code>install</code></td><td><code>deposit</code> adds to the balance and returns it; <code>balance</code> reads it.</td><td><code>deposit</code> is not idempotent; <code>balance</code> is.</td></tr>
+<tr><td>46</td><td><code>slowFirstCall("deposit", 300)</code></td><td>The first deposit replies after 300 ms.</td><td>Longer than the 200 ms timeout on line 53.</td></tr>
+<tr><td>50</td><td><code>id = c.newId()</code></td><td>One id for all attempts.</td><td>The retry is recognisable as the same operation.</td></tr>
+<tr><td>52–62</td><td>attempt loop</td><td>Calls; on timeout prints and retries, up to <code>attempts</code>.</td><td>Scenario A allows one attempt, B and C three.</td></tr>
+<tr><td>63–65</td><td>giving up</td><td>Prints that the outcome is unknown.</td><td>The honest report after a timeout.</td></tr>
+<tr><td>66–72</td><td>check</td><td>Waits, reads the balance, prints dropped late replies.</td><td>The server's real state, compared with the intent.</td></tr>
+<tr><td>83–85</td><td>three scenarios</td><td><code>Dedup::none</code> twice, then <code>Dedup::global</code>.</td><td>Only the server's reply cache differs between B and C.</td></tr>
+</tbody></table></div>
+
+<h2 id="F5-09-breaks">Where the analogy breaks</h2>
+<ul>
+<li>On the phone you hear the line drop. A TCP connection to a machine that lost power may look open for a long time; the client learns nothing until its own timeout fires (see the unverified box above).</li>
+<li>A friend who heard "request number 7" twice would remember it without a notebook. A server remembers only what the code stores, for as long as the code stores it, and forgets everything in memory when it restarts.</li>
+<li>A phone call is between two people. RPC replies can arrive late, after the caller has moved on to another request on the same connection; the request id, not the order of speaking, ties a reply to its request.</li>
+<li>Friends share a language. Two versions of a program may not: a newer client may send a message the older server cannot parse (Layer 3).</li>
+</ul>
+
+<h2 id="F5-09-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Messages arrive "corrupted" only when they are large or the network is busy.</td><td>One <code>recv</code> assumed to return one whole message.</td><td>Send a 1 MiB message (Listing 2) and compare a checksum.</td><td>Frame messages and loop until the frame is complete (<code>recvAll</code>).</td></tr>
+<tr><td>Numbers are wrong only between two different machines.</td><td>Integers sent in the CPU's own byte order (for example with <code>memcpy</code> of an <code>int</code>).</td><td>Print the bytes (Listing 2, line 84) and decode by hand.</td><td>Define the byte order in the protocol; marshal byte by byte.</td></tr>
+<tr><td>Operations happen twice after network trouble (balance 200 for one deposit).</td><td>At-least-once retries of a non-idempotent operation.</td><td>Server log shows the same (client, id) executed twice (<code>retry.out</code>, scenario B).</td><td>Reply cache keyed by (client, id), or make the operation idempotent.</td></tr>
+<tr><td>The server process dies when a client disconnects mid-reply.</td><td><code>SIGPIPE</code> on writing to a closed connection.</td><td>The process exits with a signal; no error message.</td><td><code>MSG_NOSIGNAL</code> (Listing 1, line 151) and handle the error.</td></tr>
+<tr><td>A client hangs forever when the server machine loses power.</td><td>No timeout on the reply.</td><td>Attach a debugger: the thread waits in <code>recv</code>.</td><td>Always wait with a timeout (<code>waitReadable</code>), and report "outcome unknown".</td></tr>
+<tr><td>A reply is attributed to the wrong request.</td><td>Replies matched by order instead of by id.</td><td>Log request and reply ids on both sides.</td><td>Match by id; drop replies with unknown ids (Listing 1, <code>call</code>).</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F5-09-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F5-05">F5-05</a> wrote socket programs that send bytes, and <a href="#F5-08">F5-08</a> named partial failure as the central difficulty. <b>What carries over:</b> the socket calls, the byte-stream nature of TCP and the need to loop over partial reads and writes, RAII for descriptors, and threads from SP203 <sup class="src"><a href="#F5-09-src-D4">D4</a></sup>. <b>What changes:</b> you now send <i>operations</i>, not bytes, so a lost reply means an unknown effect on another machine's state; most dangerous: a retry can execute an operation twice <sup class="src"><a href="#F5-09-src-R2">R2</a></sup>. <b>What comes next:</b> <a href="#F5-10">F5-10</a> asks how to order the events of several nodes when their clocks disagree; request ids reappear there as message identities in the logs.</p></div>
+
+<h2 id="F5-09-check">Check yourself</h2>
+<ol>
+<li>List the steps between the application calling <code>add(2, 40)</code> and the server's handler running.</li>
+<li>Why does the library put a length in front of every message? What would go wrong without it on a TCP connection?</li>
+<li>Which of these operations are idempotent: (a) read the balance; (b) set the email address to x; (c) add 100 to the balance; (d) append a line to a log; (e) delete order 17?</li>
+<li>After a timeout, a client prints "deposit failed". Explain in your own words why that message is wrong, and write a better one.</li>
+<li>Apply to a new case: a ticket-booking client retries "book seat 14C" after timeouts. The server has a reply cache keyed by (client id, request id) but the client generates a new request id for every attempt. What happens?</li>
+<li>Predict, then run: change the injected delay in Listing 3 from 300 ms to 150 ms (below the timeout). What do scenarios A, B and C print now?</li>
+<li>A colleague sets every RPC timeout to 50 ms "so that users never wait". The p99 latency of the call is 120 ms. What happens to the server under load?</li>
+<li>Name two things a reply cache needs besides a key, and why.</li>
+</ol>
+
+<h2 id="F5-09-lab">Lab</h2>
+<p><b>Goal (course lab: an RPC library over TCP).</b> Extend the RPC library of Listing 1 with a versioned format, a new procedure, a retry policy with a limit and growing delays, and duplicate detection that survives reconnection; show each feature working in a test program.</p>
+<p><b>Hardware and software.</b> Linux with g++ supporting C++20 and POSIX sockets (the build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>); loopback networking only. <b>Safety:</b> none beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F5-09</code>; expect exit status 0 and outputs matching this chapter's (the order of lines is deterministic).</li>
+<li>Add a procedure <code>transfer(from, to, amount)</code> on a server holding several accounts, with an error reply for an unknown account or insufficient funds. Write its stub.</li>
+<li>Add a 1-byte format version at the start of every request; make the server reply with an error for an unknown version. Test with a client that sends version 2.</li>
+<li>Write a retry policy: at most 4 attempts, delays of 50, 100, 200 ms plus a random 0–20 ms, and an overall deadline of 1 s. Log each attempt.</li>
+<li>Run scenario B with your policy and <code>Dedup::global</code>; then switch the client to reconnect before each retry (as in the forensic lab) and show that duplicates are still detected.</li>
+<li>Kill the server thread's work mid-way (make a handler throw on its first call) and show that the client receives an error reply, not a timeout.</li>
+</ol>
+<p><b>Expected observations.</b> Every procedure returns the right value; an unknown version and an unknown method produce error replies; with the reply cache keyed by client id, the balance after a retried deposit is 100 whether or not the client reconnects; the sanitizers report nothing.</p>
+<p><b>Verification.</b> A test program prints PASS or FAIL for: add, upper, checksum of 1 MiB, unknown method, unknown version, retried deposit with and without reconnecting (balance 100), transfer with insufficient funds (error, balances unchanged). Exit status 0 only if all pass.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The program hangs at the end → the server waits in <code>accept</code> for a connection that never comes; <code>serve(n)</code> must match the number of connections the client opens.</li>
+<li><code>bind</code> fails with "address already in use" → you used a fixed port; use port 0 and <code>getsockname</code> (Listing 1, lines 251–262).</li>
+<li>Output order changes between runs → you print from both threads; collect the server's lines and print them after <code>join</code>.</li>
+<li>AddressSanitizer reports a use after free in a handler → a lambda captured a local variable by reference that went out of scope before the server thread finished.</li>
+</ul>
+<p><b>Extension.</b> Serve many clients at once with one thread per connection, protect the shared state with a mutex (SP203), and show two clients depositing concurrently without lost updates.</p>
+
+<h2 id="F5-09-forensic">Forensic lab</h2>
+<p><b>Scenario — "the double deposit".</b> A customer deposited 100 once and now has 200. Support escalates to you. The server team insists: "duplicate detection is enabled, so a retry cannot run twice". The client team insists: "we always retry with the same request id".</p>
+<p><b>Evidence pack.</b> Generated by <code>reconnect.cpp</code> with the library of Listing 1 (the server's start-up configuration, the client log and the server log):</p>
+<pre class="output" data-run="F5-09/reconnect"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>What did the client do after its first attempt timed out? Quote the line.</li>
+<li>How many times did the server execute request 7/1? On which connections?</li>
+<li>Both teams' statements are true. State at least two hypotheses that reconcile them with a balance of 200, and say which log lines decide between them.</li>
+<li>What is the root cause, and which single change to the server fixes it? Which change to the client would also avoid it, and why is the server change better?</li>
+<li>Write a test that would have caught this before release.</li>
+</ol>
+<p><b>Method hints.</b> Put the client and server logs side by side in order; for each execution of 7/1, ask what the server remembered at that moment and why.</p>
+
+<h2 id="F5-09-project">Mini-project</h2>
+<p><b>A key-value RPC service with a written protocol.</b> Using your lab library, write a server with <code>get(key)</code>, <code>put(key, value)</code> and <code>increment(key, amount)</code>, and a one-page protocol specification (message layouts with byte offsets, error codes, the semantics of each call under retry). Make <code>increment</code> safe to retry. This is the seed of the course project (primary-backup key-value store, <a href="#F5-12">F5-12</a> and <a href="#F5-14">F5-14</a>). <b>Rubric:</b> specification precise enough for someone else to write a client 30 %, correct and tested implementation 30 %, retry safety demonstrated with injected delays 25 %, clear error handling 15 %.</p>
+
+<h2 id="F5-09-summary">Summary</h2>
+<ul>
+<li>An RPC sends a request message naming a procedure and arguments and waits for a reply; stubs, marshalling and framing make it look like a call.</li>
+<li>TCP is a byte stream: frame messages with a length and loop over partial reads and writes.</li>
+<li>Define the byte order and layout in the protocol; never send in-memory representations.</li>
+<li>A remote call differs from a local one in latency, partial failure, copied arguments and independent versions.</li>
+<li>A timeout means "no reply yet", never "it did not happen".</li>
+<li>Retries give at-least-once execution; for non-idempotent operations, add a reply cache keyed by a client identity and request id, with a defined scope, lifetime and durability.</li>
+</ul>
+
+<h2 id="F5-09-sources">Sources</h2>
+<ol>
+<li id="F5-09-src-D1">D1 — Martin Kleppmann, "Designing Data-Intensive Applications" (tier 3; edition to be recorded): the chapter on encoding and evolution (formats for data, schema evolution, dataflow through services and RPC, the problems with RPC) and the chapter on the trouble with distributed systems (timeouts, unbounded delays). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F5-09-src-D2">D2 — Maarten van Steen, Andrew S. Tanenbaum, "Distributed Systems" (tier 3; edition to be recorded): the communication chapter (remote procedure call, stubs, parameter passing, marshalling) and the fault-tolerance chapter (RPC semantics in the presence of failures; at-least-once, at-most-once; idempotent operations). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-09-src-D4">D4 — "The Open Group Base Specifications" (POSIX), System Interfaces volume (tier 1): <code>socket</code>, <code>bind</code>, <code>listen</code>, <code>accept</code>, <code>connect</code>, <code>send</code>, <code>recv</code>, <code>poll</code>, <code>getsockname</code>, <code>close</code>, <code>htonl</code>; the Linux manual pages for <code>send(2)</code> (<code>MSG_NOSIGNAL</code>) and <code>tcp(7)</code> (tier 2). <i>Title only — not opened during this build; the identifiers compiled and ran in R1–R3 (dossier gate G1 open).</i></li>
+<li id="F5-09-src-R1">R1 — <code>university/labs/F5-09/rpc_demo.log</code>: Listing 2 with Listing 1, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, Linux x86_64 cloud build container, loopback interface, exit code 0.</li>
+<li id="F5-09-src-R2">R2 — <code>university/labs/F5-09/retry.log</code>: Listing 3 with Listing 1, same toolchain, exit code 0.</li>
+<li id="F5-09-src-R3">R3 — <code>university/labs/F5-09/reconnect.log</code>: the forensic evidence generator, same toolchain, exit code 0.</li>
+</ol>
+<div class="co note"><span class="lbl">Note</span><p>Proposed addition to the F5 source registry (guide 4.5), not used as a source here: Andrew D. Birrell, Bruce Jay Nelson, "Implementing Remote Procedure Calls" (tier 5), the classic paper on RPC design. Title only, from the author's memory, to be confirmed by the Source Researcher.</p></div>
+
+<h2 id="F5-09-glossary">Glossary links</h2>
+<p><a href="#gl-remote-procedure-call-rpc">Remote procedure call (RPC)</a> · <a href="#gl-stub">Stub</a> · <a href="#gl-marshalling">Marshalling</a> · <a href="#gl-framing">Framing</a> · <a href="#gl-request-id">Request id</a> · <a href="#gl-idempotent-operation">Idempotent operation</a> · <a href="#gl-at-least-once-and-at-most-once">At-least-once and at-most-once</a> · <a href="#gl-timeout-rpc">Timeout (RPC)</a> · <a href="#gl-serialisation">Serialisation</a> · <a href="#gl-endianness-byte-order">Endianness (byte order)</a> · <a href="#gl-partial-failure">Partial failure</a></p>
+
+<h2 id="F5-09-next">Next chapter</h2>
+<p>Next: <a href="#F5-10">F5-10 Time, clocks and ordering</a>. Previous: <a href="#F5-08">F5-08 Why distribute</a>. Back to the course: <a href="#DS301">DS301</a>.</p>
+
+<h2 id="F5-09-answers">Answers to Check yourself</h2>
+<ol>
+<li>Stub marshals client id, request id, method name and arguments; the framing layer prepends the length; the socket sends the bytes; the server's framing layer reads the length and the body; the server stub unmarshals, looks up "add" in its handler table and calls it.</li>
+<li>TCP delivers bytes in order but not message boundaries: one <code>recv</code> may return half a message or the end of one and the start of the next. Without a length (or another delimiter), the server cannot know where a request ends; large messages would be cut and parsed as garbage.</li>
+<li>(a) yes; (b) yes; (c) no; (d) no (each repeat appends another line); (e) yes in effect (the second delete finds nothing), although it may return a different status ("not found"), which the client must treat as success. Distractor: (e) looks unsafe because the reply differs; idempotence is about the state, not the reply.</li>
+<li>A timeout only means no reply arrived in time; the server may have executed the deposit (scenario A shows it did). Better: "no reply within 200 ms: the deposit may or may not have been made; check the balance or retry with the same request id".</li>
+<li>Each attempt has a new id, so the server's cache sees different requests and executes each: the seat may be booked several times (or the later attempts fail with "already booked", confusing the client). The id must identify the logical operation, so it must stay the same across retries.</li>
+<li>With 150 ms the first reply arrives before the 200 ms timeout: all three scenarios print one attempt with "reply, balance 100", no dropped late replies, balance 100; the server executes the deposit once in each. (A scratch run made while writing this chapter printed exactly this; it is not one of the recorded lab runs. On a heavily loaded machine the 50 ms margin could be lost.)</li>
+<li>More than 1 % of calls (all those slower than 50 ms, which is most of the tail and probably much more) time out and are retried, adding load exactly when the server is slow; the slowdown grows, more calls time out, and the server can collapse under retries. Timeouts must be set from the measured distribution, with limited retries and backoff.</li>
+<li>A lifetime (when an entry can be discarded, for example after the client acknowledges later replies) and a scope that outlives connections (client identity, not connection); for crash safety, durability with the effect. Without a lifetime the cache grows forever; without the right scope, reconnecting defeats it; without durability, a restart does.</li>
+</ol>
+<h3 id="F5-09-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Client: "deposit id=1 attempt=1: timeout; closing connection, reconnecting", then attempt 2 succeeded with "new balance 200". Server: request 7/1 executed on connection 1, connection 1 ended, connection 2 opened, request 7/1 executed again <sup class="src"><a href="#F5-09-src-R3">R3</a></sup>.</p>
+<p><b>Hypotheses.</b> (1) The client did not reuse the id: ruled out, both server lines say 7/1. (2) Duplicate detection was not enabled: ruled out by the configuration line, and the server would not have needed a second connection to show it. (3) The reply cache does not survive the end of a connection: consistent with "connection 1 ended" between the two executions and no "duplicate" line on connection 2. (4) The server restarted between the attempts and lost an in-memory cache: ruled out, the log shows no restart, only a new connection.</p>
+<p><b>Root cause.</b> The reply cache is scoped to a connection (<code>Dedup::perConnection</code> in <code>rpc.hpp</code>, line 284: the table is cleared when a new connection is accepted). The client's retry policy opens a new connection before retrying, so the retry meets an empty cache and executes again.</p>
+<p><b>Fix.</b> Server: key the cache by client identity and keep it across connections (<code>Dedup::global</code>), with a lifetime rule. The client could avoid it by retrying on the same connection, but reconnecting after a timeout is a legitimate and common policy (the old connection may be broken), and other clients may do it; the server must not depend on it. If balances must survive server restarts, store the cache entry with the balance change.</p>
+<p><b>Test.</b> An integration test with an injected slow reply and a client that reconnects before retrying, asserting the balance is 100 (lab step 5).</p>
+<p><b>How the evidence was produced.</b> <code>reconnect.cpp</code>: server with <code>Dedup::perConnection</code> and a 300 ms injected delay on the first deposit; client 7 with a 200 ms timeout that closes and reopens the connection before each retry; output unedited.</p>
