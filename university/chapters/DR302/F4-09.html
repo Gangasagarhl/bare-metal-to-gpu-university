@@ -1,0 +1,414 @@
+<!--meta
+id: F4-09
+title: USB: xHCI, enumeration, HID, mass storage
+course: DR302
+level: L4
+prereqs: F4-08 (MSI-X and the DMA mapping API); DR301 (F4-02 PCI, F4-07 queues and doorbells); OS303 (block devices and FAT32, milestone B15)
+time: 12–14 hours including the lab
+hardware: none for the lab (QEMU 8.2.2, q35, qemu-xhci with usb-kbd, usb-storage, and a usb-mouse hot-plugged through QMP). A real USB keyboard on the spare PC is the milestone's last test and is untested in this build.
+maps: Curriculum Track C, milestone C8 (USB: xHCI, enumeration, HID keyboard, mass storage)
+analogy: F4 — the school and its visitors (the reception desk: every visitor gets a badge number and fills in a self-description form before being sent anywhere)
+-->
+
+<h2 id="F4-09-hook">Story hook</h2>
+<p>A school reception desk has eight doors. A visitor walks in, and the receptionist does the same thing every time: points to a chair (a badge number), hands over a form, and reads it. "I am a keyboard. I speak the simple keyboard language. I will send you a short note every time a key changes." Or: "I am a storage box. Give me sealed envelopes with commands; I will answer each with a receipt." Only after reading the form does the receptionist call the right teacher.</p>
+<p>The receptionist knows nothing in advance about any visitor. That is the point: the same desk handles a keyboard, a mouse, a memory stick and devices that were not invented when the desk was built. A visitor can also leave at any moment, and the desk must notice and clear the chair.</p>
+<p>USB works this way. In this chapter you build the desk (a driver for the xHCI host controller), the badge-and-form procedure (enumeration) and two teachers: a keyboard driver and a storage driver that reads a file from a FAT32 stick.</p>
+
+<h2 id="F4-09-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> USB's host-centred model: devices, configurations, interfaces and endpoints, and the four transfer types.</li>
+<li><b>Initialise</b> an xHCI controller's command ring, event ring and device context array, and use doorbells and the cycle bit correctly.</li>
+<li><b>Enumerate</b> a device: port reset, Enable Slot, Address Device, descriptor reads, Configure Endpoint and SET_CONFIGURATION.</li>
+<li><b>Write</b> a HID boot-protocol keyboard driver and a Bulk-Only Transport driver that sends SCSI READ(10) and WRITE(10).</li>
+<li><b>Read and annotate</b> a USB packet capture with Wireshark (tshark), matching each frame to a driver call.</li>
+<li><b>Handle</b> hot-plug and removal through port status change events.</li>
+</ul>
+
+<div class="co jargon" id="F4-09-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Host controller (xHCI)</dt><dd><b>Simple words:</b> the chip that runs every USB conversation for the computer. <b>Analogy:</b> the reception desk. <b>Precise:</b> a PCI device implementing the eXtensible Host Controller Interface: capability, operational, runtime and doorbell registers plus rings of 16-byte TRBs in memory, covering USB 1.x, 2.0 and 3.x devices. <sup class="src"><a href="#F4-09-src-D3">D3</a></sup></dd>
+<dt>Descriptor</dt><dd><b>Simple words:</b> a small table a device sends to describe itself. <b>Analogy:</b> the self-description form. <b>Precise:</b> a structure starting with bLength and bDescriptorType; the device descriptor (18 bytes), the configuration descriptor (9 bytes) followed by interface, endpoint and class descriptors, read with GET_DESCRIPTOR. <sup class="src"><a href="#F4-09-src-D1">D1</a></sup> <sup class="src"><a href="#F4-09-src-L1">L1</a></sup></dd>
+<dt>Endpoint</dt><dd><b>Simple words:</b> one numbered mailbox inside a device, for one direction. <b>Analogy:</b> one of the visitor's in-trays or out-trays. <b>Precise:</b> an address 0–15 with a direction bit (bit 7 = IN, toward the host) and a transfer type: control, bulk, interrupt or isochronous. Endpoint 0 is the bidirectional control endpoint every device has. <sup class="src"><a href="#F4-09-src-D1">D1</a></sup></dd>
+<dt>Enumeration</dt><dd><b>Simple words:</b> the steps that turn "something is plugged in" into "this is a keyboard on address 2". <b>Analogy:</b> chair, badge, form, teacher. <b>Precise:</b> port reset, address assignment, reading the device and configuration descriptors, selecting a configuration, then binding a class driver to each interface. <sup class="src"><a href="#F4-09-src-D1">D1</a></sup> <sup class="src"><a href="#F4-09-src-D3">D3</a></sup></dd>
+<dt>TRB (transfer request block)</dt><dd><b>Simple words:</b> one 16-byte work order on a ring. <b>Analogy:</b> one ticket on the desk's spike. <b>Precise:</b> parameter (8 bytes), status (4) and control (4, with the TRB type in bits 15:10 and the cycle bit in bit 0); used for commands, transfers and events. <sup class="src"><a href="#F4-09-src-D3">D3</a></sup></dd>
+<dt>HID boot protocol</dt><dd><b>Simple words:</b> a fixed, simple keyboard and mouse report format that works without parsing a report descriptor. <b>Analogy:</b> the "short form" every keyboard can fill in. <b>Precise:</b> for a keyboard, an 8-byte report: modifier bits, a reserved byte and up to six key usage codes from the HID Usage Tables; selected with SET_PROTOCOL(0). <sup class="src"><a href="#F4-09-src-D4">D4</a></sup></dd>
+<dt>BOT (Bulk-Only Transport)</dt><dd><b>Simple words:</b> how a USB stick carries disk commands. <b>Analogy:</b> a sealed command envelope, the goods, then a receipt. <b>Precise:</b> a 31-byte Command Block Wrapper ("USBC") on the bulk OUT endpoint holding a SCSI command, an optional data phase, and a 13-byte Command Status Wrapper ("USBS") on bulk IN with a matching tag and a status. <sup class="src"><a href="#F4-09-src-D5">D5</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-09-pictures">The idea in pictures</h2>
+<p>Figure 1 shows what the driver builds in memory and how the controller uses it. Figure 2 follows one keyboard through enumeration, in the order the lab kernel does it.</p>
+<figure id="F4-09-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 420" role="img" aria-labelledby="F4-09-f1t F4-09-f1d">
+<title id="F4-09-f1t">Figure 1: the xHCI controller&#x27;s memory structures</title>
+<desc id="F4-09-f1d">Left: the kernel&#x27;s memory. The device context base address array (DCBAA) has one pointer per slot; each points to a device context written by the controller: a slot context and up to 31 endpoint contexts, each endpoint context naming its transfer ring. The command ring holds commands such as Enable Slot, Address Device and Configure Endpoint. Each transfer ring holds transfer request blocks (TRBs) of 16 bytes: Setup, Data, Status for control transfers, Normal for bulk and interrupt. A Link TRB at the end of each ring points back to the start and toggles the cycle bit. The event ring, described by the event ring segment table, is written by the controller with command completion, transfer and port status change events. Right: the controller&#x27;s registers. The kernel writes a doorbell register (slot number, endpoint index) to say a ring has new TRBs. The controller reads the rings by DMA, performs the USB transactions on the ports, writes events by DMA and signals an MSI-X interrupt. All addresses the controller uses are IOVAs from the DMA mapping API of F4-08.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="420"/>
+<rect class="sv-box" x="10" y="10" width="560" height="400" rx="6"/>
+<text class="sv-tb" x="20" y="30">kernel memory (every address given to the controller is an IOVA)</text>
+<rect class="sv-b2" x="25" y="45" width="150" height="70" rx="6"/>
+<text class="sv-tb" x="35" y="65">DCBAA</text>
+<text class="sv-ts" x="35" y="82">[slot] -&gt; device</text>
+<text class="sv-ts" x="35" y="99">context</text>
+<rect class="sv-b2" x="205" y="40" width="170" height="110" rx="6"/>
+<text class="sv-tb" x="215" y="60">device context</text>
+<text class="sv-ts" x="215" y="77">slot context</text>
+<text class="sv-ts" x="215" y="94">EP0 context (DCI 1)</text>
+<text class="sv-ts" x="215" y="111">EP 1 IN ctx (DCI 3)</text>
+<text class="sv-ts" x="215" y="128">EP 2 OUT ctx (DCI 4)</text>
+<line class="sv-line" x1="175" y1="80" x2="194" y2="80"/>
+<polygon class="sv-head" points="205,80 194,85 194,75"/>
+<rect class="sv-b1" x="400" y="40" width="160" height="110" rx="6"/>
+<text class="sv-tb" x="410" y="60">transfer ring EP0</text>
+<text class="sv-tm" x="410" y="77">Setup TRB</text>
+<text class="sv-tm" x="410" y="94">Data TRB (IN)</text>
+<text class="sv-tm" x="410" y="111">Status TRB, IOC</text>
+<text class="sv-tm" x="410" y="128">... Link TRB</text>
+<line class="sv-line" x1="375" y1="90" x2="389" y2="90"/>
+<polygon class="sv-head" points="400,90 389,95 389,85"/>
+<rect class="sv-b4" x="25" y="175" width="260" height="90" rx="6"/>
+<text class="sv-tb" x="35" y="195">command ring</text>
+<text class="sv-tm" x="35" y="212">Enable Slot / Address Device</text>
+<text class="sv-tm" x="35" y="229">Configure Endpoint / Disable Slot</text>
+<text class="sv-ts" x="35" y="246">cycle bit marks new entries</text>
+<rect class="sv-b3" x="300" y="175" width="260" height="90" rx="6"/>
+<text class="sv-tb" x="310" y="195">event ring (controller writes)</text>
+<text class="sv-tm" x="310" y="212">Command Completion</text>
+<text class="sv-tm" x="310" y="229">Transfer Event (TRB, code)</text>
+<text class="sv-tm" x="310" y="246">Port Status Change</text>
+<rect class="sv-b6" x="25" y="285" width="535" height="110" rx="6"/>
+<text class="sv-tb" x="35" y="307">16-byte TRB: parameter, status, control</text>
+<text class="sv-ts" x="35" y="324">parameter: buffer address or the 8-byte SETUP packet; status: length;</text>
+<text class="sv-ts" x="35" y="341">control: type in bits 15:10, cycle bit 0, IOC (interrupt on completion) bit 5.</text>
+<text class="sv-ts" x="35" y="358">The producer writes the cycle bit last; the consumer takes an entry only when its</text>
+<text class="sv-ts" x="35" y="375">cycle bit equals the one it expects. The Link TRB toggles the expected value.</text>
+<rect class="sv-box" x="610" y="10" width="260" height="400" rx="6"/>
+<text class="sv-tb" x="620" y="30">xHCI controller (PCI BAR0)</text>
+<rect class="sv-b5" x="625" y="45" width="230" height="60" rx="6"/>
+<text class="sv-tb" x="635" y="65">operational registers</text>
+<text class="sv-ts" x="635" y="82">USBCMD, USBSTS, DCBAAP, CRCR</text>
+<text class="sv-ts" x="635" y="99">PORTSC per port</text>
+<rect class="sv-b5" x="625" y="125" width="230" height="50" rx="6"/>
+<text class="sv-tb" x="635" y="145">doorbell array</text>
+<text class="sv-tm" x="635" y="162">DB[slot] = endpoint index</text>
+<rect class="sv-b5" x="625" y="195" width="230" height="60" rx="6"/>
+<text class="sv-tb" x="635" y="215">runtime: interrupter 0</text>
+<text class="sv-ts" x="635" y="232">ERSTBA, ERDP, IMAN</text>
+<text class="sv-ts" x="635" y="249">-&gt; MSI-X entry 0</text>
+<rect class="sv-b7" x="625" y="280" width="230" height="95" rx="6"/>
+<text class="sv-tb" x="635" y="300">root hub ports</text>
+<text class="sv-ts" x="635" y="317">USB 3 ports 1-4</text>
+<text class="sv-ts" x="635" y="334">USB 2 ports 5-8</text>
+<text class="sv-ts" x="635" y="351">(QEMU qemu-xhci, R2)</text>
+<line class="sv-line" x1="560" y1="60" x2="618" y2="131"/>
+<polygon class="sv-head" points="625,140 614,135 622,128"/>
+<text class="sv-tb" x="582" y="82">1</text>
+<line class="sv-dash" x1="625" y1="160" x2="569" y2="126"/>
+<polygon class="sv-head" points="560,120 572,122 567,130"/>
+<text class="sv-tb" x="586" y="158">2</text>
+<line class="sv-dash" x1="625" y1="225" x2="571" y2="221"/>
+<polygon class="sv-head" points="560,220 571,216 571,226"/>
+<text class="sv-tb" x="586" y="240">3</text>
+</svg></div><figcaption><b>Figure 1.</b> The xHCI structures this chapter's driver builds (layouts from memory of D3, pending verification; port layout from R2). 1: the kernel rings a doorbell (register write, solid); 2: the controller reads the TRBs by DMA; 3: it writes events by DMA and signals MSI-X (dashed). <sup class="src"><a href="#F4-09-src-D3">D3</a></sup> <sup class="src"><a href="#F4-09-src-R2">R2</a></sup></figcaption></figure>
+<figure id="F4-09-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 470" role="img" aria-labelledby="F4-09-f2t F4-09-f2d">
+<title id="F4-09-f2t">Figure 2: enumeration of the USB keyboard, step by step</title>
+<desc id="F4-09-f2d">Three columns: the kernel, the xHCI controller and the USB device. Time runs downwards. 1: the port reports a connect; the kernel resets the port and waits for the reset-change bit. 2: the kernel sends Enable Slot and receives slot 2. 3: Address Device with an input context; the controller itself sends SET_ADDRESS to the device. 4: GET_DESCRIPTOR(device) for 8 bytes, then 18 bytes; GET_DESCRIPTOR(configuration) for 9 bytes, then for wTotalLength bytes (34). 5: the kernel reads the interface class: HID, boot subclass, keyboard protocol. 6: Configure Endpoint adds the interrupt IN endpoint 0x81 (device context index 3); SET_CONFIGURATION 1. 7: the HID driver sends SET_PROTOCOL(boot) and SET_IDLE(0). 8: Normal TRBs on the interrupt IN endpoint return 8-byte reports, one per key press or release.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="470"/>
+<rect class="sv-b2" x="15" y="10" width="190" height="30" rx="6"/>
+<text class="sv-tb" x="25" y="30">kernel (usbh.cc)</text>
+<line class="sv-dash" x1="110" y1="40" x2="110" y2="460"/>
+<rect class="sv-b2" x="345" y="10" width="190" height="30" rx="6"/>
+<text class="sv-tb" x="355" y="30">xHCI controller</text>
+<line class="sv-dash" x1="440" y1="40" x2="440" y2="460"/>
+<rect class="sv-b2" x="675" y="10" width="190" height="30" rx="6"/>
+<text class="sv-tb" x="685" y="30">USB device (usb-kbd)</text>
+<line class="sv-dash" x1="770" y1="40" x2="770" y2="460"/>
+<line class="sv-line" x1="440" y1="65" x2="121" y2="65"/>
+<polygon class="sv-head" points="110,65 121,60 121,70"/>
+<text class="sv-ts" x="122" y="60">port status change (connect)</text>
+<line class="sv-line" x1="110" y1="90" x2="429" y2="90"/>
+<polygon class="sv-head" points="440,90 429,95 429,85"/>
+<text class="sv-ts" x="122" y="85">1. PORTSC.PR = 1 (reset), wait for PRC</text>
+<line class="sv-line" x1="110" y1="120" x2="429" y2="120"/>
+<polygon class="sv-head" points="440,120 429,125 429,115"/>
+<text class="sv-ts" x="122" y="115">2. Enable Slot command</text>
+<line class="sv-line" x1="440" y1="145" x2="121" y2="145"/>
+<polygon class="sv-head" points="110,145 121,140 121,150"/>
+<text class="sv-ts" x="122" y="140">completion: slot 2</text>
+<line class="sv-line" x1="110" y1="175" x2="429" y2="175"/>
+<polygon class="sv-head" points="440,175 429,180 429,170"/>
+<text class="sv-ts" x="122" y="170">3. Address Device (input context)</text>
+<line class="sv-line" x1="440" y1="195" x2="759" y2="195"/>
+<polygon class="sv-head" points="770,195 759,200 759,190"/>
+<text class="sv-ts" x="452" y="190">SET_ADDRESS(2) sent by the controller</text>
+<line class="sv-line" x1="110" y1="230" x2="759" y2="230"/>
+<polygon class="sv-head" points="770,230 759,235 759,225"/>
+<text class="sv-ts" x="122" y="225">4. GET_DESCRIPTOR device, 8 then 18 bytes</text>
+<line class="sv-line" x1="110" y1="255" x2="759" y2="255"/>
+<polygon class="sv-head" points="770,255 759,260 759,250"/>
+<text class="sv-ts" x="122" y="250">   GET_DESCRIPTOR config, 9 then 34 bytes</text>
+<text class="sv-ts" x="118" y="285">5. class 3, subclass 1, protocol 1: boot keyboard</text>
+<line class="sv-line" x1="110" y1="315" x2="429" y2="315"/>
+<polygon class="sv-head" points="440,315 429,320 429,310"/>
+<text class="sv-ts" x="122" y="310">6. Configure Endpoint (+ EP 0x81, DCI 3)</text>
+<line class="sv-line" x1="110" y1="340" x2="759" y2="340"/>
+<polygon class="sv-head" points="770,340 759,345 759,335"/>
+<text class="sv-ts" x="122" y="335">   SET_CONFIGURATION(1)</text>
+<line class="sv-line" x1="110" y1="370" x2="759" y2="370"/>
+<polygon class="sv-head" points="770,370 759,375 759,365"/>
+<text class="sv-ts" x="122" y="365">7. SET_PROTOCOL(boot), SET_IDLE(0)</text>
+<line class="sv-line" x1="110" y1="400" x2="429" y2="400"/>
+<polygon class="sv-head" points="440,400 429,405 429,395"/>
+<text class="sv-ts" x="122" y="395">8. Normal TRB on EP 0x81 + doorbell(2, 3)</text>
+<line class="sv-line" x1="770" y1="425" x2="121" y2="425"/>
+<polygon class="sv-head" points="110,425 121,420 121,430"/>
+<text class="sv-ts" x="122" y="420">8-byte report per key change (MSI-X event)</text>
+</svg></div><figcaption><b>Figure 2.</b> Enumeration as the lab kernel performs it (usbh.cc, hid_kbd.cc); the requests and their lengths match frames 15–28 of the keyboard capture (R4). The SET_ADDRESS step is done by the controller and does not appear in QEMU's capture. <sup class="src"><a href="#F4-09-src-D1">D1</a></sup> <sup class="src"><a href="#F4-09-src-D3">D3</a></sup> <sup class="src"><a href="#F4-09-src-R4">R4</a></sup></figcaption></figure>
+
+<h2 id="F4-09-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The reception desk gives each new visitor a chair number, then reads their form. The form says what kind of visitor they are and which trays they have: "one out-tray for key presses, checked every few milliseconds". The desk then calls the matching teacher. Nobody talks directly to a visitor: every message goes through the desk.</p></div>
+<p>When you plug in a USB device, the computer does not know what it is. It asks. The device answers with small tables describing itself. The computer picks a driver from what the tables say: "keyboard", "storage", "mouse". From then on the computer keeps asking: "any keys?", "here is a command, give me block 2050". The device never speaks first; the computer polls it, many times a second.</p>
+
+<h2 id="F4-09-layer2">Layer 2 — the student explanation</h2>
+<h3>Devices, interfaces, endpoints</h3>
+<p>A USB device has one or more configurations; the one in use has interfaces, and each interface has endpoints. The class of an interface (HID = 3, mass storage = 8, hub = 9) picks the driver. In R2 the keyboard reports one interface of class 3, subclass 1 (boot), protocol 1 (keyboard) with one interrupt IN endpoint 0x81 of 8 bytes; the stick one interface of class 8, subclass 6 (SCSI), protocol 0x50 (Bulk-Only) with bulk endpoints 0x81 IN and 0x02 OUT of 1024 bytes. <sup class="src"><a href="#F4-09-src-D1">D1</a></sup> <sup class="src"><a href="#F4-09-src-R2">R2</a></sup></p>
+<p>Four transfer types: <b>control</b> (endpoint 0; setup, optional data, status; for requests like GET_DESCRIPTOR), <b>interrupt</b> (small, polled at a guaranteed interval; keyboards), <b>bulk</b> (large, whenever bandwidth is free; storage) and <b>isochronous</b> (fixed bandwidth, no retry; audio and video, not used here). "Interrupt" is a misleading name: the host still polls; the guarantee is only how often. <sup class="src"><a href="#F4-09-src-D1">D1</a></sup></p>
+<h3>The xHCI controller</h3>
+<p>An xHCI controller is a PCI device (class 0C/03/30) with four register areas: capability registers (sizes, offsets), operational registers (run/stop, the device context array pointer, the command ring pointer, one PORTSC register per port), runtime registers (interrupters, each with an event ring) and an array of doorbells. <sup class="src"><a href="#F4-09-src-D3">D3</a></sup> F4-08's <code>xhci_core.cc</code> already resets the controller, builds a command ring and an event ring, and takes MSI-X interrupts. This chapter adds devices. QEMU's controller reports 64 slots, 8 ports and two "Supported Protocol" capabilities: USB 3.00 on ports 1–4 and USB 2.00 on ports 5–8 (R2). The stick appears on port 2 as a super-speed device; the keyboard on port 5 at high speed. <sup class="src"><a href="#F4-09-src-R2">R2</a></sup></p>
+<h3>Rings and the cycle bit</h3>
+<p>All work is exchanged through rings of TRBs in memory. The kernel produces commands and transfers; the controller produces events. Neither side has a "count" register for the other to read. Instead each TRB carries a cycle bit: the producer writes it last, and the consumer accepts an entry only when its cycle bit equals the value the consumer expects. At the end of a ring a Link TRB points back to the start and flips the expected value. A doorbell write tells the controller to look at a ring; for the event ring, the kernel writes its dequeue pointer back to ERDP so the controller knows which entries it may overwrite. <sup class="src"><a href="#F4-09-src-D3">D3</a></sup></p>
+<h3>Enumeration in six steps</h3>
+<p>Figure 2 lists them. The key xHCI difference from older controllers: the host software never sends SET_ADDRESS. The Address Device command makes the controller choose an address and send the request itself. In R2 the controller gave the stick address 1 and the keyboard address 2. <sup class="src"><a href="#F4-09-src-D3">D3</a></sup> <sup class="src"><a href="#F4-09-src-R2">R2</a></sup> After addressing, the driver reads the first 8 bytes of the device descriptor (enough to learn endpoint 0's maximum packet size), then all 18, then the 9-byte configuration header (for wTotalLength), then the whole configuration (44 bytes for the stick, 34 for the keyboard). <sup class="src"><a href="#F4-09-src-D1">D1</a></sup> <sup class="src"><a href="#F4-09-src-R2">R2</a></sup></p>
+<h3>Two class drivers</h3>
+<p>The keyboard driver sends SET_PROTOCOL(boot) and SET_IDLE(0), then keeps one Normal TRB queued on endpoint 0x81. Each completed TRB is an 8-byte report: byte 0 modifier bits, bytes 2–7 the usage codes of the keys held down. A key press appears as a new code; release as its absence. <sup class="src"><a href="#F4-09-src-D4">D4</a></sup> The storage driver wraps SCSI commands in BOT: INQUIRY, TEST UNIT READY, READ CAPACITY(10), then READ(10) for the FAT32 boot sector, the root directory and the file. R2: last LBA 131071 with 512-byte blocks (64 MiB), the volume label DR302STICK, and the file text the host put there. <sup class="src"><a href="#F4-09-src-D5">D5</a></sup> <sup class="src"><a href="#F4-09-src-R2">R2</a></sup></p>
+
+<h2 id="F4-09-layer3">Layer 3 — the engineer's depth</h2>
+<h3>Contexts: the controller's view of a device</h3>
+<p>For each slot, the device context base address array (DCBAA) holds a pointer to a device context that the controller owns: a slot context (route string, speed, root port, number of context entries, USB address, slot state) followed by 31 endpoint contexts, indexed by the device context index DCI = 2 × endpoint number + direction (IN = 1), with DCI 1 for endpoint 0. <sup class="src"><a href="#F4-09-src-D3">D3</a></sup> Software never writes the device context; it hands the controller an <em>input context</em>: an input control context whose "add" flags say which contexts to take, then copies of the slot and endpoint contexts. Address Device takes the slot context and endpoint 0; Configure Endpoint takes the slot context (with a larger "context entries" field) and the new endpoints. R2 shows the result: "slot state 2" (addressed) after Address Device, endpoint 0x81 at DCI 3 and 0x02 at DCI 4. <sup class="src"><a href="#F4-09-src-R2">R2</a></sup></p>
+<p>QEMU's controller reports 32-byte contexts (CSZ = 0, R2); controllers with 64-byte contexts double every offset, which is why <code>usbh.cc</code> computes context addresses from <code>info().context_size</code> instead of a constant. <sup class="src"><a href="#F4-09-src-D3">D3</a></sup></p>
+<h3>Endpoint context fields that bite</h3>
+<p>The endpoint type is xHCI's own code, not USB's: 4 control, 2 bulk OUT, 6 bulk IN, 3 interrupt OUT, 7 interrupt IN. The interval is in units of 2<sup>n</sup> × 125 µs: for high- and super-speed endpoints n = bInterval − 1; for full- and low-speed interrupt endpoints bInterval counts 1 ms frames and must be converted. The keyboard (high speed, bInterval 7) becomes interval field 6: 2<sup>6</sup> × 125 µs = 8 ms. The max packet size of a USB 3 device's endpoint 0 is given in the device descriptor as an exponent (9 → 512). <sup class="src"><a href="#F4-09-src-D1">D1</a></sup> <sup class="src"><a href="#F4-09-src-D2">D2</a></sup> <sup class="src"><a href="#F4-09-src-D3">D3</a></sup> <sup class="src"><a href="#F4-09-src-R2">R2</a></sup></p>
+<h3>PORTSC: a register that bites back</h3>
+<p>PORTSC mixes read-only status, read-write control and write-1-to-clear change bits, and writing 1 to "port enabled" (PED) <em>disables</em> the port. A driver that reads PORTSC, sets one bit and writes it back clears every pending change and may disable the port. The lab masks the dangerous bits first (<code>PORTSC_NEUTRAL_CLEAR</code>, Listing 1 line 12). USB 2 ports need a port reset to become enabled; USB 3 ports train the link by themselves and are enabled after connect. <sup class="src"><a href="#F4-09-src-D3">D3</a></sup></p>
+<h3>Events can arrive out of order</h3>
+<p>The event ring carries command completions, transfer events and port status changes in the order the controller produces them. A driver waiting for one command completion will see the keyboard's report or a port change first. The lab keeps a small stash: events that are not the one being waited for are kept and handed to the next caller that wants them (<code>wait_transfer</code>, <code>wait_port_change</code>). The hot-plug code shows why: the two "event for port 2/5 (already enumerated), ignored" lines in R2 are port changes from the first scan, still in the stash when hot-plug waiting began. <sup class="src"><a href="#F4-09-src-R2">R2</a></sup></p>
+<h3>Hubs</h3>
+<p>The milestone asks for a hub class driver; the lab has none, so only devices on root ports work. A hub is a USB device (class 9) with an interrupt endpoint reporting port changes; each device behind it gets a route string in its slot context (one 4-bit port number per tier), and full- or low-speed devices behind a high-speed hub also need the hub's slot and port for split transactions. <sup class="src"><a href="#F4-09-src-D1">D1</a></sup> <sup class="src"><a href="#F4-09-src-D3">D3</a></sup></p>
+<h3>SCSI over BOT</h3>
+<p>SCSI fields are big-endian. READ(10) is opcode 0x28, a 4-byte logical block address in bytes 2–5 and a 2-byte block count in bytes 7–8. A failed command returns CSW status 1; REQUEST SENSE then gives a sense key and an additional sense code (ASC/ASCQ). <sup class="src"><a href="#F4-09-src-D5">D5</a></sup> The opcodes in <code>bot.h</code> were checked against <code>&lt;scsi/scsi.h&gt;</code> (R1). <sup class="src"><a href="#F4-09-src-L2">L2</a></sup> <sup class="src"><a href="#F4-09-src-R1">R1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The xHCI register offsets, PORTSC bit positions, TRB types and fields, slot and endpoint context layouts, endpoint type codes and interval rules in <code>xhci_core.cc</code>, <code>usbh.cc</code> and this section are from the author's memory of D3, which was not opened in this build. They are confirmed only by QEMU 8.2.2's qemu-xhci model accepting them (R2, R5). The BOT wrapper layout, the SCSI CDB layouts and sense codes (D5) and the HID boot report layout (D4) are confirmed the same way and by the packet capture (R4, R7). The USB chapter 9 constants and descriptor sizes and the SCSI opcodes match Linux's headers (R1). Real controllers (Intel, AMD, ASMedia, Renesas) have quirks QEMU does not model; nothing here ran on one.</p></div>
+
+<h2 id="F4-09-hardware">How the hardware actually does it</h2>
+<p>On the wire, a USB 2.0 bus is a polled, half-duplex bus: the host sends a token (IN, OUT or SETUP) addressed to a device and endpoint, then data, then a handshake (ACK, NAK or STALL). A keyboard with no new key answers every IN token with NAK; the host retries at the endpoint's interval. A STALL means "this request is not supported" or "this endpoint is halted"; the host must clear the halt before using the endpoint again. <sup class="src"><a href="#F4-09-src-D1">D1</a></sup> USB 3 adds a separate full-duplex super-speed link with its own packets and replaces polling with notifications for asynchronous endpoints. <sup class="src"><a href="#F4-09-src-D2">D2</a></sup></p>
+<p>The xHCI controller hides all of this: it schedules transactions from the transfer rings, retries NAKs itself and reports only completions (completion code 1 = success and 13 = short packet in <code>xhci_core.h</code>; 6 = stall from memory of D3). <sup class="src"><a href="#F4-09-src-D3">D3</a></sup> In QEMU there is no wire at all; the device models answer the controller model directly. QEMU can still record a capture of each device's traffic in the Linux "usbmon" format (the <code>pcap=</code> property), at the level of USB requests (URBs), not packets. <sup class="src"><a href="#F4-09-src-D6">D6</a></sup> That is why the capture in R4 shows setup requests and completions but no NAKs and no SET_ADDRESS (the controller model performs the address step internally).</p>
+<p>Before the kernel starts, the firmware (SeaBIOS in QEMU) has its own USB driver so that a USB keyboard works in the boot menu. Its traffic is visible in the captures: frames 1–14 of R4 enumerate the keyboard with a sequence the lab kernel does not use (no 18-byte request), and the CBWs with tag 0x3e7 in R7 are not the kernel's (its tags count from 1). <sup class="src"><a href="#F4-09-src-R7">R7</a></sup> That attribution is an inference from the request pattern. A real consequence showed up with the IOMMU on: QEMU reported a DMA read fault at IOVA 0x3fdec60, near the top of the guest's 64 MiB, when translation was switched on and before the kernel had reset the controller (R5). The most likely reading: the controller was still running the firmware's rings. Production kernels take USB controllers from the firmware explicitly (the "BIOS hand-off" in the USB legacy support capability) and reset them before enabling DMA remapping. <sup class="src"><a href="#F4-09-src-D3">D3</a></sup> <sup class="src"><a href="#F4-09-src-R5">R5</a></sup></p>
+
+<h2 id="F4-09-worked">Worked example</h2>
+<p><b>Task.</b> (1) Decode the first five keyboard reports of R2. (2) Annotate frames 15–22 of the keyboard capture (R4) and match each to a line of <code>usbh.cc</code>.</p>
+<p><b>Step 1.</b> HID usage codes for letters start at 0x04 = a; digits at 0x1E = 1; 0x28 = Enter, 0x2C = space. <sup class="src"><a href="#F4-09-src-D4">D4</a></sup> Report <code>00 00 0b 00 …</code>: no modifiers, key 0x0B = 0x04 + 7 = h. Next, all zeros: release. <code>00 00 08</code> = e; release; <code>00 00 0f</code> = l; release; <code>00 00 0f</code> = l again. The release report between the two l's is what makes the second one a new key press: the driver compares each report with the previous one (Listing 2 lines 46–50). The full sequence 0b 08 0f 0f 12 2c 18 16 05 2c 21 1f 28 reads "hello usb 42" and Enter, which R2 prints as the typed line.</p>
+<p><b>Step 2.</b> In R4's table, 'S' is a submission and 'C' its completion; type 0x02 is control, 0x01 interrupt.</p>
+<div class="tw"><table>
+<thead><tr><th>Frames</th><th>Request</th><th>Meaning</th><th>Code</th></tr></thead>
+<tbody>
+<tr><td class="n">15–16</td><td>bmRequestType 0x80, bRequest 6, descriptor 0x01, wLength 8 → 8 bytes</td><td>GET_DESCRIPTOR(device), first 8 bytes</td><td><code>usbh.cc</code> line 150</td></tr>
+<tr><td class="n">17–18</td><td>the same, wLength 18 → 18 bytes</td><td>the whole device descriptor</td><td>line 151</td></tr>
+<tr><td class="n">19–20</td><td>descriptor 0x02, wLength 9</td><td>configuration header</td><td>line 153</td></tr>
+<tr><td class="n">21–22</td><td>descriptor 0x02, wLength 34 → 0x02, 0x04, 0x21, 0x05</td><td>full configuration: config, interface, HID, endpoint descriptors</td><td>lines 155–156</td></tr>
+</tbody></table></div>
+<p>Frame 23 (bmRequestType 0x00, bRequest 9) is SET_CONFIGURATION (line 255); frames 25 and 27 (0x21: class request to an interface) are SET_PROTOCOL and SET_IDLE (<code>hid_kbd.cc</code> lines 26–27); from frame 29 on, interrupt IN submissions and 8-byte completions are the key reports. <sup class="src"><a href="#F4-09-src-D1">D1</a></sup> <sup class="src"><a href="#F4-09-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F4-09/capture"></pre>
+<p><b>Check.</b> Frame 18's decoded descriptor (bcdUSB 0x0200, bMaxPacketSize0 64, idVendor 0x0627, idProduct 0x0001) matches R2's "USB 2.00 … EP0 max packet 64, vendor 0x0627 product 0x0001". Note what tshark adds: it names the product "QEMU Tablet" from its ID database. The device is a keyboard; QEMU's keyboard, mouse and tablet share one vendor and product ID (R2 shows the hot-plugged mouse with the same pair). Names looked up from IDs are guesses; the interface descriptor's class and protocol are what the device says it is.</p>
+
+<h2 id="F4-09-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F4-09/</code>: <code>usb.h</code> (chapter 9 definitions), <code>usbh.cc</code> (device management), <code>hid_kbd.cc</code>, <code>bot.cc</code>, <code>f409_main.cc</code> (the tests, including a minimal read-only FAT32 directory reader), <code>qmp_usb.py</code> (the host side: types the line and hot-plugs a mouse through QEMU's QMP interface) and <code>usbcheck.cpp</code>. They build on F4-08's interrupt layer, mapping API and xHCI core.</p>
+<p><b>Listing 1</b> — <code>usbh.cc</code>: ports, slots, enumeration and transfers.</p>
+<pre class="listing" data-src="F4-09/usbh.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">8–12, 24</td><td><code>PORTSC_NEUTRAL_CLEAR</code>, <code>neutral</code></td><td>Removes write-1-to-clear and action bits before a read-modify-write.</td><td>Writing PORTSC back unchanged would disable the port and drop pending changes.</td></tr>
+<tr><td class="n">34–57</td><td><code>wait_transfer</code></td><td>Waits for the event of one TRB; stashes others.</td><td>Events for other devices and port changes arrive in between.</td></tr>
+<tr><td class="n">59–66</td><td><code>fill_ep_ctx</code></td><td>Interval, error count 3, type, max packet, ring pointer with DCS = 1.</td><td>DCS must equal the ring's initial cycle bit, or the controller ignores every TRB.</td></tr>
+<tr><td class="n">101–110</td><td>port reset</td><td>Acknowledges the connect change, resets, waits for PRC, checks PED.</td><td>A USB 2 device answers only on an enabled port.</td></tr>
+<tr><td class="n">112–114</td><td>Enable Slot</td><td>Asks the controller for a slot ID.</td><td>The slot ID indexes the DCBAA and the doorbells.</td></tr>
+<tr><td class="n">132–140</td><td>input context, Address Device</td><td>Slot context (speed, port, 1 entry) and EP0 with a default max packet; command.</td><td>The controller assigns the address and sends SET_ADDRESS itself.</td></tr>
+<tr><td class="n">145–147</td><td>read the output context</td><td>Prints the USB address and slot state the controller wrote.</td><td>Proof that the controller, not the kernel, chose the address.</td></tr>
+<tr><td class="n">150–156</td><td>four GET_DESCRIPTOR calls</td><td>8 then 18 bytes; 9 then wTotalLength bytes.</td><td>The frames 15–22 of R4.</td></tr>
+<tr><td class="n">168–195</td><td><code>control</code></td><td>Setup TRB (packet inline, IDT), optional Data TRB, Status TRB with IOC; doorbell target 1.</td><td>The status stage's direction is opposite to the data stage (IN when there is no data).</td></tr>
+<tr><td class="n">192</td><td>residual length</td><td>Bytes received = requested − residue of the data TRB's event.</td><td>Short descriptors are normal; they are not errors.</td></tr>
+<tr><td class="n">213–242</td><td><code>configure</code> loop</td><td>For each endpoint of the interface: DCI, xHCI type, interval, ring.</td><td>The translation from USB descriptor to xHCI context.</td></tr>
+<tr><td class="n">232–233</td><td>interval conversion</td><td>Exponent for high/super speed; frames → log2(frames × 8) for full/low speed.</td><td>A wrong interval polls far too often or too rarely.</td></tr>
+<tr><td class="n">243–247</td><td>slot context copy</td><td>Current slot context with more entries; address and state zeroed.</td><td>Context Entries must cover the highest DCI, or Configure Endpoint fails.</td></tr>
+<tr><td class="n">255</td><td>SET_CONFIGURATION</td><td>Tells the device which configuration to use.</td><td>Only after this does the device answer on its other endpoints.</td></tr>
+<tr><td class="n">267–282</td><td><code>transfer</code></td><td>One Normal TRB through the device's bounce page.</td><td>Every buffer address is an IOVA from F4-08's API.</td></tr>
+<tr><td class="n">288</td><td><code>1u &lt;&lt; bMaxPacketSize0</code></td><td>Decodes USB 3's exponent form.</td><td>Prints 512 for the stick, 64 for the keyboard (R2).</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>hid_kbd.cc</code>: boot keyboard.</p>
+<pre class="listing" data-src="F4-09/hid_kbd.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">7–17</td><td><code>usage_to_ascii</code></td><td>A small part of the HID keyboard usage page.</td><td>Usage codes are positions on a keyboard, not characters: a layout table maps them.</td></tr>
+<tr><td class="n">22–23</td><td>class 3, subclass 1, protocol 1</td><td>Accepts only boot keyboards.</td><td>A mouse (protocol 2) or a non-boot device needs a report-descriptor parser.</td></tr>
+<tr><td class="n">25–27</td><td>SET_PROTOCOL(0), SET_IDLE(0)</td><td>Class requests to the interface (bmRequestType 0x21).</td><td>Without SET_PROTOCOL a keyboard may send its report-protocol format.</td></tr>
+<tr><td class="n">45</td><td><code>rep[0] &amp; 0x22</code></td><td>Left Shift (bit 1) or right Shift (bit 5).</td><td>Modifiers are bits, not key codes.</td></tr>
+<tr><td class="n">46–50</td><td>compare with <code>prev</code></td><td>Counts a key only when it was not down in the previous report.</td><td>Reports describe state, not events.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>bot.cc</code>: Bulk-Only Transport and SCSI.</p>
+<pre class="listing" data-src="F4-09/bot.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">15–22</td><td><code>put_lba</code></td><td>Big-endian LBA (the forensic build uses the CPU's order).</td><td>The forensic lab's bug lives here.</td></tr>
+<tr><td class="n">29</td><td>class 8, protocol 0x50</td><td>Accepts Bulk-Only storage only.</td><td>UAS devices (protocol 0x62) use a different transport.</td></tr>
+<tr><td class="n">39–46</td><td>CBW</td><td>Signature "USBC", a new tag, length, direction flag, the CDB.</td><td>The tag lets the CSW be matched to its command.</td></tr>
+<tr><td class="n">47–50</td><td>data phase</td><td>Bulk IN or OUT for <code>length</code> bytes.</td><td>Direction must match the CBW flag.</td></tr>
+<tr><td class="n">51–54</td><td>CSW</td><td>Checks signature and tag; returns status.</td><td>Status 1 means "ask REQUEST SENSE why".</td></tr>
+<tr><td class="n">57–64</td><td>READ CAPACITY(10)</td><td>Last LBA and block size, big-endian.</td><td>The last LBA, not the count: 131071 means 131072 blocks.</td></tr>
+<tr><td class="n">75–83</td><td>REQUEST SENSE</td><td>Sense key and ASC/ASCQ from fixed-format data.</td><td>The forensic log's evidence.</td></tr>
+</tbody></table></div>
+<p><b>Constants check</b> against Linux's headers (R1):</p>
+<pre class="output" data-run="F4-09/usbcheck"></pre>
+<p><b>Build</b> (R8; flags as in <a href="#F4-08">F4-08</a>):</p>
+<pre class="output" data-run="F4-09/build"></pre>
+<p><b>The run</b> (R2). The keys were typed by <code>qmp_usb.py</code> through QMP's <code>input-send-event</code>; the mouse was hot-plugged with <code>device_add</code> and removed with <code>device_del</code>, the QMP equivalents of the monitor commands.</p>
+<pre class="output" data-run="F4-09/usb"></pre>
+<p>The host reads back the block the kernel wrote (R3); the fnv1a value matches the kernel's:</p>
+<pre class="output" data-run="F4-09/image"></pre>
+
+<h2 id="F4-09-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Visitors never speak first.</b> A real visitor walks up to the desk; a USB device only answers when the host asks. Even "interrupt" endpoints are polled.</li>
+<li><b>The desk does not walk anywhere.</b> The analogy's receptionist "calls a teacher"; in xHCI the controller does the bus work, but choosing and loading the class driver is the kernel's job, from the descriptors.</li>
+<li><b>Forms can lie or be wrong.</b> Descriptors come from the device; a malicious device can claim to be a keyboard and type commands ("BadUSB" attacks). The desk in the story trusts every form.</li>
+<li><b>One visitor can be several.</b> A composite device (a keyboard with a built-in touchpad) has several interfaces, each with its own driver; the analogy's "one form, one teacher" hides that.</li>
+</ul>
+
+<h2 id="F4-09-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> the controller never processes a ring. <b>Cause:</b> the ring's cycle state (DCS in the endpoint context, RCS in CRCR) does not match the cycle bit in the TRBs, or the doorbell target is wrong (endpoint 0 is target 1, not 0). <b>Find it:</b> dump the TRB and the endpoint context. <b>Fix:</b> initialise both with cycle 1; doorbell target = DCI.</li>
+<li><b>Symptom:</b> a port works once, then never reports changes again. <b>Cause:</b> PORTSC written back with its change bits set (clearing them) or PED set (disabling the port). <b>Find it:</b> print PORTSC before and after each write. <b>Fix:</b> Listing 1 line 24.</li>
+<li><b>Symptom:</b> Configure Endpoint fails with "parameter error". <b>Cause:</b> Context Entries in the slot context smaller than the highest DCI added, or the add flags miss the slot context. <b>Find it:</b> compare the add flags with the DCIs printed. <b>Fix:</b> lines 243–247.</li>
+<li><b>Symptom:</b> the keyboard types each letter twice, or misses repeated letters. <b>Cause:</b> treating every report as key presses, or comparing only with the last non-empty report. <b>Find it:</b> print raw reports as the lab does. <b>Fix:</b> compare with the previous report, including empty ones.</li>
+<li><b>Symptom:</b> the stick answers INQUIRY but every READ(10) fails. <b>Cause:</b> wrong byte order of LBA or count, or a data length in the CBW that differs from blocks × 512. <b>Find it:</b> REQUEST SENSE (ASC 0x21 = LBA out of range, 0x24 = invalid field), and the capture's decoded LBA. <b>Fix:</b> big-endian fields. The forensic lab is this bug.</li>
+<li><b>Symptom:</b> a bulk transfer stalls and every later command times out. <b>Cause:</b> the endpoint halted (STALL) and was not reset. <b>Find it:</b> completion code 6. <b>Fix:</b> Reset Endpoint command, Set TR Dequeue Pointer, CLEAR_FEATURE(ENDPOINT_HALT); for BOT, the reset recovery sequence (not implemented in the lab).</li>
+</ul>
+
+<div class="co transition" id="F4-09-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F4-08">F4-08</a> gave you MSI-X, the IOMMU and an xHCI core that runs NOOP commands; DR301's NVMe driver (<a href="#F4-07">F4-07</a>) taught submission and completion queues with doorbells. <b>What carries over:</b> rings in memory with a producer and a consumer, doorbells, completion entries matched to requests, every address from the mapping API, and OS303's block devices and FAT32. <b>What changes:</b> the devices are discovered at run time, describe themselves, appear and disappear while the system runs, and sit behind a bus protocol with its own requests; there are now two layers of drivers (controller and class). <b>What comes next:</b> <a href="#F4-10">F4-10</a> takes the same ring-and-descriptor pattern to a network card, then builds a protocol stack on top of it.</p></div>
+
+<h2 id="F4-09-check">Check yourself</h2>
+<ol>
+<li>Name the four USB transfer types and one device class that uses each.</li>
+<li>Why does the driver read 8 bytes of the device descriptor before reading all 18?</li>
+<li>Compute the DCI of endpoint 0x02 and of endpoint 0x83.</li>
+<li>A full-speed mouse has bInterval 10. What interval field does <code>configure</code> write, and what period does it mean?</li>
+<li>Why does R4 contain no SET_ADDRESS request?</li>
+<li>A keyboard report reads <code>02 00 04 00 00 00 00 00</code>. What was typed?</li>
+<li>READ CAPACITY(10) returns last LBA 131071, block size 512. How many bytes is the device?</li>
+<li>In R2, after "hotplug: remove it now", the kernel saw two changes on port 7. Explain both.</li>
+<li>Multiple choice: the tag in a CSW does not match the CBW's. The most likely cause is (a) a wrong LBA, (b) the driver read a stale CSW from an earlier command, (c) the device is full.</li>
+</ol>
+
+<h2 id="F4-09-lab">Lab</h2>
+<p><b>Goal.</b> Milestone C8: "A USB stack: host controller driver, device enumeration through hubs, class drivers for HID keyboards and mice and for mass-storage sticks." <sup class="src"><a href="#F4-09-src-D8">D8</a></sup></p>
+<p><b>Hardware and software needed.</b> QEMU 8.2.2 (<code>-machine q35 -device qemu-xhci -device usb-kbd -device usb-storage</code>), dosfstools and mtools for the stick image, Wireshark's tshark 4.2.2 for the captures, Python 3 for the QMP script. Run <code>university/labs/run_lab.sh university/labs/F4-09</code> (under a minute in this build).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>The lab writes to the last block of a disk image. On real hardware, never test a storage driver's write path on a stick or disk with data you want to keep: use a stick you have erased, and keep other USB storage unplugged. A USB device can claim to be a keyboard; do not test with devices of unknown origin.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In <code>usb.out</code>, for each device, find the speed, slot, address, and each descriptor field; compare with R4's decoded frame 18.</li>
+<li>Open <code>capture.out</code> and annotate frames 1–44 in your own table, as in the worked example (this is exam P's skill).</li>
+<li>Change <code>configure</code> to write interval field 0 for the keyboard. Predict the effect on the number of completed interrupt transfers; check with the capture.</li>
+<li>Remove the SET_IDLE request. Does the keyboard still work in QEMU? Look up in D4 what SET_IDLE(0) changes and why some real keyboards behave differently.</li>
+<li>Write a boot-mouse driver (class 3, protocol 2; report: buttons, X, Y) and print movement; generate movement with QMP <code>input-send-event</code> (rel events).</li>
+<li>Milestone steps not done here: a hub driver (test with <code>-device usb-hub</code>), presenting the stick as a block device to your OS303 kernel and running the B15 FAT32 tests on it.</li>
+</ol>
+<p><b>Expected observations</b> (QEMU 8.2.2, TCG): the stick on port 2 (super speed, slot 1, address 1), the keyboard on port 5 (high speed, slot 2, address 2); 25 keyboard reports for "hello usb 42"; READ CAPACITY 131071/512; HELLO.TXT read from the root directory at LBA 2050; the written block read back on the host with fnv1a 0x2879b9b2; the hot-plugged mouse on port 7, then "slot 3 disabled" after removal; 78 MSI-X interrupts (R2, R3).</p>
+<p><b>Verification</b> (the acceptance tests, verbatim, with this build's result). "In QEMU with qemu-xhci plus usb-kbd, usb-mouse and usb-storage devices, all three enumerate with correct descriptors printed." — met: keyboard and stick at boot, the mouse when hot-plugged (R2). "Typing through the USB keyboard reaches the shell" — partly: the typed line reaches the kernel; this kernel has no shell. "the USB stick mounts as FAT32 and passes the B15 tests" — partly: the FAT32 boot sector, root directory and a file are read, one raw block is written and read back; the B15 tests were not run. "Hot-plugging a USB device from the QEMU monitor is detected; unplugging removes it cleanly." — met through QMP (R2). "On the spare PC, a real USB keyboard works (recorded separately)." — not done. <sup class="src"><a href="#F4-09-src-D8">D8</a></sup> <sup class="src"><a href="#F4-09-src-R2">R2</a></sup> With intel-iommu the whole run passes as well (R5).</p>
+<div class="co unverified"><span class="lbl">Not tested in this build</span><p>No hub driver, no mouse class driver beyond enumeration, no B15 tests, no shell, no BOT reset recovery and no endpoint-halt recovery. No real controller or device: the spare-PC keyboard test is open. The firmware hand-off (USB legacy support capability) is not implemented; the R5 fault suggests it matters.</p></div>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"port N reset timed out" → PRC never set → print PORTSC after the reset write; check that PR was not masked out by <code>neutral</code> → write PR together with the neutral value.</li>
+<li>"Address Device failed, code 17" (parameter error) → input control context add flags or slot context fields wrong → dump the input context's first 64 bytes → add flags 0x3, context entries 1, speed and root port set.</li>
+<li>The keyboard enumerates but no reports arrive → no TRB queued on endpoint 0x81, or doorbell target not the DCI → print the DCI from <code>configure</code> → ring doorbell(slot, 3).</li>
+<li>tshark prints nothing → the capture path differs from the <code>pcap=</code> property, or QEMU was killed before flushing → let QEMU exit through the debug-exit device.</li>
+</ul>
+<p><b>Extension.</b> Add <code>-device usb-hub</code> and put the keyboard behind it: implement the hub class requests (GET_PORT_STATUS, SET_FEATURE(PORT_RESET)) and route strings.</p>
+
+<h2 id="F4-09-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A refactored storage driver "reads the stick fine" according to its author: INQUIRY, READ CAPACITY and the boot sector all work. But mounting fails, always on the first directory read. The author suspects the stick image.</p>
+<p><b>Evidence pack.</b> The kernel log of the failing run (R6) and the stick's capture, decoded by tshark (R7). <sup class="src"><a href="#F4-09-src-R6">R6</a></sup> <sup class="src"><a href="#F4-09-src-R7">R7</a></sup></p>
+<pre class="output" data-run="F4-09/forensic"></pre>
+<pre class="output" data-run="F4-09/forensic_capture"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Which command fails, with which sense key and ASC? What does that combination mean?</li>
+<li>Compare the LBA the kernel says it read with the LBA in the capture. Convert both to hexadecimal.</li>
+<li>Why did the boot sector read succeed with the same code?</li>
+<li>Frames 11–37 carry tag 0x3e7. Whose commands are they, and why are they irrelevant here?</li>
+<li>Give the fix, and a test that would have caught the bug before any mount.</li>
+</ol>
+<p><b>Method hints.</b> Write 2050 and 34078720 in hexadecimal, byte by byte. Ask which values look the same in either byte order.</p>
+<p>Grading follows the forensic rubric of guide 11.2.</p>
+
+<h2 id="F4-09-project">Mini-project</h2>
+<p>Exam P preparation: annotate a USB enumeration capture. Using QEMU's <code>pcap=</code> property, capture the enumeration of the hot-plugged usb-mouse (or, on the spare PC with Linux's usbmon, a real keyboard). Produce a table with one row per frame: direction, request, wValue and wLength, the bytes returned, their decoded meaning and the line of your driver that caused it. Mark which frames come from firmware, which from your kernel, and justify each attribution from the evidence.</p>
+<p><b>Rubric.</b> Every frame accounted for (30 %); decoded fields correct against the specification (30 %); attribution argued from evidence (20 %); one observation the log alone would not show (10 %); clarity (10 %).</p>
+
+<h2 id="F4-09-summary">Summary</h2>
+<ul>
+<li>USB is host-driven: devices describe themselves with descriptors; drivers bind to interfaces by class.</li>
+<li>xHCI works through rings of 16-byte TRBs with a cycle bit, doorbells and an event ring; contexts describe slots and endpoints.</li>
+<li>Enumeration: reset, Enable Slot, Address Device (the controller sends SET_ADDRESS), descriptors, Configure Endpoint, SET_CONFIGURATION (R2, R4).</li>
+<li>HID boot keyboards send 8-byte state reports; BOT carries big-endian SCSI commands in CBW/CSW wrappers.</li>
+<li>Captures show requests at URB level; IDs-to-name lookups can mislead (R4).</li>
+<li>Firmware may leave the controller running; take it over before enabling the IOMMU (R5).</li>
+</ul>
+
+<h2 id="F4-09-sources">Sources</h2>
+<ol>
+<li id="F4-09-src-D1">USB Implementers Forum, "Universal Serial Bus Specification, Revision 2.0", chapter 9 "USB Device Framework" (curriculum C8 reading); chapters 5 and 8 for transfer types and the protocol layer. <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F4-09-src-D2">USB Implementers Forum, "Universal Serial Bus 3.2 Specification" (the USB 3 equivalents of chapter 9; endpoint 0 max packet exponent). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F4-09-src-D3">Intel, "eXtensible Host Controller Interface for Universal Serial Bus (xHCI) Specification" (curriculum C8 reading: registers; device, slot and endpoint contexts; command, event and transfer rings; Host Controller Initialization; Device Slot Management; USB Legacy Support capability). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F4-09-src-D4">USB Implementers Forum, "Device Class Definition for Human Interface Devices (HID)" (boot protocol, SET_PROTOCOL, SET_IDLE) and "HID Usage Tables" (keyboard usage page). <i>Title only — not opened during this build; the Source Researcher must confirm the versions and sections (dossier gate G1 open).</i></li>
+<li id="F4-09-src-D5">USB Implementers Forum, "USB Mass Storage Class Bulk-Only Transport"; INCITS T10, "SCSI Primary Commands" and "SCSI Block Commands" (INQUIRY, REQUEST SENSE, READ CAPACITY(10), READ(10), WRITE(10); sense keys and ASC codes). <i>Title only — not opened during this build; the Source Researcher must confirm the revisions and sections (dossier gate G1 open).</i></li>
+<li id="F4-09-src-D6">QEMU documentation: USB emulation (qemu-xhci, usb-kbd, usb-mouse, usb-storage, the <code>pcap</code> property) and the QMP reference (<code>input-send-event</code>, <code>device_add</code>, <code>device_del</code>). <i>Title only — not opened during this build; the Source Researcher must confirm the version and pages (dossier gate G1 open).</i></li>
+<li id="F4-09-src-D7">Microsoft, "FAT32 File System Specification" (BPB fields, directory entries) — the OS303 milestone B15 reading, used here only for the boot sector and root directory. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-09-src-D8">This project's Systems Curriculum: milestone C8 (goal, reading, build, acceptance tests) and milestone B15 (opened in this build; the project's own page; a map, not a technical source).</li>
+<li id="F4-09-src-L1">L1 — Linux UAPI header <code>&lt;linux/usb/ch9.h&gt;</code> as installed in the build container (opened in this build by <code>usbcheck.cpp</code>; tier 4).</li>
+<li id="F4-09-src-L2">L2 — glibc/Linux header <code>&lt;scsi/scsi.h&gt;</code> as installed in the build container (opened in this build by <code>usbcheck.cpp</code>; tier 4).</li>
+<li id="F4-09-src-R1">R1 — lab run of <code>usbcheck.cpp</code>: <code>university/labs/F4-09/usbcheck.out</code>, <code>usbcheck.log</code> (30 constants, 0 mismatches).</li>
+<li id="F4-09-src-R2">R2 — lab run, step <code>usb</code>: <code>usb.out</code>, <code>usb.log</code> (QEMU 8.2.2, q35, TCG; exit code 33 = pass).</li>
+<li id="F4-09-src-R3">R3 — lab run, step <code>image</code>: <code>image.out</code>, <code>image.log</code> (host read-back of the written block).</li>
+<li id="F4-09-src-R4">R4 — lab run, step <code>capture</code>: <code>capture.out</code>, <code>capture.log</code> (tshark 4.2.2 on QEMU's keyboard capture).</li>
+<li id="F4-09-src-R5">R5 — lab run, step <code>usb_iommu</code>: <code>usb_iommu.out</code>, <code>usb_iommu.log</code> (the same with intel-iommu; exit code 33).</li>
+<li id="F4-09-src-R6">R6 — lab run, step <code>forensic</code>: <code>forensic.out</code>, <code>forensic.log</code> (built with <code>-DF409_LBA_LE</code>; exit code 3 expected).</li>
+<li id="F4-09-src-R7">R7 — lab run, step <code>forensic_capture</code>: <code>forensic_capture.out</code>, <code>forensic_capture.log</code> (tshark on the forensic run's stick capture).</li>
+<li id="F4-09-src-R8">R8 — lab run, step <code>build</code>: <code>build.out</code>, <code>build.log</code>.</li>
+</ol>
+<p>The FAT32 field offsets used in <code>f409_main.cc</code> rest on D7 and are confirmed by reading an image made by mkfs.fat (R2) <sup class="src"><a href="#F4-09-src-D7">D7</a></sup>; the QMP commands on D6 <sup class="src"><a href="#F4-09-src-D6">D6</a></sup>; the build on R8 <sup class="src"><a href="#F4-09-src-R8">R8</a></sup>; the host read-back on R3 <sup class="src"><a href="#F4-09-src-R3">R3</a></sup>.</p>
+
+<h2 id="F4-09-glossary">Glossary links</h2>
+<p><a href="#gl-host-controller-xhci">Host controller (xHCI)</a> · <a href="#gl-descriptor-usb">Descriptor (USB)</a> · <a href="#gl-endpoint-usb">Endpoint (USB)</a> · <a href="#gl-enumeration-usb">Enumeration (USB)</a> · <a href="#gl-trb-transfer-request-block">TRB (transfer request block)</a> · <a href="#gl-cycle-bit">Cycle bit</a> · <a href="#gl-doorbell-register">Doorbell register</a> · <a href="#gl-device-context-xhci">Device context (xHCI)</a> · <a href="#gl-hid-boot-protocol">HID boot protocol</a> · <a href="#gl-bot-bulk-only-transport">BOT (Bulk-Only Transport)</a> · <a href="#gl-sense-data-scsi">Sense data (SCSI)</a> · <a href="#gl-usbmon-capture">usbmon capture</a></p>
+
+<h2 id="F4-09-next">Next chapter</h2>
+<p>Next: <a href="#F4-10">F4-10 The e1000 NIC and a TCP/IP stack</a>. Back to the course: <a href="#DR302">DR302</a>. Before this chapter: <a href="#F4-08">F4-08</a>.</p>
+
+<h2 id="F4-09-answers">Answers to Check yourself</h2>
+<ol>
+<li>Control (every device, endpoint 0: descriptors and requests); interrupt (HID keyboards and mice); bulk (mass storage); isochronous (audio and video streams).</li>
+<li>Endpoint 0's maximum packet size is in byte 7 of the device descriptor; the controller needs it in the endpoint 0 context before longer transfers work reliably on full-speed devices. Eight bytes fit any legal size.</li>
+<li>0x02: 2 × 2 + 0 = 4. 0x83: 2 × 3 + 1 = 7.</li>
+<li>Frames × 8 = 80 microframes; log2(80) rounded down = 6 (the loop shifts until f &lt;= 1); 2<sup>6</sup> × 125 µs = 8 ms. Note this is shorter than the 10 ms asked for, which is allowed (the device asked for "at most 10 ms").</li>
+<li>With xHCI the controller sends SET_ADDRESS when it executes the Address Device command; QEMU's capture records the requests the device models receive from the transfer rings, and the address step is performed inside the controller model.</li>
+<li>Modifier 0x02 = left Shift; usage 0x04 = a: capital A.</li>
+<li>(131071 + 1) × 512 = 67108864 bytes = 64 MiB.</li>
+<li>The first change (connected = 1) is left over from the kernel's own port reset during enumeration of port 7 (the reset sets a change bit). The second (connected = 0) is the removal; only it leads to Disable Slot.</li>
+<li>(b).</li>
+</ol>
+<h3 id="F4-09-forensic-key">Forensic answer key</h3>
+<p><b>Observation.</b> R6: "READ(10) LBA 2050, 1 block(s) → CSW status 1, sense key 0x5 ASC 0x21": ILLEGAL REQUEST, logical block address out of range. R7: frame 69 READ(10) LBA 0 (the boot sector, which succeeded) and frame 75 READ(10) LBA 34078720.</p>
+<p><b>Root cause.</b> 2050 = 0x00000802. Stored little-endian, the CDB bytes are 02 08 00 00; the device reads them big-endian as 0x02080000 = 34078720, beyond the last LBA 131071. <code>bot.cc</code> line 18 (<code>memcpy(p, &amp;lba, 4)</code> under <code>F409_LBA_LE</code>) copies the CPU's byte order into a big-endian SCSI field. LBA 0 reads the same in both orders, so the boot sector worked.</p>
+<p><b>Injection.</b> Built with <code>-DF409_LBA_LE</code>.</p>
+<p><b>Fix and verification.</b> Use <code>put_be32</code>; rerun: the root directory read at LBA 2050 succeeds (R2). A unit test: build the CDB for LBA 0x01020304 and compare the bytes with 01 02 03 04; or read LBA 1 and check it is not the boot sector.</p>
+<p><b>Firmware frames.</b> Tag 0x3e7 (999) on frames 11–37: not the kernel's (its tags start at 1, frame 53); most likely the firmware probing the stick before the kernel ran. They show the device worked before the kernel touched it.</p>
+<p><b>Wrong answers.</b> "The image is corrupt": the host wrote it with mkfs.fat and the boot sector parses. "The FAT arithmetic is wrong": 2050 = 32 reserved + 2 × 1009 FAT sectors, correct for root cluster 2; the capture shows a different number on the wire.</p>

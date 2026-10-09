@@ -1,0 +1,426 @@
+<!--meta
+id: F4-10
+title: The e1000 NIC and a TCP/IP stack
+course: DR302
+level: L4
+prereqs: F4-08 (DMA mapping API, IOMMU); DR301 (rings and doorbells, F4-07); OS303 (timers, blocking waits)
+time: 16–20 hours including the lab and the project
+hardware: none for the lab (QEMU 8.2.2, q35, e1000, user-mode networking, Wireshark's tshark on the host). A real Intel NIC on the spare PC is untested in this build.
+maps: Curriculum Track C, milestone C9 (e1000 NIC and a TCP/IP stack); course project C9 (the kernel fetches a web page over its own TCP stack)
+analogy: F4 — the school and its visitors (the post room: letters cut into numbered pages, receipts for every page received, and a clock for the pages nobody signed for)
+-->
+
+<h2 id="F4-10-hook">Story hook</h2>
+<p>The school's post room sends long letters to another school across town. The courier only takes single pages, and sometimes a page falls off the bike. So the post room numbers every page, keeps a copy of each until the other school sends back a receipt ("I have everything up to page 41"), and keeps a kitchen timer running for the oldest page nobody has signed for. If the timer rings, that page goes out again.</p>
+<p>One day a new clerk "simplifies" the timer: he stops it whenever a receipt arrives, planning to restart it with the next new page. On a good day nobody notices. On a bad day, the last pages of a letter get lost, no new pages are left to send, and the timer is never restarted. The letter sits half delivered, forever, and nothing in the post room looks wrong.</p>
+<p>This chapter builds a network card driver and the post room on top of it: Ethernet, ARP, IPv4, ICMP, UDP, DHCP and TCP. The forensic lab is that clerk's bug, found in a Wireshark capture.</p>
+
+<h2 id="F4-10-able">What you will be able to do</h2>
+<ul>
+<li><b>Drive</b> the Intel 82540EM (QEMU's e1000): reset, MAC address from the EEPROM, receive and transmit descriptor rings, all through the DMA mapping API.</li>
+<li><b>Build</b> Ethernet, ARP, IPv4 with the Internet checksum, ICMP echo, UDP and a DHCP client, and check every header layout against the C library.</li>
+<li><b>Implement</b> TCP: the three-way handshake, sequence and acknowledgement numbers, the receive window, retransmission with RFC 6298 timers and Karn's rule, fast retransmit and orderly close.</li>
+<li><b>Measure</b> correctness end to end: 100 MiB echoed with a checksum, a web page fetched and compared byte for byte, transfers under 5 % loss.</li>
+<li><b>Read</b> a capture with Wireshark's TCP analysis and connect each flag to a line of your code.</li>
+</ul>
+
+<div class="co jargon" id="F4-10-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Descriptor ring (NIC)</dt><dd><b>Simple words:</b> a circular list in memory where the driver and the card hand packet buffers to each other. <b>Analogy:</b> the post room's pigeonholes with "full" and "empty" flags. <b>Precise:</b> an array of 16-byte descriptors (buffer address, length, status, errors) with a head register advanced by the NIC and a tail register written by the driver; the descriptor-done (DD) bit marks the ones the NIC has finished. <sup class="src"><a href="#F4-10-src-D1">D1</a></sup></dd>
+<dt>ARP</dt><dd><b>Simple words:</b> asking the local network "who has this IP address?" to learn its hardware address. <b>Analogy:</b> shouting a name in the corridor to find which room someone is in. <b>Precise:</b> the Address Resolution Protocol: a broadcast request and a unicast reply mapping an IPv4 address to an Ethernet MAC address, cached by the requester. <sup class="src"><a href="#F4-10-src-D2">D2</a></sup></dd>
+<dt>Internet checksum</dt><dd><b>Simple words:</b> a 16-bit sum that lets the receiver notice a damaged header. <b>Analogy:</b> the total written at the bottom of a page. <b>Precise:</b> the one's complement of the one's complement sum of 16-bit big-endian words; IPv4 covers its header, UDP and TCP cover a pseudo-header (addresses, protocol, length) plus their segment. <sup class="src"><a href="#F4-10-src-D3">D3</a></sup></dd>
+<dt>DHCP</dt><dd><b>Simple words:</b> how a machine gets an IP address when it joins a network. <b>Analogy:</b> asking the office for a desk number on the first day. <b>Precise:</b> a UDP protocol (client port 68, server 67): DISCOVER, OFFER, REQUEST, ACK, with options for mask, router, DNS server and lease time. <sup class="src"><a href="#F4-10-src-D5">D5</a></sup></dd>
+<dt>Sequence and acknowledgement numbers</dt><dd><b>Simple words:</b> TCP numbers every byte; the receiver says which byte it expects next. <b>Analogy:</b> page numbers and receipts. <b>Precise:</b> 32-bit numbers starting at an initial sequence number chosen per connection; ACK = next expected byte (cumulative); comparisons use modulo-2<sup>32</sup> arithmetic. <sup class="src"><a href="#F4-10-src-D6">D6</a></sup></dd>
+<dt>RTO (retransmission timeout)</dt><dd><b>Simple words:</b> how long TCP waits for a receipt before sending again. <b>Analogy:</b> the kitchen timer for the oldest unsigned page. <b>Precise:</b> computed from smoothed round-trip time SRTT and variation RTTVAR (RTO = SRTT + 4 × RTTVAR, at least 1 s per RFC 6298), doubled after each timeout; the timer must run whenever data is unacknowledged. <sup class="src"><a href="#F4-10-src-D8">D8</a></sup></dd>
+<dt>Fast retransmit</dt><dd><b>Simple words:</b> resending a missing segment as soon as three duplicate receipts show it is missing. <b>Analogy:</b> three receipts in a row saying "still waiting for page 12". <b>Precise:</b> on the third duplicate ACK the sender retransmits the first unacknowledged segment without waiting for the RTO and halves its congestion window (RFC 5681). <sup class="src"><a href="#F4-10-src-D7">D7</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-10-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the receive ring the driver shares with the NIC. Figure 2 shows how one HTTP request is wrapped by each layer. Figure 3 shows the two ways TCP recovers a lost segment, and the rule the forensic lab breaks.</p>
+<figure id="F4-10-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 330" role="img" aria-labelledby="F4-10-f1t F4-10-f1d">
+<title id="F4-10-f1t">Figure 1: the e1000 receive descriptor ring</title>
+<desc id="F4-10-f1d">A ring of 32 receive descriptors of 16 bytes each, drawn as a row of cells. Each descriptor holds the address of a 2048-byte buffer, a length, a status byte with the descriptor-done (DD) and end-of-packet (EOP) bits, and an error byte. Two registers in the NIC point into the ring: the head (RDH), advanced by the NIC when it has written a received frame into the buffer and set DD, and the tail (RDT), written by the driver to hand buffers back. The descriptors from head up to the one before tail belong to the NIC and are empty. The descriptors from tail onward up to head belong to the driver and hold received frames with DD set, waiting to be read. The driver reads the descriptor after its last position, copies the frame, clears DD and writes RDT. If head reaches tail, the ring is full and the NIC drops incoming frames. The transmit ring works the other way round: the driver fills descriptors and advances TDT; the NIC sends, sets DD and advances TDH.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="330"/>
+<rect class="sv-b2" x="40" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="46" y="112">0</text>
+<text class="sv-ts" x="46" y="134"></text>
+<rect class="sv-b2" x="90" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="96" y="112">1</text>
+<text class="sv-ts" x="96" y="134"></text>
+<rect class="sv-b2" x="140" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="146" y="112">2</text>
+<text class="sv-ts" x="146" y="134"></text>
+<rect class="sv-b5" x="190" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="196" y="112">3</text>
+<text class="sv-ts" x="196" y="134">DD</text>
+<rect class="sv-b5" x="240" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="246" y="112">4</text>
+<text class="sv-ts" x="246" y="134">DD</text>
+<rect class="sv-b5" x="290" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="296" y="112">5</text>
+<text class="sv-ts" x="296" y="134">DD</text>
+<rect class="sv-b5" x="340" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="346" y="112">6</text>
+<text class="sv-ts" x="346" y="134">DD</text>
+<rect class="sv-b2" x="390" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="396" y="112">7</text>
+<text class="sv-ts" x="396" y="134"></text>
+<rect class="sv-b2" x="440" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="446" y="112">8</text>
+<text class="sv-ts" x="446" y="134"></text>
+<rect class="sv-b2" x="490" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="496" y="112">9</text>
+<text class="sv-ts" x="496" y="134"></text>
+<rect class="sv-b2" x="540" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="546" y="112">10</text>
+<text class="sv-ts" x="546" y="134"></text>
+<rect class="sv-b2" x="590" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="596" y="112">11</text>
+<text class="sv-ts" x="596" y="134"></text>
+<rect class="sv-b2" x="640" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="646" y="112">12</text>
+<text class="sv-ts" x="646" y="134"></text>
+<rect class="sv-b2" x="690" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="696" y="112">13</text>
+<text class="sv-ts" x="696" y="134"></text>
+<rect class="sv-b2" x="740" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="746" y="112">14</text>
+<text class="sv-ts" x="746" y="134"></text>
+<rect class="sv-b2" x="790" y="90" width="46" height="60" rx="3"/>
+<text class="sv-tm" x="796" y="112">15</text>
+<text class="sv-ts" x="796" y="134"></text>
+<text class="sv-ts" x="40" y="60">descriptors 0 .. 31 (16 shown); green = frame received, owned by the driver; teal = empty, owned by the NIC</text>
+<line class="sv-line" x1="210" y1="205" x2="210" y2="163"/>
+<polygon class="sv-head" points="210,152 215,163 205,163"/>
+<text class="sv-ts" x="180" y="222">driver&#x27;s next (g_rx_next)</text>
+<line class="sv-line" x1="410" y1="240" x2="410" y2="163"/>
+<polygon class="sv-head" points="410,152 415,163 405,163"/>
+<text class="sv-ts" x="330" y="257">RDH: the NIC writes the next frame here</text>
+<line class="sv-line" x1="160" y1="80" x2="160" y2="77"/>
+<polygon class="sv-head" points="160,88 155,77 165,77"/>
+<text class="sv-tb" x="110" y="78">RDT</text>
+<rect class="sv-b6" x="40" y="285" width="800" height="36" rx="6"/>
+<text class="sv-tb" x="50" y="308">Each descriptor: buffer address (8 bytes) | length (2) | checksum (2) | status: DD bit 0, EOP bit 1 | errors | special</text>
+<rect class="sv-box" x="600" y="175" width="270" height="70" rx="6"/>
+<text class="sv-tb" x="610" y="195">driver loop (receive):</text>
+<text class="sv-ts" x="610" y="212">if DD: copy, clear DD, RDT = this index</text>
+<text class="sv-ts" x="610" y="229">next = (next + 1) mod 32</text>
+</svg></div><figcaption><b>Figure 1.</b> The receive ring of <code>e1000.cc</code>; descriptor layout and register names from memory of D1 (pending verification), confirmed by QEMU's e1000 model (R2). <sup class="src"><a href="#F4-10-src-D1">D1</a></sup> <sup class="src"><a href="#F4-10-src-R2">R2</a></sup></figcaption></figure>
+<figure id="F4-10-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 250" role="img" aria-labelledby="F4-10-f2t F4-10-f2d">
+<title id="F4-10-f2t">Figure 2: one HTTP request, wrapped by each layer</title>
+<desc id="F4-10-f2d">From top to bottom: the HTTP request text, 69 bytes; TCP adds a 20-byte header with ports 49152 and 80, sequence and acknowledgement numbers, flags, window and checksum; IPv4 adds a 20-byte header with source 10.0.2.15, destination 10.0.2.100, protocol 6, time to live 64 and its own header checksum; Ethernet adds a 14-byte header with destination and source MAC addresses and type 0x0800. The NIC appends the 4-byte frame check sequence. The TCP checksum also covers a pseudo-header of source and destination IP address, protocol and TCP length.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="250"/>
+<rect class="sv-b7" x="380" y="20" width="300" height="38" rx="6"/>
+<text class="sv-ts" x="386" y="44">HTTP: &quot;GET /index.html HTTP/1.0 ...&quot;</text>
+<rect class="sv-b1" x="320" y="75" width="60" height="38" rx="6"/>
+<text class="sv-ts" x="326" y="99">TCP 20</text>
+<rect class="sv-box" x="380" y="75" width="300" height="38" rx="6"/>
+<text class="sv-ts" x="386" y="99">data</text>
+<rect class="sv-b3" x="260" y="130" width="60" height="38" rx="6"/>
+<text class="sv-ts" x="266" y="154">IP 20</text>
+<rect class="sv-b1" x="320" y="130" width="60" height="38" rx="6"/>
+<text class="sv-ts" x="326" y="154">TCP</text>
+<rect class="sv-box" x="380" y="130" width="300" height="38" rx="6"/>
+<text class="sv-ts" x="386" y="154">data</text>
+<rect class="sv-b2" x="170" y="185" width="90" height="38" rx="6"/>
+<text class="sv-ts" x="176" y="209">Ethernet 14</text>
+<rect class="sv-b3" x="260" y="185" width="60" height="38" rx="6"/>
+<text class="sv-ts" x="266" y="209">IP</text>
+<rect class="sv-b1" x="320" y="185" width="60" height="38" rx="6"/>
+<text class="sv-ts" x="326" y="209">TCP</text>
+<rect class="sv-box" x="380" y="185" width="300" height="38" rx="6"/>
+<text class="sv-ts" x="386" y="209">data</text>
+<rect class="sv-b2" x="680" y="185" width="70" height="38" rx="6"/>
+<text class="sv-ts" x="686" y="209">FCS 4</text>
+<text class="sv-tb" x="20" y="44">application</text>
+<text class="sv-tb" x="20" y="99">transport</text>
+<text class="sv-tb" x="20" y="154">network</text>
+<text class="sv-tb" x="20" y="209">link (e1000)</text>
+<text class="sv-ts" x="760" y="99">ports, seq, ack,</text>
+<text class="sv-ts" x="760" y="115">window, checksum</text>
+<text class="sv-ts" x="760" y="154">addresses, TTL</text>
+<text class="sv-ts" x="760" y="209">added by the NIC</text>
+</svg></div><figcaption><b>Figure 2.</b> Encapsulation in the lab's HTTP fetch (header sizes without options; the SYN carries a 4-byte MSS option). Header layouts: D3–D6, checked against the C library's headers (R1). <sup class="src"><a href="#F4-10-src-D3">D3</a></sup> <sup class="src"><a href="#F4-10-src-D6">D6</a></sup> <sup class="src"><a href="#F4-10-src-R1">R1</a></sup></figcaption></figure>
+<figure id="F4-10-fig3"><div class="svgbox">
+<svg viewBox="0 0 880 435" role="img" aria-labelledby="F4-10-f3t F4-10-f3d">
+<title id="F4-10-f3t">Figure 3: how TCP recovers a lost segment</title>
+<desc id="F4-10-f3d">Two vertical time lines: the sender on the left, the receiver on the right. The sender sends segments 1 to 5. Segment 2 is lost. The receiver in this picture keeps segments that arrive after a gap. The receiver acknowledges segment 1 with ACK for byte 2 (meaning: I expect segment 2 next). Segments 3, 4 and 5 arrive after a gap; each makes the receiver repeat ACK 2: three duplicate ACKs. On the third duplicate the sender retransmits segment 2 at once (fast retransmit). The receiver now acknowledges everything up to 5. This lab&#x27;s own TCP receiver keeps no out-of-order data, so with it the sender must resend 3 to 5 too. Bottom: if fewer than three duplicates arrive, for example because the last segments were lost, only the retransmission timer recovers: when it expires, the sender resends from the oldest unacknowledged byte and doubles the timeout. The timer must be running whenever data is unacknowledged.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="435"/>
+<text class="sv-tb" x="170" y="22">sender</text>
+<text class="sv-tb" x="645" y="22">receiver</text>
+<line class="sv-line" x1="200" y1="30" x2="200" y2="420"/>
+<line class="sv-line" x1="680" y1="30" x2="680" y2="420"/>
+<line class="sv-line" x1="200" y1="45" x2="669" y2="74"/>
+<polygon class="sv-head" points="680,75 669,79 669,69"/>
+<text class="sv-ts" x="140" y="49">seg 1</text>
+<line class="sv-dash" x1="200" y1="75" x2="430" y2="89"/>
+<text class="sv-ts" x="115" y="79">seg 2 (lost)</text>
+<text class="sv-tb" x="436" y="93">x</text>
+<line class="sv-line" x1="200" y1="105" x2="669" y2="134"/>
+<polygon class="sv-head" points="680,135 669,139 669,129"/>
+<text class="sv-ts" x="140" y="109">seg 3</text>
+<line class="sv-line" x1="200" y1="135" x2="669" y2="164"/>
+<polygon class="sv-head" points="680,165 669,169 669,159"/>
+<text class="sv-ts" x="140" y="139">seg 4</text>
+<line class="sv-line" x1="200" y1="165" x2="669" y2="194"/>
+<polygon class="sv-head" points="680,195 669,199 669,189"/>
+<text class="sv-ts" x="140" y="169">seg 5</text>
+<line class="sv-line" x1="680" y1="75" x2="211" y2="104"/>
+<polygon class="sv-head" points="200,105 211,99 211,109"/>
+<text class="sv-ts" x="690" y="79">ACK 2</text>
+<line class="sv-line" x1="680" y1="135" x2="211" y2="164"/>
+<polygon class="sv-head" points="200,165 211,159 211,169"/>
+<text class="sv-ts" x="690" y="139">dup ACK 2 (1)</text>
+<line class="sv-line" x1="680" y1="165" x2="211" y2="194"/>
+<polygon class="sv-head" points="200,195 211,189 211,199"/>
+<text class="sv-ts" x="690" y="169">dup ACK 2 (2)</text>
+<line class="sv-line" x1="680" y1="195" x2="211" y2="224"/>
+<polygon class="sv-head" points="200,225 211,219 211,229"/>
+<text class="sv-ts" x="690" y="199">dup ACK 2 (3)</text>
+<line class="sv-line2" x1="200" y1="240" x2="669" y2="269"/>
+<polygon class="sv-head" points="680,270 669,274 669,264"/>
+<text class="sv-ts" x="15" y="244">fast retransmit: seg 2</text>
+<text class="sv-ts" x="15" y="260">(this lab&#x27;s receiver would</text>
+<text class="sv-ts" x="15" y="276">need 3, 4, 5 again too)</text>
+<line class="sv-line" x1="680" y1="300" x2="211" y2="329"/>
+<polygon class="sv-head" points="200,330 211,324 211,334"/>
+<text class="sv-ts" x="690" y="304">ACK 6 (receiver kept 3-5)</text>
+<rect class="sv-b6" x="20" y="345" width="840" height="80" rx="6"/>
+<text class="sv-tb" x="30" y="367">If the duplicates never come (the tail of a transfer was lost), only the timer helps:</text>
+<text class="sv-ts" x="30" y="384">RTO expires -&gt; resend from snd_una, RTO doubles (back-off), cwnd = 1 segment.</text>
+<text class="sv-ts" x="30" y="401">RFC 6298 rule: whenever data is outstanding, the timer must be running. Stop it only when all is acknowledged.</text>
+</svg></div><figcaption><b>Figure 3.</b> Fast retransmit and the retransmission timeout, as <code>tcp.cc</code> implements them. Behaviour per RFC 5681 and RFC 6298 (D7, D8; from memory, pending verification). <sup class="src"><a href="#F4-10-src-D7">D7</a></sup> <sup class="src"><a href="#F4-10-src-D8">D8</a></sup></figcaption></figure>
+
+<h2 id="F4-10-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The post room cuts every letter into numbered pages and posts them. The other school sends a receipt saying "I have everything before page 42". If a page goes missing, receipts keep saying "still waiting for 42", and after three such receipts the post room resends page 42 at once. If no receipts come at all, a kitchen timer rings and the post room resends the oldest page anyway.</p></div>
+<p>A network card puts packets into memory and takes packets out of memory, by itself. The kernel and the card share a ring of boxes for this. On top of the card, each layer adds a label: the Ethernet label says which card on the wire, the IP label says which computer in the world, the TCP label says which conversation and which byte. TCP turns lossy, unordered packets into a reliable stream of bytes by numbering, acknowledging and resending.</p>
+
+<h2 id="F4-10-layer2">Layer 2 — the student explanation</h2>
+<h3>The NIC</h3>
+<p>The e1000 is found by PCI ID 8086:100E. The driver resets it (CTRL.RST), sets "link up", reads the MAC address from the first three EEPROM words, programs it into the receive address registers, and builds two rings of 32 descriptors: receive (each with a 2048-byte buffer) and transmit. Receiving: the NIC writes a frame into the buffer of the descriptor at its head, sets DD and advances; the driver copies frames from descriptors with DD set and hands each back by writing the tail register. Transmitting is the mirror image. <sup class="src"><a href="#F4-10-src-D1">D1</a></sup> R2's first lines: MAC 52:54:00:12:34:56, link up, 32/32 descriptors. <sup class="src"><a href="#F4-10-src-R2">R2</a></sup> The lab's driver polls instead of taking interrupts; the interrupt path of the same NIC is tested in <a href="#F4-11">F4-11</a>.</p>
+<h3>The layers</h3>
+<p>Ethernet frames carry a type: 0x0800 IPv4, 0x0806 ARP. ARP fills a small cache. IPv4 adds addresses, a time-to-live and a header checksum; ICMP echo is ping; UDP adds ports and a length. DHCP runs over UDP broadcasts before the machine has an address. R2: offer and ACK from 10.0.2.2, address 10.0.2.15, mask 255.255.255.0, router 10.0.2.2, DNS 10.0.2.3, lease 86400 s; three pings to the router answered. <sup class="src"><a href="#F4-10-src-D2">D2</a></sup> <sup class="src"><a href="#F4-10-src-D3">D3</a></sup> <sup class="src"><a href="#F4-10-src-D4">D4</a></sup> <sup class="src"><a href="#F4-10-src-D5">D5</a></sup> <sup class="src"><a href="#F4-10-src-R2">R2</a></sup> Every header offset was checked against the C library's <code>&lt;netinet/*.h&gt;</code> (R1). <sup class="src"><a href="#F4-10-src-L1">L1</a></sup> <sup class="src"><a href="#F4-10-src-R1">R1</a></sup></p>
+<h3>TCP in one page</h3>
+<p>A connection is opened with SYN, SYN-ACK, ACK and closed with a FIN from each side. Each side numbers its bytes; the other acknowledges the next byte it expects. The sender may have at most min(receiver's window, congestion window) bytes in flight. Lost data is detected two ways: three duplicate ACKs (fast retransmit) or the retransmission timer. <sup class="src"><a href="#F4-10-src-D6">D6</a></sup> <sup class="src"><a href="#F4-10-src-D7">D7</a></sup> <sup class="src"><a href="#F4-10-src-D8">D8</a></sup> The lab's TCP is about 480 lines: no window scaling, no selective acknowledgements, no out-of-order queue (segments after a gap are dropped and acknowledged with a duplicate ACK), no RST for unknown ports.</p>
+<h3>The test network</h3>
+<p>QEMU's user-mode network ("slirp") puts the guest behind a small virtual router at 10.0.2.2 with a DHCP server and a DNS proxy at 10.0.2.3. A <code>hostfwd</code> rule forwards a host port to the guest's echo server; <code>guestfwd</code> rules connect the guest's connections to 10.0.2.100:80 and :9 to programs on the host (a tiny HTTP server and a sink). A <code>filter-dump</code> object writes every frame to a pcap file for Wireshark. <sup class="src"><a href="#F4-10-src-D10">D10</a></sup></p>
+<h3>Results</h3>
+<p>R2: the host client sent 104857600 bytes (100 MiB) to the kernel's echo server and received the same bytes back (identical: True); index.html arrived with 158 body bytes, fnv1a 0xcab45e74, the same value the host server logged; a 262144-byte file matched before and under 5 % induced loss; a 262144-byte upload under loss arrived at the host sink with matching fnv1a 0x8c69edc5. <sup class="src"><a href="#F4-10-src-R2">R2</a></sup> tshark found 295906 frames, 0 malformed packets and 0 bad IPv4 or TCP checksums (R3). <sup class="src"><a href="#F4-10-src-R3">R3</a></sup></p>
+
+<h2 id="F4-10-layer3">Layer 3 — the engineer's depth</h2>
+<h3>Sequence arithmetic and state</h3>
+<p>Sequence numbers wrap at 2<sup>32</sup>, so "a before b" is <code>(int32_t)(a - b) &lt; 0</code>, never <code>a &lt; b</code> (<code>tcp.cc</code> lines 54–55). The sender keeps snd_una (oldest unacknowledged), snd_nxt (next to send) and snd_max (highest sent); after a timeout snd_nxt goes back to snd_una (go-back-N) while snd_max remembers what was already sent once. An ACK is acceptable when snd_una &lt; ack ≤ snd_max. <sup class="src"><a href="#F4-10-src-D6">D6</a></sup></p>
+<h3>Timers: RFC 6298</h3>
+<p>The first RTT sample R sets SRTT = R and RTTVAR = R/2; later samples update RTTVAR = ¾ RTTVAR + ¼ |SRTT − R| and SRTT = ⅞ SRTT + ⅛ R; RTO = SRTT + max(G, 4 × RTTVAR), rounded up to 1 s. Karn's rule: never take a sample from a retransmitted segment. On expiry: retransmit the oldest segment, double the RTO, restart the timer. The three rules that matter most: (5.1) when sending data, start the timer if it is not running; (5.2) when everything is acknowledged, stop it; (5.3) when an ACK acknowledges new data but not all, restart it. <sup class="src"><a href="#F4-10-src-D8">D8</a></sup> The lab deviates in one place, marked "LAB:" in the code: the minimum RTO is 200 ms instead of 1 s, so loss runs finish in seconds. In QEMU the measured RTT is 0–1 ms (SRTT 0 or 1 in R2), so every RTO in the run is the minimum, doubled after each timeout (400 ms in R5). <sup class="src"><a href="#F4-10-src-R2">R2</a></sup> <sup class="src"><a href="#F4-10-src-R5">R5</a></sup></p>
+<h3>Congestion control: RFC 5681</h3>
+<p>The congestion window starts at two segments and grows by one segment per ACK in slow start (until ssthresh) and by about one segment per round trip afterwards. Three duplicate ACKs: ssthresh = max(flight/2, 2 × MSS), retransmit, cwnd = ssthresh + 3 × MSS, inflate by one MSS per further duplicate, deflate to ssthresh on the next new ACK. A timeout: ssthresh the same way, cwnd = one segment. <sup class="src"><a href="#F4-10-src-D7">D7</a></sup> On a virtual link with 0 ms RTT and no real bottleneck these rules barely matter for speed, but they decide behaviour under loss.</p>
+<h3>Loss without induced loss: the receive ring</h3>
+<p>The echo run had no induced loss, yet the kernel's TCP counted 23 segments arriving after a gap, and tshark counted 29 retransmissions and 23 duplicate ACKs on port 7 (R2, R3). The NIC's own statistics registers answer where they went: "missed packets (MPC) 41417, receive-no-buffers events (RNBC) 41417" (R2). QEMU's router sends as fast as the guest's window allows; the polled driver with 32 receive descriptors falls behind; when the ring is full the NIC has nowhere to put a frame. The capture is taken at QEMU's network layer, before the NIC model, which is why tshark sees the segments the kernel never received. <sup class="src"><a href="#F4-10-src-D1">D1</a></sup> <sup class="src"><a href="#F4-10-src-R2">R2</a></sup> <sup class="src"><a href="#F4-10-src-R3">R3</a></sup> How QEMU's model counts (one per lost frame or one per refused delivery attempt) was not established; the two counters are equal, and the IOMMU run with a 64 KiB echo shows 0 (R4). TCP recovered every time, which is the point of the exercise: the layer above must survive the layer below.</p>
+<h3>Induced loss</h3>
+<p>The milestone asks for 5 % packet loss "(QEMU network filters)". QEMU 8.2.2's filters, as far as the author knows, dump, buffer, mirror, redirect and rewrite traffic but do not drop a percentage of it (unverified, D10), so the lab induces loss in the kernel itself: <code>net::set_loss</code> drops TCP segments on transmit and on receive by a hash of the sequence number and the retransmission count, which makes runs repeatable (seeded) while giving a retransmission a fresh decision. R2: 13 transmit and 28 receive segments dropped. <sup class="src"><a href="#F4-10-src-R2">R2</a></sup> A drop in the kernel is not the same as a drop on the wire: the sender's own counters see it. Treat this as a substitute, recorded as an open decision.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The e1000 register offsets and bits, the EEPROM read protocol, the legacy descriptor formats and the statistics registers (MPC, RNBC) in <code>e1000.h</code> are from the author's memory of D1, confirmed only by QEMU 8.2.2's e1000 model. The protocol behaviour of <code>net.cc</code> and <code>tcp.cc</code> follows the RFCs (D2–D8) as remembered; the RFCs were not opened. Header layouts are confirmed by glibc's headers (R1), and the wire format by tshark decoding every frame without a malformed packet or bad checksum (R3), which is strong evidence for the formats but none for the timer and congestion rules. The claim that QEMU has no loss filter is unverified.</p></div>
+
+<h2 id="F4-10-hardware">How the hardware actually does it</h2>
+<p>The 82540EM has its own receive FIFO in front of the descriptor ring: frames arrive from the PHY at line rate, are filtered by MAC address (exact, multicast hash, broadcast), checked against the Ethernet CRC, and written by DMA into the buffer of the next free descriptor. When the ring has no free descriptor the FIFO fills and frames are counted as missed. <sup class="src"><a href="#F4-10-src-D1">D1</a></sup> Real drivers keep the ring large (256–4096 descriptors), take an interrupt per batch (with interrupt moderation timers so that one interrupt covers many frames) and refill buffers in the handler. Modern NICs add many queues with MSI-X vectors (the pattern of <a href="#F4-08">F4-08</a>), checksum and segmentation offload (the NIC computes TCP checksums and cuts large sends into segments), and receive-side scaling that hashes each connection to a queue and a CPU. <sup class="src"><a href="#F4-10-src-D1">D1</a></sup></p>
+<p>The minimum Ethernet frame is 64 bytes including the 4-byte CRC; the driver pads shorter frames to 60 bytes before the NIC adds the CRC (<code>e1000.cc</code> lines 112–113; ARP requests are 42 bytes). The NIC appends the CRC itself when the descriptor's IFCS bit is set and, with SECRC in RCTL, strips it from received frames. <sup class="src"><a href="#F4-10-src-D1">D1</a></sup></p>
+
+<h2 id="F4-10-worked">Worked example</h2>
+<p><b>Task.</b> (1) Compute the IPv4 header checksum of the ping packet the kernel sends to the router. (2) Follow the retransmission timer through R2's numbers. (3) Check that the forensic sink's byte count, the sender's snd_una and the capture's last ACK agree.</p>
+<p><b>Step 1.</b> The header is 45 00 | 00 54 | 00 01 | 40 00 | 40 01 | 00 00 | 0a 00 | 02 0f | 0a 00 | 02 02 (version 4, 20-byte header, total length 84, id 1, don't fragment, TTL 64, protocol 1 = ICMP, checksum 0 while computing, 10.0.2.15 → 10.0.2.2). Sum of the ten 16-bit words: 0x4500 + 0x0054 + 0x0001 + 0x4000 + 0x4001 + 0x0000 + 0x0a00 + 0x020f + 0x0a00 + 0x0202 = 0xDD67. No carry to fold. One's complement: 0xFFFF − 0xDD67 = 0x2298. Check: with 0x2298 in place the sum is 0xFFFF, whose complement is 0. R1's last line computed the same header with the kernel's checksum code: "0x2298; re-check … 0x0000 ok". <sup class="src"><a href="#F4-10-src-D3">D3</a></sup> <sup class="src"><a href="#F4-10-src-R1">R1</a></sup></p>
+<p><b>Step 2.</b> A first sample R = 1 ms gives SRTT = 1, RTTVAR = 0 (integer half of 1), RTO = 1 + max(1, 0) = 2 ms, raised to the lab minimum 200 ms. One timeout doubles it to 400 ms (the forensic run, R5: "RTO now 400 ms"); two to 800 ms. With the RFC's 1 s minimum the same run would wait 1 s, 2 s, 4 s. <sup class="src"><a href="#F4-10-src-D8">D8</a></sup> <sup class="src"><a href="#F4-10-src-R5">R5</a></sup></p>
+<p><b>Step 3.</b> The relative sequence number of data byte k is k + 1 (byte 0 is sequence 1, after the SYN). The host sink says it received 34310 bytes: bytes 0 … 34309, sequence 1 … 34310. The next byte expected is sequence 34311. The kernel's snd_una is 34311 and the capture's last ACK from 10.0.2.100 is 34311 (R5, R6). All three agree: the receiver has everything before 34311 and nothing from 34311 on. <sup class="src"><a href="#F4-10-src-R5">R5</a></sup> <sup class="src"><a href="#F4-10-src-R6">R6</a></sup></p>
+
+<h2 id="F4-10-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F4-10/</code>: <code>e1000.h/.cc</code> (driver), <code>net.h/.cc</code> (Ethernet to DHCP), <code>tcp.h/.cc</code>, <code>f410_main.cc</code> (tests and the HTTP client), host programs <code>echo_client.py</code>, <code>httpd_stdio.py</code>, <code>sink.py</code>, and <code>netcheck.cpp</code>.</p>
+<p><b>Listing 1</b> — <code>e1000.cc</code>.</p>
+<pre class="listing" data-src="F4-10/e1000.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">56–57</td><td><code>pci::enable</code>, <code>dma::attach</code></td><td>Memory and bus mastering on; a DMA domain.</td><td>With the IOMMU on, every buffer below goes through it (R4).</td></tr>
+<tr><td class="n">59–64</td><td>reset</td><td>Masks interrupts, sets CTRL.RST, waits for it to clear.</td><td>Starts from a known state whatever firmware left.</td></tr>
+<tr><td class="n">68–74</td><td>MAC from EEPROM</td><td>Three words, low byte first; RAL0/RAH0 with "address valid".</td><td>Without RAH0.AV the NIC drops unicast frames to us.</td></tr>
+<tr><td class="n">77–86</td><td>receive ring</td><td>Buffers mapped device-writable; RDT = 31.</td><td>Head = tail would mean "no buffers": one slot always stays empty.</td></tr>
+<tr><td class="n">88–96</td><td>transmit ring</td><td>Buffers mapped read-only for the device; TCTL, TIPG.</td><td>Descriptors start with DD set: "free".</td></tr>
+<tr><td class="n">107–110</td><td>wait for DD</td><td>Waits until the slot's previous frame is sent.</td><td>Reusing a buffer the NIC is still reading corrupts a frame.</td></tr>
+<tr><td class="n">112–118</td><td>pad, EOP | IFCS | RS, TDT</td><td>Pads to 60 bytes, asks for CRC and status, hands over.</td><td>The tail write is the doorbell.</td></tr>
+<tr><td class="n">126–134</td><td>receive</td><td>Takes a frame if DD; drops multi-buffer or errored frames; returns the descriptor.</td><td>Frames longer than 2048 bytes would span descriptors.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>net.cc</code>.</p>
+<pre class="listing" data-src="F4-10/net.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">37–49</td><td><code>arp_send</code></td><td>28-byte ARP packet; requests broadcast.</td><td>Frame 5 of R3.</td></tr>
+<tr><td class="n">64–72</td><td><code>arp_input</code></td><td>Learns the sender, answers requests for our address.</td><td>Without answering, the router cannot reach us for the echo server.</td></tr>
+<tr><td class="n">97–119</td><td><code>ip_input</code></td><td>Checks version, lengths, header checksum, fragments, destination; dispatches.</td><td>Every check is a way a malformed packet is refused, not trusted.</td></tr>
+<tr><td class="n">113–116</td><td>receive-side induced loss</td><td>Drops by a hash of sequence number and IP id.</td><td>The substitute for a loss filter.</td></tr>
+<tr><td class="n">140–156</td><td><code>dhcp_build</code></td><td>BOOTP header, magic cookie, options 53, 50, 54, 55, end.</td><td>Frames 1 and 3 of R3.</td></tr>
+<tr><td class="n">194–207</td><td><code>sum16</code>, <code>checksum</code></td><td>RFC 1071 sum, fold carries, complement.</td><td>The worked example's arithmetic.</td></tr>
+<tr><td class="n">222–234</td><td><code>poll</code></td><td>Up to 64 frames per call, then TCP timers.</td><td>The receive ring overflows when this is not called often enough.</td></tr>
+<tr><td class="n">255–276</td><td><code>ip_send</code></td><td>Resolves the next hop, fills the header, checksum last.</td><td>Next hop = destination on the subnet, otherwise the router.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>tcp.cc</code>.</p>
+<pre class="listing" data-src="F4-10/tcp.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">44–46</td><td>RTO and TIME-WAIT constants</td><td>Two marked lab deviations.</td><td>Production values would make each loss run take minutes.</td></tr>
+<tr><td class="n">54–55</td><td><code>lt</code>, <code>le</code></td><td>Modulo-2<sup>32</sup> comparisons.</td><td>Correct across wrap-around.</td></tr>
+<tr><td class="n">64–98</td><td><code>output</code></td><td>Header, MSS option on SYN, payload from the send ring, pseudo-header checksum; transmit-side induced loss.</td><td>Data is resent from the ring, so the buffer keeps bytes until acknowledged.</td></tr>
+<tr><td class="n">103–139</td><td><code>try_send</code></td><td>Sends while data and window allow; FIN after the last byte.</td><td>Lines 119–123: where the forensic bug lives (arm the timer only for fresh data).</td></tr>
+<tr><td class="n">141–156</td><td><code>rtt_sample</code></td><td>RFC 6298 estimator.</td><td>Worked example step 2.</td></tr>
+<tr><td class="n">158–204</td><td><code>on_ack</code></td><td>New data acknowledged: RTT sample (Karn), cwnd growth, timer rule 5.2/5.3; duplicate ACKs: fast retransmit.</td><td>Lines 174–179: the second half of the forensic bug.</td></tr>
+<tr><td class="n">353–448</td><td><code>input</code></td><td>Checksum, connection lookup, handshake states, ACK processing, in-order data, FIN.</td><td>Line 422–426: out-of-order segments are dropped and answered with a duplicate ACK.</td></tr>
+<tr><td class="n">450–480</td><td><code>timers</code></td><td>TIME-WAIT expiry; RTO expiry with back-off, ssthresh, go-back-N.</td><td>Line 478: restart the timer after a retransmission (rule 5.6).</td></tr>
+</tbody></table></div>
+<p><b>Header layouts</b> checked against glibc (R1):</p>
+<pre class="output" data-run="F4-10/netcheck"></pre>
+<p><b>Build</b> (R7; flags as in <a href="#F4-08">F4-08</a>):</p>
+<pre class="output" data-run="F4-10/build"></pre>
+<p><b>The run</b> (R2). Lines starting with "host" come from the host-side programs.</p>
+<pre class="output" data-run="F4-10/net"></pre>
+<p><b>The capture</b>, analysed by tshark (R3):</p>
+<pre class="output" data-run="F4-10/capture"></pre>
+<p><b>With intel-iommu</b> (R4; a 64 KiB echo instead of 100 MiB):</p>
+<pre class="output" data-run="F4-10/net_iommu"></pre>
+
+<h2 id="F4-10-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Pages are bytes.</b> TCP numbers bytes, not segments; a retransmission may carry a different split of the same bytes.</li>
+<li><b>Receipts are cumulative only.</b> A receipt cannot say "I have 44 and 45 but not 42" in this lab's TCP (real stacks add selective acknowledgements); the analogy's clerk would naturally list them.</li>
+<li><b>The courier's speed is unknown and changing.</b> The kitchen timer's length is learned from measured round trips and doubles after each ring; a fixed timer is the wrong picture.</li>
+<li><b>Losing pages is also a signal.</b> In TCP, loss means "the network is congested" and makes the sender slow down; the post room only resends.</li>
+</ul>
+
+<h2 id="F4-10-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> nothing is received, DHCP times out. <b>Cause:</b> RCTL.EN not set, RAH0.AV missing, broadcast not accepted (BAM), or the receive tail not written. <b>Find it:</b> read RDH after a few seconds; if it never moves, the NIC is not receiving. <b>Fix:</b> lines 73–86.</li>
+<li><b>Symptom:</b> every received IPv4 packet is dropped as "bad checksum". <b>Cause:</b> summing little-endian words, or not folding carries. <b>Find it:</b> run the checksum on a known header (R1). <b>Fix:</b> big-endian words, fold, complement.</li>
+<li><b>Symptom:</b> the TCP handshake completes but the peer resets after the first data. <b>Cause:</b> a wrong pseudo-header (length or byte order), so every data segment fails the peer's checksum. <b>Find it:</b> tshark with checksum validation on (R3's command). <b>Fix:</b> pseudo-header = source, destination, 0, protocol 6, TCP length.</li>
+<li><b>Symptom:</b> a transfer stalls for ever after a loss. <b>Cause:</b> the retransmission timer not running while data is outstanding. <b>Find it:</b> the forensic lab's capture: silence after the last duplicate ACK. <b>Fix:</b> RFC 6298 rules 5.1–5.3.</li>
+<li><b>Symptom:</b> a 100 MiB transfer works, but slowly, with many retransmissions and no induced loss. <b>Cause:</b> the receive ring overflows (R2's MPC). <b>Find it:</b> the NIC's statistics registers. <b>Fix:</b> a larger ring, interrupts instead of polling, a smaller advertised window.</li>
+<li><b>Symptom:</b> the HTTP body has extra bytes at the end. <b>Cause</b> in this lab: the host program wrote log text to stderr, and QEMU's <code>guestfwd … cmd:</code> connects the program's stderr to the guest connection too. <b>Find it:</b> compare the body length with Content-Length. <b>Fix:</b> log to a file (<code>httpd_stdio.py</code> does).</li>
+</ul>
+
+<div class="co transition" id="F4-10-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F4-08">F4-08</a> (DMA mapping, IOMMU) and <a href="#F4-09">F4-09</a> (rings with ownership bits, completions). <b>What carries over:</b> descriptor rings with head and tail, ownership marked by a status bit, buffers that stay mapped until the device is done, polling or interrupt-driven completion. <b>What changes:</b> the device is the simple part; most of the code is protocol: state machines, timers and arithmetic modulo 2<sup>32</sup>, where bugs show up only under loss and timing you do not control. <b>What comes next:</b> <a href="#F4-11">F4-11</a> leaves the data path for the platform: the ACPI tables that say how this NIC's interrupt is wired and how the machine powers off.</p></div>
+
+<h2 id="F4-10-check">Check yourself</h2>
+<ol>
+<li>Why does the driver write RDT = 31 and not 32 (or 0) at start-up?</li>
+<li>Compute the checksum of the header in the worked example if the TTL were 63 instead of 64.</li>
+<li>Why must "a before b" for sequence numbers be computed as <code>(int32_t)(a - b) &lt; 0</code>?</li>
+<li>A segment is retransmitted after a timeout and then acknowledged 5 ms later. Why must this 5 ms not update SRTT?</li>
+<li>Name the three RFC 6298 timer rules for sending, full acknowledgement and partial acknowledgement.</li>
+<li>In R2 the echo connection had 21 "segments dropped after a gap" with no induced loss. Where were the missing segments lost, and which line proves it?</li>
+<li>Why is induced loss inside the kernel weaker evidence than loss in the network?</li>
+<li>Multiple choice: the receiver drops out-of-order segments. Compared with a receiver that queues them, the sender must (a) retransmit only the lost segment, (b) retransmit the lost segment and everything after it, (c) nothing different.</li>
+</ol>
+
+<h2 id="F4-10-lab">Lab</h2>
+<p><b>Goal.</b> Milestone C9: "Ethernet driver for QEMU's e1000 (and e1000e) plus a network stack: Ethernet, ARP, IPv4, ICMP, UDP, DHCP client, DNS resolver, TCP; IPv6 later; a socket API." <sup class="src"><a href="#F4-10-src-D12">D12</a></sup></p>
+<p><b>Hardware and software needed.</b> QEMU 8.2.2 with user-mode networking, Python 3, tshark 4.2.2. Run <code>university/labs/run_lab.sh university/labs/F4-10</code> (about two minutes; the 100 MiB echo takes 10–30 s of wall clock under TCG).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>On a real network your kernel is a new, untested host: it may answer ARP for addresses it does not own, flood broadcasts or send malformed frames that confuse other machines. Test on an isolated network (a switch with only the spare PC and a laptop), never on a shared office or campus network, and never forward ports from the internet to it.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Match R3's first 12 frames to the functions in Listing 2 that produced them.</li>
+<li>Open <code>cap.pcap</code> in Wireshark (the run deletes it; keep a copy by removing it from the final <code>rm</code> in <code>run.sh</code>) and follow the port-80 stream. Find a duplicate ACK and the retransmission it triggered.</li>
+<li>Change NRX from 32 to 256 in <code>e1000.cc</code>. Predict MPC and the number of gaps in the echo run; rerun.</li>
+<li>Set RTO_MIN to 1000 ms (the RFC value) and time the loss runs.</li>
+<li>Add a DNS resolver (UDP to 10.0.2.3, a query for an A record) and resolve a name QEMU's DNS proxy can answer.</li>
+<li>Milestone steps not done here: a socket API and an echo server in user space, IPv6, the e1000e.</li>
+</ol>
+<p><b>Expected observations</b> (QEMU 8.2.2, TCG): DHCP 10.0.2.15; ping replies from 10.0.2.2; echo 104857600 bytes identical; index.html 158 body bytes with matching fnv1a; big.bin identical with and without loss; upload under loss confirmed by the sink; 0 malformed packets, 0 bad checksums; a large MPC count for the 100 MiB run (41417 in this build) (R2, R3).</p>
+<p><b>Verification</b> (the acceptance tests, verbatim, with this build's result). "DHCP obtains an address from QEMU's user-mode network" — met (R2). "the host can ping the guest through port forwarding" — not done: user-mode networking forwards TCP and UDP ports, not ICMP; the TCP echo through <code>hostfwd</code> shows the forwarding path instead. "and the guest can ping the gateway" — met. "A TCP echo server in your kernel's user space passes a 100 MiB round-trip test with checksum from a host client." — met in kernel space (no user space or sockets yet): 104857600 bytes, identical, sha256 printed. "Your kernel fetches a small web page over plain HTTP from a host-side server and the bytes match." — met: fnv1a 0xcab45e74 on both sides. "Wireshark on the capture shows no malformed packets" — met: 0 (R3). "TCP survives 5 % induced packet loss (QEMU network filters) with the transfer still completing." — met with loss induced in the kernel, not by a QEMU filter. <sup class="src"><a href="#F4-10-src-D12">D12</a></sup> <sup class="src"><a href="#F4-10-src-R2">R2</a></sup> <sup class="src"><a href="#F4-10-src-R3">R3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not tested in this build</span><p>No DNS resolver, socket API, user-space server, IPv6, e1000e, interrupts on the data path, or real NIC. Host-to-guest ping is not possible with user-mode networking as configured. The loss substitute and the 200 ms RTO minimum are documented deviations. Nothing ran on real hardware or a real network.</p></div>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"DHCP failed" → no OFFER → check the capture for the DISCOVER; if it is there, check RCTL.BAM (broadcast accept) and the receive tail.</li>
+<li>The <code>http_get</code> log says "connect failed" → the SYN-ACK was lost and QEMU's router ignores a repeated SYN, then retransmits its SYN-ACK only after seconds → keep the connect timeout long (the lab uses 20 s).</li>
+<li>The echo client waits for ever → the kernel never printed "echo: listening", or the forwarded port is in use → read <code>net.out</code>; the script picks a free port each run.</li>
+<li>HTTP body length wrong → the host program wrote to stderr (see Common mistakes).</li>
+</ul>
+<p><b>Extension.</b> Replace polling with the NIC's interrupt (MSI if available, otherwise the routed INTx of F4-11) and interrupt moderation; measure the echo time and MPC again.</p>
+
+<h2 id="F4-10-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "Packets vanish at 5 % loss." A nightly job uploads 512 KiB from the kernel to a collector over a link that loses about 5 % of segments. Since a colleague "simplified the timer code", the job hangs every night after a few tens of kilobytes; it never errors, it never finishes. The colleague points at the network: "packets vanish".</p>
+<p><b>Evidence pack.</b> The kernel log with TCP tracing on (R5), the collector's log line (end of R5), and the Wireshark (tshark) analysis of the capture (R6).</p>
+<pre class="output" data-run="F4-10/forensic"></pre>
+<pre class="output" data-run="F4-10/forensic_capture"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>How many bytes did the collector receive, and which sequence number is the first one missing? Show that the capture and the kernel agree.</li>
+<li>What did the sender do between t = 1.2141 s (the last frame) and the timeout 20 s later? What should it have done?</li>
+<li>The kernel's last state line says "RTO 400 ms (NOT armed)" with snd_una 34311 and snd_max 37231. Which RFC 6298 rule is violated?</li>
+<li>Find the two code changes in <code>tcp.cc</code> that produce this state.</li>
+<li>Why did the segment at 34311 get dropped twice, and why does that not excuse the hang?</li>
+<li>Write a test that catches this bug without any loss model.</li>
+</ol>
+<p><b>Method hints.</b> Look for the last frame in the capture and compare its time with the kernel's "send timed out". Silence is evidence: a sender with outstanding data must transmit again within one RTO.</p>
+<p>Grading follows the forensic rubric of guide 11.2 (observation 20 %, hypotheses 20 %, evidence-based conclusion 30 %, fix and verification 20 %, prevention and communication 10 %).</p>
+
+<h2 id="F4-10-project">Mini-project</h2>
+<p>Course project C9: <b>the kernel fetches a web page over its own TCP stack.</b> The lab's <code>http_get</code> is the starting point. Extend it to: resolve the server's name through your DNS resolver; parse the status line and headers (Content-Length, chunked transfer is optional); handle a 404 and a server that closes early; save the body to your OS303 file system; and run it from user space through a socket API (<code>socket</code>, <code>connect</code>, <code>send</code>, <code>recv</code>, <code>close</code>). Demonstrate it against the host server with and without 5 % loss and against a real web server on the isolated test network.</p>
+<p><b>Rubric.</b> Socket API with documented semantics and errors (25 %); DNS and HTTP correctness, byte-for-byte check against the host (25 %); robustness: loss, early close, 404, timeouts (20 %); evidence: captures with tshark analysis and a short report (20 %); code quality (10 %).</p>
+
+<h2 id="F4-10-summary">Summary</h2>
+<ul>
+<li>The e1000 exchanges frames with the driver through descriptor rings: DD bits mark finished descriptors, tail writes hand them over (R2).</li>
+<li>Each layer adds a header; every layout was checked against glibc and every frame decoded by tshark without errors (R1, R3).</li>
+<li>TCP's reliability rests on cumulative ACKs, fast retransmit and a retransmission timer that runs whenever data is outstanding.</li>
+<li>Loss happened even without induced loss, at the NIC's receive ring (MPC, R2); TCP recovered.</li>
+<li>100 MiB echoed, a web page fetched byte-identical, transfers completed under 5 % loss (R2).</li>
+<li>Breaking one timer rule turns a lossy link into a permanent hang (R5, R6).</li>
+</ul>
+
+<h2 id="F4-10-sources">Sources</h2>
+<ol>
+<li id="F4-10-src-D1">Intel, "PCI/PCI-X Family of Gigabit Ethernet Controllers Software Developer's Manual" (8254x) (curriculum C9 reading: initialization, receive and transmit descriptor rings, EEPROM and MAC address, interrupt cause registers, statistics). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and sections (dossier gate G1 open).</i></li>
+<li id="F4-10-src-D2">IETF RFC 826, "An Ethernet Address Resolution Protocol". <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-10-src-D3">IETF RFC 791, "Internet Protocol", and RFC 1071, "Computing the Internet Checksum". <i>Titles only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-10-src-D4">IETF RFC 792, "Internet Control Message Protocol", and RFC 768, "User Datagram Protocol". <i>Titles only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-10-src-D5">IETF RFC 2131, "Dynamic Host Configuration Protocol" (and RFC 2132 for the options). <i>Titles only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-10-src-D6">IETF RFC 9293, "Transmission Control Protocol (TCP)". <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-10-src-D7">IETF RFC 5681, "TCP Congestion Control". <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-10-src-D8">IETF RFC 6298, "Computing TCP's Retransmission Timer" (rules 2.1–2.5 and 5.1–5.7 as cited). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-10-src-D9">W. R. Stevens and K. R. Fall, "TCP/IP Illustrated, Volume 1"; G. R. Wright and W. R. Stevens, "Volume 2" (curriculum C9 reading, for an implementation's structure). <i>Titles only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-10-src-D10">QEMU documentation: user-mode networking (hostfwd, guestfwd with cmd:), network filters (filter-dump and the others), the e1000 device. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-10-src-D11">Wireshark User's Guide: TCP analysis flags (retransmission, fast retransmission, duplicate ACK, previous segment not captured, window full) and tshark options. <i>Title only — not opened during this build; the flags' names are those tshark 4.2.2 printed (R3, R6).</i></li>
+<li id="F4-10-src-D12">This project's Systems Curriculum: milestone C9 (goal, reading, build, acceptance tests) (opened in this build; the project's own page; a map, not a technical source).</li>
+<li id="F4-10-src-L1">L1 — glibc headers <code>&lt;net/ethernet.h&gt;</code>, <code>&lt;netinet/if_ether.h&gt;</code>, <code>&lt;netinet/ip.h&gt;</code>, <code>&lt;netinet/ip_icmp.h&gt;</code>, <code>&lt;netinet/tcp.h&gt;</code> as installed in the build container (opened in this build by <code>netcheck.cpp</code>; tier 4).</li>
+<li id="F4-10-src-R1">R1 — lab run of <code>netcheck.cpp</code>: <code>university/labs/F4-10/netcheck.out</code>, <code>netcheck.log</code> (0 mismatches; checksum self-test).</li>
+<li id="F4-10-src-R2">R2 — lab run, step <code>net</code>: <code>net.out</code>, <code>net.log</code> (QEMU 8.2.2, q35, TCG; exit code 33 = pass; host programs' lines appended).</li>
+<li id="F4-10-src-R3">R3 — lab run, step <code>capture</code>: <code>capture.out</code>, <code>capture.log</code> (tshark 4.2.2 on the R2 capture).</li>
+<li id="F4-10-src-R4">R4 — lab run, step <code>net_iommu</code>: <code>net_iommu.out</code>, <code>net_iommu.log</code> (intel-iommu; exit code 33).</li>
+<li id="F4-10-src-R5">R5 — lab run, step <code>forensic</code>: <code>forensic.out</code>, <code>forensic.log</code> (built with <code>-DF410_TIMER_BUG</code>; exit code 3 expected).</li>
+<li id="F4-10-src-R6">R6 — lab run, step <code>forensic_capture</code>: <code>forensic_capture.out</code>, <code>forensic_capture.log</code> (tshark on the R5 capture).</li>
+<li id="F4-10-src-R7">R7 — lab run, step <code>build</code>: <code>build.out</code>, <code>build.log</code>.</li>
+</ol>
+<p>Implementation structure follows the spirit of D9 <sup class="src"><a href="#F4-10-src-D9">D9</a></sup>; the capture flags are tshark's (D11) <sup class="src"><a href="#F4-10-src-D11">D11</a></sup>; the IOMMU run is R4 <sup class="src"><a href="#F4-10-src-R4">R4</a></sup>; the build R7 <sup class="src"><a href="#F4-10-src-R7">R7</a></sup>.</p>
+
+<h2 id="F4-10-glossary">Glossary links</h2>
+<p><a href="#gl-descriptor-ring-nic">Descriptor ring (NIC)</a> · <a href="#gl-arp">ARP</a> · <a href="#gl-internet-checksum">Internet checksum</a> · <a href="#gl-dhcp">DHCP</a> · <a href="#gl-sequence-and-acknowledgement-numbers">Sequence and acknowledgement numbers</a> · <a href="#gl-rto-retransmission-timeout">RTO (retransmission timeout)</a> · <a href="#gl-fast-retransmit">Fast retransmit</a> · <a href="#gl-congestion-window">Congestion window</a> · <a href="#gl-karn-s-rule">Karn's rule</a> · <a href="#gl-mss-maximum-segment-size">MSS (maximum segment size)</a> · <a href="#gl-user-mode-networking-slirp">User-mode networking (slirp)</a> · <a href="#gl-duplicate-ack">Duplicate ACK</a></p>
+
+<h2 id="F4-10-next">Next chapter</h2>
+<p>Next: <a href="#F4-11">F4-11 ACPI AML: power button, shutdown, routing</a>. Back to the course: <a href="#DR302">DR302</a>. Before this chapter: <a href="#F4-09">F4-09</a>.</p>
+
+<h2 id="F4-10-answers">Answers to Check yourself</h2>
+<ol>
+<li>If tail = head the ring is empty from the NIC's point of view (no buffers). Writing 31 gives the NIC descriptors 0–30 and keeps one slot as the separator between "owned by NIC" and "owned by driver".</li>
+<li>The TTL/protocol word becomes 0x3F01 instead of 0x4001: the sum drops by 0x0100 to 0xDC67; the checksum is 0xFFFF − 0xDC67 = 0x2398.</li>
+<li>Sequence numbers wrap at 2<sup>32</sup>; after wrapping, a later number is numerically smaller. The signed difference is correct as long as the two are less than 2<sup>31</sup> apart.</li>
+<li>Karn's rule: the ACK may be for the original transmission or the retransmission; the sample would be ambiguous and can shrink the RTO wrongly.</li>
+<li>5.1: when sending data, start the timer if it is not running. 5.2: when all outstanding data is acknowledged, stop it. 5.3: when an ACK acknowledges new data but not all, restart it.</li>
+<li>In the NIC: its receive ring was full, so the NIC had no buffer for them. The line "e1000: missed packets (MPC) 41417" in R2; the capture (taken before the NIC model) contains the segments.</li>
+<li>The kernel decides which segments to drop and knows it; timing, reordering and the peer's view differ from real loss, and a bug that only appears when the sender does not know about the loss is hidden on the transmit side.</li>
+<li>(b).</li>
+</ol>
+<h3 id="F4-10-forensic-key">Forensic answer key</h3>
+<p><b>Observation.</b> The sink received 34310 bytes (sequence 1–34310). The capture's last frames: retransmission of 27741 at 1.2133 s, ACK 34311, retransmission of 35771 at 1.2141 s, duplicate ACK 34311 — then nothing. The kernel gave up at about 21 s ("send timed out", "state ESTABLISHED after 20002 ms") with snd_una 34311 &lt; snd_max 37231 and "RTO 400 ms (NOT armed)". Wireshark flags: 4 retransmissions, 2 fast retransmissions, 14 duplicate ACKs, 3 "previous segment not captured".</p>
+<p><b>Root cause.</b> Data outstanding with no retransmission timer: RFC 6298 rule 5.3 broken. Built with <code>-DF410_TIMER_BUG</code>, <code>on_ack</code> stops the timer on every new ACK (<code>tcp.cc</code> line 175) and <code>try_send</code> re-arms it only when sending <em>fresh</em> data (line 120). After the timeout at t = 1204 ms the sender went back to 27741 and resent 27741 and 34311 as retransmissions (not fresh): the ACK for 27741 stopped the timer, the resent 34311 was lost again, then 35771 was resent, which used up the congestion window (2920 bytes, two segments, as the last state line shows), so no new data could be sent; one duplicate ACK is not enough for fast retransmit, and nothing ever re-armed the timer.</p>
+<p><b>Why 34311 was dropped twice.</b> The lab's loss model decides by sequence number and retransmission count; <code>on_ack</code> resets the count when new data is acknowledged, so the go-back resend of 34311 got the same decision as the original. A real network loses retransmissions too; a correct sender survives any number of consecutive losses by backing off and retrying. The double drop exposed the bug; it did not cause it.</p>
+<p><b>Fix and verification.</b> Lines 122 and 177–178: arm when sending if not armed; on a partial ACK restart, on a full ACK stop. The default build's upload under loss completes (R2: "sink replied: received 262144 bytes"). Test without loss: send data to a peer that never acknowledges; assert a retransmission within RTO and back-off to 2 × RTO.</p>
+<p><b>Wrong answers.</b> "The network drops everything after 34311": the capture shows ACKs flowing until the sender went silent. "The receiver's window is zero": every ACK shows window 65535. "Fast retransmit is broken": it worked twice (t = 1003 and 1004 ms); it cannot help when no further segments produce duplicate ACKs.</p>
+<p><b>Prevention.</b> An invariant check in <code>timers()</code>: <code>snd_una != snd_max</code> implies <code>rto_armed</code>; a loss test that drops the same segment several times in a row.</p>

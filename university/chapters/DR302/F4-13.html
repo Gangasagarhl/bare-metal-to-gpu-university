@@ -1,0 +1,418 @@
+<!--meta
+id: F4-13
+title: TPM 2.0: measured boot you can check
+course: DR302
+level: L4
+prereqs: F4-08 (MMIO, the interrupt layer); DR301 F4-02 (ACPI tables); F4-11 (reading firmware-provided tables); basic hashing (SHA-256 as a black box is enough)
+time: 6–8 hours including the lab (optional chapter)
+hardware: none for the lab (QEMU 8.2.2, q35, tpm-tis with the "emulator" backend). The milestone asks for swtpm; it was not available in this build, and a small Python stand-in (mock_tpm.py) played the TPM. A real TPM on the spare PC is optional and untested.
+maps: Curriculum Track C, milestone C13 (optional: TPM 2.0)
+analogy: F4 — the school and its visitors (the porter's sealed tally: every visitor is added to a running seal that can never be undone; the open visitors' book next to it can be checked against the seal)
+-->
+
+<h2 id="F4-13-hook">Story hook</h2>
+<p>The school porter keeps two records of who came in. One is an ordinary visitors' book: name, time, which room. Anyone with a pen could change it. The other is a sealed tally: each time someone arrives, the porter takes the tally's current number, mixes in the visitor's name by a fixed recipe, and writes down only the new number. Nobody can take a step back; the recipe has no undo.</p>
+<p>At the end of the day an inspector arrives. She does not trust the visitors' book. She takes it, starts from zero, applies the recipe to each name in order, and compares her final number with the sealed tally. If they agree, the book is an honest account of who came in. If one name was changed, added or removed, the numbers disagree, and she knows the book lies, though not where.</p>
+<p>That is measured boot with a TPM. The firmware and the kernel record what they run in the TPM's sealed tallies (PCRs) and in an ordinary event log; a verifier replays the log and compares. In this chapter you write the driver, read the firmware's log, add your own measurement, and build the inspector.</p>
+
+<h2 id="F4-13-able">What you will be able to do</h2>
+<ul>
+<li><b>Locate</b> a TPM and its firmware event log from the ACPI TPM2 table.</li>
+<li><b>Send</b> TPM 2.0 commands through the TIS (FIFO) interface and decode the response codes.</li>
+<li><b>Marshal</b> PCR_Read, PCR_Extend and GetRandom by hand, big-endian, field by field.</li>
+<li><b>Parse</b> a crypto-agile event log and replay it into software PCRs.</li>
+<li><b>Measure</b> data into a PCR and log it so that a verifier can check it.</li>
+<li><b>Explain</b> the difference between measured boot and verified boot, and what an attestation does and does not prove.</li>
+</ul>
+
+<div class="co jargon" id="F4-13-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>TPM (Trusted Platform Module)</dt><dd><b>Simple words:</b> a small security chip that keeps records nobody can roll back and keys nobody can copy out. <b>Analogy:</b> the porter with the sealed tally. <b>Precise:</b> a device implementing the TCG TPM 2.0 Library Specification: PCR banks, hierarchies of keys, a random number generator, sealed storage and signing (quotes), reached through a command/response interface. <sup class="src"><a href="#F4-13-src-D1">D1</a></sup></dd>
+<dt>PCR (Platform Configuration Register)</dt><dd><b>Simple words:</b> a register you can only add to, never set. <b>Analogy:</b> the sealed tally. <b>Precise:</b> a hash-sized register, one per bank (SHA-256 here), reset to zero at power-on (PCRs 0–15 on PC clients) and changed only by extend: new = H(old ‖ digest). <sup class="src"><a href="#F4-13-src-D1">D1</a></sup></dd>
+<dt>Extend</dt><dd><b>Simple words:</b> the one way a PCR changes. <b>Analogy:</b> mixing the next name into the tally. <b>Precise:</b> TPM2_PCR_Extend replaces a PCR with the hash of its old value concatenated with a new digest; the order of extends matters and no command undoes one. <sup class="src"><a href="#F4-13-src-D1">D1</a></sup></dd>
+<dt>Event log</dt><dd><b>Simple words:</b> the list of what was measured, kept in ordinary memory. <b>Analogy:</b> the visitors' book. <b>Precise:</b> a table in memory (its address in the ACPI TPM2 table or from UEFI) with one entry per extend: PCR index, event type, the digest per bank and event data; the TCG PC Client Platform Firmware Profile defines the format. <sup class="src"><a href="#F4-13-src-D3">D3</a></sup></dd>
+<dt>Measured boot</dt><dd><b>Simple words:</b> each boot stage records what it is about to run. <b>Analogy:</b> every visitor signs in; nobody is turned away. <b>Precise:</b> before passing control to the next stage, each stage hashes it, extends a PCR and logs an event; nothing is checked at boot time. <sup class="src"><a href="#F4-13-src-D3">D3</a></sup></dd>
+<dt>Attestation and quote</dt><dd><b>Simple words:</b> proving to someone else what your machine booted. <b>Analogy:</b> the inspector's check, with the porter's signature on the tally. <b>Precise:</b> the verifier receives the event log and a quote (PCR values signed by a TPM attestation key it trusts), replays the log and compares. <sup class="src"><a href="#F4-13-src-D1">D1</a></sup></dd>
+<dt>TIS / FIFO interface</dt><dd><b>Simple words:</b> the register window through which commands go in and responses come out, byte by byte. <b>Analogy:</b> the porter's hatch. <b>Precise:</b> the TPM Interface Specification register set (one 4 KiB page per locality at 0xFED40000 + 0x1000 × locality: ACCESS, STS, DATA_FIFO, DID_VID …), defined in the PC Client Platform TPM Profile; CRB is the alternative, buffer-based interface. <sup class="src"><a href="#F4-13-src-D2">D2</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-13-pictures">The idea in pictures</h2>
+<p>Figure 1 is the chain: who measures, where it goes, who verifies, and how this differs from verified boot. Figure 2 is one command through the TIS interface. Figure 3 is what went wrong in the forensic build.</p>
+<figure id="F4-13-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 400" role="img" aria-labelledby="F4-13-f1t F4-13-f1d">
+<title id="F4-13-f1t">Figure 1: measured boot and the verifier</title>
+<desc id="F4-13-f1d">Top row, left to right, the boot chain: SeaBIOS (the root of trust for measurement), then option ROMs and the boot loader, then the lab kernel. Each stage, before handing over, hashes what it is about to run or use, extends the hash into a PCR of the TPM and appends an event to the event log in memory. The TPM, in the middle row, keeps PCRs 0 to 7 for the firmware and PCR 8 for the kernel&#x27;s command line; a PCR can only be extended, never written. The event log is plain memory: anyone can change it. Bottom row: the verifier receives the log and the PCR values (in real attestation, signed by the TPM as a quote), replays the log in software and compares. Equal: the log is an honest account of what was measured. Different: reject. A dashed box on the right contrasts verified boot, where each stage checks a signature and refuses to run what fails; measured boot never stops anything, it only records.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="400"/>
+<rect class="sv-b1" x="10" y="20" width="180" height="70" rx="6"/>
+<text class="sv-tb" x="20" y="40">SeaBIOS</text>
+<text class="sv-ts" x="20" y="57">root of trust for</text>
+<text class="sv-ts" x="20" y="74">measurement</text>
+<rect class="sv-b1" x="230" y="20" width="180" height="70" rx="6"/>
+<text class="sv-tb" x="240" y="40">option ROMs,</text>
+<text class="sv-ts" x="240" y="57">boot loader</text>
+<text class="sv-ts" x="240" y="74">(PCR 2, 4)</text>
+<rect class="sv-b1" x="450" y="20" width="180" height="70" rx="6"/>
+<text class="sv-tb" x="460" y="40">lab kernel</text>
+<text class="sv-ts" x="460" y="57">measures its command</text>
+<text class="sv-ts" x="460" y="74">line into PCR 8</text>
+<line class="sv-line" x1="190" y1="55" x2="219" y2="55"/>
+<polygon class="sv-head" points="230,55 219,60 219,50"/>
+<line class="sv-line" x1="410" y1="55" x2="439" y2="55"/>
+<polygon class="sv-head" points="450,55 439,60 439,50"/>
+<rect class="sv-b6" x="80" y="140" width="260" height="90" rx="6"/>
+<text class="sv-tb" x="90" y="160">TPM (tpm-tis at 0xFED40000)</text>
+<text class="sv-ts" x="90" y="177">PCR 0-7: firmware</text>
+<text class="sv-ts" x="90" y="194">PCR 8: kernel command line</text>
+<text class="sv-tm" x="90" y="211">new = SHA-256(old || digest)</text>
+<rect class="sv-b2" x="380" y="140" width="250" height="90" rx="6"/>
+<text class="sv-tb" x="390" y="160">event log (memory)</text>
+<text class="sv-ts" x="390" y="177">per event: PCR, type,</text>
+<text class="sv-ts" x="390" y="194">digest, data</text>
+<text class="sv-ts" x="390" y="211">can be edited by anyone</text>
+<line class="sv-line" x1="100" y1="90" x2="100" y2="129"/>
+<polygon class="sv-head" points="100,140 95,129 105,129"/>
+<line class="sv-line" x1="320" y1="90" x2="320" y2="129"/>
+<polygon class="sv-head" points="320,140 315,129 325,129"/>
+<line class="sv-line" x1="540" y1="90" x2="540" y2="129"/>
+<polygon class="sv-head" points="540,140 535,129 545,129"/>
+<text class="sv-ts" x="150" y="118">extend</text>
+<text class="sv-ts" x="470" y="118">append event</text>
+<rect class="sv-b3" x="80" y="290" width="550" height="90" rx="6"/>
+<text class="sv-tb" x="90" y="310">verifier (verify.cc)</text>
+<text class="sv-ts" x="90" y="327">1. replay every digest of the log into software PCRs</text>
+<text class="sv-ts" x="90" y="344">2. compare with the PCR values (a signed quote in real attestation)</text>
+<text class="sv-tm" x="90" y="361">equal -&gt; ACCEPT; different -&gt; REJECT</text>
+<line class="sv-line" x1="210" y1="230" x2="210" y2="279"/>
+<polygon class="sv-head" points="210,290 205,279 215,279"/>
+<line class="sv-line" x1="505" y1="230" x2="505" y2="279"/>
+<polygon class="sv-head" points="505,290 500,279 510,279"/>
+<text class="sv-ts" x="220" y="262">PCR values</text>
+<text class="sv-ts" x="515" y="262">log</text>
+<rect class="sv-box sv-dash" x="670" y="20" width="200" height="210" rx="6"/>
+<text class="sv-tb" x="682" y="44">verified boot (contrast)</text>
+<text class="sv-ts" x="682" y="68">each stage checks a</text>
+<text class="sv-ts" x="682" y="85">signature on the next</text>
+<text class="sv-ts" x="682" y="102">and refuses to run</text>
+<text class="sv-ts" x="682" y="119">what fails.</text>
+<text class="sv-ts" x="682" y="136"></text>
+<text class="sv-ts" x="682" y="153">measured boot checks</text>
+<text class="sv-ts" x="682" y="170">nothing at boot: it</text>
+<text class="sv-ts" x="682" y="187">records, and a verifier</text>
+<text class="sv-ts" x="682" y="204">decides later.</text>
+</svg></div><figcaption><b>Figure 1.</b> Measure, then verify. Event types and PCR use from the lab run (R4, R5); the roles of firmware, TPM and verifier from memory of D1 and D3, pending verification. <sup class="src"><a href="#F4-13-src-D1">D1</a></sup> <sup class="src"><a href="#F4-13-src-D3">D3</a></sup> <sup class="src"><a href="#F4-13-src-R4">R4</a></sup> <sup class="src"><a href="#F4-13-src-R5">R5</a></sup></figcaption></figure>
+<figure id="F4-13-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 250" role="img" aria-labelledby="F4-13-f2t F4-13-f2d">
+<title id="F4-13-f2t">Figure 2: one command through the TIS FIFO</title>
+<desc id="F4-13-f2d">Five states, left to right. Idle. The driver writes commandReady to STS; the TPM enters Ready. The driver writes the command bytes to the data FIFO, at most burstCount at a time, and checks Expect: set while more bytes are wanted, clear after the last. The driver writes tpmGo; the TPM executes. When stsValid and dataAvail are set, the driver reads the 10-byte header, takes the response size from it and reads the rest. Finally it writes commandReady again to return to Idle. Below, the 65-byte PCR_Extend command of the lab: tag 8002 (with sessions), size, command code 0182, the PCR handle, the 9-byte password session, one SHA-256 digest.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="250"/>
+<rect class="sv-b5" x="15" y="25" width="140" height="60" rx="6"/>
+<text class="sv-tb" x="25" y="45">idle</text>
+<text class="sv-ts" x="25" y="62"></text>
+<line class="sv-line" x1="155" y1="55" x2="176" y2="55"/>
+<polygon class="sv-head" points="187,55 176,60 176,50"/>
+<rect class="sv-b5" x="187" y="25" width="140" height="60" rx="6"/>
+<text class="sv-tb" x="197" y="45">ready</text>
+<text class="sv-ts" x="197" y="62">STS.commandReady</text>
+<line class="sv-line" x1="327" y1="55" x2="348" y2="55"/>
+<polygon class="sv-head" points="359,55 348,60 348,50"/>
+<rect class="sv-b5" x="359" y="25" width="140" height="60" rx="6"/>
+<text class="sv-tb" x="369" y="45">reception</text>
+<text class="sv-ts" x="369" y="62">FIFO bytes, Expect</text>
+<line class="sv-line" x1="499" y1="55" x2="520" y2="55"/>
+<polygon class="sv-head" points="531,55 520,60 520,50"/>
+<rect class="sv-b6" x="531" y="25" width="140" height="60" rx="6"/>
+<text class="sv-tb" x="541" y="45">execution</text>
+<text class="sv-ts" x="541" y="62">STS.tpmGo</text>
+<line class="sv-line" x1="671" y1="55" x2="692" y2="55"/>
+<polygon class="sv-head" points="703,55 692,60 692,50"/>
+<rect class="sv-b5" x="703" y="25" width="140" height="60" rx="6"/>
+<text class="sv-tb" x="713" y="45">completion</text>
+<text class="sv-ts" x="713" y="62">dataAvail: read</text>
+<line class="sv-line" x1="790" y1="85" x2="790" y2="105"/>
+<polyline class="sv-line" points="790,105 85,105"/>
+<line class="sv-line" x1="85" y1="105" x2="85" y2="96"/>
+<polygon class="sv-head" points="85,85 90,96 80,96"/>
+<text class="sv-ts" x="330" y="120">write commandReady again: back to idle</text>
+<rect class="sv-b2" x="15" y="150" width="56" height="60" rx="3"/>
+<text class="sv-tm" x="21" y="174">80 02</text>
+<text class="sv-ts" x="21" y="197">tag</text>
+<rect class="sv-b2" x="75" y="150" width="101" height="60" rx="3"/>
+<text class="sv-tm" x="81" y="174">00 00 00 41</text>
+<text class="sv-ts" x="81" y="197">size 65</text>
+<rect class="sv-b2" x="180" y="150" width="101" height="60" rx="3"/>
+<text class="sv-tm" x="186" y="174">00 00 01 82</text>
+<text class="sv-ts" x="186" y="197">PCR_Extend</text>
+<rect class="sv-b2" x="285" y="150" width="96" height="60" rx="3"/>
+<text class="sv-tm" x="291" y="174">00 00 00 08</text>
+<text class="sv-ts" x="291" y="197">PCR 8</text>
+<rect class="sv-b2" x="385" y="150" width="96" height="60" rx="3"/>
+<text class="sv-tm" x="391" y="174">00 00 00 09</text>
+<text class="sv-ts" x="391" y="197">auth size</text>
+<rect class="sv-b2" x="485" y="150" width="131" height="60" rx="3"/>
+<text class="sv-tm" x="491" y="174">40 00 00 09 ...</text>
+<text class="sv-ts" x="491" y="197">password session</text>
+<rect class="sv-b2" x="620" y="150" width="96" height="60" rx="3"/>
+<text class="sv-tm" x="626" y="174">00 00 00 01</text>
+<text class="sv-ts" x="626" y="197">1 digest</text>
+<rect class="sv-b2" x="720" y="150" width="141" height="60" rx="3"/>
+<text class="sv-tm" x="726" y="174">00 0b + 32 bytes</text>
+<text class="sv-ts" x="726" y="197">SHA-256</text>
+<text class="sv-ts" x="15" y="238">All TPM 2.0 command fields are big-endian; the firmware&#x27;s event log is little-endian.</text>
+</svg></div><figcaption><b>Figure 2.</b> The TIS command cycle of <code>tpm.cc</code> and the PCR_Extend bytes it sends. State and bit names from memory of D2 and D1, pending verification; the byte layout was accepted by the mock TPM, which parses SeaBIOS's own PCR_Extend commands the same way; Layer 3 says what that proves (R4). <sup class="src"><a href="#F4-13-src-D1">D1</a></sup> <sup class="src"><a href="#F4-13-src-D2">D2</a></sup> <sup class="src"><a href="#F4-13-src-R4">R4</a></sup></figcaption></figure>
+<figure id="F4-13-fig3"><div class="svgbox">
+<svg viewBox="0 0 880 240" role="img" aria-labelledby="F4-13-f3t F4-13-f3d">
+<title id="F4-13-f3t">Figure 3: what the forensic build put into PCR 8</title>
+<desc id="F4-13-f3d">Two columns. Left: the event log entry for PCR 8, written by the kernel: digest 946ac9d1..., SHA-256 of the 47 bytes of the command line. Right: what the TPM received in PCR_Extend: 578a0344..., SHA-256 of the 64 bytes of the array holding the command line, 47 characters followed by 17 zero bytes. The verifier replays the log: PCR 8 from the log is 553bbb9d..., the TPM reports 072bdea3...; reject. The firmware&#x27;s PCRs 0 to 7 match.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="240"/>
+<rect class="sv-b2" x="15" y="20" width="400" height="110" rx="6"/>
+<text class="sv-tb" x="25" y="40">event log says (kernel line 144)</text>
+<text class="sv-ts" x="25" y="57">SHA-256 of 47 bytes:</text>
+<text class="sv-tm" x="25" y="74">946ac9d19a3dc59c ...</text>
+<text class="sv-tm" x="25" y="91">replay: PCR 8 = 553bbb9db1bafdb5 ...</text>
+<rect class="sv-b6" x="465" y="20" width="400" height="110" rx="6"/>
+<text class="sv-tb" x="475" y="40">TPM received (line 146, forensic)</text>
+<text class="sv-ts" x="475" y="57">SHA-256 of 64 bytes (47 + 17 zeros):</text>
+<text class="sv-tm" x="475" y="74">578a034400af395e ...</text>
+<text class="sv-tm" x="475" y="91">TPM: PCR 8 = 072bdea3beaf0687 ...</text>
+<rect class="sv-b3" x="15" y="160" width="850" height="60" rx="6"/>
+<text class="sv-tb" x="25" y="180">verifier: PCR 0-7 replay == TPM; PCR 8 replay != TPM -&gt; REJECT</text>
+<text class="sv-ts" x="25" y="197">the kernel itself printed TPM_RC_SUCCESS and &quot;F4-13 done&quot;</text>
+<line class="sv-line" x1="215" y1="130" x2="215" y2="149"/>
+<polygon class="sv-head" points="215,160 210,149 220,149"/>
+<line class="sv-line" x1="665" y1="130" x2="665" y2="149"/>
+<polygon class="sv-head" points="665,160 660,149 670,149"/>
+</svg></div><figcaption><b>Figure 3.</b> The forensic run (R6, R7). The value the TPM received appears only in the mock TPM's own log; a real verifier sees the mismatch, not its cause. <sup class="src"><a href="#F4-13-src-R6">R6</a></sup> <sup class="src"><a href="#F4-13-src-R7">R7</a></sup></figcaption></figure>
+
+<h2 id="F4-13-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The porter's tally can only go forward. The visitors' book can say anything. The inspector trusts the book only when replaying it gives the porter's number. The porter turns no one away: if a stranger came in, the tally says so, but only the inspector, later, decides whether that is a problem.</p></div>
+<p>A computer starts in stages: first the firmware, then a boot loader, then the operating system. With a TPM, each stage writes down a fingerprint of the next stage before running it. The fingerprints go into a list anyone can read, and also into the TPM's registers, which can only add new fingerprints on top of old ones. Later, another computer can read both, redo the sums from the list, and see whether they agree. If someone changed a program or the list, the sums do not match.</p>
+
+<h2 id="F4-13-layer2">Layer 2 — the student explanation</h2>
+<h3>Finding the TPM</h3>
+<p>The ACPI TPM2 table says which interface the TPM uses (its start method) and, in newer revisions, where the firmware put its event log. QEMU with <code>-device tpm-tis</code> gives a 76-byte table, revision 4, start method 6 (TIS), and a 65536-byte log area at 0x3ff0000 (R4). <sup class="src"><a href="#F4-13-src-D7">D7</a></sup> <sup class="src"><a href="#F4-13-src-R4">R4</a></sup> The TIS registers are at 0xFED40000; locality 0 is the first 4 KiB page. DID_VID read 0x00011014 (vendor 0x1014, the ID QEMU's model reports), and STS bits 27–26 = 1 said "TPM 2.0" (R4). On a machine without a TPM there is no TPM2 table and DID_VID reads 0 (R8). <sup class="src"><a href="#F4-13-src-D2">D2</a></sup> <sup class="src"><a href="#F4-13-src-R8">R8</a></sup></p>
+<h3>Sending a command</h3>
+<p>Every TPM 2.0 command is a byte string: a 10-byte header (tag, total size, command code), handles, an authorization area if the tag says "with sessions", then parameters. Every response starts with a tag, its size and a response code; 0 means success. All fields are big-endian. <sup class="src"><a href="#F4-13-src-D1">D1</a></sup> Through TIS, the driver requests locality 0, sets commandReady, writes the bytes into DATA_FIFO no faster than STS.burstCount allows, checks that the TPM expects no more bytes, writes tpmGo, waits for dataAvail, reads the header to learn the size, reads the rest and sets commandReady again (Figure 2). <sup class="src"><a href="#F4-13-src-D2">D2</a></sup></p>
+<h3>The firmware's log</h3>
+<p>SeaBIOS (QEMU's default firmware) measures as it boots: option ROMs, its own actions ("Start Option ROM Scan", "Calling INT 19h") and a separator in each of PCRs 0–7 that marks the end of the firmware's part. It writes a crypto-agile log: a first entry in the old TPM 1.2 format whose data is "Spec ID Event03" and the list of digest algorithms (here one, SHA-256, 32 bytes), then entries with one digest per algorithm. The kernel parsed 13 events (R4). <sup class="src"><a href="#F4-13-src-D3">D3</a></sup> <sup class="src"><a href="#F4-13-src-R4">R4</a></sup></p>
+<h3>Replay and compare</h3>
+<p>The kernel starts 24 software PCRs at zero, extends each with the digests of its events in log order, then reads PCRs 0–7 from the TPM with PCR_Read. All eight matched (R4). It then measures its own "command line": hashes the 47 bytes, extends PCR 8 and adds an event to its report. <sup class="src"><a href="#F4-13-src-R4">R4</a></sup></p>
+<h3>The verifier</h3>
+<p><code>verify.cc</code> runs on the host. It reads the report (every event plus the PCR values), checks that events whose data is the measured content (EV_ACTION, EV_IPL) have digest = SHA-256(data), replays all digests and compares. R5: 14 events, 9 PCRs, ACCEPT. <sup class="src"><a href="#F4-13-src-R5">R5</a></sup> In real attestation the PCR values would arrive in a quote signed by the TPM; the mock has no keys, so here they are the kernel's own PCR_Read results. A lying kernel could print anything; a quote is what stops that.</p>
+<h3>GetRandom</h3>
+<p>GetRandom(16) returned TPM_RC_SUCCESS and 16 bytes (R4). With the mock those bytes come from the host's <code>os.urandom</code>; they say nothing about a real TPM's generator. <sup class="src"><a href="#F4-13-src-R4">R4</a></sup></p>
+
+<h2 id="F4-13-layer3">Layer 3 — the engineer's depth</h2>
+<h3>What the evidence in this lab proves</h3>
+<p>The TPM in this lab is <code>mock_tpm.py</code>, written by the same author from the same memory as the driver. Where both sides come from one person's memory, agreement proves little. The lab's evidence splits three ways. <sup class="src"><a href="#F4-13-src-D5">D5</a></sup></p>
+<ul>
+<li><b>Independent.</b> The TIS register protocol is QEMU's real tpm-tis model. The event log is written by SeaBIOS, a real implementation; the kernel's parser read all 13 events and the replay matched the PCRs that SeaBIOS's own PCR_Extend commands produced. SHA-256 is checked against the FIPS examples and against Python's hashlib on 2000 messages of every length from 0 to 300 bytes (R1, R2). <sup class="src"><a href="#F4-13-src-R1">R1</a></sup> <sup class="src"><a href="#F4-13-src-R2">R2</a></sup></li>
+<li><b>Partly independent.</b> The kernel's PCR_Extend has the layout the mock parses, and the mock parses SeaBIOS's PCR_Extend commands correctly (the PCRs match SeaBIOS's log). So the kernel's command matches SeaBIOS's at least as far as the mock reads it.</li>
+<li><b>Circular.</b> PCR_Read and GetRandom response layouts, response codes, and the mock's behaviour before Startup. These pass because the same memory wrote both sides.</li>
+</ul>
+<p>The milestone's acceptance test names swtpm, a full software TPM. Rerunning with swtpm, or with a real TPM, is the step that turns the circular items into evidence.</p>
+<h3>Sessions and authorization</h3>
+<p>PCR_Extend needs authorization for the PCR. The lab uses the password session (handle 0x40000009) with an empty password: nonce size 0, attributes 0, HMAC size 0, 9 bytes in all, after a 4-byte authorization size (Figure 2). <sup class="src"><a href="#F4-13-src-D1">D1</a></sup> Real TPMs check this; the mock does not. Commands with sessions return a response with a parameter size and a session area, which is why the response tag is 0x8002.</p>
+<h3>Localities and who may reset what</h3>
+<p>The TIS interface has five localities (0–4), each a page of the register space. Software normally uses locality 0; higher localities belong to the CPU's dynamic launch (DRTM) and can reset PCRs 17–22, which plain firmware and OS code cannot. <sup class="src"><a href="#F4-13-src-D2">D2</a></sup></p>
+<h3>Event log details</h3>
+<p>Event 0 uses the TPM 1.2 layout (PCR, type, a 20-byte SHA-1 field, size, data) so that old parsers can skip it. In the crypto-agile entries that follow, each digest is a 2-byte algorithm ID followed by a digest of that algorithm's size, taken from the Spec ID event; a parser that does not know an algorithm's size cannot continue. EV_NO_ACTION entries are never extended. For EV_ACTION and EV_IPL the data is what was hashed; for many other types (EV_EVENT_TAG, EV_SEPARATOR on some firmware) the data only describes it, and the verifier must trust the digest or know the measured object. <sup class="src"><a href="#F4-13-src-D3">D3</a></sup> R5 shows both kinds. <sup class="src"><a href="#F4-13-src-R5">R5</a></sup></p>
+<h3>Measured boot versus verified boot</h3>
+<p>Verified boot (UEFI Secure Boot, for example) checks a signature before running each stage and refuses what fails. Measured boot refuses nothing: it records. The two complement each other: verified boot keeps unsigned code out; measured boot lets a remote party see which signed code ran, and lets the TPM release a sealed secret (a disk key) only when the PCRs have expected values. <sup class="src"><a href="#F4-13-src-D3">D3</a></sup> The lab kernel measures its command line before using it; Linux's IMA and systemd's PCR use extend the same idea to files and boot phases.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The TIS register offsets and bits (<code>tpm.h</code>), the command and response layouts, command codes and response codes, the TPM2 table field offsets, the event log structures and the PCR conventions in this chapter are from the author's memory of D1–D3 and D7, which were not opened in this build. The swtpm control protocol in <code>mock_tpm.py</code> is from memory of swtpm's sources; QEMU 8.2.2 accepted it. The first command the mock saw (code 0x181, before Startup) is probably QEMU's own TPM version probe; this was not checked. Vendor 0x1014 for QEMU's model is from memory. Layer 3 lists which results are circular.</p></div>
+
+<h2 id="F4-13-hardware">How the hardware actually does it</h2>
+<p>A discrete TPM is a microcontroller with its own flash, random number generator and hash engine, on the LPC or SPI bus; the chipset decodes 0xFED40000–0xFED44FFF to it and turns MMIO reads and writes into bus cycles, one byte at a time on LPC. Firmware TPMs (Intel PTT, AMD fTPM) run in a security processor inside the chipset or CPU and usually use the CRB interface: a control area and command and response buffers in memory, with a "start" bit instead of a byte FIFO. <sup class="src"><a href="#F4-13-src-D2">D2</a></sup></p>
+<p>The PCRs live inside the TPM and are reset only by a platform reset (or, for the DRTM PCRs, by a special locality-4 sequence the CPU performs). That is what makes them trustworthy: software running later cannot return a PCR to an earlier value. The first measurement must come from code that cannot itself have been changed unnoticed, the core root of trust for measurement, often the first block of firmware in boot ROM or a CPU-verified boot block. <sup class="src"><a href="#F4-13-src-D3">D3</a></sup></p>
+<p>In the lab, QEMU's tpm-tis model implements the register interface and passes each complete command over a socket to the backend ("emulator" = swtpm's protocol), here played by the mock. <sup class="src"><a href="#F4-13-src-D5">D5</a></sup> TPM commands are slow on real hardware: tens of milliseconds for an extend on some discrete TPMs, seconds for key generation. The lab's 750 ms and 2 s timeouts were chosen without measurements on real devices.</p>
+
+<h2 id="F4-13-worked">Worked example</h2>
+<p><b>Task.</b> Compute PCR 4 from the log by hand, using R4's events: EV_ACTION "Calling INT 19h" (15 bytes) on PCR 4, then the separator on PCR 4.</p>
+<p><b>Step 1.</b> PCR 4 starts as 32 zero bytes.</p>
+<p><b>Step 2.</b> The first event's digest is SHA-256("Calling INT 19h") = 7a19a5a5…df12b; the verifier recomputes this from the data (R5: "digest == SHA-256(data)"). Extend: SHA-256(0³² ‖ 7a19a5a5…) = fa6833d9…5c1e. The mock's log shows the same value after SeaBIOS's extend (R4).</p>
+<p><b>Step 3.</b> The separator's data is ff ff ff ff; its digest SHA-256(ffffffff) = ad95131b…bfd0e. Extend: SHA-256(fa6833d9… ‖ ad95131b…) = 1eb9aa21337cc1fa…57ca.</p>
+<p><b>Step 4.</b> Compare: R4 "pcr 4: TPM 1eb9aa21337cc1fa… = replay". <sup class="src"><a href="#F4-13-src-R4">R4</a></sup></p>
+<p><b>Check.</b> PCR 0, 3, 5, 6 and 7 hold only the separator: SHA-256(0³² ‖ ad95131b…) = e21b703e…ea93, and R4 shows that value five times. The hashes in steps 2 and 3 were computed with Python's hashlib while writing this chapter; R1 checks one extend of the same kind ("extend(0^32, sha256(abc))").</p>
+<pre class="output" data-run="F4-13/sha256check"></pre>
+
+<h2 id="F4-13-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F4-13/</code>: <code>sha256.h</code> (SHA-256 and extend, header-only, shared by kernel and host tools), <code>tpm.h/.cc</code> (TIS driver and commands), <code>f413_main.cc</code> (the kernel), <code>verify.cc</code> (the verifier), <code>mock_tpm.py</code> (the stand-in TPM) and <code>run.sh</code>.</p>
+<p><b>Listing 1</b> — <code>tpm.cc</code>: the TIS driver and three commands.</p>
+<pre class="listing" data-src="F4-13/tpm.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">26–35</td><td><code>Out</code></td><td>Big-endian writers; <code>finish</code> fills in the size field.</td><td>The size is known only at the end; one wrong size and the TPM rejects the command.</td></tr>
+<tr><td class="n">50–66</td><td><code>probe</code></td><td>Checks DID_VID, requests locality 0, prints identity and family.</td><td>"No TPM" is a normal result (R8).</td></tr>
+<tr><td class="n">71–72</td><td>commandReady</td><td>Idle to ready.</td><td>Figure 2, first step.</td></tr>
+<tr><td class="n">73–82</td><td>FIFO write</td><td>At most burstCount bytes, then checks Expect.</td><td>Catches a size field that disagrees with the bytes sent.</td></tr>
+<tr><td class="n">83–94</td><td>tpmGo, read</td><td>Executes, waits for dataAvail, reads the header, then the rest.</td><td>The response size is in the header.</td></tr>
+<tr><td class="n">115–132</td><td><code>pcr_read</code></td><td>One bank, a 3-byte bitmap, one PCR; skips the update counter and echoed selection.</td><td>Circular evidence only (Layer 3).</td></tr>
+<tr><td class="n">134–146</td><td><code>pcr_extend</code></td><td>Handle = PCR number, password session, one SHA-256 digest.</td><td>Figure 2's bytes.</td></tr>
+<tr><td class="n">148–158</td><td><code>get_random</code></td><td>Asks for n bytes, copies at most n.</td><td>A TPM may return fewer bytes than asked.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>f413_main.cc</code>: TPM2 table, log replay, measurement, report.</p>
+<pre class="listing" data-src="F4-13/f413_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">17–22</td><td><code>le&lt;T&gt;</code></td><td>Little-endian reads with <code>memcpy</code>.</td><td>The log is little-endian; commands are big-endian.</td></tr>
+<tr><td class="n">51–64</td><td>Spec ID event</td><td>Event 0 in the old layout; reads the algorithm list and digest sizes.</td><td>Without the sizes the entries cannot be parsed.</td></tr>
+<tr><td class="n">68–93</td><td>event loop</td><td>Walks each entry's digests, picks SHA-256, extends the software PCR.</td><td>Stops at the zeroed rest of the log area.</td></tr>
+<tr><td class="n">89</td><td>EV_NO_ACTION</td><td>Never extended.</td><td>Replaying it would break every PCR it names.</td></tr>
+<tr><td class="n">108–122</td><td>TPM2 table</td><td>Start method and log area.</td><td>Where the log is, without UEFI.</td></tr>
+<tr><td class="n">131–140</td><td>compare</td><td>PCR_Read 0–7 against the replay.</td><td>The milestone's main test.</td></tr>
+<tr><td class="n">143–152</td><td>measure</td><td>Hashes the command line, extends PCR 8.</td><td>Lines 145–146 are the forensic build's bug.</td></tr>
+<tr><td class="n">164–182</td><td>report</td><td>Prints every event and PCR 0–8 for the verifier.</td><td>The verifier's only input.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>verify.cc</code>: the host verifier.</p>
+<pre class="listing" data-src="F4-13/verify.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">50–56</td><td>data check</td><td>For EV_ACTION and EV_IPL, recomputes the digest from the data.</td><td>Catches a log whose data and digest disagree.</td></tr>
+<tr><td class="n">61</td><td>replay</td><td>Extends the software PCR with the logged digest.</td><td>Same rule as the TPM.</td></tr>
+<tr><td class="n">69–76</td><td>compare</td><td>Every reported PCR against the replay; ACCEPT or REJECT.</td><td>Says that the log is wrong, not where.</td></tr>
+</tbody></table></div>
+<p><b>SHA-256 against hashlib</b> (R2):</p>
+<pre class="output" data-run="F4-13/hashcmp"></pre>
+<p><b>Build</b> (R3):</p>
+<pre class="output" data-run="F4-13/build"></pre>
+<p><b>Without a TPM</b> (R8):</p>
+<pre class="output" data-run="F4-13/notpm"></pre>
+<p><b>With the TPM</b> (R4; the mock's own log is appended at the end):</p>
+<pre class="output" data-run="F4-13/tpm"></pre>
+<p><b>The verifier</b> (R5):</p>
+<pre class="output" data-run="F4-13/verify"></pre>
+
+<h2 id="F4-13-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The porter is not a judge.</b> A TPM never refuses to boot anything; even the "sealed secret" use only withholds a key.</li>
+<li><b>The tally is many tallies.</b> There are 24 PCRs per bank and several banks (SHA-1, SHA-256, …), each extended separately.</li>
+<li><b>The inspector needs a signature.</b> A tally read out by the very machine under suspicion proves nothing; the quote, signed by a key that never leaves the TPM, is what she trusts.</li>
+<li><b>The book can be incomplete honestly.</b> Many event types record a description rather than the measured bytes; the inspector must know what the digests should be.</li>
+</ul>
+
+<h2 id="F4-13-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> every command returns TPM_RC_INITIALIZE (0x100). <b>Cause:</b> no TPM2_Startup since reset. <b>Find it:</b> the response code. <b>Fix:</b> firmware sends Startup on PCs; a kernel on a platform without it must send Startup(CLEAR) itself.</li>
+<li><b>Symptom:</b> the driver hangs after writing the command. <b>Cause:</b> a wrong size field, so the TPM still expects bytes (or stopped expecting them early). <b>Find it:</b> STS.Expect after the last byte. <b>Fix:</b> compute the size last, as <code>Out::finish</code> does.</li>
+<li><b>Symptom:</b> the replay matches no PCR. <b>Cause:</b> digests of the wrong algorithm, EV_NO_ACTION extended, or the log read big-endian. <b>Find it:</b> recompute one PCR by hand (the worked example). <b>Fix:</b> use the Spec ID event's sizes; skip EV_NO_ACTION; read the log little-endian.</li>
+<li><b>Symptom:</b> the replay matches every PCR except the one your code extends. <b>Cause:</b> what you logged is not what you extended. <b>Fix:</b> the forensic lab.</li>
+<li><b>Symptom:</b> PCR_Read returns a value but the wrong PCR. <b>Cause:</b> the selection bitmap built in the wrong byte or bit order. <b>Find it:</b> print the command (the lab's <code>tpm::trace</code>). <b>Fix:</b> PCR n is bit n mod 8 of byte n / 8.</li>
+</ul>
+
+<div class="co transition" id="F4-13-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F4-11">F4-11</a> read firmware tables and decided what to trust; <a href="#F4-12">F4-12</a> drove a device only through commands and checked the result outside the machine. <b>What carries over:</b> locating a device from ACPI, MMIO register handshakes, byte-exact message layouts, checking results with an independent program on the host. <b>What changes:</b> the device's job is to be trustworthy rather than fast, and the important question becomes "who could have changed this record?". <b>What comes next:</b> this is the last chapter of <a href="#DR302">DR302</a>. A real TPM and a real firmware log replace the mock when you bring up the spare PC (milestone C12).</p></div>
+
+<h2 id="F4-13-check">Check yourself</h2>
+<ol>
+<li>Why can software not set a PCR back to the value it had before an extend?</li>
+<li>Where did the lab kernel find the event log, and why could a UEFI kernel look elsewhere?</li>
+<li>The TPM2 table says start method 6. Which interface is that, and what would 7 mean?</li>
+<li>Why is EV_NO_ACTION never replayed?</li>
+<li>Compute the size of the lab's PCR_Read command for one PCR.</li>
+<li>Multiple choice: an attacker edits one EV_EVENT_TAG entry's digest in the log. What does the verifier report? (a) ACCEPT. (b) REJECT on that event's PCR. (c) REJECT on every PCR.</li>
+<li>Which results of this lab would change meaning if the mock TPM were replaced by swtpm, and why?</li>
+<li>What is the difference between measured boot and verified boot? Give one thing each can do that the other cannot.</li>
+</ol>
+
+<h2 id="F4-13-lab">Lab</h2>
+<p><b>Goal.</b> Milestone C13 (optional): "Talk to a TPM 2.0 through the CRB or FIFO interface: get random bytes, read PCRs, compare with the firmware event log." <sup class="src"><a href="#F4-13-src-D6">D6</a></sup></p>
+<p><b>Hardware and software needed.</b> QEMU 8.2.2 with <code>-chardev socket,… -tpmdev emulator,… -device tpm-tis,…</code>; swtpm if you have it (recommended), otherwise the lab's <code>mock_tpm.py</code>; a C++ compiler for the host tools. Run <code>university/labs/run_lab.sh university/labs/F4-13</code> (under a minute).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>On a real machine, do not send TPM2_Clear, hierarchy or NV commands while experimenting: they can destroy keys that protect a disk (BitLocker, LUKS with TPM unlock) or lock the TPM after repeated authorization failures. PCR_Read, GetRandom and extends of PCR 8–15 are harmless to other systems, but extending a PCR that sealed a disk key will stop that key from unsealing until the next reboot. Make sure you have your recovery keys before touching a real TPM.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In <code>tpm.out</code>, decode the TPM2 table, DID_VID and STS by hand with D2 and D7.</li>
+<li>Recompute PCR 2 by hand from its four events, as in the worked example.</li>
+<li>Edit one digest in the <code>report:</code> lines and feed them to the verifier. Which PCR does it reject? Then edit only the data of the "Calling INT 19h" event.</li>
+<li>Decode the PCR_Read response shown in hex in <code>tpm.out</code> field by field.</li>
+<li>If you have swtpm: start it with <code>swtpm socket --tpm2 --ctrl type=unixio,path=…</code>, point QEMU at it instead of the mock, and rerun. Record which results changed.</li>
+<li>Milestone step not done here: the CRB interface (a firmware TPM on the spare PC uses it).</li>
+</ol>
+<p><b>Expected observations</b> (QEMU 8.2.2, TCG, SeaBIOS, mock TPM): TPM2 table revision 4, start method 6, log at 0x3ff0000; TPM 2.0 family; 13 firmware events with one SHA-256 digest each; PCRs 0–7 equal to the replay; PCR 8 extended; GetRandom success; verifier ACCEPT on 14 events and 9 PCRs (R4, R5).</p>
+<p><b>Verification</b> (the acceptance tests, verbatim, with this build's result). "With QEMU and the swtpm software TPM, PCR values read by your kernel equal the values obtained by replaying the firmware event log." — met with the mock TPM instead of swtpm (R4); see Layer 3 for what that proves. "GetRandom returns data and the TPM's response codes are decoded in the log." — met with the mock: data returned, response codes printed with names (R4); circular evidence. <sup class="src"><a href="#F4-13-src-D6">D6</a></sup> <sup class="src"><a href="#F4-13-src-R4">R4</a></sup></p>
+<div class="co unverified"><span class="lbl">Not tested in this build</span><p>No swtpm and no real TPM: every TPM-side result comes from <code>mock_tpm.py</code>. No CRB interface, no UEFI event log (only SeaBIOS's), no quotes or attestation keys, no sessions other than the empty password, no TPM interrupts (the driver polls), no SHA-1 or SHA-384 banks. Nothing ran on real hardware.</p></div>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"acpi: no TPM2 table" with a TPM device given → the firmware did not build one (old SeaBIOS) or QEMU options are wrong → check <code>-device tpm-tis</code> → the kernel still probes the TIS registers.</li>
+<li>QEMU exits at once with a tpm-emulator error → the backend did not answer the control protocol → read the mock's log at the end of <code>tpm.out</code> → start swtpm or the mock before QEMU and check the socket path.</li>
+<li>"firmware log replay DOES NOT MATCH" → see the third common mistake → recompute one PCR by hand.</li>
+</ul>
+<p><b>Extension.</b> Seal a secret to PCR 8: with swtpm, create a primary key and a sealed object with a PCR policy, unseal it in a normal boot, then change the command line and show that unsealing fails.</p>
+
+<h2 id="F4-13-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> After a refactor of the command-line handling, the attestation server rejects every machine running the new kernel. The kernel log is clean: TPM_RC_SUCCESS everywhere and "F4-13 done". The kernel team says the attestation server must have a bug, since the firmware PCRs pass.</p>
+<p><b>Evidence pack.</b> The verifier's output (R7) and the kernel log with, at the end, the TPM side's own log (R6):</p>
+<pre class="output" data-run="F4-13/forensic_verify"></pre>
+<pre class="output" data-run="F4-13/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Which PCRs pass and which fail? What does that narrow the problem to?</li>
+<li>Compare the digest of the PCR 8 event in the report with the digest the TPM received. Which one is SHA-256 of the 47 bytes?</li>
+<li>Find the bug in <code>f413_main.cc</code>. What exactly was hashed into the TPM?</li>
+<li>Why did the kernel print success?</li>
+<li>Why is "the attestation server has a bug" not supported by the evidence?</li>
+<li>In a real deployment there is no mock log. What evidence would you have, and how would you find the cause?</li>
+</ol>
+<p><b>Method hints.</b> <code>g_cmdline</code> is declared as <code>char[64]</code>. Hash the first 47 bytes and all 64 bytes of it on the host and compare.</p>
+<p>Grading follows the forensic rubric of guide 11.2.</p>
+
+<h2 id="F4-13-project">Mini-project</h2>
+<p>Write the CRB interface for the same driver (control area, start bit, command and response buffers) behind the same <code>transmit</code> function, and select TIS or CRB from the TPM2 table's start method. Test TIS with swtpm in QEMU (<code>-device tpm-tis</code>) and CRB with swtpm (<code>-device tpm-crb</code>); if you have a spare PC with a firmware TPM, run the PCR comparison there with the UEFI event log.</p>
+<p><b>Rubric.</b> CRB handshake correct with timeouts (30 %); one <code>transmit</code> for both interfaces (15 %); PCR comparison passing on both in QEMU with swtpm (30 %); real-hardware result or a clear report of why not (15 %); code quality (10 %).</p>
+
+<h2 id="F4-13-summary">Summary</h2>
+<ul>
+<li>A PCR changes only by extend: new = SHA-256(old ‖ digest), with no undo (R1).</li>
+<li>The firmware measures into PCRs 0–7 and writes an event log; the log's location comes from the ACPI TPM2 table (R4).</li>
+<li>TPM commands are big-endian byte strings; TIS moves them through a FIFO with a five-state handshake.</li>
+<li>Replaying the log must reproduce the PCRs; the kernel's replay matched SeaBIOS's PCRs 0–7 (R4).</li>
+<li>Measured boot records; verification happens later, by replay plus a signed quote (R5).</li>
+<li>Log and extend must describe the same bytes, or every attestation fails (R6, R7). The lab's TPM is a mock: part of its evidence is circular.</li>
+</ul>
+
+<h2 id="F4-13-sources">Sources</h2>
+<ol>
+<li id="F4-13-src-D1">Trusted Computing Group, "TPM 2.0 Library Specification", Parts 1–3 (curriculum C13 reading: architecture; PCRs and extend; command and response structures; TPM2_Startup, PCR_Read, PCR_Extend, GetRandom; response codes; password sessions). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and sections (dossier gate G1 open).</i></li>
+<li id="F4-13-src-D2">Trusted Computing Group, "PC Client Platform TPM Profile (PTP) Specification" (curriculum C13 reading: TIS/FIFO and CRB interfaces, localities, register layout). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-13-src-D3">Trusted Computing Group, "PC Client Platform Firmware Profile Specification" (curriculum C13 reading: event log format, event types, PCR usage, roots of trust). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-13-src-D4">NIST, FIPS 180-4, "Secure Hash Standard" (SHA-256 and its example digests). <i>Title only — not opened during this build; the example digests in <code>sha256check.cpp</code> are from memory and agree with Python's hashlib (R1, R2).</i></li>
+<li id="F4-13-src-D5">QEMU documentation: TPM devices (tpm-tis, tpm-crb) and the "emulator" backend; swtpm documentation and its control protocol (<code>tpm_ioctl.h</code>). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-13-src-D6">This project's Systems Curriculum: milestone C13 (goal, reading, build, acceptance tests) (opened in this build; the project's own page; a map, not a technical source).</li>
+<li id="F4-13-src-D7">Trusted Computing Group, "TCG ACPI Specification" (the TPM2 table: start method, log area length and address). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-13-src-R1">R1 — lab run of <code>sha256check.cpp</code>: <code>university/labs/F4-13/sha256check.out</code>, <code>sha256check.log</code>.</li>
+<li id="F4-13-src-R2">R2 — lab run, step <code>hashcmp</code>: <code>hashcmp.out</code>, <code>hashcmp.log</code> (2000 messages against Python's hashlib).</li>
+<li id="F4-13-src-R3">R3 — lab run, step <code>build</code>: <code>build.out</code>, <code>build.log</code>.</li>
+<li id="F4-13-src-R4">R4 — lab run, step <code>tpm</code>: <code>tpm.out</code>, <code>tpm.log</code> (QEMU 8.2.2, q35, TCG, SeaBIOS; TPM played by <code>mock_tpm.py</code>; exit code 33 = pass).</li>
+<li id="F4-13-src-R5">R5 — lab run, step <code>verify</code>: <code>verify.out</code>, <code>verify.log</code> (exit code 0 = ACCEPT).</li>
+<li id="F4-13-src-R6">R6 — lab run, step <code>forensic</code>: <code>forensic.out</code>, <code>forensic.log</code> (built with <code>-DF413_SIZEOF_BUG</code>).</li>
+<li id="F4-13-src-R7">R7 — lab run, step <code>forensic_verify</code>: <code>forensic_verify.out</code>, <code>forensic_verify.log</code> (exit code 1 = REJECT, expected).</li>
+<li id="F4-13-src-R8">R8 — lab run, step <code>notpm</code>: <code>notpm.out</code>, <code>notpm.log</code> (no TPM device).</li>
+</ol>
+<p>SHA-256 rests on D4 <sup class="src"><a href="#F4-13-src-D4">D4</a></sup>; the build is R3 <sup class="src"><a href="#F4-13-src-R3">R3</a></sup>.</p>
+
+<h2 id="F4-13-glossary">Glossary links</h2>
+<p><a href="#gl-tpm-trusted-platform-module">TPM</a> · <a href="#gl-pcr-platform-configuration-register">PCR</a> · <a href="#gl-extend-tpm">Extend</a> · <a href="#gl-event-log-tpm">Event log</a> · <a href="#gl-measured-boot">Measured boot</a> · <a href="#gl-verified-boot">Verified boot</a> · <a href="#gl-attestation-and-quote">Attestation and quote</a> · <a href="#gl-tis-fifo-interface">TIS / FIFO interface</a> · <a href="#gl-crb-command-response-buffer">CRB</a> · <a href="#gl-locality-tpm">Locality</a> · <a href="#gl-root-of-trust-for-measurement">Root of trust for measurement</a> · <a href="#gl-tpm2-acpi-table">TPM2 ACPI table</a></p>
+
+<h2 id="F4-13-next">Next chapter</h2>
+<p>This is the last chapter of the course. Back to the course: <a href="#DR302">DR302</a>. Before this chapter: <a href="#F4-12">F4-12</a>.</p>
+
+<h2 id="F4-13-answers">Answers to Check yourself</h2>
+<ol>
+<li>The TPM offers no command that writes a PCR, only extend, and SHA-256 cannot be inverted: no input gives back an earlier value except by finding a preimage. Only a platform reset (or a DRTM locality reset for PCRs 17–22) clears them.</li>
+<li>From the ACPI TPM2 table's log area fields (LAML and LASA), 65536 bytes at 0x3ff0000 (R4). Under UEFI the firmware hands the log over through the EFI TCG2 protocol (and Linux exposes it), and the TPM2 table may not hold the address.</li>
+<li>6 is the TIS (FIFO) interface; 7 is CRB (command response buffer). These values are from memory of D7.</li>
+<li>EV_NO_ACTION events are informational (like the Spec ID header); the firmware never extended them into a PCR, so replaying them would produce a value the TPM never had.</li>
+<li>Header 10 bytes + count 4 + algorithm 2 + size-of-select 1 + bitmap 3 = 20 bytes (0x14), as in R4's traced command "80 01 00 00 00 14 …".</li>
+<li>(b). The edited digest changes only the replay of that event's PCR; the others still match.</li>
+<li>Every circular item of Layer 3 would become evidence: PCR_Read's response layout, GetRandom, response codes and Startup behaviour would then be checked against an implementation of D1 written by someone else. The TIS and event-log results would not change meaning; they are independent already.</li>
+<li>Verified boot checks signatures and refuses to run what fails; measured boot records and refuses nothing. Verified boot can stop unsigned code before it runs; measured boot can show a remote party exactly which (even signed) code ran and can bind secrets to that state.</li>
+</ol>
+<h3 id="F4-13-forensic-key">Forensic answer key</h3>
+<p><b>Observation.</b> R7: PCRs 0–7 match, PCR 8 "replay 553bbb9db1bafdb5 … != TPM 072bdea3beaf0687 …", REJECT. R6: the report's PCR 8 event has digest 946ac9d1… with the 47 bytes of the command line as data; the mock's log shows "PCR_Extend(PCR 8, sha256 578a0344…)". The kernel printed "TPM_RC_SUCCESS" and "F4-13 done".</p>
+<p><b>Root cause.</b> SHA-256 of the 47 bytes is 946ac9d1… (the verifier's data check also says "digest == SHA-256(data)" for event 14). SHA-256 of all 64 bytes of <code>g_cmdline</code> (47 characters and 17 zero bytes) is 578a0344…. <code>f413_main.cc</code> lines 145–146, active with <code>-DF413_SIZEOF_BUG</code>, hash <code>sizeof g_cmdline</code> (the array size, 64) for the TPM while line 144 hashes <code>kstrlen</code> (47) for the log. The log and the TPM describe different bytes.</p>
+<p><b>Why the kernel printed success.</b> TPM_RC_SUCCESS means only that the extend was carried out. The TPM cannot know what the digest was meant to describe, and the kernel never compares its own log with its PCRs.</p>
+<p><b>Injection.</b> Built with <code>-DF413_SIZEOF_BUG</code>.</p>
+<p><b>Fix and verification.</b> Use one digest for both (line 148: extend what was logged); rerun: PCR 8 "553bbb9db1bafdb5 … == TPM", ACCEPT (R4, R5).</p>
+<p><b>Wrong answers.</b> "The attestation server has a bug": it accepts PCRs 0–7 with the same code and rejects only the PCR the new kernel writes. "The TPM is broken": it returned success and its value is exactly SHA-256(0³² ‖ 578a0344…).</p>
+<p><b>Without the mock log.</b> A real verifier sees only the mismatch on PCR 8. The cause can be found by making the kernel replay its own log and compare with PCR_Read before reporting, or by hashing candidate inputs (string length, buffer size, with and without a terminating zero) on the host until one reproduces the TPM's PCR value.</p>
+<p><b>Prevention.</b> Compute the digest once and use the same bytes for the log and the extend; add a self-check that replays the kernel's own events against PCR_Read after measuring.</p>
