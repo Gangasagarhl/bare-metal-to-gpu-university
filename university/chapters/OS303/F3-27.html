@@ -1,0 +1,330 @@
+<!--meta
+id: F3-27
+title: Synchronization primitives
+course: OS303
+level: L3
+prereqs: F3-26; F2-36; F2-37; F2-38; F2-39; F2-40
+time: 10–14 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with TCG; host programs with g++ 13.3 and sanitizers)
+maps: Curriculum Track B, milestone B10 (spinlocks, mutexes, semaphores, wait queues, condition variables, lock-order checker)
+analogy: F3 — the school (one copy of the attendance sheet, a queue with numbered tickets, hall passes, the bell)
+-->
+
+<h2 id="F3-27-hook">Story hook</h2>
+<p>The school keeps one attendance sheet. Whoever is writing on it holds it; anyone else who needs it waits by the desk. Mostly this is fine: writing a name takes seconds. To be fair, the office hands out numbered tickets, and the sheet goes to ticket 41, then 42, then 43.</p>
+<p>One afternoon Dara is filling in the sheet when the bell rings. The rule says: when the bell rings, whoever is nearest must stop what they are doing and record the bell on the attendance sheet. Dara is nearest. Dara stops, turns to the desk to record the bell, and waits for the sheet. The sheet is in Dara's other hand, and that hand will not move until the bell has been recorded. Nobody else can help; Dara will wait until the caretaker comes at night.</p>
+<p>That is the forensic case of this chapter, found in a real kernel log from this build. The chapter builds the locks that prevent it: spinlocks that know about interrupts, sleeping mutexes, semaphores, condition variables, and two detectives that catch mistakes early: a lock-order checker and a lockup detector.</p>
+
+<h2 id="F3-27-able">What you will be able to do</h2>
+<ul>
+<li><b>Build</b> a ticket spinlock on C++ atomics with documented memory orders, and say exactly when it must disable interrupts.</li>
+<li><b>Build</b> a mutex, a semaphore and a condition variable that sleep on F3-26's wait queues without losing wake-ups.</li>
+<li><b>Detect</b> lock-order inversions before they deadlock, and mutexes taken in interrupt handlers, with a small debug checker.</li>
+<li><b>Detect</b> a real deadlock with a time-based lockup detector and print who holds and who waits for what on every CPU.</li>
+<li><b>Prove</b> the B10 acceptance tests in QEMU: 10 million items through a bounded buffer with no loss or duplicate, an inverted pair reported, a mutex in an interrupt handler reported.</li>
+<li><b>Diagnose</b> a single-CPU lockup from a lockup report and <code>addr2line</code>.</li>
+</ul>
+
+<div class="co jargon" id="F3-27-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Spinlock</dt><dd><b>Simple words:</b> a lock you wait for by checking again and again. <b>Analogy:</b> standing by the desk until the sheet is free. <b>Precise:</b> a lock whose waiters busy-wait on a memory location; correct only for short critical sections that never sleep; in a kernel, combined with disabling preemption and, where needed, interrupts. <sup class="src"><a href="#F3-27-src-D3">D3</a></sup></dd>
+<dt>Ticket lock</dt><dd><b>Simple words:</b> a spinlock that serves waiters in arrival order. <b>Analogy:</b> numbered tickets at the office desk. <b>Precise:</b> a spinlock with two counters: <code>next</code> (atomically incremented to take a ticket) and <code>serving</code> (incremented on release); a CPU enters when <code>serving</code> equals its ticket, so the lock is first-come, first-served. <sup class="src"><a href="#F3-27-src-D3">D3</a></sup> <sup class="src"><a href="#F3-27-src-R2">R2</a></sup></dd>
+<dt>IRQ-safe lock</dt><dd><b>Simple words:</b> a lock taken with interrupts switched off on this CPU, because an interrupt handler also takes it. <b>Analogy:</b> the bell may not ring while you hold the sheet. <b>Precise:</b> <code>lock_irqsave()</code> saves RFLAGS and executes <code>cli</code> before taking the lock; <code>unlock_irqrestore()</code> releases it and restores the saved interrupt flag. Any lock that an interrupt handler takes must be taken this way everywhere else. <sup class="src"><a href="#F3-27-src-D3">D3</a></sup> <sup class="src"><a href="#F3-27-src-R3">R3</a></sup></dd>
+<dt>Preemption count</dt><dd><b>Simple words:</b> a counter of spinlocks held by this CPU; while it is above zero the scheduler must not switch threads. <b>Analogy:</b> "do not move the student while they hold the sheet". <b>Precise:</b> <code>Cpu::preempt_count</code>, incremented by <code>Spinlock::lock</code> and decremented by <code>unlock</code>; <code>trap_dispatch</code> preempts only when it is zero (F3-26). <sup class="src"><a href="#F3-27-src-R2">R2</a></sup></dd>
+<dt>Mutex</dt><dd><b>Simple words:</b> a lock you wait for by going to sleep. <b>Analogy:</b> take a ticket, sit down, and be called. <b>Precise:</b> a mutual-exclusion lock with an owner; a thread that finds it held sleeps on a wait queue; may be held across blocking operations; never taken in interrupt context. <sup class="src"><a href="#F3-27-src-D1">D1</a></sup></dd>
+<dt>Adaptive spinning</dt><dd><b>Simple words:</b> waiting a moment before going to sleep, if the holder is busy on another CPU. <b>Analogy:</b> if the person with the sheet is writing right now, waiting a few seconds is cheaper than sitting down. <b>Precise:</b> before sleeping, <code>Mutex::lock</code> spins up to 2000 iterations while the owner thread is in state Running; sleeping and waking cost a switch each. <sup class="src"><a href="#F3-27-src-R2">R2</a></sup></dd>
+<dt>Semaphore</dt><dd><b>Simple words:</b> a counter of available "permits"; taking one waits if none are left. <b>Analogy:</b> a box with N hall passes. <b>Precise:</b> an integer with <code>down</code> (P: wait until positive, then decrement) and <code>up</code> (V: increment and wake one waiter), after Dijkstra. <sup class="src"><a href="#F3-27-src-D1">D1</a></sup></dd>
+<dt>Condition variable</dt><dd><b>Simple words:</b> a place to sleep until another thread says "something changed". <b>Analogy:</b> the "call me when the book comes back" list at the library desk. <b>Precise:</b> an object with <code>wait(m)</code> (atomically release mutex <code>m</code> and sleep; re-acquire before returning), <code>signal</code> and <code>broadcast</code>; the waiter re-checks its condition in a loop. <sup class="src"><a href="#F3-27-src-D1">D1</a></sup> <sup class="src"><a href="#F3-27-src-D4">D4</a></sup></dd>
+<dt>Lost wake-up</dt><dd><b>Simple words:</b> a "wake up" that arrives just before the sleeper goes to sleep, so it sleeps forever. <b>Analogy:</b> being called while you were still walking to your seat. <b>Precise:</b> a race between checking a condition and sleeping on it; prevented here by enqueuing the thread on the wait queue before releasing the lock that protects the condition, with interrupts off. <sup class="src"><a href="#F3-27-src-D1">D1</a></sup></dd>
+<dt>Lock-order inversion</dt><dd><b>Simple words:</b> one code path takes lock A then B, another takes B then A. <b>Analogy:</b> two students each holding a book the other needs. <b>Precise:</b> a cycle in the graph whose edges are "lock X was held while lock Y was acquired"; a necessary condition for an ABBA deadlock, detectable even when no deadlock happened. <sup class="src"><a href="#F3-27-src-D3">D3</a></sup></dd>
+<dt>Lock-order checker</dt><dd><b>Simple words:</b> debug code that remembers which locks were taken while others were held and complains about the reverse order. <b>Analogy:</b> a hall monitor who writes down who held which book first. <b>Precise:</b> here <code>lockdep_check_order</code>: per thread, the lock classes held; globally, a table <code>before[a][b]</code>; the first acquisition of <code>a</code> while holding <code>b</code> after <code>before[a][b]</code> was set is reported. Linux's "lockdep" is a far larger version of the same idea. <sup class="src"><a href="#F3-27-src-D5">D5</a></sup></dd>
+<dt>Lockup detector</dt><dd><b>Simple words:</b> a timer inside the spin loop that gives up after too long and prints who holds what. <b>Analogy:</b> the caretaker at night. <b>Precise:</b> <code>Spinlock::lock</code> measures its wait with the TSC and calls <code>lockup()</code> after 2000 ms; the first CPU to report prints every CPU's thread, interrupt depth, awaited lock and held locks, then panics. <sup class="src"><a href="#F3-27-src-R3">R3</a></sup></dd>
+</dl></div>
+
+<h2 id="F3-27-pictures">The idea in pictures</h2>
+<figure id="F3-27-fig1"><div class="svgbox">
+<svg viewBox="0 0 900 280" role="img" aria-labelledby="F3-27-f1t F3-27-f1d">
+<title id="F3-27-f1t">Figure 1: a ticket spinlock with three CPUs</title>
+<desc id="F3-27-f1d">A spinlock holds two counters: next = 44 and serving = 41. CPU 2 holds ticket 41 and is inside the critical section. CPU 0 took ticket 42 and CPU 5 took ticket 43; both spin reading serving with acquire order. When CPU 2 releases, it stores serving = 42 with release order; CPU 0 sees its number and enters. A newcomer does fetch_add on next and receives 44. Waiters are served in ticket order.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="280"/>
+<rect class="sv-b5" x="340" y="30" width="220" height="90" rx="6"/><text class="sv-tb" x="355" y="56">Spinlock "buffer"</text><text class="sv-t" x="355" y="80">next    = 44</text><text class="sv-t" x="355" y="104">serving = 41</text>
+<rect class="sv-b3" x="40" y="170" width="200" height="70" rx="6"/><text class="sv-tb" x="52" y="196">CPU 2: ticket 41</text><text class="sv-ts" x="52" y="220">inside: owns the lock</text>
+<rect class="sv-b4" x="350" y="170" width="200" height="70" rx="6"/><text class="sv-tb" x="362" y="196">CPU 0: ticket 42</text><text class="sv-ts" x="362" y="220">spins: serving == 42?</text>
+<rect class="sv-b4" x="660" y="170" width="200" height="70" rx="6"/><text class="sv-tb" x="672" y="196">CPU 5: ticket 43</text><text class="sv-ts" x="672" y="220">spins: serving == 43?</text>
+<line class="sv-line" x1="140" y1="170" x2="340" y2="104"/><polygon class="sv-head" points="345,102 334,100 337,110"/><text class="sv-ts" x="60" y="140">unlock: serving = 42 (release)</text>
+<line class="sv-dash" x1="450" y1="170" x2="450" y2="126"/><polygon class="sv-head" points="450,120 444,130 456,130"/>
+<line class="sv-dash" x1="760" y1="170" x2="560" y2="110"/><polygon class="sv-head" points="555,108 565,104 563,116"/><text class="sv-ts" x="640" y="140">load serving (acquire)</text>
+<text class="sv-ts" x="600" y="50">a newcomer: fetch_add(next) → 44</text>
+</svg></div><figcaption><b>Figure 1.</b> A ticket lock is fair: waiters enter in the order they took tickets. Solid arrow: the releasing store; dashed arrows: waiters' loads (data flow). From <code>sync.cc</code> lines 51–86 <sup class="src"><a href="#F3-27-src-R2">R2</a></sup>; memory orders after D2.</figcaption></figure>
+
+<figure id="F3-27-fig2"><div class="svgbox">
+<svg viewBox="0 0 900 260" role="img" aria-labelledby="F3-27-f2t F3-27-f2d">
+<title id="F3-27-f2t">Figure 2: how a spinlock shared with an interrupt handler deadlocks one CPU</title>
+<desc id="F3-27-f2d">A timeline for one CPU. At time 1 thread stats_worker takes the spinlock stats with plain lock(): interrupts stay enabled. At time 2 the timer interrupt arrives on the same CPU; the CPU switches to the interrupt handler, which calls stats_hook. At time 3 stats_hook calls stats_lock.lock() and spins. The lock's owner is the interrupted thread, which cannot run until the handler returns, and the handler cannot return until it gets the lock. At time 4, 2000 ms later, the lockup detector reports. The fix is drawn below: if the thread takes the lock with lock_irqsave(), the interrupt waits (pending) until unlock_irqrestore(), and then the handler finds the lock free.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="260"/>
+<line class="sv-line2" x1="40" y1="90" x2="860" y2="90"/>
+<text class="sv-ts" x="40" y="30">CPU 0, plain lock() (the forensic kernel)</text>
+<rect class="sv-b3" x="60" y="70" width="200" height="40"/><text class="sv-ts" x="68" y="95">1 worker: lock(stats)</text>
+<rect class="sv-b6" x="270" y="70" width="190" height="40"/><text class="sv-ts" x="278" y="95">2 timer IRQ arrives</text>
+<rect class="sv-b8" x="470" y="70" width="230" height="40"/><text class="sv-ts" x="478" y="95">3 hook: lock(stats) … spins</text>
+<rect class="sv-b8" x="710" y="70" width="150" height="40"/><text class="sv-ts" x="716" y="95">4 LOCKUP 2000 ms</text>
+<line class="sv-line2" x1="40" y1="200" x2="860" y2="200"/>
+<text class="sv-ts" x="40" y="150">CPU 0, lock_irqsave() (the correct kernel)</text>
+<rect class="sv-b3" x="60" y="180" width="300" height="40"/><text class="sv-ts" x="68" y="205">worker: cli, lock … unlock, restore IF</text>
+<rect class="sv-b6" x="370" y="180" width="220" height="40"/><text class="sv-ts" x="378" y="205">pending IRQ delivered now</text>
+<rect class="sv-b4" x="600" y="180" width="260" height="40"/><text class="sv-ts" x="608" y="205">hook: lock(stats) free → done</text>
+<text class="sv-ts" x="40" y="245">Time runs to the right; not to scale.</text>
+</svg></div><figcaption><b>Figure 2.</b> A spinlock that an interrupt handler takes must be taken with interrupts disabled everywhere else, or one CPU can deadlock against itself (time runs to the right). Top row recorded in the forensic run <sup class="src"><a href="#F3-27-src-R3">R3</a></sup>; the rule after D3.</figcaption></figure>
+
+<figure id="F3-27-fig3"><div class="svgbox">
+<svg viewBox="0 0 900 220" role="img" aria-labelledby="F3-27-f3t F3-27-f3d">
+<title id="F3-27-f3t">Figure 3: the lock-order graph of the checker test</title>
+<desc id="F3-27-f3d">Two nodes, lock class A and lock class B. The first sequence takes A, then B while holding A: the checker adds the edge A to B and records the return address. The second sequence takes B, then A while holding B: the checker finds the edge A to B already present, so the new edge B to A closes a cycle, and it prints a LOCKDEP report with both addresses. No deadlock happened, because one thread ran both sequences one after the other.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="220"/>
+<circle class="sv-b4" cx="250" cy="110" r="45"/><text class="sv-tb" x="243" y="116">A</text>
+<circle class="sv-b4" cx="650" cy="110" r="45"/><text class="sv-tb" x="643" y="116">B</text>
+<path class="sv-line" d="M290 90 Q450 30 606 90"/><polygon class="sv-head" points="611,93 600,84 598,96"/><text class="sv-ts" x="330" y="40">edge 1: B taken while A held (recorded)</text>
+<path class="sv-dash" d="M606 130 Q450 190 294 130"/><polygon class="sv-head" points="289,127 300,136 302,124"/><text class="sv-ts" x="330" y="205">edge 2: A taken while B held → cycle → LOCKDEP report</text>
+</svg></div><figcaption><b>Figure 3.</b> The checker keeps a graph of "held → taken" edges between lock classes (names) and reports the first edge that closes a two-lock cycle (arrows: order of acquisition). Recorded in the <code>sync</code> run <sup class="src"><a href="#F3-27-src-R2">R2</a></sup>; the idea after D5.</figcaption></figure>
+
+<h2 id="F3-27-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Some things in school exist only once, like the attendance sheet. Only one person may write on it at a time. Sometimes you wait standing up because it will be quick (a spinlock); sometimes you take a ticket and sit down until you are called (a mutex). A box of hall passes lets five students out at once, not more (a semaphore). And two students who each hold a book the other one needs will wait for ever unless everyone agrees to pick up books in alphabetical order.</p></div>
+<p>When two threads change the same thing at the same time, the result can be garbage. A lock makes them take turns. The hard parts are choosing how to wait, and making sure nobody ends up waiting for ever.</p>
+
+<h2 id="F3-27-layer2">Layer 2 — the student explanation</h2>
+<p>SP203 built these tools in user space with <code>std::mutex</code> and <code>std::condition_variable</code> (<a href="#F2-36">F2-36</a>, <a href="#F2-37">F2-37</a>). The kernel cannot use them: they are implemented on top of system calls into a kernel, and this <i>is</i> the kernel. It builds its own, from two ingredients: atomic instructions and F3-26's ability to make a thread sleep and wake.</p>
+<p><b>Spinlock.</b> The lab's spinlock is a <b>ticket lock</b>: <code>lock()</code> takes a ticket with an atomic <code>fetch_add</code> on <code>next_</code> and spins until <code>serving_</code> shows its number; <code>unlock()</code> adds one to <code>serving_</code>. It never sleeps, so it is the only lock an interrupt handler may take, and it must only protect a few instructions. While a CPU holds a spinlock, <code>preempt_count</code> is above zero, so F3-26's scheduler will not switch the holder away.</p>
+<p><b>Interrupts.</b> If an interrupt handler on CPU 0 takes a spinlock that the thread it interrupted already holds, CPU 0 spins on a lock that only CPU 0 can release: Figure 2. So the rule is: a lock that any interrupt handler takes is always taken elsewhere with <code>lock_irqsave()</code>, which disables interrupts on this CPU first and restores the previous state afterwards. Inside a handler interrupts are already off (the CPU cleared IF when it entered through an interrupt gate), so the handler itself can use plain <code>lock()</code>.</p>
+<p><b>Mutex.</b> A mutex records its owner thread. If it is taken, the caller sleeps on the mutex's wait queue; <code>unlock()</code> clears the owner and wakes one waiter, who loops back and tries again. A mutex may be held across long operations, but because it can sleep it must never be taken in an interrupt handler; the lab's <code>Mutex::lock</code> checks <code>irq_depth</code> and reports such a call as a bug (a B10 acceptance test) instead of executing it.</p>
+<p><b>Semaphore and condition variable.</b> A semaphore is a counter with <code>down</code> (wait until positive, then decrement) and <code>up</code> (increment, wake one). A condition variable lets a thread wait for a condition protected by a mutex: <code>wait(m)</code> releases <code>m</code> and sleeps in one step, then re-acquires <code>m</code>. The waiter always re-checks its condition in a <code>while</code> loop, because another thread may have changed it again before the waiter ran.</p>
+<p><b>The bounded buffer.</b> The B10 test passes 10 million numbers from producers to consumers through a 64-slot ring protected by one mutex, with two condition variables (<code>not_full</code>, <code>not_empty</code>). Consumers mark every number in a 10-million-bit bitmap; a bit set twice is a duplicate, a bit never set is a lost item. On one CPU the run passed with no loss and no duplicate <sup class="src"><a href="#F3-27-src-R2">R2</a></sup>; F3-28 runs the same code on 8 CPUs.</p>
+<p><b>Detectives.</b> Two kinds of bugs are hard to find by testing: deadlocks that need unlucky timing, and lock misuse that happens to work. The <b>lock-order checker</b> catches the first kind from a single, harmless run: it records "B was taken while A was held" and reports the first time "A is taken while B is held". The <b>lockup detector</b> catches actual deadlocks: a spinner that has waited 2 seconds prints a report of every CPU and panics.</p>
+
+<h2 id="F3-27-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-27-l3-orders">Memory orders in the ticket lock</h3>
+<p>Taking a ticket is a <code>fetch_add</code> with relaxed order: it only has to be atomic. The load that lets a CPU in (<code>serving_ == my</code>) uses <b>acquire</b> order, and the store that lets the next CPU in uses <b>release</b> order (<code>sync.cc</code> lines 60, 63, 81). Together they make every write inside the previous holder's critical section visible to the next holder before it reads anything protected by the lock <sup class="src"><a href="#F3-27-src-D2">D2</a></sup>. On x86 ordinary loads and stores already have these properties at the hardware level, so the orders mainly stop the <i>compiler</i> from moving protected accesses out of the critical section; on the weakly ordered CPUs of DR402 they also produce fences. The C++ orders are what the code promises, independent of the CPU.</p>
+<p>The release uses <code>serving_.load(relaxed) + 1</code> followed by a store, not a <code>fetch_add</code>: only the holder ever writes <code>serving_</code>, so no other CPU can race with it. A ticket lock with 32-bit counters wraps after 2<sup>32</sup> acquisitions; the comparison is equality, so wrapping is harmless as long as fewer than 2<sup>32</sup> CPUs wait at once.</p>
+<h3 id="F3-27-l3-fair">Why tickets, and what they cost</h3>
+<p>A simple test-and-set lock lets whichever CPU wins the race in; under contention one CPU can lose for a long time. Tickets make the order fair. The price is that every waiter spins on the same cache line, which every release invalidates; McKenney discusses queued locks (MCS and the Linux qspinlock) that give each waiter its own line <sup class="src"><a href="#F3-27-src-D3">D3</a></sup>. Fairness also has a sharp edge in a virtual machine: if the vCPU holding ticket <i>n</i>+1 is descheduled by the host, everyone behind it waits even after the lock is free. That is one reason the lab's runs under TCG are slow under contention.</p>
+<h3 id="F3-27-l3-wq">Sleeping without losing a wake-up</h3>
+<p>The dangerous moment of a sleeping lock is between "I see the lock is taken" and "I am asleep". If the owner unlocks in between and wakes nobody (because the sleeper is not yet on the queue), the sleeper sleeps forever. The lab closes the gap in <code>WaitQueue::sleep</code> (<code>thread.cc</code> lines 340–355): the caller holds the guard spinlock of the mutex with interrupts off; <code>sleep</code> takes the scheduler lock, puts the thread on the queue and marks it Blocked, and only then releases the guard. A waker must take the guard to see the state and then the scheduler lock to wake; by then the sleeper is on the queue. <code>CondVar::wait</code> applies the same rule one level up: it takes its own guard before releasing the mutex, so a <code>signal</code> cannot slip in between (<code>sync.cc</code> lines 146–153).</p>
+<h3 id="F3-27-l3-adaptive">Adaptive spinning, and why it was needed</h3>
+<p>The first version of the mutex went to sleep immediately. On one CPU that is ideal. On 8 emulated CPUs (F3-28) the 10-million-item run became so slow that it looked hung: every handover of the buffer mutex cost a sleep, a wake-up IPI and a switch on both sides. The lab therefore spins up to 2000 iterations first, but only while the owner is <i>running</i> on some CPU (<code>sync.cc</code> lines 99–107); if the owner is asleep or preempted, spinning is pointless and the caller sleeps at once. Linux and Solaris mutexes use the same heuristic <sup class="src"><a href="#F3-27-src-D3">D3</a></sup>. The 2000 is a guess tuned on this emulator, not a measured optimum.</p>
+<h3 id="F3-27-l3-checker">The lock-order checker in detail</h3>
+<p>Locks are grouped into <b>classes</b> by name: every lock named "account:alice" is one class. Each thread keeps the classes it holds (<code>Thread::held</code>, at most 8). Before waiting for a lock of class <i>b</i>, <code>lockdep_check_order</code> looks at every held class <i>a</i>: if the table says <i>a</i> was earlier taken while <i>b</i> was held (<code>before[b][a]</code>), it prints both call sites; then it records <code>before[a][b]</code>. The check runs <i>before</i> spinning, so an inversion is reported even in the run that is about to deadlock (you will see this in F3-28). The checker finds only two-lock cycles, and it ignores a lock taken while a lock of the same class is held (<code>a == b</code>) — which is exactly the shape of this chapter's forensic case, so that case is caught by the lockup detector instead. The scheduler lock is not checked at all, because it is released by a different thread (F3-26).</p>
+<h3 id="F3-27-l3-lockup">The lockup detector</h3>
+<p>Each spin loop reads the TSC; after 2000 ms worth of cycles (calibrated against the PIT at boot) it calls <code>lockup()</code>. Several CPUs may time out at once; an atomic flag lets only the first report, while the others halt, so the log is readable. The report switches the console to panic mode (it must not wait for the console lock, which a stuck CPU might hold) and prints, for every online CPU, the current thread, its interrupt depth, the lock it is spinning on and the classes it holds. Those four columns are usually enough to name the bug.</p>
+<h3 id="F3-27-l3-sizes">What was and was not reproduced</h3>
+<p>The single-CPU B10 test ran at the curriculum's full size, 10 million items, in a little over 2000 ticks of guest time <sup class="src"><a href="#F3-27-src-R2">R2</a></sup>. The re-run "after B11 on 4 and 8 CPUs" uses smaller sizes by default in F3-28 and is explained there. Read-copy-update (RCU) is named in the curriculum as a topic <sup class="src"><a href="#F3-27-src-C1">C1</a></sup>; this chapter does not implement it.</p>
+
+<h2 id="F3-27-hardware">How the hardware actually does it</h2>
+<p>An atomic <code>fetch_add</code> on x86-64 compiles to a <code>lock xadd</code>: the CPU performs the read, the addition and the write as one indivisible operation with respect to every other CPU, using the cache-coherence protocol to own the cache line for the duration <sup class="src"><a href="#F3-27-src-D6">D6</a></sup>. The spin loop calls <code>cpu_relax()</code>, the <code>pause</code> instruction, which tells the core it is in a spin-wait loop (saving power and, on hyper-threaded cores, giving the sibling thread resources). <code>cli</code> and <code>sti</code> clear and set RFLAGS.IF on this CPU only: disabling interrupts never protects against another CPU, which is why kernel code needs both the lock and, where an interrupt handler is involved, <code>cli</code>. The lockup detector reads the time-stamp counter with <code>rdtsc</code>.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Written from memory, not checked in this build: that <code>std::atomic::fetch_add</code> compiles to <code>lock xadd</code> with g++ 13 for x86-64 (check with <code>objdump -d</code> on <code>kernel.elf</code>, which this build did not record); x86-TSO ordering ("loads are not reordered with older loads, stores not with older stores", the store-buffer exception) as described in the Intel SDM Vol. 3 "Memory Ordering" section; the effect of <code>pause</code>; RFLAGS.IF being bit 9 and the <code>pushfq</code>-based save and the conditional <code>sti</code> restore in <code>kbase.h</code>; the TSC being constant-rate on the emulated CPU. The QEMU runs show only that the code works on QEMU 8.2.2's TCG model.</p></div>
+<div class="co note"><span class="lbl">Note</span><p>Untested on hardware. Every kernel run in this chapter used one emulated CPU under TCG. Timing-dependent numbers (ticks per run, how many increments the thread and the handler made in the counter test) change from run to run; the verdicts must not.</p></div>
+
+<h2 id="F3-27-worked">Worked example</h2>
+<p><b>Ticket arithmetic.</b> A lock starts with <code>next = serving = 0</code>. CPU 1 calls <code>lock()</code>: <code>fetch_add</code> returns 0 and sets <code>next = 1</code>; <code>serving == 0</code>, so CPU 1 enters at once. CPU 2 arrives: ticket 1, <code>next = 2</code>, spins. CPU 3 arrives: ticket 2, <code>next = 3</code>, spins. CPU 1 unlocks: <code>serving = 1</code>; CPU 2 enters. CPU 2 unlocks: <code>serving = 2</code>; CPU 3 enters. At any moment, <code>next − serving</code> is the number of CPUs inside or waiting: here at most 3, then 2, then 1, then 0 after CPU 3 unlocks.</p>
+<p><b>The checker on the B10 test.</b> The <code>sync</code> run (Listing 3, lines 196–205) executes, in one thread:</p>
+<div class="tw"><table>
+<thead><tr><th>Step</th><th>Call</th><th>Held before</th><th>Table effect</th><th>Report?</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><code>lock_a.lock()</code></td><td>(none)</td><td>none</td><td>no</td></tr>
+<tr><td>2</td><td><code>lock_b.lock()</code></td><td>A</td><td><code>before[A][B]</code> = true, address of line 198</td><td>no</td></tr>
+<tr><td>3–4</td><td>unlock B, unlock A</td><td>—</td><td>held list emptied</td><td>no</td></tr>
+<tr><td>5</td><td><code>lock_b.lock()</code></td><td>(none)</td><td>none</td><td>no</td></tr>
+<tr><td>6</td><td><code>lock_a.lock()</code></td><td>B</td><td>finds <code>before[A][B]</code>; then sets <code>before[B][A]</code></td><td>yes: "acquiring 'A' while holding 'B'"</td></tr>
+</tbody></table></div>
+<p>The run printed exactly one report, with two different addresses (step 6 and step 2) <sup class="src"><a href="#F3-27-src-R2">R2</a></sup>. The output wording "earlier: 'A' was held while acquiring 'B'" reads the table entry of step 2.</p>
+<p><b>The counter shared with an interrupt handler.</b> For 100 ticks the test thread increments <code>shared_counter</code> under <code>counter_lock.lock_irqsave()</code>, and the timer hook increments it under plain <code>lock()</code> (interrupts are already off in the handler). The check is arithmetic: the final counter must equal the thread's increments plus the handler's. In this build: thread 1 387 500, handler 100, counter 1 387 600 <sup class="src"><a href="#F3-27-src-R2">R2</a></sup>. 100 handler increments is one per tick for 100 ticks, as expected. Replace <code>lock_irqsave()</code> by <code>lock()</code> in line 218 and the test does not fail with a wrong sum: it deadlocks, as the forensic case shows.</p>
+
+<h2 id="F3-27-code">Code walk-through</h2>
+<p>All files are in <code>university/labs/F3-27/</code>; the wait queue is in F3-26's <code>thread.cc</code> (lines 339–379). The kernel is built by F3-26's <code>build_kernel.sh</code> (see <a href="#F3-26">F3-26</a>).</p>
+<p><b>Listing 1</b> — <code>sync.h</code></p>
+<pre class="listing" data-src="F3-27/sync.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–49</td><td><code>Spinlock</code></td><td>Name, checked flag, two atomic counters, last owner and call site.</td><td>Names make reports readable; the owner fields feed the lockup report.</td></tr>
+<tr><td>24–34</td><td><code>lock_irqsave</code></td><td>Save flags, disable interrupts, lock; the reverse on release.</td><td>The default for any lock an interrupt handler might take.</td></tr>
+<tr><td>52–65</td><td><code>WaitQueue</code></td><td>Sleep with a held spinlock; wake one or all.</td><td>The only way the primitives below sleep.</td></tr>
+<tr><td>67–104</td><td><code>Mutex</code>, <code>Semaphore</code>, <code>CondVar</code></td><td>Each has an unchecked guard spinlock and a wait queue.</td><td>Guards are internal and short, so they are not in the order checker.</td></tr>
+<tr><td>106–127</td><td>guards</td><td>RAII lock holders.</td><td>Every return path unlocks (SP102's RAII).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>sync.cc</code></p>
+<pre class="listing" data-src="F3-27/sync.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–42</td><td><code>lockup</code></td><td>First reporter prints every CPU's thread, interrupt depth, awaited and held locks; others halt.</td><td>The evidence pack of this chapter and of F3-28.</td></tr>
+<tr><td>53–58</td><td>start of <code>lock</code></td><td>Return address, preemption count, order check before waiting.</td><td>An inversion is reported even if this very call deadlocks.</td></tr>
+<tr><td>59–70</td><td>ticket and spin</td><td>Relaxed <code>fetch_add</code>; acquire loads; TSC timeout.</td><td>Fair order; bounded wait in debug builds.</td></tr>
+<tr><td>78–86</td><td><code>unlock</code></td><td>Clear owner, release store, bookkeeping, preemption count.</td><td>The release store must come after the protected writes.</td></tr>
+<tr><td>94–97</td><td>interrupt check</td><td>Refuses (and reports) a mutex in an interrupt handler.</td><td>B10 acceptance test 3.</td></tr>
+<tr><td>99–111</td><td>adaptive spin, then sleep</td><td>Spin while the owner runs; otherwise sleep until woken, and re-check.</td><td>The <code>while</code> handles a waiter woken and overtaken.</td></tr>
+<tr><td>128–167</td><td>semaphore, condition variable</td><td>Counter or nothing, guarded, with a wait queue.</td><td><code>CondVar::wait</code> holds its guard while releasing the mutex.</td></tr>
+<tr><td>202–233</td><td><code>lockdep_check_order</code></td><td>Reports a reversed pair once; records new pairs with their address.</td><td>The two-lock cycle detector of Figure 3.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>test_sync.cc</code>, the B10 tests and the forensic case</p>
+<pre class="listing" data-src="F3-27/test_sync.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–20</td><td>buffer</td><td>64 slots, one mutex, two condition variables; a 10-million-bit bitmap.</td><td>The bitmap catches both loss and duplication.</td></tr>
+<tr><td>32–54</td><td><code>put</code>, <code>get</code></td><td>Wait in a loop, change the ring, signal the other side.</td><td>The classic bounded buffer (OSTEP's condition-variable chapter).</td></tr>
+<tr><td>62–66</td><td>stop markers</td><td>The <i>last</i> producer to finish puts one marker per consumer.</td><td>A marker put earlier could stop a consumer while items are still coming.</td></tr>
+<tr><td>88–119</td><td><code>producer_consumer</code></td><td>Runs one test of any size; dumps the scheduler after 30 s.</td><td>Reused by F3-28 on many CPUs.</td></tr>
+<tr><td>132–157</td><td>semaphores</td><td>The same ring with two semaphores and a spinlock; checks the sum 1+…+10<sup>6</sup>.</td><td>A second, independent primitive under the same load.</td></tr>
+<tr><td>196–212</td><td>checker tests</td><td>The inverted pair; the mutex in a timer hook.</td><td>B10 acceptance tests 2 and 3.</td></tr>
+<tr><td>214–227</td><td>shared counter</td><td>Thread with <code>lock_irqsave</code>, handler with <code>lock</code>.</td><td>The correct version of the forensic case.</td></tr>
+<tr><td>234–268</td><td>forensic case</td><td>A worker holds <code>stats</code> with interrupts on; the timer hook takes it too.</td><td>See the forensic lab.</td></tr>
+</tbody></table></div>
+<p><b>Run</b> (QEMU, one CPU, <code>test=sync</code>; script <code>F3-27/run.sh</code>, which uses F3-26's <code>labtools.sh</code>):</p>
+<pre class="listing" data-src="F3-27/run.sh"></pre>
+<pre class="output" data-run="F3-27/sync"></pre>
+
+<p><b>Listing 4</b> — <code>prodcons.cpp</code>, the same bounded buffer on the host with <code>std::mutex</code></p>
+<pre class="listing" data-src="F3-27/prodcons.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–20</td><td><code>put</code></td><td><code>wait</code> with a predicate, store, <code>notify_one</code>.</td><td>The predicate form is the <code>while</code> loop of Listing 3.</td></tr>
+<tr><td>49–60</td><td>threads</td><td>Four producers with interleaved numbers, four consumers with a seen-array.</td><td>The same loss/duplicate check as the kernel test.</td></tr>
+<tr><td>62–63</td><td>stop markers</td><td>Put after all producers joined.</td><td>The host version of "the last producer puts them".</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-27/prodcons"></pre>
+
+<p><b>Listing 5</b> — <code>lockorder.cpp</code>, the checker's idea in 50 lines</p>
+<pre class="listing" data-src="F3-27/lockorder.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–22</td><td><code>acquire</code></td><td>Reports if the reverse edge exists, then records held → taken.</td><td>Same logic as <code>lockdep_check_order</code>.</td></tr>
+<tr><td>35–41</td><td>two transfers</td><td>alice→bob, then bob→alice.</td><td>The F3-28 forensic bank, in miniature.</td></tr>
+<tr><td>45–51</td><td><code>ordered</code></td><td>Always take the two locks in name order.</td><td>The standard fix: one global lock order.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-27/lockorder"></pre>
+
+<h2 id="F3-27-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Nobody waits politely.</b> A spinning CPU does not stand still: it reads the lock's memory as fast as it can, and that traffic slows the holder down. A waiting student costs nothing.</li>
+<li><b>The bell is not in the same person.</b> In school, the person who rings the bell is somebody else. On a CPU the interrupt handler runs <i>on the same CPU</i>, in the middle of the interrupted thread; that is why a single CPU can deadlock with itself.</li>
+<li><b>Ticket order is not "fair" in time.</b> First-come, first-served at the lock says nothing about which thread gets the CPU; a ticket holder that is preempted or whose virtual CPU is descheduled blocks everyone behind it.</li>
+<li><b>"Alphabetical order" must be global and enforced.</b> In school a rule on the wall is enough; in a kernel the order must hold across all code paths, written by different people, which is why a checker is needed.</li>
+</ul>
+
+<h2 id="F3-27-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Plain <code>lock()</code> on a lock shared with an interrupt handler.</b> Works almost always and deadlocks one CPU when the interrupt hits inside the critical section. Rule: if any handler takes it, every other user takes it with <code>lock_irqsave()</code>.</li>
+<li><b>Restoring "interrupts on" instead of the saved state.</b> <code>unlock_irqrestore</code> restores what was there; code that blindly executes <code>sti</code> enables interrupts inside a caller that had them off.</li>
+<li><b>Sleeping with a spinlock held.</b> Calling <code>Mutex::lock</code>, a semaphore <code>down</code> or <code>thread_sleep_ticks</code> inside a spinlock section switches away with <code>preempt_count &gt; 0</code>. Other CPUs spin until a lockup report.</li>
+<li><b><code>if</code> instead of <code>while</code> around a condition wait.</b> After waking, the condition may be false again (another consumer took the item). Always loop.</li>
+<li><b>Stop markers at the wrong time.</b> The first version of the test let each producer put a stop marker when it finished; consumers then stopped while other producers still had items, and items were "lost". The bitmap found it.</li>
+<li><b>Debugging method.</b> Read a lockup report column by column: which lock is each CPU waiting for, which locks does it hold; draw the arrows "waits for → held by"; a cycle is a deadlock, an arrow from a CPU to itself is an interrupt or recursion problem. Then <code>addr2line</code> the two addresses in the report.</li>
+</ul>
+
+<div class="co transition" id="F3-27-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F3-26 gave the kernel threads, wait queues and a preemptive scheduler on one CPU. <b>What carries over:</b> <code>WaitQueue</code>, <code>preempt_count</code>, the scheduler lock and the timer hook; SP203's memory model and condition-variable discipline. <b>What changes:</b> shared kernel data is now protected by named locks of the right kind; misuse is reported (inversions, mutexes in handlers) and real deadlocks end in a readable lockup report rather than a silent hang. <b>What comes next:</b> F3-28 starts the other CPUs. The same locks now face true parallelism: the producer/consumer test runs on 8 CPUs, the TLB must be shot down on every CPU, and an ABBA bug that never fires on one CPU deadlocks on eight.</p></div>
+
+<h2 id="F3-27-check">Check yourself</h2>
+<ol>
+<li>A ticket lock shows <code>next = 17</code>, <code>serving = 14</code>. How many CPUs hold or wait for it, and which ticket is inside?</li>
+<li>Why is the ticket taken with a relaxed <code>fetch_add</code>, but <code>serving_</code> loaded with acquire order?</li>
+<li>Explain in your own words why a single CPU can deadlock on a spinlock, and the rule that prevents it.</li>
+<li>Why may an interrupt handler take a spinlock but never a mutex?</li>
+<li>In <code>WaitQueue::sleep</code>, what would go wrong if line 352 (<code>held.unlock()</code>) came before the thread was put on the queue?</li>
+<li>Why does <code>Mutex::lock</code> stop spinning when the owner is not in state Running?</li>
+<li>The checker ignores a lock taken while a lock of the same class is held. Give one legitimate reason for this rule and one bug it hides.</li>
+<li>Apply to a new case: a network driver's receive interrupt handler adds packets to a queue protected by spinlock <code>rxq</code>, and a kernel thread removes them. Which calls does each side use, and what does the lockup report look like if the thread uses plain <code>lock()</code>?</li>
+<li>Why did the first version of the test "lose" items, and why does putting the stop markers in the last producer fix it?</li>
+</ol>
+
+<h2 id="F3-27-lab">Lab</h2>
+<div class="co safety"><span class="lbl">Safety</span><p>QEMU only. Real hardware only on a designated spare machine with a recovery path (guide section 5.8); nothing here was run on hardware.</p></div>
+<p><b>Goal (milestone B10, verbatim):</b> "Correct spinlocks (interrupt-safe), mutexes, semaphores, wait queues and condition variables; a lock-order checker." <sup class="src"><a href="#F3-27-src-C1">C1</a></sup></p>
+<p><b>Acceptance tests (verbatim):</b></p>
+<ol>
+<li>"Producer/consumer test with bounded buffer: 10 million items, no loss, no duplicates (single CPU now, re-run after B11 on 4 and 8 CPUs)."</li>
+<li>"The lock-order checker reports a deliberately inverted pair in a test build."</li>
+<li>"Acquiring a mutex inside an interrupt handler is detected and reported as a bug."</li>
+</ol>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F3-27</code>. Check <code>sync.log</code> (exit 1 = pass), <code>prodcons.log</code> and <code>lockorder.log</code> (exit 0), <code>forensic_irqlock.log</code> (exit 3, expected).</li>
+<li>Remove the <code>while</code> loop in <code>get()</code> (make it an <code>if</code>) and run with one producer and four consumers (<code>producer_consumer(kMaxItems, 1, 4)</code>). Does it fail? Explain why or why not on one CPU, and predict what F3-28's 8 CPUs will do.</li>
+<li>Set the adaptive spin count to 0 and compare the tick counts of the <code>sync</code> run. Record both numbers.</li>
+<li>Extend the checker to report a lock acquired while a lock of the same class is held <i>by this CPU</i> (the owner field tells you). Rerun the forensic kernel: what does it print now, and when?</li>
+</ol>
+
+<h2 id="F3-27-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A colleague replaced <code>lock_irqsave()</code> by <code>lock()</code> in a statistics counter, "because the critical section is tiny and <code>cli</code> is slow". The kernel ran fine in their quick test. In the nightly run it stopped printing; two seconds later this appeared.</p>
+<p><b>Evidence 1</b> — serial log (<code>test=irqlock</code>, one CPU):</p>
+<pre class="output" data-run="F3-27/forensic_irqlock"></pre>
+<p><b>Evidence 2</b> — <code>addr2line</code> on the two addresses of the report (the lock call site of the spinning CPU, then the recorded owner's):</p>
+<pre class="output" data-run="F3-27/forensic_addr2line"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>How many CPUs are involved? Which thread runs, and what does "irq depth 1" tell you?</li>
+<li>The thread is "waiting for 'stats', holds: 'stats'". How can one thread both hold and wait for a lock?</li>
+<li>Which two source lines took or tried to take the lock, and in which contexts (thread or interrupt)?</li>
+<li>Why did the colleague's quick test pass? Estimate how often the bug fires from the program's structure.</li>
+<li>Why did the lock-order checker stay silent?</li>
+<li>Give the fix, and a check that would have caught this before any deadlock.</li>
+</ol>
+<p><b>Method hints.</b> Draw Figure 2 for this log. Then ask what the CPU would have to do to release the lock.</p>
+
+<h2 id="F3-27-project">Mini-project</h2>
+<p><b>Interrupt-safety tracking.</b> Extend the checker so it learns, per lock class, two facts: "taken in an interrupt handler" (<code>irq_depth &gt; 0</code>) and "taken with interrupts enabled". As soon as a class has both, print a report naming both call sites, without any deadlock having to happen. (Linux's lockdep tracks this as "IRQ-safe" and "IRQ-unsafe" usage <sup class="src"><a href="#F3-27-src-D5">D5</a></sup>; design yours from the description above, not from its source.)</p>
+<p><b>Rubric (10 points).</b> Both facts recorded per class with call sites (3); the forensic kernel reports the problem within the first second, before the lockup (3); the correct <code>sync</code> run reports nothing (2); a short note on false positives, for example a lock that is only taken with interrupts enabled before any handler is installed (2).</p>
+
+<h2 id="F3-27-summary">Summary</h2>
+<ul>
+<li>A ticket spinlock takes a ticket with an atomic add and enters when <code>serving</code> reaches it: fair, short, never sleeps. Acquire on entry, release on exit.</li>
+<li>Any lock an interrupt handler takes must be taken elsewhere with interrupts disabled (<code>lock_irqsave</code>), or one CPU deadlocks with itself.</li>
+<li>Mutexes, semaphores and condition variables sleep on wait queues; the thread is queued before the protecting lock is released, so no wake-up is lost. Waiters re-check in a loop.</li>
+<li>Adaptive spinning (spin while the owner runs) made the mutex usable under emulated SMP.</li>
+<li>A lock-order checker reports A→B / B→A from a single harmless run; a lockup detector turns real deadlocks into a per-CPU report.</li>
+<li>All three B10 acceptance tests passed on one emulated CPU, at full size; the forensic deadlock was reproduced and located. Nothing was tested on hardware.</li>
+</ul>
+
+<h2 id="F3-27-sources">Sources</h2>
+<ol>
+<li id="F3-27-src-D1">Remzi H. Arpaci-Dusseau and Andrea C. Arpaci-Dusseau, "Operating Systems: Three Easy Pieces" (tier 3; curriculum item 2): "Locks", "Condition Variables", "Semaphores", "Common Concurrency Problems". <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-27-src-D2">Anthony Williams, "C++ Concurrency in Action" (tier 3; named in B10), chapter on the memory model and atomic operations (acquire and release). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-27-src-D3">Paul E. McKenney, "Is Parallel Programming Hard, And, If So, What Can You Do About It?" (tier 3; curriculum item 28; named in B10), locking chapter (ticket and queued locks, interrupt-safe locking, adaptive mutexes). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-27-src-D4">Russ Cox, Frans Kaashoek, Robert Morris, "xv6: a simple, Unix-like teaching operating system" (tier 3; curriculum item 9): "Locking" and "Sleep and wakeup" chapters. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-27-src-D5">The Linux kernel documentation and source (tier 4; curriculum item 40): the lock-validator ("lockdep") design notes. Cited as "what that implementation does". <i>Not opened during this build (dossier gate G1 open).</i></li>
+<li id="F3-27-src-D6">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual" (tier 1; curriculum item 10; named in B10): Vol. 3 "Memory Ordering" and "Locked Atomic Operations"; instruction reference for LOCK, XADD, PAUSE, CLI, STI, RDTSC. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-27-src-C1">C1 — "Systems Curriculum", Track B, milestone B10 (goal, reading list and acceptance tests quoted verbatim) and the topic list naming RCU. A map, not a technical source (AH-4).</li>
+<li id="F3-27-src-R1">R1 — lab run <code>F3-27/build.log</code>: the OS303 kernel built with g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0 and GNU ld 2.42, exit code 0.</li>
+<li id="F3-27-src-R2">R2 — lab run <code>sync.log</code>: the B10 tests in QEMU emulator version 8.2.2 (TCG, one CPU), exit code 1 = pass; sources <code>sync.h</code>, <code>sync.cc</code>, <code>test_sync.cc</code>. Untested on hardware.</li>
+<li id="F3-27-src-R3">R3 — forensic run <code>forensic_irqlock.log</code> (exit code 3, expected) and <code>forensic_addr2line.log</code> (GNU addr2line 2.42). Untested on hardware.</li>
+<li id="F3-27-src-R4">R4 — lab runs <code>prodcons.log</code> and <code>lockorder.log</code>: g++ 13.3.0 with AddressSanitizer and UBSan, exit code 0.</li>
+</ol>
+
+<h2 id="F3-27-glossary">Glossary links</h2>
+<p><a href="#gl-spinlock">Spinlock</a> · <a href="#gl-ticket-lock">Ticket lock</a> · <a href="#gl-irq-safe-lock">IRQ-safe lock</a> · <a href="#gl-preemption-count">Preemption count</a> · <a href="#gl-mutex">Mutex</a> · <a href="#gl-adaptive-spinning">Adaptive spinning</a> · <a href="#gl-semaphore">Semaphore</a> · <a href="#gl-condition-variable">Condition variable</a> · <a href="#gl-wait-queue">Wait queue</a> · <a href="#gl-lost-wake-up">Lost wake-up</a> · <a href="#gl-lock-order-inversion">Lock-order inversion</a> · <a href="#gl-lock-order-checker">Lock-order checker</a> · <a href="#gl-lockup-detector">Lockup detector</a> · <a href="#gl-acquire-and-release">Acquire and release</a> · <a href="#gl-deadlock">Deadlock</a></p>
+
+<h2 id="F3-27-next">Next chapter</h2>
+<p>Next: <a href="#F3-28">F3-28 SMP bring-up and per-CPU data</a>. Previous: <a href="#F3-26">F3-26 Kernel threads and context switching</a>. Back to the course: <a href="#OS303">OS303</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (milestone B10).</p>
+
+<h2 id="F3-27-answers">Answers to Check yourself</h2>
+<ol>
+<li><code>next − serving = 3</code>: one CPU inside (ticket 14) and two waiting (tickets 15 and 16).</li>
+<li>Taking a ticket only needs atomicity: no data is protected yet, so no ordering is needed. The load of <code>serving_</code> that lets a CPU in must be acquire so that its reads of protected data cannot be moved before it (by the compiler or, on weak CPUs, the hardware); it pairs with the release store in <code>unlock</code>.</li>
+<li>Good answers say: the interrupt handler runs on the same CPU as the code it interrupted; if the interrupted code holds the lock, the handler spins, and the holder cannot run until the handler returns. Rule: a lock that a handler takes is taken everywhere else with interrupts disabled.</li>
+<li>A spinlock never sleeps. A mutex may put the caller to sleep, and an interrupt handler has no thread of its own to put to sleep: it borrowed the interrupted thread's stack, so sleeping would block an unrelated thread inside a half-finished handler. The lab reports such a call as a bug.</li>
+<li>A waker could take the guard in the gap, see the mutex free or the waiter missing, and wake nobody; the sleeper then queues itself and sleeps although the event already happened: a lost wake-up.</li>
+<li>If the owner is not running (asleep, preempted, or waiting), it cannot release the mutex soon; spinning only wastes this CPU. Spinning pays only while the owner is making progress on another CPU.</li>
+<li>Legitimate: many objects of one class (two accounts, two inodes) may be locked together in a well-defined order the checker cannot see from names alone, so reporting every same-class nesting would flood the log. Hidden bug: taking the <i>same</i> lock twice (recursion, or an interrupt on the same CPU, as in the forensic case), and ABBA between two objects of one class.</li>
+<li>The handler uses <code>rxq.lock()</code> (interrupts are already off); the thread uses <code>rxq.lock_irqsave()</code>/<code>unlock_irqrestore()</code>. With plain <code>lock()</code> in the thread, a report like Evidence 1: one CPU running the driver thread, irq depth 1, waiting for 'rxq', holding 'rxq'.</li>
+<li>A producer that finished early put its stop markers while other producers were still putting items; a consumer that took a marker stopped, and if all consumers stopped, the remaining items were never consumed (and producers blocked on a full buffer). The last producer to finish knows that every item is already in the buffer before any marker, and FIFO order delivers the markers after them.</li>
+</ol>
+<h3 id="F3-27-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> One CPU (cpu0). It runs thread 'stats_worker' at interrupt depth 1, i.e. inside an interrupt handler that interrupted that thread. It has spun 2000 ms on 'stats'; the last recorded owner is cpu0 itself. <code>addr2line</code>: the spinning call site is in <code>stats_hook()</code>, <code>test_sync.cc:241</code> (the line after <code>stats_lock.lock()</code>: the address is the call's return address); the owner's call site is <code>stats_worker</code>, line 248.</p>
+<p><b>Hypotheses.</b> Another CPU holding the lock: excluded, there is one CPU and the owner is cpu0. A missing unlock in the worker: would show depth 0 and the worker's own call site as the spinner. A same-CPU interrupt re-entry: fits depth 1, owner = spinner's CPU, two different call sites (thread and hook).</p>
+<p><b>Root cause.</b> <code>stats_worker</code> takes <code>stats_lock</code> with plain <code>lock()</code>, so interrupts stay enabled inside the critical section. The timer interrupt arrives on the same CPU, the timer hook <code>stats_hook</code> calls <code>stats_lock.lock()</code> and spins. The owner is the interrupted thread, which can only continue after the handler returns: the CPU waits for itself. The "holds: 'stats'" column is the interrupted thread's held list, shown because the handler runs on that thread's stack.</p>
+<p><b>Why the quick test passed.</b> The bug needs a timer interrupt to land inside the worker's critical section. The worker spends most of its loop inside it (2000 increments under the lock, a few instructions outside), so here it fired within the first second (the log has no "still alive" line); with a truly tiny critical section it fires rarely and randomly, which is worse.</p>
+<p><b>Why the checker stayed silent.</b> Both acquisitions are of the same class 'stats'; the checker skips same-class pairs (Layer 3), and nothing about the order of two different locks is wrong.</p>
+<p><b>Fix.</b> Take <code>stats_lock</code> with <code>lock_irqsave()</code> in the worker, as the correct counter test does (lines 218–220); or make the hook not take a lock at all (a per-CPU counter or an atomic increment).</p>
+<p><b>Prevention.</b> The mini-project's interrupt-safety tracking reports "taken in a handler and taken with interrupts enabled" at the first occurrence, without needing the unlucky timing; the lab step 4 "same lock already held by this CPU" check reports the deadlock immediately instead of after 2 s.</p>

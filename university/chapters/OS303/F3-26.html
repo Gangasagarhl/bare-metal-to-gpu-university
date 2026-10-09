@@ -1,0 +1,382 @@
+<!--meta
+id: F3-26
+title: Kernel threads and context switching
+course: OS303
+level: L3
+prereqs: F3-25; F3-19; F3-21; F2-47; F2-34
+time: 10–14 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with TCG; the kernel boots through QEMU's Multiboot loader)
+maps: Curriculum Track B, milestone B9 (kernel threads, context switching, preemptive scheduler)
+analogy: F3 — the school (students, a teacher who helps one student at a time, and the bell)
+-->
+
+<h2 id="F3-26-hook">Story hook</h2>
+<p>A teacher on homework duty sits with one student at a time. When Amara gets stuck, she closes her notebook, the teacher writes "page 14, line 3" on a bookmark, and moves to Kwame, opens his notebook at his bookmark and carries on exactly where they left off. Each student keeps their own notebook; the teacher only needs the bookmark to pick up the thread.</p>
+<p>The system works well until Lior arrives. Lior never says "I am stuck". He keeps talking, happily, for the whole afternoon, and the teacher never reaches anyone else. The school's fix is simple and slightly rude: every ten minutes a bell rings, and when it rings the teacher puts a bookmark in whatever notebook is open and moves to the next student in the queue, whether the student likes it or not.</p>
+<p>This chapter builds that teacher, those notebooks, those bookmarks and that bell inside the kernel of OS302: kernel threads with their own stacks, a context switch of fourteen instructions, a run queue, an idle thread, and preemption driven by the local APIC timer of <a href="#F3-25">F3-25</a>.</p>
+
+<h2 id="F3-26-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what a kernel thread is made of (a control block, a kernel stack, saved registers) and why only the callee-saved registers need saving in a voluntary switch.</li>
+<li><b>Write</b> a context switch in a few lines of assembly and build the first stack frame of a thread that has never run.</li>
+<li><b>Build</b> a run queue, an idle thread that halts the CPU, sleep and wake on timer ticks, and round-robin preemption from the timer interrupt.</li>
+<li><b>Place</b> every kernel stack in its own slot with an unmapped guard page, and free a dead thread's stack safely (never on that stack).</li>
+<li><b>Prove</b> the three B9 acceptance tests in QEMU: fairness for 100 threads, preemption of an infinite loop, and 100,000 create/exit cycles with no leak.</li>
+<li><b>Diagnose</b> a kernel stack overflow from a double-fault dump, CR2 and <code>addr2line</code>.</li>
+</ul>
+
+<div class="co jargon" id="F3-26-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Kernel thread</dt><dd><b>Simple words:</b> a piece of kernel work that can be paused and resumed, with its own place to keep its unfinished business. <b>Analogy:</b> a student with a notebook. <b>Precise:</b> an independently scheduled flow of execution in kernel mode, made of a control block (here <code>struct Thread</code>) and a private kernel stack; while it is not running, its register state is saved on that stack. <sup class="src"><a href="#F3-26-src-D3">D3</a></sup> <sup class="src"><a href="#F3-26-src-R2">R2</a></sup></dd>
+<dt>Kernel stack</dt><dd><b>Simple words:</b> the scratch memory a thread uses for function calls inside the kernel. <b>Analogy:</b> the student's own notebook. <b>Precise:</b> a region of kernel memory used as the call stack while the thread runs in ring 0; in this kernel 16 KiB (four 4 KiB pages) per thread, mapped in a slot of the stack area that starts at 4 GiB. <sup class="src"><a href="#F3-26-src-R2">R2</a></sup></dd>
+<dt>Guard page</dt><dd><b>Simple words:</b> an empty, unmapped page placed just below a stack so that running off the end crashes loudly instead of silently overwriting something. <b>Analogy:</b> a sheet in the notebook that tears if you write on it. <b>Precise:</b> a page of virtual addresses with no translation; any access raises a page fault, so a stack overflow is detected at its first byte. <sup class="src"><a href="#F3-26-src-D1">D1</a></sup> <sup class="src"><a href="#F3-26-src-R3">R3</a></sup></dd>
+<dt>Context switch</dt><dd><b>Simple words:</b> stopping one thread and starting another on the same CPU. <b>Analogy:</b> bookmark one notebook, open the next at its bookmark. <b>Precise:</b> saving the register state of the running thread and loading the saved state of another; in this kernel, pushing the callee-saved registers, swapping the stack pointer and popping them (<code>switch.S</code>). <sup class="src"><a href="#F3-26-src-D2">D2</a></sup></dd>
+<dt>Callee-saved register</dt><dd><b>Simple words:</b> a register that a function promises to give back unchanged. <b>Analogy:</b> the pages you must leave as you found them. <b>Precise:</b> in the System V AMD64 ABI, RBX, RBP, R12–R15 (and RSP) must be preserved across a call; the caller cannot assume anything about the others. <sup class="src"><a href="#F3-26-src-D2">D2</a></sup></dd>
+<dt>Run queue</dt><dd><b>Simple words:</b> the line of threads that are ready to run and waiting for a CPU. <b>Analogy:</b> the queue of students waiting for the teacher. <b>Precise:</b> a data structure holding the threads in state Ready; here one global FIFO list protected by one spinlock. <sup class="src"><a href="#F3-26-src-D3">D3</a></sup></dd>
+<dt>Idle thread</dt><dd><b>Simple words:</b> the thread a CPU runs when nobody else is ready; it sleeps until something happens. <b>Analogy:</b> the teacher marking papers until a hand goes up. <b>Precise:</b> a per-CPU thread that never blocks, which loops on "look for work, then <code>sti; hlt</code>"; it is never put in the run queue. <sup class="src"><a href="#F3-26-src-D1">D1</a></sup></dd>
+<dt>Preemption</dt><dd><b>Simple words:</b> taking the CPU away from a thread that did not offer it. <b>Analogy:</b> the bell. <b>Precise:</b> a switch forced from outside the running code, here at the end of the timer interrupt handler, when the thread's time slice is used up and no spinlock is held. <sup class="src"><a href="#F3-26-src-D3">D3</a></sup></dd>
+<dt>Time slice (quantum)</dt><dd><b>Simple words:</b> how long a thread may run before the next one gets a turn. <b>Analogy:</b> ten minutes between bells. <b>Precise:</b> in this kernel one timer tick, 10 ms of the calibrated APIC timer at 100 Hz (<code>kTickHz</code>, <code>kQuantumTicks</code>). <sup class="src"><a href="#F3-26-src-R2">R2</a></sup></dd>
+<dt>Interrupt stack table (IST)</dt><dd><b>Simple words:</b> a list of spare stacks the CPU can switch to for chosen interrupts, even in kernel mode. <b>Analogy:</b> an emergency notebook kept in the teacher's drawer. <b>Precise:</b> seven stack pointers in the 64-bit TSS; an IDT gate with a non-zero IST index makes the CPU load that stack before pushing the interrupt frame. <sup class="src"><a href="#F3-26-src-D1">D1</a></sup></dd>
+<dt>Double fault</dt><dd><b>Simple words:</b> the CPU's "I failed to report a fault" fault. <b>Analogy:</b> the fire alarm going off while you were calling about the first fire. <b>Precise:</b> exception 8, raised when the CPU cannot deliver certain exceptions (here: a page fault whose frame cannot be pushed because the stack itself is unmapped). <sup class="src"><a href="#F3-26-src-D1">D1</a></sup></dd>
+<dt>Zombie (thread)</dt><dd><b>Simple words:</b> a finished thread whose memory has not been cleaned up yet. <b>Analogy:</b> a student who has gone home but whose notebook is still on the desk. <b>Precise:</b> a thread in state Dead that is still on the <code>zombies</code> list; its stack can be freed only by another thread, because a thread cannot free the stack it is running on. <sup class="src"><a href="#F3-26-src-R2">R2</a></sup></dd>
+</dl></div>
+<p>"Thread" here is a CPU thread in the operating-system kernel. GPU threads (F6) are a different thing with the same name, and "kernel" here means the operating-system kernel, not a GPU kernel.</p>
+
+<h2 id="F3-26-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the memory of two threads and the moment of a switch. Figure 2 shows the four states a thread moves through and which code moves it.</p>
+<figure id="F3-26-fig1"><div class="svgbox">
+<svg viewBox="0 0 900 400" role="img" aria-labelledby="F3-26-f1t F3-26-f1d">
+<title id="F3-26-f1t">Figure 1: two kernel stacks with guard pages, and switch_context</title>
+<desc id="F3-26-f1d">The stack area starts at virtual address 0x1_0000_0000 (4 GiB) and is divided into slots of five pages. In each slot the lowest page is the guard page, never mapped, and the four pages above it are the 16 KiB kernel stack, which grows downwards from the slot's top. Thread A (left) is about to switch: its stack holds, from the top down, its own call frames, then the return address into schedule_locked, then the six saved registers RBP, RBX, R12, R13, R14, R15; its control block stores the resulting stack pointer in Thread::rsp. Thread B (right) was switched out earlier the same way; its Thread::rsp points at its saved R15. switch_context pushes A's six registers, stores RSP into A's rsp field, loads B's rsp into RSP, pops B's six registers in reverse order and executes ret, which continues B where it called switch_context. A thread that never ran has a hand-made frame whose return address is thread_start and whose R12 and R13 hold the entry function and its argument.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="400"/>
+<text class="sv-tb" x="40" y="28">slot of thread A</text>
+<text class="sv-tb" x="620" y="28">slot of thread B</text>
+<rect class="sv-box" x="40" y="40" width="230" height="40"/><text class="sv-ts" x="50" y="64">call frames of A (top of slot)</text>
+<rect class="sv-b3" x="40" y="80" width="230" height="30"/><text class="sv-ts" x="50" y="100">return address (into schedule)</text>
+<rect class="sv-b2" x="40" y="110" width="230" height="120"/><text class="sv-ts" x="50" y="132">saved RBP</text><text class="sv-ts" x="50" y="150">saved RBX</text><text class="sv-ts" x="50" y="168">saved R12</text><text class="sv-ts" x="50" y="186">saved R13</text><text class="sv-ts" x="50" y="204">saved R14</text><text class="sv-ts" x="50" y="222">saved R15  ← A.rsp</text>
+<rect class="sv-box" x="40" y="230" width="230" height="70"/><text class="sv-ts" x="50" y="262">free part of A's 16 KiB stack</text><text class="sv-ts" x="50" y="282">(grows downwards)</text>
+<rect class="sv-b8" x="40" y="300" width="230" height="40"/><text class="sv-tb" x="50" y="325">guard page: unmapped</text>
+<rect class="sv-box" x="620" y="40" width="230" height="40"/><text class="sv-ts" x="630" y="64">call frames of B</text>
+<rect class="sv-b3" x="620" y="80" width="230" height="30"/><text class="sv-ts" x="630" y="100">return address</text>
+<rect class="sv-b2" x="620" y="110" width="230" height="120"/><text class="sv-ts" x="630" y="132">saved RBP … R14</text><text class="sv-ts" x="630" y="222">saved R15  ← B.rsp</text>
+<rect class="sv-box" x="620" y="230" width="230" height="70"/><text class="sv-ts" x="630" y="262">free part of B's stack</text>
+<rect class="sv-b8" x="620" y="300" width="230" height="40"/><text class="sv-tb" x="630" y="325">guard page: unmapped</text>
+<rect class="sv-b5" x="330" y="120" width="230" height="150" rx="6"/>
+<text class="sv-tb" x="345" y="144">switch_context(&amp;A.rsp, B.rsp)</text>
+<text class="sv-ts" x="345" y="168">1. push RBP, RBX, R12–R15 (A)</text>
+<text class="sv-ts" x="345" y="188">2. A.rsp = RSP</text>
+<text class="sv-ts" x="345" y="208">3. RSP = B.rsp</text>
+<text class="sv-ts" x="345" y="228">4. pop R15 … RBP (B)</text>
+<text class="sv-ts" x="345" y="248">5. ret: B continues</text>
+<line class="sv-line" x1="270" y1="190" x2="324" y2="190"/><polygon class="sv-head" points="330,190 320,184 320,196"/>
+<line class="sv-line" x1="560" y1="190" x2="614" y2="190"/><polygon class="sv-head" points="620,190 610,184 610,196"/>
+<text class="sv-ts" x="40" y="370">Not to scale. Slot s starts at 0x1_0000_0000 + s × 5 × 4 KiB; addresses grow upwards in this drawing.</text>
+</svg></div><figcaption><b>Figure 1.</b> Each thread owns a slot of five pages: one unmapped guard page and a 16 KiB stack. A switch saves six callee-saved registers on the old stack, swaps the stack pointer and restores six registers from the new stack. Arrows show the direction of the switch (control flow). Layout from the lab's <code>thread.cc</code> <sup class="src"><a href="#F3-26-src-R2">R2</a></sup>; the register list from the psABI <sup class="src"><a href="#F3-26-src-D2">D2</a></sup>.</figcaption></figure>
+
+<figure id="F3-26-fig2"><div class="svgbox">
+<svg viewBox="0 0 900 300" role="img" aria-labelledby="F3-26-f2t F3-26-f2d">
+<title id="F3-26-f2t">Figure 2: thread states and the code that changes them</title>
+<desc id="F3-26-f2d">Four states in a row: Ready, Running, Blocked, Dead. thread_create puts a new thread into Ready. schedule picks the first Ready thread allowed on this CPU and makes it Running. From Running: the timer tick or thread_yield sends it back to Ready (the back of the run queue); thread_sleep_ticks or WaitQueue::sleep make it Blocked; thread_exit makes it Dead. From Blocked: the timer (when the wake tick is reached) or WaitQueue::wake_one make it Ready again. From Dead: thread_reap_zombies, run later by another thread, frees its stack slot and control block.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="300"/>
+<rect class="sv-b4" x="40" y="110" width="150" height="60" rx="8"/><text class="sv-tb" x="85" y="146">Ready</text>
+<rect class="sv-b3" x="280" y="110" width="150" height="60" rx="8"/><text class="sv-tb" x="315" y="146">Running</text>
+<rect class="sv-b6" x="520" y="110" width="150" height="60" rx="8"/><text class="sv-tb" x="560" y="146">Blocked</text>
+<rect class="sv-b8" x="740" y="110" width="130" height="60" rx="8"/><text class="sv-tb" x="785" y="146">Dead</text>
+<line class="sv-line" x1="115" y1="40" x2="115" y2="104"/><polygon class="sv-head" points="115,110 109,100 121,100"/><text class="sv-ts" x="125" y="50">thread_create</text>
+<line class="sv-line" x1="190" y1="125" x2="274" y2="125"/><polygon class="sv-head" points="280,125 270,119 270,131"/><text class="sv-ts" x="196" y="117">schedule</text>
+<line class="sv-line" x1="280" y1="158" x2="196" y2="158"/><polygon class="sv-head" points="190,158 200,152 200,164"/><text class="sv-ts" x="196" y="184">tick / yield</text>
+<line class="sv-line" x1="430" y1="125" x2="514" y2="125"/><polygon class="sv-head" points="520,125 510,119 510,131"/><text class="sv-ts" x="436" y="117">sleep</text>
+<path class="sv-line" d="M595 170 Q595 250 115 250 L115 176"/><polygon class="sv-head" points="115,170 109,180 121,180"/><text class="sv-ts" x="300" y="270">wake (timer reached wake_tick, or wake_one)</text>
+<path class="sv-line" d="M355 110 Q355 70 805 70 L805 104"/><polygon class="sv-head" points="805,110 799,100 811,100"/><text class="sv-ts" x="560" y="62">thread_exit</text>
+<text class="sv-ts" x="740" y="196">freed later by</text><text class="sv-ts" x="740" y="212">thread_reap_zombies</text>
+</svg></div><figcaption><b>Figure 2.</b> Thread states in the lab kernel and the functions that move a thread between them (control flow). A Dead thread is still in memory until another thread reaps it. From <code>thread.cc</code> <sup class="src"><a href="#F3-26-src-R2">R2</a></sup>; the state model follows OSTEP's process states <sup class="src"><a href="#F3-26-src-D3">D3</a></sup>.</figcaption></figure>
+
+<h2 id="F3-26-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>One teacher, many students, each with a notebook. To switch, the teacher bookmarks the open notebook and opens the next one at its bookmark. Students who are stuck put up their hand and wait (blocked); students who are ready queue up (ready). A bell every ten minutes makes sure a chatterbox cannot keep the teacher forever. When nobody needs help, the teacher rests until a hand goes up.</p></div>
+<p>A computer's processor can only follow one list of instructions at a time. To do many jobs "at once", the kernel lets each job run for a short while, then saves exactly where it was and lets the next one run. It saves so carefully that each job never notices it was paused.</p>
+
+<h2 id="F3-26-layer2">Layer 2 — the student explanation</h2>
+<p>The kernel of OS302 runs one flow of code from <code>kmain</code> to the end. A <b>kernel thread</b> lets it run several. Each thread is a <code>struct Thread</code> (its name, its state, the saved stack pointer, links into lists) plus a private <b>kernel stack</b>. While a thread is not running, everything it needs to continue is on that stack.</p>
+<p><b>The switch.</b> Switching from thread A to thread B happens inside a normal C++ function call: <code>switch_context(&amp;A-&gt;rsp, B-&gt;rsp)</code>. The ABI already says which registers a callee must preserve: RBX, RBP and R12–R15 (plus RSP) <sup class="src"><a href="#F3-26-src-D2">D2</a></sup>. The compiler assumes every other register may be destroyed by any call, so it has already saved whatever it needed. <code>switch_context</code> therefore pushes only those six registers, stores RSP into A's control block, loads B's saved RSP, pops B's six registers and returns. The return lands in B's copy of the code that called <code>switch_context</code> some time ago. That is the whole trick: a switch is a function call that returns into a different thread.</p>
+<p><b>The first switch into a new thread.</b> A thread that has never run did not call <code>switch_context</code>, so <code>thread_alloc</code> builds by hand the frame that a call would have left: six register slots (with the entry function in R12 and its argument in R13) and a return address pointing at <code>thread_start</code>. The first switch into it pops those values and "returns" into <code>thread_start</code>, which enables interrupts and calls the entry function. If the function returns, <code>thread_start</code> calls <code>thread_exit</code>.</p>
+<p><b>The run queue and the policy.</b> Ready threads wait in a first-in, first-out list. <code>schedule()</code> takes the current thread, puts it at the back of the list if it is still runnable, takes the first thread from the front and switches to it. That is <b>round robin</b> <sup class="src"><a href="#F3-26-src-D3">D3</a></sup>. If nobody is ready, the CPU runs its <b>idle thread</b>, which executes <code>sti; hlt</code>: enable interrupts and halt until the next one.</p>
+<p><b>Preemption.</b> If threads called <code>thread_yield()</code> politely, that would be enough (cooperative scheduling). The B9 tests contain a thread in an infinite loop that never yields. So the timer interrupt of F3-25 now ends with a decision: when the running thread has used its time slice (one 10 ms tick here), the handler sets <code>need_resched</code>, and after the interrupt work is done, <code>trap_dispatch</code> calls <code>schedule()</code>. The interrupted thread's registers are already saved in the trap frame on its stack, so switching away from inside the handler is safe: when the thread is switched back in, it finishes the handler and returns from the interrupt as if nothing had happened. Listing 7, a host model, shows the difference in numbers: with cooperative scheduling one spinner keeps the CPU for all 40 slices; with a quantum of 2 the other two jobs finish at slices 8 and 16 <sup class="src"><a href="#F3-26-src-R4">R4</a></sup>.</p>
+<p><b>Sleeping.</b> <code>thread_sleep_ticks(n)</code> records a wake tick, marks the thread Blocked, puts it on a sleep list and switches away. CPU 0's timer handler moves every sleeper whose time has come back to the run queue. Blocked threads use no CPU time.</p>
+<p><b>Ending.</b> <code>thread_exit()</code> marks the thread Dead and switches away for the last time. It cannot free its own stack: it is standing on it. The scheduler puts it on a <b>zombie</b> list, and <code>thread_reap_zombies()</code>, called later by some other thread, unmaps the stack pages, returns the frames and frees the control block.</p>
+
+<h2 id="F3-26-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-26-l3-lock">The scheduler lock is handed across the switch</h3>
+<p>The run queue is shared by every CPU (from F3-28 on), so it is protected by one spinlock, <code>g_sched</code>. The delicate moment is the switch itself. Thread A puts itself on the run queue and then switches away. If A released the lock before switching, another CPU could take A from the queue and start running it while A's registers are still being pushed onto A's stack: two CPUs on one stack. The lab kernel therefore keeps the lock held through <code>switch_context</code> and lets the thread that switches <i>in</i> release it: either in <code>finish_switch()</code> right after <code>switch_context</code> returns (<code>thread.cc</code> line 152), or in <code>thread_start</code>/<code>idle_loop</code> for a thread's first run. xv6 uses the same handover in its scheduler <sup class="src"><a href="#F3-26-src-D4">D4</a></sup>. For this reason <code>g_sched</code> is excluded from the lock-order checker of F3-27: it is acquired by one thread and released by another, which the checker cannot model.</p>
+<h3 id="F3-26-l3-safe">Where preemption is allowed</h3>
+<p>Preemption happens only at the end of <code>trap_dispatch</code> and only if three conditions hold (<code>trap.cc</code> lines 113–116): a reschedule was requested, this CPU holds no spinlock (<code>preempt_count == 0</code>), and it is not nested inside another interrupt handler (<code>irq_depth == 0</code>). Switching away while holding a spinlock would leave other CPUs spinning until the holder is scheduled again; switching inside a nested handler would leave the outer handler half done. Every <code>Spinlock::lock()</code> increments <code>preempt_count</code> and every <code>unlock()</code> decrements it, so the rule costs one counter. Linux uses the same idea under the same name <sup class="src"><a href="#F3-26-src-D6">D6</a></sup>.</p>
+<h3 id="F3-26-l3-idle">The idle thread and the lost-wake-up window</h3>
+<p>The idle loop disables interrupts, calls <code>schedule()</code> to run anything that is ready, then executes <code>sti; hlt</code>. The pair matters. If the code enabled interrupts, checked "anything ready?", and then halted, an interrupt arriving between the check and the halt could make a thread ready and the CPU would still go to sleep until the next tick. The x86 <code>sti</code> instruction delays interrupt delivery until after the following instruction, so <code>sti; hlt</code> enters the halt with no window <sup class="src"><a href="#F3-26-src-D1">D1</a></sup>. That property is register-level behaviour from memory: see the unverified box in the hardware section.</p>
+<h3 id="F3-26-l3-stacks">Stack slots and guard pages</h3>
+<p>Kernel stacks do not come from the heap of F3-22. They live in a dedicated stack area starting at 4 GiB (above the identity map of the first 4 GiB). Slot <i>s</i> covers five pages starting at <code>0x1_0000_0000 + s × 0x5000</code>: the lowest page is never mapped (the guard page), and the four pages above it are mapped to freshly allocated frames when the thread is created (<code>thread_alloc</code>, lines 88–92). A thread that writes below its stack touches the guard page and faults immediately, instead of overwriting another thread's stack or a heap object. Freeing a stack unmaps the four pages and then calls <code>tlb_shootdown()</code> (F3-28), so that no CPU keeps a cached translation to frames that are about to be reused.</p>
+<h3 id="F3-26-l3-overflow">What a stack overflow looks like</h3>
+<p>A page fault in kernel mode does not switch stacks: the CPU pushes its exception frame onto the current stack. If the current stack pointer is already inside the guard page, that push faults too. The CPU gives up on the page fault and raises a <b>double fault</b>. If the double fault also used the broken stack, the third fault would reset the machine (a triple fault, F3-19). So <code>idt_init</code> marks vector 8 to use IST1, a 4 KiB emergency stack per CPU (<code>cpu.cc</code> line 36). The forensic lab of this chapter is exactly this sequence, recorded.</p>
+<h3 id="F3-26-l3-reap">Reaping, leaks and the 100,000-cycle test</h3>
+<p>The third B9 test creates and finishes 100,000 threads and requires frames, heap objects, stack slots and the thread count to return to the baseline <sup class="src"><a href="#F3-26-src-C1">C1</a></sup>. Two details made it pass. First, a warm-up of 100 threads runs before the baseline is taken: the stack area's own page tables are created on first use and never freed, which is fine, but they must exist before the baseline. Second, zombies are reaped in <code>thread_create</code> and in the test's snapshot, never with interrupts disabled, because freeing a stack calls a TLB shootdown that waits for other CPUs to answer an interrupt (F3-28).</p>
+<h3 id="F3-26-l3-limits">What this scheduler deliberately leaves out</h3>
+<ul>
+<li><b>Priorities.</b> B9 says "a simple round-robin policy, then priorities" <sup class="src"><a href="#F3-26-src-C1">C1</a></sup>. This chapter stops at round robin; priorities are the mini-project.</li>
+<li><b>Floating-point and SIMD state.</b> The kernel is compiled with <code>-mgeneral-regs-only</code>, and user programs in F3-29 and F3-30 are too, so no thread ever has SSE or x87 state to save. A real kernel must save it (FXSAVE/XSAVE) on switches between user threads <sup class="src"><a href="#F3-26-src-D1">D1</a></sup>.</li>
+<li><b>One global run queue.</b> Per-CPU queues with work stealing come later (B11 allows "a global queue first").</li>
+<li><b>No higher-half kernel.</b> OS302 linked its kernel at the top of the address space. The OS303 teaching kernel is a fresh, smaller kernel loaded at 1 MiB and identity-mapped, so that one build serves all five chapters; the ideas are unchanged.</li>
+</ul>
+
+<h2 id="F3-26-hardware">How the hardware actually does it</h2>
+<p>Three pieces of hardware behaviour carry the whole chapter. <b>The interrupt frame:</b> when an interrupt arrives in 64-bit mode the CPU pushes SS, RSP, RFLAGS, CS and RIP (plus an error code for some exceptions) and jumps through the IDT; through an interrupt gate it also clears RFLAGS.IF, so the handler starts with interrupts disabled <sup class="src"><a href="#F3-26-src-D1">D1</a></sup>. <code>trap.S</code> pushes the general registers on top, which forms the <code>TrapFrame</code> of <code>cpu.h</code>. <b>The timer:</b> the local APIC timer of F3-25, calibrated here against PIT channel 2, interrupts each CPU 100 times per (guest) second on vector 32 <sup class="src"><a href="#F3-26-src-R2">R2</a></sup>. <b>The halt:</b> <code>hlt</code> stops the CPU until the next interrupt.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Written from memory and not checked against the Intel SDM or AMD64 APM in this build: the 64-bit interrupt frame layout (SS, RSP, RFLAGS, CS, RIP, error code); interrupt gates clearing IF; vector 8 = double fault and the "contributory/page fault" rules that turn a fault during delivery into a double fault; the TSS layout with IST1–IST7 at the offsets in <code>cpu.h</code>; the IDT gate type 0x8E; the one-instruction interrupt shadow after <code>sti</code>; the PIT input clock of 1 193 182 Hz and port numbers 0x42, 0x43, 0x61 in <code>lapic.cc</code>; the Multiboot v1 magic numbers in <code>boot.S</code>; that a local APIC keeps at most one pending interrupt per vector, so missed timer ticks are not delivered one by one. The QEMU runs prove that these values work on QEMU 8.2.2's TCG model of a PC, and nothing more. The Source Researcher must confirm each against the SDM Vol. 3 ("Interrupt and Exception Handling", "Task Management", "Instruction Set Reference" for STI/HLT), the 8254 PIT datasheet and the Multiboot Specification (D1, D7, D8).</p></div>
+<div class="co note"><span class="lbl">Note</span><p>Untested on hardware: every run in this chapter is QEMU 8.2.2 in TCG mode (software emulation) in the build container, which has no KVM. The "seconds" of the tests are guest timer ticks, not wall-clock seconds: under TCG, guest time and host time drift apart, which is why fairness is measured in ticks.</p></div>
+
+<h2 id="F3-26-worked">Worked example</h2>
+<p><b>Building the first frame of a thread in slot 1.</b> The forensic run below crashed in a thread whose stack slot was 1, so take that slot. Slot 1 starts at <code>0x1_0000_0000 + 1 × 5 × 0x1000 = 0x1_0000_5000</code>. The guard page is <code>0x1_0000_5000</code>–<code>0x1_0000_5fff</code>; the stack pages are <code>0x1_0000_6000</code>–<code>0x1_0000_9fff</code>; <code>kstack_top = 0x1_0000_a000</code>. The crash dump of the forensic run prints exactly these ranges <sup class="src"><a href="#F3-26-src-R3">R3</a></sup>.</p>
+<p><code>thread_alloc</code> then writes seven 8-byte words downwards from the top:</p>
+<div class="tw"><table>
+<thead><tr><th>Address</th><th>Value</th><th>Popped by switch_context as</th></tr></thead>
+<tbody>
+<tr><td>0x1_0000_9ff8</td><td>address of <code>thread_start</code></td><td>return address of <code>ret</code></td></tr>
+<tr><td>0x1_0000_9ff0</td><td>0</td><td>RBP</td></tr>
+<tr><td>0x1_0000_9fe8</td><td>0</td><td>RBX</td></tr>
+<tr><td>0x1_0000_9fe0</td><td>entry function <code>fn</code></td><td>R12</td></tr>
+<tr><td>0x1_0000_9fd8</td><td>argument <code>arg</code></td><td>R13</td></tr>
+<tr><td>0x1_0000_9fd0</td><td>0</td><td>R14</td></tr>
+<tr><td>0x1_0000_9fc8</td><td>0</td><td>R15 ← <code>t-&gt;rsp</code></td></tr>
+</tbody></table></div>
+<p>The first <code>switch_context</code> into this thread loads RSP = <code>0x1_0000_9fc8</code>, pops R15, R14, R13, R12, RBX, RBP (RSP is now <code>0x1_0000_9ff8</code>), and <code>ret</code> pops <code>thread_start</code> into RIP, leaving RSP = <code>0x1_0000_a000</code>, the very top. <code>thread_start</code> calls <code>finish_switch</code> (the scheduler lock is released), enables interrupts, moves R13 into RDI (the first argument register) and calls R12. One detail: the ABI wants RSP to be a multiple of 16 plus 8 at function entry (right after a call pushed its return address); <code>thread_start</code> is entered by <code>ret</code> with RSP a multiple of 16, and its <code>call</code> pushes 8 bytes, so <code>fn</code> starts correctly aligned <sup class="src"><a href="#F3-26-src-D2">D2</a></sup>. Notice also that RSI in the crash dump of the forensic run is <code>0x1_0000_9fc8</code>: the value <code>switch_context</code> received as the new thread's stack pointer when the crashing thread was first switched in.</p>
+<p><b>The fairness bound.</b> The B9 test leaves the choice of bound to the student <sup class="src"><a href="#F3-26-src-C1">C1</a></sup>. With 100 threads and a 10 ms quantum, each thread gets one slice per round of 100 ticks, so in about 500 ticks each thread gets about five slices; one extra or one missing slice is a 20 % difference. The bound "every counter non-zero and max/min ≤ 2" allows for that and for slices that are cut short by interrupts, while still failing a scheduler that starves anybody. In this build the measured ratio was well inside it (Listing 6 output) <sup class="src"><a href="#F3-26-src-R2">R2</a></sup>.</p>
+
+<h2 id="F3-26-code">Code walk-through</h2>
+<p>The OS303 teaching kernel is one program built from the five lab folders <code>F3-26</code> … <code>F3-30</code>; each chapter adds its folder. <code>F3-26/build_kernel.sh</code> compiles all of them, so the kernel booted in this chapter already contains the code of later chapters, which simply stays unused by the thread tests. Files of this folder not shown in full: <code>boot.S</code> (Multiboot entry, 4 GiB identity map with 2 MiB pages, long mode), <code>kernel.ld</code>, <code>kbase.h</code> (MSR, CR and port helpers, <code>kprintf</code>), <code>console.cc</code> (COM1 output with a lock and a panic mode), <code>mem.cc</code> (frame allocator, <code>kmap_page</code>, a small heap, the Multiboot memory map and modules), <code>lapic.cc</code>, <code>cpu.cc</code>, <code>trap.S</code> and <code>main.cc</code>. They follow OS302's chapters closely.</p>
+
+<p><b>Listing 1</b> — <code>thread.h</code></p>
+<pre class="listing" data-src="F3-26/thread.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–31</td><td><code>struct Thread</code></td><td>The control block. <code>rsp</code> must be the first field.</td><td><code>switch.S</code> stores and loads it at offset 0 through a pointer to the field.</td></tr>
+<tr><td>18–19</td><td><code>next</code>, <code>all_next</code></td><td>Intrusive links: one for whichever queue the thread is in, one for the list of all threads.</td><td>No allocation is needed to queue a thread, which matters inside interrupt handlers.</td></tr>
+<tr><td>27–28</td><td><code>held</code>, <code>nheld</code></td><td>Lock classes held by this thread.</td><td>Used by the lock-order checker of F3-27 and printed in lockup reports.</td></tr>
+<tr><td>33–35</td><td>constants</td><td>16 KiB stacks, 100 Hz tick, one-tick quantum.</td><td>Change <code>kQuantumTicks</code> to experiment with slice length.</td></tr>
+<tr><td>52–57</td><td>internals</td><td><code>schedule</code>, <code>sched_timer_tick</code>, <code>finish_switch</code>, <code>switch_context</code>.</td><td>The interface the timer, wait queues and processes use.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>switch.S</code></p>
+<pre class="listing" data-src="F3-26/switch.S"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–17</td><td>six <code>pushq</code></td><td>Saves the callee-saved registers on the old stack.</td><td>The only registers the caller expects to survive the call <sup class="src"><a href="#F3-26-src-D2">D2</a></sup>.</td></tr>
+<tr><td>18</td><td><code>movq %rsp, (%rdi)</code></td><td>Stores the old stack pointer into <code>old-&gt;rsp</code>.</td><td>The bookmark.</td></tr>
+<tr><td>19</td><td><code>movq %rsi, %rsp</code></td><td>Loads the new thread's stack pointer.</td><td>From this instruction on, the CPU runs the new thread.</td></tr>
+<tr><td>20–26</td><td>six <code>popq</code>, <code>ret</code></td><td>Restores the new thread's registers in reverse order and returns into it.</td><td>The return address on the new stack decides where execution continues.</td></tr>
+<tr><td>31–38</td><td><code>thread_start</code></td><td>Releases the scheduler lock, enables interrupts, calls <code>fn(arg)</code>, then exits.</td><td>First code of every new thread.</td></tr>
+<tr><td>42–43</td><td><code>idle_entry</code></td><td>First code of CPU 0's idle thread.</td><td>CPU 0's idle thread is created, the others are made from their start-up code (F3-28).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>thread.cc</code></p>
+<pre class="listing" data-src="F3-26/thread.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–22</td><td>globals</td><td>Scheduler lock, run queue, sleep list, zombie list, list of all threads, tick counter.</td><td>All protected by <code>g_sched</code> except the atomics.</td></tr>
+<tr><td>31–56</td><td><code>rq_push</code>, <code>rq_pop_for</code></td><td>FIFO queue; the pop skips threads pinned to another CPU.</td><td>Round robin; pinning is needed by the shootdown test of F3-28.</td></tr>
+<tr><td>58–74</td><td>slots</td><td>A bitmap of stack slots and the slot's base address.</td><td>Slots are reused, so the stack area stays small.</td></tr>
+<tr><td>88–92</td><td>map pages 1–4</td><td>Page 0 of the slot is the guard page and is never mapped.</td><td>Stack overflows fault at once (forensic lab).</td></tr>
+<tr><td>93–103</td><td>first frame</td><td>Builds the seven words of the worked example.</td><td>A new thread is "returned into" like any other.</td></tr>
+<tr><td>114–153</td><td><code>schedule_locked</code></td><td>Requeues or buries the current thread, picks the next, loads its CR3 and stack pointers, switches.</td><td>Called with <code>g_sched</code> held; the next thread releases it.</td></tr>
+<tr><td>145–146</td><td><code>kernel_rsp</code>, <code>tss.rsp0</code></td><td>Records the new thread's stack top for entries from ring 3.</td><td>Used from F3-29 on: a system call or interrupt from user mode lands on this stack.</td></tr>
+<tr><td>188–195</td><td><code>idle_forever</code></td><td>Schedule, then <code>sti; hlt</code>.</td><td>No lost wake-up between the check and the halt.</td></tr>
+<tr><td>214–226</td><td><code>sched_make_ready</code></td><td>Queues a thread and sends a reschedule IPI to one idle CPU.</td><td>On one CPU the loop finds nobody; it matters from F3-28.</td></tr>
+<tr><td>249–260</td><td><code>thread_sleep_ticks</code></td><td>Blocked on the sleep list until the wake tick.</td><td>The test's "5 seconds" and the producer/consumer watchdog.</td></tr>
+<tr><td>280–301</td><td><code>sched_timer_tick</code></td><td>CPU 0 wakes sleepers; every CPU counts its slice and requests a reschedule.</td><td>Requests only: the switch happens at the end of <code>trap_dispatch</code>.</td></tr>
+<tr><td>303–337</td><td><code>thread_reap_zombies</code></td><td>Unmaps and frees dead threads' stacks, with a TLB shootdown.</td><td>Never called with interrupts off (line 305).</td></tr>
+<tr><td>340–379</td><td><code>WaitQueue</code></td><td>Sleep and wake for F3-27's mutexes, semaphores and condition variables.</td><td>Line 352 releases the caller's lock only after the thread is queued.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>trap.cc</code> (the preemption point and the crash dump)</p>
+<pre class="listing" data-src="F3-26/trap.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>28–63</td><td><code>kernel_crash</code></td><td>Prints the trap frame, CR2, the thread's stack range and a frame-pointer backtrace.</td><td>The evidence pack of every forensic lab in this course.</td></tr>
+<tr><td>55–61</td><td>backtrace loop</td><td>Follows saved RBP values while they stay inside the thread's stack.</td><td>Works because the kernel is built with <code>-fno-omit-frame-pointer</code>.</td></tr>
+<tr><td>91–97</td><td>timer</td><td>EOI, tick, optional test hook.</td><td>The hook is used by F3-27's tests.</td></tr>
+<tr><td>113–116</td><td>preemption</td><td>Switch only with no spinlock held and no nested handler.</td><td>The three conditions of Layer 3.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 5</b> — the lab scripts: <code>build_kernel.sh</code>, <code>labtools.sh</code>, <code>run.sh</code></p>
+<pre class="listing" data-src="F3-26/build_kernel.sh"></pre>
+<pre class="listing" data-src="F3-26/labtools.sh"></pre>
+<pre class="listing" data-src="F3-26/run.sh"></pre>
+<div class="tw"><table>
+<thead><tr><th>File, lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>build_kernel.sh 12–15</td><td><code>KFLAGS</code></td><td>Freestanding C++20 without exceptions, RTTI, red zone or SSE; frame pointers kept.</td><td>No red zone: interrupts push onto the kernel stack below RSP. No SSE: no FPU state to switch.</td></tr>
+<tr><td>build_kernel.sh 27–29</td><td><code>ld</code>, <code>objcopy</code></td><td>Links at 1 MiB, then copies to a 32-bit ELF container.</td><td>QEMU's Multiboot loader accepts only 32-bit ELF files (observed in this build).</td></tr>
+<tr><td>labtools.sh 38–57</td><td><code>qemu_step</code></td><td>Boots the kernel with a test name, keeps the serial log, records the exit status.</td><td>Exit 1 = pass, 3 = fail or panic, through <code>isa-debug-exit</code>.</td></tr>
+<tr><td>run.sh 8–12</td><td>steps</td><td>Build, the B9 tests, the forensic kernel run, <code>addr2line</code> on its backtrace.</td><td>Everything below is produced by these lines.</td></tr>
+</tbody></table></div>
+<p><b>Build</b> (the real output: link step and section sizes):</p>
+<pre class="output" data-run="F3-26/build"></pre>
+
+<p><b>Listing 6</b> — <code>test_threads.cc</code>, the B9 acceptance tests</p>
+<pre class="listing" data-src="F3-26/test_threads.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–21</td><td><code>count_forever</code></td><td>Increments its own counter until told to stop; never yields.</td><td>Only preemption can share the CPU between these threads.</td></tr>
+<tr><td>59–82</td><td>test 1</td><td>100 threads, 500 ticks of sleep in <code>main</code>, then min, max and ratio.</td><td>Fairness bound: all non-zero, max/min ≤ 2.</td></tr>
+<tr><td>84–102</td><td>test 2</td><td>A spinner plus ten short threads; <code>main</code> sleeps and wakes five times.</td><td><code>main</code> can only wake if the timer takes the CPU from the spinner.</td></tr>
+<tr><td>104–125</td><td>test 3</td><td>Warm-up, baseline, 1000 rounds of 100 create/exit, compare.</td><td>Frames, heap objects, stack slots and threads must all match.</td></tr>
+<tr><td>131–139</td><td><code>parse_group</code></td><td>The forensic lab's recursive parser.</td><td>See the forensic lab.</td></tr>
+</tbody></table></div>
+<p><b>Run</b> (QEMU, one CPU, <code>test=threads</code>):</p>
+<pre class="output" data-run="F3-26/threads"></pre>
+
+<p><b>Listing 7</b> — <code>rr_model.cpp</code>, a host model of cooperative versus preemptive scheduling</p>
+<pre class="listing" data-src="F3-26/rr_model.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–14</td><td><code>Job</code></td><td>Work left, how often it yields, when it finished.</td><td><code>work_left = -1</code> models the spinner.</td></tr>
+<tr><td>25–47</td><td>main loop</td><td>Take the front job, run it slice by slice, put it back if unfinished.</td><td>The same FIFO as <code>rq_push</code>/<code>rq_pop_for</code>.</td></tr>
+<tr><td>37–42</td><td>two stop rules</td><td>The quantum (preemptive) or the job's own yield (cooperative).</td><td>The only difference between the two policies.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-26/rr_model"></pre>
+
+<h2 id="F3-26-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The teacher is a student too.</b> The kernel's scheduler is not a separate person: it is code that runs on the very CPU it manages, on the stack of whichever thread called it. That is why the handover of the scheduler lock across the switch is needed; a real teacher never has this problem.</li>
+<li><b>Bookmarks are not enough for every notebook.</b> A bookmark records one page. A context switch must record every register the thread may still need, and which registers those are is a contract (the ABI), not common sense. A preempted thread is saved twice: its full register set in the trap frame, then six registers by <code>switch_context</code>.</li>
+<li><b>Students know when they are interrupted.</b> A preempted thread does not. Nothing in its code marks the place; any instruction can be the last before a switch, which is why shared data needs the locks of F3-27.</li>
+<li><b>The "ten minutes" are not ten minutes.</b> Under emulation the tick is guest time; the teacher's clock and the wall clock do not agree.</li>
+</ul>
+
+<h2 id="F3-26-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Saving the wrong registers.</b> Forgetting one callee-saved register gives bugs that appear only when the compiler happens to keep a value there across the call. Compare <code>switch.S</code> with the ABI list, and check that pushes and pops are in mirror order.</li>
+<li><b>Releasing the scheduler lock before the switch.</b> Works on one CPU, corrupts stacks on several: two CPUs run the same thread. Symptom: random crashes with RSP inside another thread's slot.</li>
+<li><b>Freeing a thread's stack in <code>thread_exit</code>.</b> The function is still running on that stack; the next push lands in a freed (or unmapped) page. Use a zombie list.</li>
+<li><b>Calling <code>schedule()</code> with a spinlock held.</b> Another thread then spins for a lock whose owner is not running. The <code>preempt_count</code> check prevents this for preemption; for explicit calls, F3-27's lockup detector reports it.</li>
+<li><b>Enabling interrupts too early in a new thread.</b> <code>thread_start</code> must release the scheduler lock before <code>sti</code>; otherwise the timer interrupt can try to reschedule while the lock is still held by this CPU.</li>
+<li><b>A red zone in kernel code.</b> Without <code>-mno-red-zone</code>, leaf functions may keep data below RSP, and an interrupt frame pushed there overwrites it.</li>
+<li><b>Debugging method.</b> When a thread misbehaves, call <code>sched_dump()</code> (it prints every thread, its state, its last CPU and how often it ran) and boot QEMU with <code>-d int</code> to see interrupts and exceptions as they are delivered; for crashes, take the RIP and the backtrace to <code>addr2line -f -i -e kernel.elf</code>.</li>
+</ul>
+
+<div class="co transition" id="F3-26-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> OS302 ended with a kernel that boots, handles exceptions, manages memory, has a heap, a console, the local APIC and timers (F3-18 to F3-25) — one flow of code. <b>What carries over:</b> the IDT and trap frame, the frame allocator and <code>kmap_page</code>, the APIC timer and its calibration, the panic path that never waits for the console lock. <b>What changes:</b> the kernel now runs many threads, each with its own stack and guard page, switched by a timer-driven round-robin scheduler; every shared structure from here on can be touched by two threads "at once". <b>What comes next:</b> F3-27 makes that safe: spinlocks that respect interrupts, sleeping mutexes, semaphores and condition variables built on this chapter's wait queues, and a checker that catches lock-order inversions before they deadlock.</p></div>
+
+<h2 id="F3-26-check">Check yourself</h2>
+<ol>
+<li>Why does <code>switch_context</code> save RBX but not RAX?</li>
+<li>Slot 3 of the stack area: give the guard page range and the initial <code>t-&gt;rsp</code> of a new thread in that slot.</li>
+<li>Explain in your own words why the scheduler lock is released by the thread that switches in, not by the one that switches out.</li>
+<li>The idle loop is "schedule; <code>sti; hlt</code>". What could go wrong with "<code>sti</code>; schedule; <code>hlt</code>"?</li>
+<li>Why is a page fault on a kernel stack overflow reported as a double fault, and why must the double fault use IST1?</li>
+<li>In Listing 7, why does the cooperative run finish nothing at all, although "editor" yields after every slice?</li>
+<li>Which three conditions must hold before <code>trap_dispatch</code> preempts the current thread, and what goes wrong without each one?</li>
+<li>Apply to a new case: a thread calls <code>thread_sleep_ticks(5)</code> while CPU 0's timer interrupts are masked for 100 ms by a long section with interrupts disabled. When does the thread wake, and what does that tell you about sleeping as a timing tool?</li>
+<li>Why does the 100,000-cycle test take its baseline after a warm-up of 100 threads, and is that cheating?</li>
+</ol>
+
+<h2 id="F3-26-lab">Lab</h2>
+<div class="co safety"><span class="lbl">Safety</span><p>All OS303 labs run in QEMU. Real hardware only on a designated spare machine with a recovery path, following the faculty rule (guide section 5.8) and the curriculum's safety box and runbook rules; nothing in this lab was run on real hardware.</p></div>
+<p><b>Goal (milestone B9, verbatim):</b> "Create, run, block, wake and destroy kernel threads; timer-driven preemption with a simple round-robin policy, then priorities." <sup class="src"><a href="#F3-26-src-C1">C1</a></sup></p>
+<p><b>Acceptance tests (verbatim):</b></p>
+<ol>
+<li>"100 threads each increment their own counter; after 5 seconds every counter is non-zero and the spread is within a fairness bound you define."</li>
+<li>"A thread in an infinite loop does not stop others (preemption works)."</li>
+<li>"Thread create/exit loop of 100,000 iterations ends with no leaked stacks (heap and frame statistics return to baseline)."</li>
+</ol>
+<p><b>Steps.</b></p>
+<ol>
+<li>From the repository root run <code>university/labs/run_lab.sh university/labs/F3-26</code>. It builds the host model, then <code>run.sh</code> builds the kernel and boots it twice. Compare your <code>threads.out</code> with the one above; your counters will differ, the verdict must not.</li>
+<li>Write your fairness bound in your lab notes before you look at the numbers, and justify it from the quantum and the number of threads (worked example).</li>
+<li>Change <code>kQuantumTicks</code> to 5 and rerun. Predict, then observe, what happens to the "switched in" count of the spinner.</li>
+<li>Remove the <code>preempt_count == 0</code> condition from <code>trap.cc</code> line 114 and rerun the F3-27 <code>sync</code> test (<code>-append test=sync</code>). Record what happens and restore the line.</li>
+<li>Remove the warm-up loop (lines 106–109 of <code>test_threads.cc</code>) and rerun. Explain the difference in the baseline line.</li>
+</ol>
+<p><b>Expected results:</b> <code>threads.log</code> exit code 1 (pass) and <code>forensic_overflow.log</code> exit code 3 (expected crash).</p>
+
+<h2 id="F3-26-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A colleague added a parser for nested parentheses to a kernel thread. Shallow input works ("parser: depth 7"); a configuration file with 39 nested groups kills the machine. The serial log and an <code>addr2line</code> run are all you have.</p>
+<p><b>Evidence 1</b> — serial log of the run (<code>test=stackoverflow</code>, one CPU):</p>
+<pre class="output" data-run="F3-26/forensic_overflow"></pre>
+<p><b>Evidence 2</b> — <code>addr2line -f -C -i -e kernel.elf</code> on the distinct backtrace addresses, in order:</p>
+<pre class="output" data-run="F3-26/forensic_addr2line"></pre>
+<p><b>Evidence 3</b> — the first instructions of the function at the crashing RIP, from <code>objdump -d kernel.elf</code> of the same build (run by hand in this build, not part of <code>run.sh</code>):</p>
+<pre>101cb0:	push   %rbp
+101cb3:	mov    %rsp,%rbp
+101cb6:	sub    $0x800,%rsp
+101cbd:	movzbl (%rdi),%eax
+101cc0:	mov    %al,-0x800(%rbp)
+...
+101cfc:	call   101cb0 &lt;parse_group ... .isra.0&gt;
+101d01:	mov    %eax,%edx</pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Is CR2 inside the thread's stack, its guard page, or elsewhere? Show the arithmetic.</li>
+<li>CR2 is exactly 8 bytes below the RSP of the dump. What tried to write there, and why is that the address reported?</li>
+<li>Why is the report a double fault and not a page fault?</li>
+<li>How large is each <code>parse_group</code> frame according to Evidence 3, and how many levels of recursion does each frame hold? (Hint: compare <code>0x800</code> with <code>scratch[1024]</code>, and look for the second <code>-0x400(%rbp)</code> slot.)</li>
+<li>Estimate the maximum nesting depth this 16 KiB stack allows. Does it explain "7 works, 39 crashes"?</li>
+<li>Propose a fix and a prevention.</li>
+</ol>
+<p><b>Method hints.</b> Write the slot layout first (worked example). Then read the dump from the top: which exception, which addresses, which stack. Use the backtrace only after you know where the stack pointer was.</p>
+
+<h2 id="F3-26-project">Mini-project</h2>
+<p><b>Priorities (the second half of B9's goal).</b> Add two or three priority levels to the run queue (one FIFO per level, always run the highest non-empty level) and an aging rule so that a low-priority thread that has waited a whole second runs once anyway. Write a kernel test with one high-priority spinner and ten low-priority counters: without aging the counters must stay at zero, with aging every counter must be non-zero after 5 seconds.</p>
+<p><b>Rubric (10 points).</b> Correct queue selection (2); aging implemented and justified with a number of ticks (2); the test fails without aging and passes with it, both runs recorded with <code>qemu_step</code> (3); the B9 tests still pass (2); a one-paragraph note on priority inversion and why F3-27's locks make it possible (1).</p>
+
+<h2 id="F3-26-summary">Summary</h2>
+<ul>
+<li>A kernel thread is a control block plus a private kernel stack; while it is not running, its state is on that stack.</li>
+<li>A context switch is a function call that returns into a different thread: push the six callee-saved registers, swap RSP, pop, return. A new thread gets a hand-made frame that "returns" into <code>thread_start</code>.</li>
+<li>Round robin keeps a FIFO of ready threads; the idle thread halts with <code>sti; hlt</code>; sleepers are woken by the tick.</li>
+<li>Preemption happens at the end of the timer interrupt, only with no spinlock held and no nested handler. The scheduler lock is handed from the outgoing to the incoming thread.</li>
+<li>Stacks live in slots with unmapped guard pages; an overflow becomes a double fault on IST1 with CR2 inside the guard page. Dead threads are reaped by other threads.</li>
+<li>In this build all three B9 tests passed under QEMU TCG, and the forensic overflow was caught and located by <code>addr2line</code>; nothing was tested on hardware.</li>
+</ul>
+
+<h2 id="F3-26-sources">Sources</h2>
+<ol>
+<li id="F3-26-src-D1">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3 (tier 1; curriculum item 10): "Interrupt and Exception Handling" (64-bit interrupt frame, IST, double fault), "Task Management" (64-bit TSS), "Paging" (not-present faults), and the instruction reference for STI, HLT, FXSAVE/XSAVE. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-26-src-D2">H. J. Lu, Michael Matz, Milind Girkar, Jan Hubička, Andreas Jaeger, Mark Mitchell (eds.), "System V Application Binary Interface, AMD64 Architecture Processor Supplement" (tier 1): register usage (callee-saved registers) and stack alignment at function entry. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-26-src-D3">Remzi H. Arpaci-Dusseau and Andrea C. Arpaci-Dusseau, "Operating Systems: Three Easy Pieces" (tier 3; curriculum item 2; named in B9): "Scheduling: Introduction", "Multi-level Feedback Queue", and the process-state chapters. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-26-src-D4">Russ Cox, Frans Kaashoek, Robert Morris, "xv6: a simple, Unix-like teaching operating system" (tier 3; curriculum item 9; named in B9), scheduling chapter (the scheduler lock held across <code>swtch</code>). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-26-src-D5">Pavel Yosifovich, Alex Ionescu, Mark E. Russinovich, David A. Solomon, "Windows Internals, Part 1" (tier 3; curriculum item 30; named in B9), "Thread scheduling". Cited for comparison only. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-26-src-D6">The Linux kernel source (tier 4; curriculum item 40): the <code>preempt_count</code> mechanism. Cited as "what that implementation does". <i>Not opened during this build (dossier gate G1 open).</i></li>
+<li id="F3-26-src-D7">Intel, "8254 Programmable Interval Timer" datasheet (tier 1): channel 2, mode 0, input clock. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-26-src-D8">Free Software Foundation, "Multiboot Specification" version 0.6.96 (tier 1; curriculum item 18 covers Multiboot2): header magic, machine state at entry, information structure. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-26-src-C1">C1 — "Systems Curriculum" (repository root, <code>SYSTEMS_CURRICULUM.html</code>), Track B, milestone B9: goal, reading list and acceptance tests quoted verbatim. A map, not a technical source (AH-4).</li>
+<li id="F3-26-src-R1">R1 — lab run <code>university/labs/F3-26/build.log</code>: the OS303 kernel and user programs built with g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0 and GNU ld 2.42, exit code 0.</li>
+<li id="F3-26-src-R2">R2 — lab run <code>threads.log</code>: the B9 tests in QEMU emulator version 8.2.2 (TCG, machine <code>pc</code>, one CPU), exit code 1 = pass; the sources <code>thread.cc</code>, <code>switch.S</code>, <code>trap.cc</code>, <code>test_threads.cc</code> of this build. Untested on hardware.</li>
+<li id="F3-26-src-R3">R3 — forensic run <code>forensic_overflow.log</code> (exit code 3, expected) and <code>forensic_addr2line.log</code> (GNU addr2line 2.42); Evidence 3 from <code>objdump -d</code> of the same build. Untested on hardware.</li>
+<li id="F3-26-src-R4">R4 — lab run <code>rr_model.log</code>: g++ 13.3.0 with AddressSanitizer and UBSan, exit code 0.</li>
+</ol>
+
+<h2 id="F3-26-glossary">Glossary links</h2>
+<p><a href="#gl-kernel-thread">Kernel thread</a> · <a href="#gl-kernel-stack">Kernel stack</a> · <a href="#gl-guard-page">Guard page</a> · <a href="#gl-context-switch">Context switch</a> · <a href="#gl-callee-saved-register">Callee-saved register</a> · <a href="#gl-run-queue">Run queue</a> · <a href="#gl-idle-thread">Idle thread</a> · <a href="#gl-preemption">Preemption</a> · <a href="#gl-time-slice-quantum">Time slice (quantum)</a> · <a href="#gl-ist-interrupt-stack-table">IST (Interrupt Stack Table)</a> · <a href="#gl-double-fault-df">Double fault (#DF)</a> · <a href="#gl-zombie-thread">Zombie (thread)</a> · <a href="#gl-scheduler">Scheduler</a></p>
+
+<h2 id="F3-26-next">Next chapter</h2>
+<p>Next: <a href="#F3-27">F3-27 Synchronization primitives</a>. Previous: <a href="#F3-25">F3-25 Timers and time keeping</a> (OS302). Back to the course: <a href="#OS303">OS303</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (milestone B9).</p>
+
+<h2 id="F3-26-answers">Answers to Check yourself</h2>
+<ol>
+<li>RBX is callee-saved: the code that called <code>switch_context</code> may keep a value in it and expects it back. RAX is caller-saved (and holds return values): the compiler has already saved anything it needed from it before the call. Saving it would be harmless but useless.</li>
+<li>Slot 3 starts at <code>0x1_0000_0000 + 3 × 0x5000 = 0x1_0000_f000</code>; guard page <code>0x1_0000_f000</code>–<code>0x1_0000_ffff</code>; stack <code>0x1_0001_0000</code>–<code>0x1_0001_3fff</code>; top <code>0x1_0001_4000</code>; initial <code>t-&gt;rsp</code> = top − 7 × 8 = <code>0x1_0001_3fc8</code>.</li>
+<li>Good answers say: while the old thread's registers are being saved it is already on the run queue; if the lock were free, another CPU could pick that thread and start running on its stack at the same time. Holding the lock until the switch is complete, and letting the new thread (which knows the switch is complete) release it, closes the window.</li>
+<li>An interrupt between <code>schedule</code> finding nothing and <code>hlt</code> could make a thread ready (say, a timer wake-up); the CPU would then halt anyway and the thread would wait for the next interrupt: a lost wake-up of up to one tick. <code>sti</code> as the instruction right before <code>hlt</code> closes the window because interrupts are recognised only after the next instruction (see the unverified box).</li>
+<li>In ring 0 the CPU pushes the page-fault frame on the current stack, which is the guard page; the push faults during delivery, so the CPU raises a double fault. If the double fault were also delivered on that stack, it would fault a third time and reset the machine; IST1 gives it a known-good stack.</li>
+<li>The cooperative policy lets the running job keep the CPU until it yields. "editor" yields after slice 1, then "spinner" runs and never yields, so slices 2 to 40 all go to it. Yielding is only as good as the worst job's manners.</li>
+<li>A reschedule was requested (otherwise there is nothing to do); <code>preempt_count == 0</code> (otherwise other CPUs spin on a lock whose owner is switched out, and on one CPU the next thread to take that lock spins forever); <code>irq_depth == 0</code> (otherwise an outer handler is left half-finished and its interrupt source may stay unacknowledged).</li>
+<li>Ticks are counted by CPU 0's timer interrupt, so while interrupts are masked no ticks happen and no sleeper is woken; the thread wakes only some ticks after interrupts are enabled again, and the ticks missed while they were masked are not made up (pending timer interrupts are not queued one by one; see the hardware section's unverified box for this kind of detail). Sleeping guarantees "at least", never "exactly"; a long interrupts-off section delays every sleeper, and the tick counter itself loses time.</li>
+<li>The stack area's page tables (one page table per 2 MiB of stack area, and its parents) are allocated the first time a slot in that range is used and are kept on purpose. Without the warm-up the baseline would be taken before they exist and the comparison would report a "leak" of those few frames. It is not cheating as long as the warm-up is bounded and the test then runs 100,000 more cycles with constant memory, which is what B9 asks.</li>
+</ol>
+<h3 id="F3-26-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> The dump says "double fault (vector 8)" in thread 3 'parser'. The thread's stack is <code>0x1_0000_6000</code>–<code>0x1_0000_9fff</code> and its guard page <code>0x1_0000_5000</code>–<code>0x1_0000_5fff</code>; CR2 = <code>0x1_0000_5f68</code> is inside the guard page, and so is RSP = <code>0x1_0000_5f70</code>. RIP = <code>0x101cc0</code> resolves to <code>parse_group</code>, <code>test_threads.cc:134</code> (<code>scratch[0] = s[0]</code>); the backtrace repeats return address <code>0x101d01</code> (line 136, the recursive call) and ends in <code>parser_thread</code> (line 144).</p>
+<p><b>Hypotheses.</b> A bad pointer would give a page fault with a CR2 far from the stack, not 8 bytes below RSP; a corrupted return address would show a backtrace into nonsense; a stack overflow predicts CR2 and RSP inside the guard page and a deep repetition in the backtrace. Only the last fits.</p>
+<p><b>Root cause.</b> Each call reserves 0x800 bytes (Evidence 3: <code>sub $0x800,%rsp</code>): the compiler inlined one level of recursion into the other, so each real frame holds two 1 KiB <code>scratch</code> buffers (at <code>-0x800</code> and <code>-0x400</code> from RBP) plus the saved RBP and return address, about 2 KiB for two levels. The 16 KiB stack holds about 8 such frames, about 16 levels, minus the frames below the parser. Depth 7 fits; depth 39 does not. The <code>sub</code> moved RSP into the guard page; the next store, at RIP <code>0x101cc0</code>, faulted with CR2 = RSP. The CPU then tried to push the page-fault frame at RSP − 8 = <code>0x1_0000_5f68</code>, which faulted again: that second fault is the one CR2 now records, and it turned into a double fault delivered on IST1.</p>
+<p><b>Fix.</b> Do not put kilobyte buffers on a kernel stack: allocate the scratch buffer once (heap or caller), make the parser iterative, and reject input deeper than a fixed limit with an error.</p>
+<p><b>Prevention.</b> Keep guard pages (they turned silent corruption into a precise report); compile the kernel with <code>-Wframe-larger-than=512</code> (GCC option) so a 2 KiB frame is a build error; add a depth limit to every recursive kernel function; and keep this forensic test in the lab so the double-fault path itself stays tested.</p>
