@@ -1,0 +1,336 @@
+<!--meta
+id: F5-38
+title: Kernel bypass and zero copy
+course: DS401
+level: L4
+prereqs: F5-37; F5-36; F5-34; SP203 (atomics, SPSC ring buffer); OS201 (system calls, context switches); HW301 (pinned memory)
+time: 10–14 hours including the lab and the forensic lab; the course project is separate (about 30 hours)
+hardware: for the lab: Linux and g++ only (two processes on one machine, shared memory, strace). The RDMA statements of this chapter are untested on hardware: the build container has no RDMA device.
+maps: Curriculum Track F, section 14.1 row "Inter-node networks" (kernel bypass, zero copy, registered memory) and milestone F5 (perftest verification, transport for the hierarchical all-reduce over verbs); reading-list item 81; course DS401 goal "understand kernel bypass" and the course project "an RDMA-based replicated log append benchmark"
+analogy: F5 — friends in different towns (proposed mappings in NOTES.md: kernel bypass = the courier collects from your own shelf instead of the post office counter; zero copy = the courier takes the original, not a photocopy; pinned memory = a shelf bolted to the wall so it cannot be moved while the courier has the key; busy polling = standing at the window watching for the courier; sleeping = napping and asking to be woken)
+-->
+
+<h2 id="F5-38-hook">Story hook</h2>
+<p>Amara's town post office is careful: every letter is handed over the counter, the clerk copies the address into a ledger, puts the letter into the office's own bag, and later hands it to the courier. It is safe and fair to everyone, and it takes a clerk's time for every letter. The courier from <a href="#F5-34">F5-34</a> skips all of it: he has a key to Amara's shelf and takes the letter himself. No counter, no clerk, no second bag.</p>
+<p>But the courier only works if two things hold. The shelf must not move while he has the key (if Amara rearranges her house, he takes the wrong thing). And someone must notice when a parcel arrives. Amara can stand at the window all day watching for the courier, which is quick and tiring, or nap and ask to be woken, which is restful and slow. Her neighbour tried to have both by napping "for one second" between looks out of the window. It did not work the way he expected.</p>
+<p>This chapter measures each of these ideas on one computer, where it can be run, and then sets the course project.</p>
+
+<h2 id="F5-38-able">What you will be able to do</h2>
+<ul>
+<li><b>Measure</b> what a kernel data path costs in system calls and copies, and what a shared-memory bypass path saves, with strace and a timing harness.</li>
+<li><b>Explain</b> zero copy and why it requires registered (pinned) memory, and check a process's locked-memory limit.</li>
+<li><b>Choose</b> an idle policy (busy poll, block, spin-then-sleep) and predict its latency and CPU cost.</li>
+<li><b>Diagnose</b> a "kernel bypass made it slower" case from latency, CPU and system-call evidence.</li>
+<li><b>Plan</b> the course project: an RDMA-based replicated log append benchmark with a correct protocol and an honest measurement.</li>
+</ul>
+
+<div class="co jargon" id="F5-38-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Data path and control path</dt><dd><b>Simple words:</b> the data path is the work done for every message; the control path is the set-up done once or rarely. <b>Analogy:</b> handing over each letter, versus signing up with the courier company. <b>Precise:</b> in kernel-bypass designs the control path (opening the device, registering memory, creating and connecting queue pairs) goes through the kernel with system calls, while the data path (posting work requests, ringing doorbells, polling completions) runs in user space without system calls. <sup class="src"><a href="#F5-38-src-D1">D1</a></sup> <sup class="src"><a href="#F5-38-src-R2">R2</a></sup></dd>
+<dt>Locked-memory limit (RLIMIT_MEMLOCK)</dt><dd><b>Simple words:</b> the most memory a process is allowed to pin so that it cannot be swapped or moved. <b>Analogy:</b> how many shelves you may bolt to the wall. <b>Precise:</b> the per-process resource limit that bounds memory locked with <code>mlock</code> and, on Linux, memory pinned by RDMA registration for unprivileged processes; read with <code>getrlimit(RLIMIT_MEMLOCK)</code> (soft and hard values). <sup class="src"><a href="#F5-38-src-D2">D2</a></sup> <sup class="src"><a href="#F5-38-src-R3">R3</a></sup></dd>
+<dt>Idle policy</dt><dd><b>Simple words:</b> what a program does while it waits for the next message: keep checking, or sleep. <b>Analogy:</b> stand at the window, or nap and ask to be woken. <b>Precise:</b> the choice between busy polling (lowest latency, one core fully used), blocking on a notification such as a completion channel, eventfd or futex (no CPU while idle, a wake-up latency per message), and hybrids that spin for a bounded time and then block; a timed sleep in a polling loop is a poor hybrid because sleep durations are not precise. <sup class="src"><a href="#F5-38-src-R4">R4</a></sup> <sup class="src"><a href="#F5-38-src-D2">D2</a></sup></dd>
+<dt>Registration cache</dt><dd><b>Simple words:</b> a library's memory of which buffers are already registered, so it does not register them again. <b>Analogy:</b> a list of shelves that already have a courier key. <b>Precise:</b> a cache in communication libraries (MPI implementations, UCX, NCCL) mapping user buffers to existing memory regions, to avoid the cost of <code>ibv_reg_mr</code> per message; it must be invalidated when memory is freed or remapped. <sup class="src"><a href="#F5-38-src-D3">D3</a></sup></dd>
+<dt>Replicated log append</dt><dd><b>Simple words:</b> adding a record to the end of a log that is kept as identical copies on several machines. <b>Analogy:</b> Amara writes each diary entry and posts copies to two friends; an entry counts once most of the copies have arrived. <b>Precise:</b> the leader writes entry i to the log of each follower, and the entry is committed when a quorum (for example, a majority including the leader) has stored it; the operation underneath primary-backup replication and consensus protocols (DS301). <sup class="src"><a href="#F5-38-src-D4">D4</a></sup></dd>
+</dl>
+<p>Terms from earlier: <a href="#gl-kernel-bypass">kernel bypass</a>, <a href="#gl-zero-copy">zero copy</a> and <a href="#gl-system-call-cost">system call cost</a> (<a href="#F5-34">F5-34</a>); <a href="#gl-system-call">system call</a> and <a href="#gl-context-switch">context switch</a> (OS201); <a href="#gl-spsc-ring-buffer">SPSC ring buffer</a> and <a href="#gl-false-sharing">false sharing</a> (SP203); <a href="#gl-polling">polling</a> (HW204); <a href="#gl-adaptive-spinning">adaptive spinning</a> (OS303); <a href="#gl-pinned-page-locked-memory">pinned (page-locked) memory</a> (HW301); <a href="#gl-numa">NUMA</a> (HW203); <a href="#gl-memory-region-and-registration">memory region and registration</a> (HW205); <a href="#gl-quorum-read-and-write-quorum">quorum</a> and <a href="#gl-primary-backup-replication">primary-backup replication</a> (DS301).</p>
+</div>
+
+<h2 id="F5-38-pictures">The idea in pictures</h2>
+<p>Figure 1 compares the two data paths of Listing 1 and counts what the build measured on each.</p>
+<figure id="F5-38-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F5-38-f1t F5-38-f1d">
+<title id="F5-38-f1t">Figure 1: a kernel data path and a bypass data path between two processes</title>
+<desc id="F5-38-f1d">Left, the socket path: process A's buffer, a write system call crossing into the kernel, a copy into a kernel socket buffer, a read system call by process B, a copy into B's buffer. Measured with strace over 240000 message transfers: 240003 write and 240005 read calls. Right, the bypass path: processes A and B both map one shared-memory ring; A copies 64 bytes into a slot and publishes it by storing the head index; B polls the head index and reads the slot; strace counted 79 system calls in the whole run, none on the data path. Below, measured with -O2: socket round trip median 24.27 microseconds, 0.87 million messages per second one way; ring round trip median 0.75 microseconds, 56.49 million messages per second.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="20" y="22">Socket pair (through the kernel)</text><text class="sv-tb" x="410" y="22">Shared-memory ring (bypass)</text>
+<rect class="sv-b1" x="20" y="36" width="140" height="36" rx="4"/><text class="sv-t" x="30" y="59">process A buffer</text>
+<rect class="sv-b1" x="200" y="36" width="140" height="36" rx="4"/><text class="sv-t" x="210" y="59">process B buffer</text>
+<line class="sv-dash" x1="20" y1="96" x2="350" y2="96"/><text class="sv-ts" x="24" y="90">user space</text><text class="sv-ts" x="24" y="110">kernel</text>
+<rect class="sv-b8" x="95" y="130" width="170" height="40" rx="4"/><text class="sv-t" x="105" y="148">socket buffer</text><text class="sv-ts" x="105" y="163">(kernel memory)</text>
+<line class="sv-line" x1="90" y1="72" x2="140" y2="124"/><polygon class="sv-head" points="135,124 144,130 143,120"/><text class="sv-ts" x="20" y="124">write(): copy in</text>
+<line class="sv-line" x1="220" y1="124" x2="262" y2="78"/><polygon class="sv-head" points="257,77 267,72 265,83"/><text class="sv-ts" x="256" y="124">read(): copy out</text>
+<text class="sv-ts" x="20" y="200">strace, whole run (240000 transfers):</text>
+<text class="sv-tm" x="20" y="218">write 240003   read 240005</text>
+<rect class="sv-b1" x="410" y="36" width="140" height="36" rx="4"/><text class="sv-t" x="420" y="59">process A</text>
+<rect class="sv-b1" x="600" y="36" width="140" height="36" rx="4"/><text class="sv-t" x="610" y="59">process B</text>
+<rect class="sv-b5" x="440" y="112" width="270" height="58" rx="4"/><text class="sv-t" x="450" y="132">shared ring: head | tail | 1024 slots</text><text class="sv-ts" x="450" y="150">mapped into both processes</text><text class="sv-ts" x="450" y="164">(mmap MAP_SHARED, before fork)</text>
+<line class="sv-line" x1="480" y1="72" x2="510" y2="104"/><polygon class="sv-head" points="505,105 514,111 513,101"/><text class="sv-ts" x="410" y="96">memcpy + store head</text>
+<line class="sv-line" x1="640" y1="104" x2="670" y2="78"/><polygon class="sv-head" points="664,77 674,72 671,83"/><text class="sv-ts" x="636" y="96">poll head, read</text>
+<line class="sv-dash" x1="410" y1="96" x2="740" y2="96"/>
+<text class="sv-ts" x="410" y="200">strace, whole run: 79 system calls,</text><text class="sv-ts" x="410" y="218">none per message</text>
+<text class="sv-tb" x="20" y="256">-O2 run: socket RTT median 24.27 us, 0.87 M msgs/s</text>
+<text class="sv-tb" x="410" y="256">-O2 run: ring RTT median 0.75 us, 56.49 M msgs/s</text>
+<text class="sv-ts" x="20" y="284">64-byte messages, two processes on one machine (4 CPUs visible). Measured in this build (R1, R2).</text>
+</svg></div><figcaption><b>Figure 1.</b> Listing 1's two paths. Counts from R2, times from R1 (<code>ring_O2.out</code>). An RDMA adapter's data path has the bypass structure of the right half, with the adapter in place of process B <sup class="src"><a href="#F5-38-src-D1">D1</a></sup> (pending verification; untested on hardware).</figcaption></figure>
+
+<p>Figure 2 shows why the forensic lab's "sleep 1 µs when idle" server is slow: the time from a request's arrival to the moment the server looks.</p>
+<figure id="F5-38-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 220" role="img" aria-labelledby="F5-38-f2t F5-38-f2d">
+<title id="F5-38-f2t">Figure 2: busy polling versus polling with a sleep between checks</title>
+<desc id="F5-38-f2d">Two time lines. Upper, busy poll: the server checks the ring continuously, drawn as dense ticks; a request arrives and is seen at the next check, within a fraction of a microsecond; measured median round trip 1.09 microseconds at 97 percent of one core. Lower, sleep between checks: the server checks, finds nothing, calls a sleep of 1 microsecond which enters the kernel and returns much later, drawn as wide gaps; a request that arrives during a gap waits until the sleep ends; measured median round trip 40.78 microseconds and 99th percentile 2105 microseconds at 19 percent of one core.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="220"/>
+<text class="sv-tb" x="20" y="24">busy poll</text>
+<line class="sv-line" x1="20" y1="60" x2="740" y2="60"/>
+<line class="sv-line" x1="40" y1="52" x2="40" y2="68"/><line class="sv-line" x1="52" y1="52" x2="52" y2="68"/><line class="sv-line" x1="64" y1="52" x2="64" y2="68"/><line class="sv-line" x1="76" y1="52" x2="76" y2="68"/><line class="sv-line" x1="88" y1="52" x2="88" y2="68"/><line class="sv-line" x1="100" y1="52" x2="100" y2="68"/><line class="sv-line" x1="112" y1="52" x2="112" y2="68"/><line class="sv-line" x1="124" y1="52" x2="124" y2="68"/><line class="sv-line" x1="136" y1="52" x2="136" y2="68"/><line class="sv-line" x1="148" y1="52" x2="148" y2="68"/><line class="sv-line" x1="160" y1="52" x2="160" y2="68"/><line class="sv-line" x1="172" y1="52" x2="172" y2="68"/>
+<polygon class="sv-head" points="126,36 131,46 136,36"/><text class="sv-ts" x="140" y="42">request arrives: seen at the next check</text>
+<text class="sv-ts" x="200" y="84">checks every few nanoseconds: median RTT 1.09 us, 97 % of a core</text>
+<text class="sv-tb" x="20" y="124">sleep_for(1 us) between checks</text>
+<line class="sv-line" x1="20" y1="160" x2="740" y2="160"/>
+<line class="sv-line" x1="40" y1="152" x2="40" y2="168"/><rect class="sv-b8" x="42" y="154" width="150" height="12"/><line class="sv-line" x1="194" y1="152" x2="194" y2="168"/><rect class="sv-b8" x="196" y="154" width="150" height="12"/><line class="sv-line" x1="348" y1="152" x2="348" y2="168"/><rect class="sv-b8" x="350" y="154" width="150" height="12"/><line class="sv-line" x1="502" y1="152" x2="502" y2="168"/>
+<polygon class="sv-head" points="225,136 230,146 235,136"/><text class="sv-ts" x="240" y="142">request arrives during a sleep: waits until 348</text>
+<text class="sv-ts" x="42" y="186">each shaded gap: a clock_nanosleep system call that lasts far longer than 1 us</text>
+<text class="sv-ts" x="42" y="204">median RTT 40.78 us, p99 2105 us, 19 % of a core</text>
+</svg></div><figcaption><b>Figure 2.</b> Schematic time lines (not to scale) with the measured results of the forensic program (R4: <code>bypass_spin.out</code>, <code>bypass_sleep_O2.out</code>). Why a 1 µs sleep lasts longer is explained, with an unverified box, in Layer 3.</figcaption></figure>
+
+<p>Figure 3 is the architecture of the course project.</p>
+<figure id="F5-38-fig3"><div class="svgbox">
+<svg viewBox="0 0 760 260" role="img" aria-labelledby="F5-38-f3t F5-38-f3d">
+<title id="F5-38-f3t">Figure 3: the replicated log append of the course project</title>
+<desc id="F5-38-f3d">A leader node on the left with a client request queue, a log of entries and a commit index. Two follower nodes on the right, each with a registered log ring (access LOCAL_WRITE and REMOTE_WRITE) and a consumer that applies entries. Arrows from the leader to each follower: RDMA WRITE of the entry into the next free slot, followed by a small signal (WRITE WITH IMMEDIATE or SEND) carrying the entry index. Arrows back from each follower: an acknowledgement with the highest stored index and free credits. The leader marks an entry committed when a majority of the three copies, counting its own, hold it, and reports append latency from request to commit.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="260"/>
+<rect class="sv-b1" x="20" y="40" width="230" height="170" rx="6"/><text class="sv-tb" x="32" y="62">Leader</text>
+<rect class="sv-box" x="34" y="74" width="200" height="30" rx="3"/><text class="sv-ts" x="44" y="94">client appends (request queue)</text>
+<rect class="sv-box" x="34" y="112" width="200" height="30" rx="3"/><text class="sv-ts" x="44" y="132">local log (registered, lkey)</text>
+<rect class="sv-box" x="34" y="150" width="200" height="44" rx="3"/><text class="sv-ts" x="44" y="168">commit index = highest index</text><text class="sv-ts" x="44" y="184">held by a majority (2 of 3)</text>
+<rect class="sv-b2" x="500" y="30" width="240" height="90" rx="6"/><text class="sv-tb" x="512" y="52">Follower 1</text><text class="sv-ts" x="512" y="72">log ring: LOCAL_WRITE | REMOTE_WRITE</text><text class="sv-ts" x="512" y="88">addr, length, rkey sent out of band</text><text class="sv-ts" x="512" y="104">consumer applies entries, frees slots</text>
+<rect class="sv-b2" x="500" y="140" width="240" height="90" rx="6"/><text class="sv-tb" x="512" y="162">Follower 2</text><text class="sv-ts" x="512" y="182">log ring: LOCAL_WRITE | REMOTE_WRITE</text><text class="sv-ts" x="512" y="198">addr, length, rkey sent out of band</text><text class="sv-ts" x="512" y="214">consumer applies entries, frees slots</text>
+<line class="sv-line2" x1="250" y1="80" x2="492" y2="60"/><polygon class="sv-head" points="491,55 500,59 492,65"/><text class="sv-ts" x="290" y="62">RDMA WRITE entry + signal (index)</text>
+<line class="sv-line" x1="500" y1="100" x2="258" y2="120"/><polygon class="sv-head" points="259,115 250,121 260,125"/><text class="sv-ts" x="300" y="122">ack: stored index, credits</text>
+<line class="sv-line2" x1="250" y1="160" x2="492" y2="170"/><polygon class="sv-head" points="491,165 500,170 491,175"/><text class="sv-ts" x="290" y="156">RDMA WRITE entry + signal</text>
+<line class="sv-line" x1="500" y1="210" x2="258" y2="200"/><polygon class="sv-head" points="259,195 250,200 259,205"/><text class="sv-ts" x="300" y="216">ack: stored index, credits</text>
+<text class="sv-ts" x="20" y="248">Measure: append latency (request to commit) percentiles; appends per second; versus entry size, batch size, follower count.</text>
+</svg></div><figcaption><b>Figure 3.</b> The course project's protocol, a design proposed by this chapter (the course card names only the project's subject). One-sided writes and the signalling patterns are from <a href="#F5-36">F5-36</a>; the forensic lab of F5-36 shows what happens when a follower forgets <code>REMOTE_WRITE</code> <sup class="src"><a href="#F5-38-src-D4">D4</a></sup>.</figcaption></figure>
+
+<h2 id="F5-38-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Mapping (proposed): kernel = the post office counter and its clerk; system call = queuing at the counter; kernel copy = the clerk putting your letter into the office's own bag; kernel bypass = the courier collects from your shelf with his key; zero copy = he takes the original, not a photocopy; pinned memory = a shelf bolted to the wall; RLIMIT_MEMLOCK = how many shelves you may bolt down; busy polling = standing at the window; blocking = napping and asking to be woken; "sleep 1 µs between looks" = a nap that always lasts much longer than you asked.</p></div>
+<p>Going through the counter costs a little every time; skipping it saves that every time. But skipping it means you must be ready yourself: your shelf must stay put, and you must keep watching for the courier, because no clerk will come and wake you. Watching all the time is quick but tiring; napping is restful but slow. There is no free choice, only a trade.</p>
+
+<h2 id="F5-38-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F5-38-l2-cost">What the kernel path costs, measured</h3>
+<p>Listing 1 sends 64-byte messages between two processes on one machine, first through a Unix-domain socket pair, then through two shared-memory rings (Listing 1's header, <code>spsc_ring.hpp</code>, is the SPSC ring of SP203 placed in memory mapped with <code>MAP_SHARED</code> before <code>fork</code>). It measures 20000 ping-pongs and a stream of 200000 messages one way. The <code>-O2</code> build printed <sup class="src"><a href="#F5-38-src-R1">R1</a></sup>:</p>
+<pre class="output" data-run="F5-38/ring_O2"></pre>
+<p>Running each path under <code>strace -f -c</code> counts the system calls of both processes (R2). The socket path made 240003 <code>write</code> and 240005 <code>read</code> calls: one per message per direction (20000 + 20000 for the ping-pong, 200000 for the stream, plus a final byte and a few at start-up). The ring path made 79 system calls in total, all for start-up (loading, <code>mmap</code>, <code>clone</code> for the fork, two <code>write</code> calls for the printed lines) and none per message:</p>
+<pre class="output" data-run="F5-38/syscalls_socket"></pre>
+<pre class="output" data-run="F5-38/syscalls_ring"></pre>
+<p>That is kernel bypass on one machine: the control path (create the shared mapping, fork) uses the kernel once; the data path (copy into a slot, publish with an atomic store, poll with an atomic load) never does. On the stream test the ring delivered 56.49 million messages per second against 0.87 million for the socket: a factor of about 65, because each socket message costs two system calls and two copies through a kernel buffer, while a ring message costs one 64-byte copy and two atomic operations.</p>
+<p>The ping-pong medians need care. The <code>-O2</code> run's socket median was 24.27 µs; the sanitizer run (R1, <code>ring_ipc.out</code>) printed 4.50 µs for the same path, although sanitizers only add work. As in <a href="#F5-37">F5-37</a>, small-message socket latency here is dominated by whether the sleeping peer process is woken on an idle CPU or must be scheduled; the ring's ping-pong (0.75 µs and 1.13 µs) is stable because neither process ever sleeps. The figure to quote is the system-call count, which does not depend on scheduling.</p>
+<h3 id="F5-38-l2-zero">Zero copy and why memory must be pinned</h3>
+<p>A socket <code>write</code> copies the user's bytes into kernel memory, so the application may reuse its buffer at once. A zero-copy interface instead passes a <b>descriptor</b> (address and length) and lets the device read the bytes where they are (<a href="#F5-34">F5-34</a>). Listing 2 shows what the copy costs on this machine: handing over 500 messages of 1 MiB took 31.55 ms with a copy each time (16.62 GB/s of copying) and 0.49 ms by descriptor (the "device" here touches one byte per 4 KiB page) <sup class="src"><a href="#F5-38-src-R3">R3</a></sup>:</p>
+<pre class="output" data-run="F5-38/zero_copy"></pre>
+<p>Zero copy has two conditions. First, the device must be able to find the buffer's physical pages and they must not move or be swapped out while the device uses them: this is what registration does for RDMA, by pinning the pages and giving the adapter their translations (<a href="#F5-36">F5-36</a>; HW301 for the GPU equivalent) <sup class="src"><a href="#F5-38-src-D1">D1</a></sup>. Pinned memory counts against the process's locked-memory limit; in the build container that limit is 8388608 bytes (8 MiB) soft and hard, and <code>mlock</code> of 1 MiB succeeded (R3). The process ran as user id 0, which may be allowed to exceed the limit; an ordinary user registering more than 8 MiB would need the limit raised by the administrator <sup class="src"><a href="#F5-38-src-D2">D2</a></sup>. Second, the application must not touch the buffer until the device is done: the buffer-ownership rule of <a href="#F5-36">F5-36</a> (a buffer belongs to the adapter until its completion).</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That RDMA registration by an unprivileged process is charged against <code>RLIMIT_MEMLOCK</code>, how privileged processes are treated, and whether on-demand paging (ODP, a feature of some adapters that avoids pinning) changes this, were not checked: they need the Linux kernel's RDMA documentation and the adapter's manual (D1, D2). The build only shows the limit's value and that <code>mlock</code> works (R3). How the limit is raised for a service (shell limits, service manager settings, container runtime settings) varies and is not shown here.</p></div>
+<h3 id="F5-38-l2-idle">Who notices the message: idle policies</h3>
+<p>Without the kernel on the data path, nobody wakes a waiting process when a message arrives. The program must look. Three policies:</p>
+<ul>
+<li><b>Busy poll:</b> check in a tight loop. Lowest latency; one core at 100 % even when idle. The ring path of Listing 1 and <code>waitOne</code> in <a href="#F5-36">F5-36</a> do this.</li>
+<li><b>Block on a notification:</b> ask the kernel to wake you (for verbs, a completion channel; for shared memory, an eventfd or a futex). No CPU while idle; each wake-up costs a system call and a scheduling delay, the very costs bypass was meant to remove.</li>
+<li><b>Spin, then block:</b> poll for a bounded time (a few microseconds, or about the expected message gap), then arm the notification and block. Good latency under load, low CPU when idle (<a href="#gl-adaptive-spinning">adaptive spinning</a>, OS303).</li>
+</ul>
+<p>A fourth, tempting policy, "poll, and sleep a little when empty", is the subject of the forensic lab.</p>
+
+<h2 id="F5-38-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F5-38-l3-ring">Why the ring is correct and fast</h3>
+<p>The ring (header lines 17–61) has one producer and one consumer. The producer writes a slot and then stores <code>head</code> with release order (line 48); the consumer loads <code>head</code> with acquire order (line 55) and only then reads the slot. Release/acquire guarantees the consumer sees the slot's bytes written before the index that publishes them (SP203). <code>head</code>, <code>tail</code> and the slots are each aligned to 64 bytes (lines 19–21) so the producer's and the consumer's index writes do not share a cache line (<a href="#gl-false-sharing">false sharing</a>). The atomics must be lock-free (line 23), or two processes could not share them through plain memory. An RDMA adapter uses the same pattern with different actors: the program writes a descriptor and then a doorbell; the adapter writes a completion entry and then makes it visible, and <code>ibv_poll_cq</code> reads it <sup class="src"><a href="#F5-38-src-D1">D1</a></sup>.</p>
+<h3 id="F5-38-l3-sleep">Why "sleep 1 µs" is not 1 µs</h3>
+<p>A timed sleep is a system call (<code>clock_nanosleep</code> in R4's strace), which deschedules the thread and sets a timer; when the timer fires, the thread must be scheduled again. The forensic program's server asked for 1 µs and the run shows the consequence: 10932 <code>clock_nanosleep</code> calls in a run with 2000 requests (2000 of them are the client's deliberate 200 µs pauses between requests, line 145; the rest are the server's idle sleeps), a median round trip of 40.78 µs instead of 1.09 µs, and a p99 of 2105 µs <sup class="src"><a href="#F5-38-src-R4">R4</a></sup>.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The <i>reasons</i> a 1 µs sleep lasts tens of microseconds were not measured in this build: Linux's timer slack (a per-thread allowance that lets the kernel delay timer expiry to batch wake-ups; the author recalls a default of 50 µs for normal threads, adjustable with <code>prctl(PR_SET_TIMERSLACK)</code>), the scheduler's wake-up latency, and the CPU's idle-state exit latency. Check <code>prctl(2)</code> and the kernel's timer documentation for the version in use, and measure the actual sleep length on your machine (lab step 4).</p></div>
+<h3 id="F5-38-l3-rdma">The same trade-offs on an RDMA adapter</h3>
+<ul>
+<li><b>Polling the CQ</b> gives the lowest latency (the F5-36 ping-pong polls); completion channels (<code>ibv_create_comp_channel</code>, <code>ibv_req_notify_cq</code>, <code>ibv_get_cq_event</code>, all declared in the installed header) give interrupt-driven waiting at the cost of a system call and a wake-up per event, and need the "arm, then poll again" sequence to avoid losing a completion that arrived while arming <sup class="src"><a href="#F5-38-src-D1">D1</a></sup> <sup class="src"><a href="#F5-38-src-D2">D2</a></sup>.</li>
+<li><b>Registration cost</b> moves the copy's cost to set-up time. Programs register pools once; libraries keep a registration cache; a cache that misses on every message (fresh buffers from the allocator each time) can make RDMA slower than copying into a pre-registered bounce buffer for small messages <sup class="src"><a href="#F5-38-src-D3">D3</a></sup>.</li>
+<li><b>NUMA placement</b>: the adapter sits on one CPU socket's PCIe lanes; a buffer or a polling thread on the other socket adds an interconnect hop to every DMA and every poll (<a href="#gl-numa">NUMA</a>, HW203).</li>
+<li><b>Zero copy across the whole path</b> needs the data to be produced in registered memory: copying it there first is a copy again. For GPUs, GPUDirect RDMA registers GPU memory so the adapter reads it directly (milestone F5; DS402) <sup class="src"><a href="#F5-38-src-D3">D3</a></sup>.</li>
+</ul>
+<h3 id="F5-38-l3-other">Other kernel-bypass systems</h3>
+<p>RDMA is one of several designs that move the data path to user space: user-space packet processing frameworks that map a NIC's descriptor rings into a process and poll them, user-space storage drivers that poll NVMe queues, and io_uring, which keeps the kernel but replaces per-operation system calls with shared submission and completion rings. All of them share this chapter's structure: shared rings, descriptors instead of copies, pinned or registered memory, and an explicit idle policy <sup class="src"><a href="#F5-38-src-D2">D2</a></sup>. (Names given from general knowledge; their documentation was not opened in this build.)</p>
+
+<h2 id="F5-38-hardware">How the hardware actually does it</h2>
+<p>On one machine, Listing 1's bypass works because both processes' page tables map the same physical pages (<code>MAP_SHARED</code>) and the CPU's cache coherence makes a store on one core visible to a load on another. The cost of a ring message is a 64-byte copy and the transfer of a few cache lines between cores. An RDMA adapter extends this across machines: the doorbell page of the adapter is mapped into the process; registered pages are translated by the adapter's own tables; DMA reads and writes go over PCIe into host memory and become visible to the CPU through the platform's coherence for device writes <sup class="src"><a href="#F5-38-src-D1">D1</a></sup>.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> No RDMA adapter was available; every RDMA statement in this chapter is the author's reading of D1–D3 (title only) and the installed header. The one-machine measurements (R1–R4) are real but are about shared memory between processes, not about RDMA. To test the RDMA side: on two RDMA hosts, run the F5-36 ping-pong with polling and with a completion channel, and record latency and CPU use for both, with the adapter's NUMA node and the polling core recorded.</p></div>
+
+<h2 id="F5-38-worked">Worked example</h2>
+<p><b>How much CPU does a message cost on each path, and what does it buy?</b> From R1 and R2 (<code>-O2</code>):</p>
+<ol>
+<li>Socket stream: 0.87 million messages/s, each with one <code>write</code> by the sender and one <code>read</code> by the receiver: 1.74 million system calls per second across two processes, about 1.15 µs of wall time per message. strace attributed 1.43 s to 240003 writes (about 6 µs each under tracing; strace itself slows every call, so this is an upper bound, not a cost).</li>
+<li>Ring stream: 56.49 million messages/s: 17.7 ns per message, which is a 64-byte copy, an acquire load and a release store on each side, and the transfer of cache lines between cores.</li>
+<li>Ratio: 56.49 / 0.87 ≈ 65. For 64-byte messages, almost all of the socket path's cost is per message, not per byte.</li>
+<li>The price: both ring processes spin. In the stream test this costs nothing extra (they are busy anyway); in a service with requests 200 µs apart (forensic lab) a spinning server burns 97 % of a core to answer in 1.09 µs.</li>
+</ol>
+<p><b>Will this registration fit?</b> A service wants to register 64 send buffers and 64 receive buffers of 64 KiB each, as an ordinary user, under the container's limit of 8388608 bytes. 128 × 65536 = 8388608 bytes: exactly the limit, so any other locked memory (or a second region) makes registration fail. Raise the limit or register one pool and carve buffers from it with headroom.</p>
+
+<h2 id="F5-38-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>spsc_ring.hpp</code> and <code>ring_ipc.cpp</code>: socket pair versus shared-memory rings between two processes.</p>
+<pre class="listing" data-src="F5-38/spsc_ring.hpp"></pre>
+<pre class="listing" data-src="F5-38/ring_ipc.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>hpp 14–23</td><td><code>Ring</code></td><td>1024 slots of 64 bytes; head and tail on separate cache lines; lock-free check.</td><td>Power-of-two slot count; no false sharing between producer and consumer.</td></tr>
+<tr><td>hpp 26–39</td><td><code>mapSharedRing</code>, <code>unmapRing</code></td><td><code>mmap</code> anonymous shared memory and construct the ring in it with placement new.</td><td>Mapped before <code>fork</code>, the same pages are shared by parent and child.</td></tr>
+<tr><td>hpp 41–61</td><td><code>tryPush</code>, <code>tryPop</code></td><td>Full if head − tail = slots; copy then release-store head; empty if head = tail; copy then release-store tail.</td><td>The whole data path: no system call.</td></tr>
+<tr><td>85–109</td><td><code>readAll</code>, <code>writeAll</code></td><td>Loop until all bytes moved.</td><td>A stream socket may move fewer bytes per call.</td></tr>
+<tr><td>111–116</td><td><code>report</code></td><td>Sorts the round trips; prints median, p99 and the stream rate.</td><td>Percentiles, as in <a href="#F5-37">F5-37</a> (no warm-up here: a limitation).</td></tr>
+<tr><td>118–160</td><td><code>socketPath</code></td><td><code>socketpair</code>, <code>fork</code>; the child echoes then sinks; the parent times ping-pongs and the stream.</td><td>Two system calls and two copies per message.</td></tr>
+<tr><td>162–206</td><td><code>ringPath</code></td><td>Two rings (one per direction), <code>fork</code>; both sides spin on <code>tryPop</code>/<code>tryPush</code>.</td><td>Busy polling on both sides.</td></tr>
+<tr><td>210–225</td><td><code>main</code></td><td>Runs both paths, or one (for strace); flushes stdout before each fork.</td><td>Without the flush, the child would inherit and print the parent's buffered text.</td></tr>
+</tbody></table></div>
+<p>The sanitizer build's output, for comparison (R1):</p>
+<pre class="output" data-run="F5-38/ring_ipc"></pre>
+
+<p><b>Listing 2</b> — <code>zero_copy.cpp</code>: the cost of a copy, and the locked-memory limit.</p>
+<pre class="listing" data-src="F5-38/zero_copy.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–33</td><td><code>Descriptor</code>, <code>consume</code></td><td>Address and length; the "device" reads one byte per page.</td><td>What a zero-copy interface hands over instead of the bytes.</td></tr>
+<tr><td>44–48</td><td>copy loop</td><td>Copy 1 MiB into a send buffer, then hand over a descriptor of the copy.</td><td>What a kernel socket write does internally.</td></tr>
+<tr><td>50–52</td><td>descriptor loop</td><td>Hand over a descriptor of the original.</td><td>Zero copy.</td></tr>
+<tr><td>61–77</td><td><code>getrlimit(RLIMIT_MEMLOCK)</code></td><td>Prints the soft and hard locked-memory limits and the page size.</td><td>The budget for pinned memory.</td></tr>
+<tr><td>78–84</td><td><code>mlock</code>, <code>geteuid</code></td><td>Pins 1 MiB and releases it; prints the user id.</td><td>Pinning in action; the user id explains why limits might not apply.</td></tr>
+</tbody></table></div>
+
+<h2 id="F5-38-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A courier with a key can take anything from the shelf. A memory region's access flags restrict what a remote adapter may do, and its bounds are checked on every operation (<a href="#F5-36">F5-36</a>).</li>
+<li>"Bolting a shelf to the wall" sounds permanent. Pinning lasts until deregistration or <code>munlock</code>; the danger is the opposite of the analogy: forgetting to release it, until the limit is reached.</li>
+<li>Standing at the window costs only the watcher's time. A spinning core also costs power, heat and a core another program could have used, and on a shared machine it can slow its neighbours.</li>
+<li>On one machine, "bypass" in Listing 1 means no kernel at all. With RDMA the kernel is still on the control path (device open, registration, QP creation), and the adapter, not another process, does the work at the other end.</li>
+</ul>
+
+<h2 id="F5-38-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Mistake</th><th>Symptom</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Sleeping in a polling loop</td><td>Bypass slower than expected; high p99; low CPU</td><td><code>strace -c</code> shows many <code>clock_nanosleep</code> calls (R4)</td><td>Busy poll, or spin-then-block on a real notification.</td></tr>
+<tr><td>Registering per message</td><td>Latency high, CPU in the kernel</td><td>Profile; count <code>ibv_reg_mr</code> calls</td><td>Register pools at start-up; use a registration cache.</td></tr>
+<tr><td>Locked-memory limit too low</td><td><code>ibv_reg_mr</code> or <code>mlock</code> fails</td><td>Print <code>RLIMIT_MEMLOCK</code> (Listing 2)</td><td>Raise the limit for the service; register less.</td></tr>
+<tr><td>Reusing a buffer before its completion</td><td>Corrupted data at the receiver, sometimes</td><td>Poison the buffer after posting in a debug build</td><td>Wait for the completion (or use inline sends for small data).</td></tr>
+<tr><td>Polling thread on the wrong NUMA node or sharing a core</td><td>Latency high and variable</td><td>Check affinity and the adapter's node</td><td>Pin the polling thread to a dedicated core near the adapter.</td></tr>
+<tr><td>Head and tail on one cache line</td><td>Ring slower than expected</td><td>Check alignment; a profiler shows cache-line contention</td><td>Align each index to 64 bytes (header lines 19–21).</td></tr>
+<tr><td>Forking after opening RDMA resources</td><td>Undefined behaviour, corrupted registrations</td><td>Review process start-up</td><td>Fork first, or call <code>ibv_fork_init</code> as the header describes (<a href="#F5-36">F5-36</a>).</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F5-38-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F5-34">F5-34</a> named kernel bypass and zero copy; <a href="#F5-36">F5-36</a> built the verbs objects; <a href="#F5-37">F5-37</a> taught the measurement protocol; SP203 the SPSC ring; OS201 system calls. <b>What carries over:</b> the ring buffer and release/acquire ordering, the buffer-ownership rule, percentiles and recorded configurations, strace as evidence <sup class="src"><a href="#F5-38-src-R2">R2</a></sup>. <b>What changes:</b> most dangerous first: without the kernel on the data path, no one wakes you, so idle policy becomes your design decision and a careless one (sleeping) puts the kernel back with worse latency than before; memory must be pinned and stays pinned until you release it; and the course project now combines all five chapters <sup class="src"><a href="#F5-38-src-R4">R4</a></sup>. <b>What comes next:</b> the DS401 course project (below), then DS402 (collective communication at scale), which builds all-reduce over these transports (milestone F5).</p></div>
+
+<h2 id="F5-38-check">Check yourself</h2>
+<ol>
+<li>From R2, how many system calls did the socket path make per message, and how many did the ring path make in total? Why is the ring's number independent of the message count?</li>
+<li>Which two operations of <code>spsc_ring.hpp</code> make a slot's bytes visible to the other process, and what order do they need?</li>
+<li>What are the two conditions zero copy needs, and how does RDMA meet each?</li>
+<li>The container's locked-memory limit is 8388608 bytes. How many 1 MiB regions can an ordinary user register under it, at most, and why might the real answer be smaller?</li>
+<li>Apply to a new case: a service receives one request every 2 ms on average and must answer within 50 µs at p99, using at most 10 % of a core when idle. Which idle policy do you choose, and how do you tune it?</li>
+<li>Why did the forensic program's strace show 10932 <code>clock_nanosleep</code> calls for 2000 requests?</li>
+<li>Name two RDMA situations in which copying can be faster than zero copy.</li>
+<li>What must the leader of the course project know about each follower before its first append, and how does it learn it?</li>
+</ol>
+
+<h2 id="F5-38-lab">Lab</h2>
+<p><b>Goal.</b> Measure kernel bypass and zero copy on one machine, and measure the cost of each idle policy.</p>
+<p><b>Hardware and software needed.</b> Linux, g++ (the build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>), strace (the build used <code>strace -- version 6.8</code>), at least 2 CPUs. <b>Safety:</b> none beyond normal computer use; busy-polling programs use a whole core, so do not leave them running on a shared machine.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F5-38</code>; expect exit status 0 and the outputs quoted in this chapter (numbers will differ on your machine; system-call counts should match).</li>
+<li>Add a warm-up of 1000 round trips to both paths of Listing 1 and repeat the <code>-O2</code> run five times; tabulate the medians.</li>
+<li>Change the message size to 4096 bytes (a ring slot of 4096) and compare the stream rates of both paths: how does the ratio change, and why?</li>
+<li>Measure what <code>std::this_thread::sleep_for(1 us)</code> actually sleeps on your machine: time 10000 calls and print min, median and p99. Then call <code>prctl(PR_SET_TIMERSLACK, 1)</code> first (check the man page) and measure again.</li>
+<li>Implement spin-then-block in the forensic program: spin for S microseconds, then block on an eventfd that the client writes after pushing a request. Measure median, p99 and server CPU for S = 0, 5, 50 and 500 µs.</li>
+</ol>
+<p><b>Expected observations.</b> The socket path's system calls grow with the message count, the ring's do not; the 4096-byte ratio is smaller because the per-byte copy now matters; the measured sleep is much longer than 1 µs (by how much is for you to measure); spin-then-block gives low CPU at S = 0 and busy-poll latency once S exceeds the request gap.</p>
+<p><b>Verification.</b> A table per step with the machine, CPU count and compile command recorded; a plot of p99 against CPU use for the four values of S.</p>
+<p><b>Troubleshooting.</b> The ring test never finishes: one side is not running (check that both processes were created and that no core is overloaded; with one CPU, spinning processes take turns only at scheduler ticks). strace changes the timings a lot: it is meant to; use it for counts, not for times.</p>
+
+<h2 id="F5-38-forensic">Forensic lab</h2>
+<p><b>Scenario — "kernel bypass made it slower".</b> A team replaced the socket transport of an internal two-process service with shared-memory rings ("version 2"), after a benchmark showed ring round trips under 1 µs. To avoid one core spinning at 100 % all day, a reviewer asked for "a tiny sleep when there is no work", and the server now sleeps 1 µs whenever its request ring is empty. In production, where requests arrive about every 200 µs, latency did not improve as promised: the median is tens of microseconds and the tail is in milliseconds. The ticket asks whether shared memory "is just slower on this hardware".</p>
+<p><b>Evidence pack.</b> The service's own report as deployed (<code>-O2</code> build):</p>
+<pre class="output" data-run="F5-38/bypass_sleep_O2"></pre>
+<p>The same program built with sanitizers by the lab runner, for reference:</p>
+<pre class="output" data-run="F5-38/bypass_sleep"></pre>
+<p>System calls of both processes over one run (<code>strace -f -c</code>):</p>
+<pre class="output" data-run="F5-38/bypass_syscalls"></pre>
+<p>The server's idle loop, from the program's lines 119–123: <code>while (!tryPop(*req, msg)) { std::this_thread::sleep_for(std::chrono::microseconds(1)); }</code> (full source in the answer key). The client sends a request, waits for the reply, then pauses 200 µs before the next one, to imitate production's request rate.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>The benchmark promised under 1 µs. What does the evidence say about the median, the p99 and the server's CPU use?</li>
+<li>Which system call dominates the strace table, and how many of its calls belong to the server? (Hint: read the client's loop.)</li>
+<li>State at least three hypotheses (hardware, shared memory, the idle policy, measurement) and the evidence for or against each.</li>
+<li>Explain the mechanism: why does a server that sleeps "1 µs" add tens of microseconds to the median and milliseconds to the tail?</li>
+<li>Propose a fix that meets "low CPU when idle" and "low latency", and a measurement that proves it.</li>
+</ol>
+<p><b>Method hints.</b> Separate what the data path does from what the idle loop does. Count system calls per request. Compare the minimum with the median.</p>
+
+<h2 id="F5-38-project">Mini-project and course project</h2>
+<h3 id="F5-38-mini">Mini-project: an idle-policy curve</h3>
+<p>Extend lab step 5 into a small study: for request gaps of 10 µs, 200 µs and 2 ms, measure median and p99 round trip and server CPU for busy poll, block-only (eventfd), and spin-then-block with S chosen per gap. Present one chart per gap (CPU on one axis, p99 on the other) and a recommendation table. <b>Rubric:</b> correct implementation of the three policies 30 %; measurement protocol of <a href="#F5-37">F5-37</a> followed and recorded 30 %; charts and recommendation 25 %; discussion of how this maps to RDMA completion channels 15 %.</p>
+<h3 id="F5-38-course-project">DS401 course project: an RDMA-based replicated log append benchmark</h3>
+<p><b>Goal.</b> Build a leader and two followers that replicate an append-only log with one-sided RDMA WRITEs, and measure append latency (request to commit) and throughput honestly. The protocol of Figure 3 is a suggested starting point.</p>
+<p><b>Functional requirements.</b></p>
+<ol>
+<li>Each follower registers a log ring with <code>IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE</code> and sends its address, length and rkey to the leader out of band; the leader checks the advertised access before the first append (F5-36's forensic lesson).</li>
+<li>The leader appends fixed-size entries (header with term, index, length and a checksum; payload 64 B to 64 KiB) by RDMA WRITE into the next free slot of each follower, then signals the entry index (RDMA WRITE WITH IMMEDIATE, or a SEND on the same RC queue pair).</li>
+<li>Followers acknowledge the highest index stored and return credits (free slots); the leader never writes into a slot whose credit it has not received.</li>
+<li>An entry is committed when a majority (2 of 3 copies, counting the leader's) holds it; the leader reports commit latency per entry.</li>
+<li>Every completion's status is checked; on an error the leader logs the first error, marks the follower down, resets and reconnects its queue pair, and resends missing entries from the follower's last acknowledged index.</li>
+<li>A baseline implementation of the same protocol over TCP (DS201 sockets) on the same hosts.</li>
+</ol>
+<p><b>Quality requirements.</b> Followers' logs are byte-identical to the leader's for all committed entries (checked by a test); the measurement follows <a href="#F5-37">F5-37</a> (release build, warm-up, percentiles, repetitions, recorded configuration dump including path MTU and lossless settings); the raw fabric is verified first with perftest (curriculum milestone F5 acceptance test: raw RDMA bandwidth within 10 % of the adapter's line rate, recorded).</p>
+<p><b>Constraints.</b> Hardware: three hosts with RDMA adapters on one InfiniBand or RoCE network, or three hosts or virtual machines with Soft-RoCE (results then labelled "Soft-RoCE"). Without either, the <b>model track</b>: implement the protocol on the toy verbs model of <a href="#F5-36">F5-36</a> (correctness and fault tests) and on the shared-memory rings of this chapter (one process per node, for timing), graded on correctness and analysis with every number labelled "model" or "shared memory, not RDMA". Time: about 30 hours.</p>
+<p><b>Deliverables.</b> Code with build instructions; tests (byte-identical logs, a follower that stops consuming makes the leader stall rather than overwrite, a follower registered without REMOTE_WRITE is refused at set-up, a killed follower is caught up after restart); a report of at most six pages with plots of commit latency percentiles and appends per second against entry size, batch size and number of followers, RDMA against TCP; a five-minute demo.</p>
+<p><b>Milestones.</b> M1 (week 1): the F5-36 ping-pong runs on the project hosts, and perftest results are recorded. M2 (week 2): one follower, RDMA WRITE plus signal plus acknowledgement, with credits. M3 (week 3): two followers, majority commit, error handling and catch-up. M4 (week 4): benchmarks, TCP baseline, report and demo.</p>
+<div class="tw"><table>
+<thead><tr><th>Criterion</th><th>Weight</th><th>Full marks</th></tr></thead>
+<tbody>
+<tr><td>Protocol correctness</td><td>30 %</td><td>All tests pass; credits prevent overwrites; commit rule correct; written protocol specification.</td></tr>
+<tr><td>Measurement quality</td><td>25 %</td><td>F5-37 protocol followed; perftest baseline; configuration recorded; numbers reproducible from the report.</td></tr>
+<tr><td>Failure handling</td><td>15 %</td><td>First error identified in logs; reconnect and catch-up demonstrated.</td></tr>
+<tr><td>Analysis</td><td>20 %</td><td>Explains RDMA versus TCP results with the alpha–beta model, header overhead and idle policy; honest limitations.</td></tr>
+<tr><td>Code quality</td><td>10 %</td><td>RAII for every verbs object, warnings clean, readable.</td></tr>
+</tbody></table></div>
+<div class="co warning"><span class="lbl">Watch out</span><p>No reference solution of this project was built or run for this chapter, and nothing in it was tested on RDMA hardware. The protocol is a teaching design, not a consensus algorithm: it has no leader election and no term changes; for those, see DS301 and the consensus literature.</p></div>
+
+<h2 id="F5-38-summary">Summary</h2>
+<ul>
+<li>Kernel bypass moves the data path to user space; the control path still uses the kernel. Measured here: 240003 writes and 240005 reads for the socket path, 79 system calls in total for the ring path.</li>
+<li>The ring delivered 56.49 million 64-byte messages per second against 0.87 million for the socket pair (<code>-O2</code>): almost all of a small message's kernel cost is per message.</li>
+<li>Zero copy passes descriptors instead of bytes; it needs pinned, registered memory and the buffer-ownership rule. The container's locked-memory limit was 8 MiB.</li>
+<li>Without the kernel nobody wakes you: choose busy poll, block, or spin-then-block. A timed sleep in a poll loop brought the kernel back: median 40.78 µs and p99 2105 µs instead of 1.09 µs and 18.52 µs.</li>
+<li>The course project replicates a log with RDMA WRITEs, credits and majority commit, and must be measured with the F5-37 protocol.</li>
+</ul>
+
+<h2 id="F5-38-sources">Sources</h2>
+<ol>
+<li id="F5-38-src-D1">D1 — InfiniBand Trade Association, "InfiniBand Architecture Specification" (tier 1; curriculum item 81), and rdma-core header <code>infiniband/verbs.h</code> as installed by <code>libibverbs-dev 50.0-2ubuntu0.2</code> (tier 2). <i>Specification: title only — not opened during this build (dossier gate G1 open). Header: opened in this build (2026-10-09); the completion-channel functions named in Layer 3 are declared there.</i></li>
+<li id="F5-38-src-D2">D2 — Linux man-pages project: <code>mlock(2)</code>, <code>getrlimit(2)</code>, <code>prctl(2)</code>, <code>clock_nanosleep(2)</code>, <code>eventfd(2)</code>, <code>futex(2)</code>; the Linux kernel's InfiniBand/RDMA documentation (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-38-src-D3">D3 — NVIDIA, "RDMA Aware Networks Programming User Manual" and GPUDirect RDMA documentation (curriculum items 81, 82); UCX and Open MPI documentation on memory registration caches (curriculum item 83) (tier 1 for vendor material, tier 2 for projects). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-38-src-D4">D4 — Curriculum Track F, milestone F5 (build and accept text) and the DS401 course card; DS301 chapters on replication and quorums (university internal). <i>Opened in this build (curriculum and course card).</i></li>
+<li id="F5-38-src-R1">R1 — <code>university/labs/F5-38/ring_ipc.log</code> (sanitizer build, by <code>run_lab.sh</code>) and <code>ring_O2.log</code> (<code>-O2</code>, by the lab's <code>run.sh</code>): Listing 1, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, Linux x86_64 cloud build container with 4 CPUs visible, exit code 0 each.</li>
+<li id="F5-38-src-R2">R2 — <code>university/labs/F5-38/syscalls_socket.log</code>, <code>syscalls_ring.log</code>: <code>strace -f -c</code> (strace 6.8) of the <code>-O2</code> build, one path each, exit code 0 each.</li>
+<li id="F5-38-src-R3">R3 — <code>university/labs/F5-38/zero_copy.log</code>: Listing 2, same compiler, exit code 0.</li>
+<li id="F5-38-src-R4">R4 — <code>university/labs/F5-38/bypass_sleep.log</code> (sanitizer build), <code>bypass_sleep_O2.log</code>, <code>bypass_syscalls.log</code> (strace of the <code>-O2</code> build) and <code>bypass_spin.log</code>: the forensic program, exit code 0 each.</li>
+</ol>
+
+<h2 id="F5-38-glossary">Glossary links</h2>
+<p><a href="#gl-data-path-and-control-path">Data path and control path</a> · <a href="#gl-locked-memory-limit-rlimit-memlock">Locked-memory limit (RLIMIT_MEMLOCK)</a> · <a href="#gl-idle-policy">Idle policy</a> · <a href="#gl-registration-cache">Registration cache</a> · <a href="#gl-replicated-log-append">Replicated log append</a> · <a href="#gl-kernel-bypass">Kernel bypass</a> · <a href="#gl-zero-copy">Zero copy</a> · <a href="#gl-pinned-page-locked-memory">Pinned (page-locked) memory</a> · <a href="#gl-spsc-ring-buffer">SPSC ring buffer</a> · <a href="#gl-polling">Polling</a></p>
+
+<h2 id="F5-38-next">Next chapter</h2>
+<p>This is the last chapter of DS401. Next: the course project above, then <a href="#DS402">DS402</a>. Previous: <a href="#F5-37">F5-37 Measuring with perftest</a>. Back to the course: <a href="#DS401">DS401</a>.</p>
+
+<h2 id="F5-38-answers">Answers to Check yourself</h2>
+<ol>
+<li>Socket: two per message (one <code>write</code> by the sender, one <code>read</code> by the receiver): 240003 writes and 240005 reads for 240000 transfers plus a few. Ring: 79 in total. The ring's calls are all start-up (loading, mapping, fork, printing); the data path is loads, stores and copies in shared memory, which the kernel never sees.</li>
+<li>The producer's release store of <code>head</code> after copying into the slot (line 48) and the consumer's acquire load of <code>head</code> before reading it (line 55). Release/acquire ordering guarantees the slot's bytes are visible once the new head is.</li>
+<li>(a) The device must find the pages and they must not move: RDMA registers the region, pinning the pages and giving the adapter their translations. (b) The application must not change the buffer while the device uses it: the buffer belongs to the adapter until its completion.</li>
+<li>At most 8 (8 × 1048576 = 8388608). Less if the process has any other locked memory, if the regions are not page-aligned (an extra page each), or if the library registers extra memory itself.</li>
+<li>Spin-then-block: spin for a short bounded time after each request (bursts are served at polling latency), then block on a notification (eventfd, or a completion channel for verbs), whose wake-up latency must be measured to be well under 50 µs at p99 on the target machine; tune the spin time with the lab-step-5 curve so idle CPU stays under 10 %. Busy polling would use 100 %; a timed sleep has the forensic lab's tail.</li>
+<li>The client sleeps 200 µs after each request on purpose (line 145): 2000 calls. The other 8932 are the server's idle sleeps: while it waits for the next request it sleeps repeatedly, each call lasting far longer than 1 µs, several per gap.</li>
+<li>Small messages: copying into a pre-registered bounce buffer is cheaper than registering a fresh buffer per message (registration cost), and inline sends copy small data into the work request anyway. Also, when the registration cache misses because buffers are freed and reallocated each time.</li>
+<li>For each follower: QP number, first PSN, LID/GID (to connect), and the log ring's address, length, rkey and access (to write), plus the starting index; learned through the out-of-band exchange at connection set-up (TCP or rdma-cm), with the access checked before the first append.</li>
+</ol>
+<h3 id="F5-38-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> As deployed (<code>-O2</code>): minimum round trip 0.98 µs (the ring path works when the server happens to be awake), median 40.78 µs, p99 2104.99 µs, server at 19 % of one core <sup class="src"><a href="#F5-38-src-R4">R4</a></sup>. The sanitizer build shows the same pattern (median 65.42 µs, p99 3880.11 µs, 17 %). strace: 10932 <code>clock_nanosleep</code> calls dominate; 2000 are the client's 200 µs pauses, about 8900 are the server's idle sleeps. There are no <code>read</code>/<code>write</code> calls on the data path.</p>
+<p><b>Hypotheses.</b> H1 hardware or shared memory slow: against, the minimum is 0.98 µs and the busy-polling variant on the same machine gives a median of 1.09 µs (R4, <code>bypass_spin.out</code>, below); R1's ring ping-pong median was 0.75 µs. H2 measurement error: against, the minimum and the spin variant use the same clock and code. H3 the idle policy: for, the median is far above the minimum, the tail is in milliseconds, and the only system call in the steady state is the sleep. H3 explains everything.</p>
+<p><b>Mechanism.</b> Requests arrive every 200 µs, so the server is almost always idle when a request comes and is inside a sleep. <code>sleep_for(1 µs)</code> is a <code>clock_nanosleep</code> system call: the thread is descheduled and is woken by a timer, later than asked (timer slack, wake-up and idle-exit latency; see the unverified box in Layer 3). The request waits for the sleep to end; occasionally the thread is not rescheduled for milliseconds (the p99). Bypass removed the kernel from the data path; the sleep put it back, with a timer in front.</p>
+<p><b>Fix.</b> Replace the sleep by spin-then-block: spin for a bounded time after each request, then block on an eventfd (or futex) that the client signals only when the server is blocked; or dedicate a core and busy-poll if the latency target justifies 100 % of a core. The busy-poll result, for comparison:</p>
+<pre class="output" data-run="F5-38/bypass_spin"></pre>
+<p>Prove it with the lab-step-5 curve at the production request gap: median and p99 near the busy-poll values, idle CPU near the block-only value.</p>
+<pre class="listing" data-src="F5-38/bypass_sleep.cpp"></pre>
+<p><b>How the evidence was produced.</b> <code>bypass_sleep.cpp</code> as listed, the sleeping server as deployed, the spinning server with the argument <code>spin</code>; strace counted both processes (<code>-f</code>).</p>
