@@ -1,0 +1,333 @@
+<!--meta
+id: F4-43
+title: A virtio-gpu driver
+course: DR405
+level: L4
+prereqs: F4-42; F4-05 (virtio transport and virtqueues); F4-02 (PCI); DR302 (interrupts, F4-08)
+time: 12–16 hours including the lab
+hardware: none (QEMU 8.2.2 with virtio-gpu-pci, TCG); the lab kernel is the DR301 kernel with the F4-05 virtio transport
+maps: Curriculum Track G, milestone G2 (course project option); section 15
+analogy: F4 — the school and its visitors (the hall's projector, its slide store and the order board at the stage door)
+-->
+
+<h2 id="F4-43-hook">Story hook</h2>
+<p>The school hall has a projector, and the visiting theatre company owns it. Teachers may not touch the projector. Instead, the stage manager keeps a store of slides in the company's own room, and teachers work through the order board at the stage door, as with every other request. A teacher who wants to show a picture first asks for a blank slide of the right size and gets a number for it. Then she tells the company where in the school her drawing is, and asks for the slide to be loaded onto the projector. Each time she changes her drawing, she pins two orders: "copy this part of my drawing onto slide 1" and "show that part on the screen". A new teacher once pinned only the second order. The audience kept seeing the old picture, although her drawing had changed. Nobody had told the company to copy it.</p>
+<p>QEMU's virtio-gpu works exactly like this. Your driver draws into its own memory; the device keeps its own copy of every image (a resource); two commands copy and show. This chapter writes that driver, on top of the virtio transport from F4-05, and checks it the way milestone G2 asks: QEMU's screen dump against a reference image.</p>
+
+<h2 id="F4-43-able">What you will be able to do</h2>
+<ul>
+<li><b>Write</b> a virtio-gpu 2D driver for your own kernel: control and cursor queues, display information, EDID, resources, backing memory, scan-out, transfers and flushes.</li>
+<li><b>Explain</b> why virtio-gpu has two copies of every image and which command moves pixels from one to the other.</li>
+<li><b>Compute</b> a damage rectangle and the transfer offset that goes with it.</li>
+<li><b>Verify</b> a display driver automatically by comparing a QEMU screen dump with a CPU-rendered reference image, pixel by pixel.</li>
+<li><b>Use</b> QEMU's trace events to see which commands the device received, as evidence independent of your driver's own log.</li>
+<li><b>Diagnose</b> a screen that shows stale content after an update, from a screen-dump comparison and a device trace.</li>
+</ul>
+
+<div class="co jargon" id="F4-43-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>virtio-gpu</dt><dd><b>Simple words:</b> a pretend graphics card that virtual machines use, described in an open standard. <b>Analogy:</b> the company's projector, which teachers reach only through orders on the board. <b>Precise:</b> the <a href="#gl-virtio">virtio</a> device type 16; its 2D command set creates host-side resources, attaches guest memory as backing, copies rectangles into resources and assigns resources to scan-outs; optional features add EDID, 3D (virgl) and blob resources. <sup class="src"><a href="#F4-43-src-D1">D1</a></sup> <sup class="src"><a href="#F4-43-src-D2">D2</a></sup></dd>
+<dt>Resource (virtio-gpu)</dt><dd><b>Simple words:</b> an image the device keeps on its side. <b>Analogy:</b> a numbered slide in the company's slide store. <b>Precise:</b> a device-side object with an id chosen by the driver, a format and a size, created with <code>RESOURCE_CREATE_2D</code>; it is the device's copy of the pixels, separate from the guest's backing memory. <sup class="src"><a href="#F4-43-src-D1">D1</a></sup> <sup class="src"><a href="#F4-43-src-D2">D2</a></sup></dd>
+<dt>Backing memory</dt><dd><b>Simple words:</b> the guest's own memory where the driver draws the pixels. <b>Analogy:</b> the teacher's drawing in her classroom. <b>Precise:</b> a list of guest-physical memory ranges attached to a resource with <code>RESOURCE_ATTACH_BACKING</code>; <code>TRANSFER_TO_HOST_2D</code> copies a rectangle from it into the resource. <sup class="src"><a href="#F4-43-src-D1">D1</a></sup> <sup class="src"><a href="#F4-43-src-D2">D2</a></sup></dd>
+<dt>Scan-out</dt><dd><b>Simple words:</b> one output of a graphics card, like one monitor connector. <b>Analogy:</b> the projector. <b>Precise:</b> a display output of the device (virtio-gpu reports up to 16); <code>SET_SCANOUT</code> selects which resource, and which rectangle of it, the output shows. In real hardware the term also means the act of reading a framebuffer out to the display, line by line (F4-46). <sup class="src"><a href="#F4-43-src-D2">D2</a></sup></dd>
+<dt>Damage rectangle</dt><dd><b>Simple words:</b> the part of the screen that changed. <b>Analogy:</b> the bit of the drawing the teacher re-did, so only that part is copied onto the slide. <b>Precise:</b> a rectangle (or set of rectangles) bounding all pixels that differ between two frames; a driver or compositor sends and shows only that region to save copying. <sup class="src"><a href="#F4-43-src-R2">R2</a></sup></dd>
+<dt>EDID</dt><dd><b>Simple words:</b> a small block of data in which a monitor describes itself. <b>Analogy:</b> the projector's label: maker, model, and the picture sizes it can show. <b>Precise:</b> Extended Display Identification Data, a 128-byte base block (plus 128-byte extension blocks) with a fixed header, manufacturer and product ids, supported timings and detailed timing descriptors; read over DDC on real hardware and with <code>GET_EDID</code> on virtio-gpu. F4-46 parses it. <sup class="src"><a href="#F4-43-src-D2">D2</a></sup> <sup class="src"><a href="#F4-43-src-D4">D4</a></sup></dd>
+<dt>Screen dump</dt><dd><b>Simple words:</b> a picture file of what a virtual monitor shows right now. <b>Analogy:</b> a photograph of the hall's screen taken from the back row. <b>Precise:</b> QEMU's monitor command <code>screendump</code>, which writes the current contents of the guest display, here as a binary PPM file; it is the evidence for G2's acceptance test. <sup class="src"><a href="#F4-43-src-D3">D3</a></sup> <sup class="src"><a href="#F4-43-src-R3">R3</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-43-pictures">The idea in pictures</h2>
+<p>Figure 1 is the one picture to remember: pixels exist twice. Everything the driver does is either setting up the three boxes or moving pixels along the two arrows.</p>
+<figure id="F4-43-fig1"><div class="svgbox">
+<svg viewBox="0 0 870 372" role="img" aria-labelledby="F4-43-f1t F4-43-f1d">
+<title id="F4-43-f1t">Figure 1: where the pixels live in virtio-gpu 2D and which commands move them</title><desc id="F4-43-f1d">Three boxes from left to right. The guest's backing memory g_fb, 640 by 480 pixels of 4 bytes in guest RAM, where the driver draws. Arrow a leads to resource 1, the device's host-side copy of 640 by 480 pixels in format B8G8R8X8, created by RESOURCE_CREATE_2D. Arrow b leads to scanout 0, which shows resource 1 after SET_SCANOUT. A legend: a is TRANSFER_TO_HOST_2D with a rectangle and an offset, which copies guest pixels into the resource; b is RESOURCE_FLUSH with a rectangle, which shows that part. Below, the control queue 0: each command is a chain of two descriptors, the request which the device reads, then the response which the device writes; the driver polls the used ring for the response type. The cursor queue 1 uses one descriptor per command without a response buffer. The set-up order is GET_DISPLAY_INFO, GET_EDID, RESOURCE_CREATE_2D, RESOURCE_ATTACH_BACKING, SET_SCANOUT; each frame sends TRANSFER_TO_HOST_2D then RESOURCE_FLUSH for the damaged rectangle.</desc>
+<rect class="sv-bg" x="0" y="0" width="870" height="372"/>
+<text class="sv-tb" x="20" y="26">guest (your kernel)</text>
+<text class="sv-tb" x="330" y="26">virtio-gpu device (QEMU)</text>
+<text class="sv-tb" x="680" y="26">host window / screen dump</text>
+<rect class="sv-b1" x="20" y="40" width="260" height="80" rx="6"/><text class="sv-tb" x="150" y="68" text-anchor="middle">backing memory g_fb</text><text class="sv-ts" x="150" y="84" text-anchor="middle">640 x 480 x 4 bytes in guest RAM</text><text class="sv-ts" x="150" y="100" text-anchor="middle">your code draws here</text>
+<rect class="sv-b2" x="330" y="40" width="300" height="80" rx="6"/><text class="sv-tb" x="480" y="68" text-anchor="middle">resource 1 (host copy)</text><text class="sv-ts" x="480" y="84" text-anchor="middle">640 x 480, format B8G8R8X8</text><text class="sv-ts" x="480" y="100" text-anchor="middle">created by RESOURCE_CREATE_2D</text>
+<rect class="sv-b5" x="680" y="40" width="170" height="80" rx="6"/><text class="sv-tb" x="765" y="68" text-anchor="middle">scanout 0</text><text class="sv-ts" x="765" y="84" text-anchor="middle">shows resource 1</text><text class="sv-ts" x="765" y="100" text-anchor="middle">after SET_SCANOUT</text>
+<line class="sv-line" x1="280" y1="70" x2="323.0" y2="70.0"/><polygon class="sv-head" points="330.0,70.0 323.0,73.8 323.0,66.2"/>
+<text class="sv-tb" x="286" y="62">a</text>
+<line class="sv-line" x1="630" y1="70" x2="673.0" y2="70.0"/><polygon class="sv-head" points="680.0,70.0 673.0,73.8 673.0,66.2"/>
+<text class="sv-tb" x="640" y="62">b</text>
+<rect class="sv-box" x="20" y="150" width="830" height="30" rx="6"/><text class="sv-ts" x="435" y="169" text-anchor="middle">a = TRANSFER_TO_HOST_2D (rectangle, offset): copy guest pixels into the resource.   b = RESOURCE_FLUSH (rectangle): show that part.</text>
+<text class="sv-tb" x="20" y="214">control queue 0: every command is a chain of two descriptors</text>
+<rect class="sv-b3" x="20" y="226" width="250" height="56" rx="6"/><text class="sv-tb" x="145" y="250" text-anchor="middle">descriptor 1: request</text><text class="sv-ts" x="145" y="266" text-anchor="middle">device reads (flags NEXT)</text>
+<rect class="sv-b4" x="290" y="226" width="250" height="56" rx="6"/><text class="sv-tb" x="415" y="250" text-anchor="middle">descriptor 2: response</text><text class="sv-ts" x="415" y="266" text-anchor="middle">device writes (flags WRITE)</text>
+<line class="sv-line" x1="270" y1="254" x2="283.0" y2="254.0"/><polygon class="sv-head" points="290.0,254.0 283.0,257.9 283.0,250.2"/>
+<rect class="sv-box" x="580" y="226" width="270" height="56" rx="6"/><text class="sv-tb" x="715" y="250" text-anchor="middle">poll the used ring</text><text class="sv-ts" x="715" y="266" text-anchor="middle">response type OK_NODATA etc.</text>
+<line class="sv-line" x1="540" y1="254" x2="573.0" y2="254.0"/><polygon class="sv-head" points="580.0,254.0 573.0,257.9 573.0,250.2"/>
+<text class="sv-tb" x="20" y="316">cursor queue 1: one descriptor per command (UPDATE_CURSOR, MOVE_CURSOR), no response buffer</text>
+<text class="sv-ts" x="20" y="340">Set-up order: GET_DISPLAY_INFO -&gt; GET_EDID -&gt; RESOURCE_CREATE_2D -&gt; RESOURCE_ATTACH_BACKING -&gt; SET_SCANOUT;</text>
+<text class="sv-ts" x="20" y="356">every frame: TRANSFER_TO_HOST_2D (damaged rectangle) -&gt; RESOURCE_FLUSH (same rectangle).</text>
+</svg></div><figcaption><b>Figure 1.</b> The two copies of every pixel in virtio-gpu 2D and the commands that move them. Command names and structure layouts are from Linux's <code>virtio_gpu.h</code>, checked by Listing 1 <sup class="src"><a href="#F4-43-src-D2">D2</a></sup> <sup class="src"><a href="#F4-43-src-R1">R1</a></sup>; the order is the one this driver uses and QEMU traced <sup class="src"><a href="#F4-43-src-R4">R4</a></sup>. Arrows show data flow.</figcaption></figure>
+<p>Figure 2 shows the two frames the lab driver draws: two windows on a tiled background, then the same scene with window B moved and window A raised. Only the dashed rectangle changes.</p>
+<figure id="F4-43-fig2"><div class="svgbox">
+<svg viewBox="0 0 720 346" role="img" aria-labelledby="F4-43-f2t F4-43-f2d">
+<title id="F4-43-f2t">Figure 2: the two lab frames and the damaged rectangle between them</title><desc id="F4-43-f2d">Two screens drawn at half scale. Frame 1: a tiled blue background, window A at 40,40 of size 300 by 200, and window B at 200,150 of size 320 by 220 on top of A. Frame 2: window B has moved to 280,210 and window A is now on top. A dashed rectangle in frame 2 marks the damage, x 40, y 40, width 560, height 390, the union of A, B's old position and B's new position. A note says that frame 1 is sent whole, frame 2 sends 218,400 of 307,200 pixels, and that forgetting the transfer for the damage leaves frame-1 pixels in the device's copy, which the flush then shows.</desc>
+<rect class="sv-bg" x="0" y="0" width="720" height="346"/>
+<text class="sv-tb" x="20" y="24">frame 1 (B on top)</text>
+<rect class="sv-b6" x="20" y="34" width="320" height="240" rx="0"/>
+<rect class="sv-b5" x="40" y="54" width="150" height="100" rx="0"/>
+<text class="sv-tb" x="48" y="70">window A</text>
+<rect class="sv-b8" x="120" y="109" width="160" height="110" rx="0"/>
+<text class="sv-tb" x="128" y="125">window B</text>
+<text class="sv-tb" x="380" y="24">frame 2 (B moved, A raised)</text>
+<rect class="sv-b6" x="380" y="34" width="320" height="240" rx="0"/>
+<rect class="sv-b8" x="520" y="139" width="160" height="110" rx="0"/>
+<text class="sv-tb" x="528" y="155">window B</text>
+<rect class="sv-b5" x="400" y="54" width="150" height="100" rx="0"/>
+<text class="sv-tb" x="408" y="70">window A</text>
+<rect class="sv-dash" x="400" y="54" width="280" height="195" rx="0"/>
+<text class="sv-ts" x="390" y="296">dashed: damage x=40 y=40 w=560 h=390 = union of A, B old, B new</text>
+<text class="sv-ts" x="20" y="296">the whole screen is sent once (TRANSFER + FLUSH 640 x 480)</text>
+<text class="sv-ts" x="20" y="316">Frame 2 sends 218,400 of 307,200 pixels. Forgetting the TRANSFER for the damage leaves the old frame-1 pixels</text>
+<text class="sv-ts" x="20" y="332">in the device's copy: the flush shows stale content (the forensic lab).</text>
+</svg></div><figcaption><b>Figure 2.</b> The two frames the lab driver shows, at half scale, with the damage rectangle the driver computes (<code>scene.h</code>) and sends in frame 2. Sizes and pixel counts are from R2 <sup class="src"><a href="#F4-43-src-R2">R2</a></sup>.</figcaption></figure>
+
+<h2 id="F4-43-layer1">Layer 1 — the kid explanation</h2>
+<p>A virtual computer has a pretend screen. To put a picture on it, your program draws the picture in its own memory. Then it asks the pretend graphics card for a blank picture of the same size, tells the card where its drawing is, and connects that picture to the screen. Each time the drawing changes, the program sends two messages: "copy this part of my drawing" and "show this part". If it forgets to copy, the screen keeps showing the old picture, even though the drawing in memory is new.</p>
+
+<h2 id="F4-43-layer2">Layer 2 — the student explanation</h2>
+<p>virtio-gpu is a virtio device like the block and network devices of F4-05, so the transport is not new: find the PCI function (vendor 0x1AF4, device 0x1040 + 16 = 0x1050 for the modern interface), negotiate features, set up virtqueues, tell the device <code>DRIVER_OK</code>. Queue 0 is the control queue and queue 1 the cursor queue. On the control queue every command is a request structure that the device reads, followed by a response structure that the device writes, both starting with the same 24-byte control header whose first field is a type: a command code going in, a response code coming out. <sup class="src"><a href="#F4-43-src-D1">D1</a></sup> <sup class="src"><a href="#F4-43-src-D2">D2</a></sup> <sup class="src"><a href="#F4-43-src-R1">R1</a></sup></p>
+<p>A minimal 2D driver needs eight commands, in this order:</p>
+<ol>
+<li><code>GET_DISPLAY_INFO</code>: which scan-outs are enabled and what size each one is. The response has 16 entries; the driver takes scan-out 0's width and height.</li>
+<li><code>GET_EDID</code> (only if the device offered feature bit 1, <code>VIRTIO_GPU_F_EDID</code>): the monitor description for a scan-out.</li>
+<li><code>RESOURCE_CREATE_2D</code>: a new resource with an id the driver picks (not 0), a format, a width and a height.</li>
+<li><code>RESOURCE_ATTACH_BACKING</code>: a list of guest memory ranges that hold the pixels.</li>
+<li><code>SET_SCANOUT</code>: show this resource on this scan-out.</li>
+<li><code>TRANSFER_TO_HOST_2D</code>: copy a rectangle from the backing memory into the resource.</li>
+<li><code>RESOURCE_FLUSH</code>: update the display from a rectangle of the resource.</li>
+<li>On the cursor queue, <code>UPDATE_CURSOR</code> (set the cursor image and position) and <code>MOVE_CURSOR</code> (position only).</li>
+</ol>
+<p>Steps 6 and 7 repeat for every frame, with the damaged rectangle. <sup class="src"><a href="#F4-43-src-D1">D1</a></sup> <sup class="src"><a href="#F4-43-src-D2">D2</a></sup></p>
+<p>The format matters because "a pixel" is four bytes in some order. <code>B8G8R8X8_UNORM</code> (value 2) means the bytes in memory are blue, green, red, unused. On a little-endian CPU a 32-bit value <code>0x00RRGGBB</code> stored in memory is exactly those bytes, so the lab draws with ordinary integers. The cursor uses <code>B8G8R8A8_UNORM</code> (value 1), with alpha, so that the area around the arrow is transparent. <sup class="src"><a href="#F4-43-src-D2">D2</a></sup> <sup class="src"><a href="#F4-43-src-R1">R1</a></sup></p>
+<p>How do you know the picture is right? Not by looking: the build container has no screen, and a learner's eyes are not a test. Milestone G2's acceptance test says "QEMU screen dump matches a reference image". The lab draws its frames with one file of plain integer code, <code>scene.h</code>, compiled twice: into the kernel and into a host program that renders the same frame in ordinary memory. The run script asks QEMU for a screen dump of each frame and the host program compares the two, pixel by pixel. Any bug in the driver (wrong format, wrong stride, wrong offset, missing transfer) shows up as pixels that differ, together with the rectangle they lie in. <sup class="src"><a href="#F4-43-src-D5">D5</a></sup> <sup class="src"><a href="#F4-43-src-R3">R3</a></sup></p>
+
+<h2 id="F4-43-layer3">Layer 3 — the engineer's depth</h2>
+<h3>Writing the protocol from the header</h3>
+<p>The lab does not include Linux's <code>&lt;linux/virtio_gpu.h&gt;</code> in the kernel: a freestanding kernel should not depend on a host's headers, and the point is to understand every byte. <code>vgpu_proto.h</code> declares only what the driver uses, written after reading the Linux UAPI header, and <code>vgpu_check.cpp</code> is a host program that includes both and compares 39 constants, sizes and offsets. R1 reports zero differences. This is the same pattern as F4-05's <code>virtio_check</code>: a hand-written protocol is allowed, an unchecked one is not. <sup class="src"><a href="#F4-43-src-D2">D2</a></sup> <sup class="src"><a href="#F4-43-src-R1">R1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The normative description of virtio-gpu is the OASIS VIRTIO specification, section "GPU Device" (D1), which was not opened in this build. Everything about the protocol here is from Linux's UAPI header (D2, opened) and from what QEMU 8.2.2 did in the lab runs. Not verified against D1: that resource id 0 is reserved; the exact rule for <code>offset</code> in <code>TRANSFER_TO_HOST_2D</code> (the lab uses <code>y × stride + x × 4</code>, which QEMU accepted and which the pixel comparison confirms for QEMU only); whether a device may complete control commands out of order (the driver has one command in flight, so it does not depend on it); the meaning of the fence flag in the control header (unused here).</p></div>
+
+<h3>One command, two descriptors</h3>
+<p><code>command()</code> (Listing 2, lines 21–41) is the whole control-queue protocol. It copies the request into a static buffer, clears the response buffer, takes a chain of two descriptors from the F4-05 allocator, points the first at the request and the second at the response with the <code>WRITE</code> flag (the device writes into it), publishes the chain in the available ring, notifies the device and polls the used ring. The response's type field is the result. Polling with a spin limit is a choice for a first driver; DR302's interrupt-driven completion (F4-08) is the next step, and the extension asks for it. <sup class="src"><a href="#F4-43-src-D2">D2</a></sup> <sup class="src"><a href="#F4-43-src-R2">R2</a></sup></p>
+<p>The cursor queue is different: its commands have no response, so <code>cursor_command()</code> uses a single read-only descriptor and waits only until the device has consumed it. The cursor image is a separate 64 × 64 resource; <code>UPDATE_CURSOR</code> names it and a position; <code>MOVE_CURSOR</code> changes the position only, with resource id 0. R4 shows QEMU's own trace of both: <code>update, res 0x2</code> at (100, 100), then <code>move, res 0x0</code> at (300, 250). <sup class="src"><a href="#F4-43-src-R4">R4</a></sup></p>
+
+<h3>Backing memory and physical addresses</h3>
+<p><code>RESOURCE_ATTACH_BACKING</code> takes a list of <code>{address, length}</code> entries in guest-physical memory. The lab kernel runs with paging off, so the framebuffer's address in the program is its physical address and one entry covers it. A kernel with paging must translate each page and send one entry per physically contiguous run; a 640 × 480 framebuffer is 1,228,800 bytes, 300 pages of 4 KiB, which could be 300 entries in the worst case. The backing memory must stay where it is for as long as it is attached: if your memory manager ever moves or frees it, the device copies from whatever is there next. <sup class="src"><a href="#F4-43-src-D2">D2</a></sup> <sup class="src"><a href="#F4-43-src-R2">R2</a></sup></p>
+
+<h3>Transfers, flushes and damage</h3>
+<p><code>TRANSFER_TO_HOST_2D</code> carries a rectangle in resource coordinates and an <code>offset</code> into the backing memory where the rectangle's first pixel lies. For a framebuffer with stride <code>w × 4</code> bytes, the pixel (x, y) is at <code>y × stride + x × 4</code>. <code>RESOURCE_FLUSH</code> carries only a rectangle. The driver could send the whole screen every time; sending the damage instead saves copying. In the lab, frame 2's damage is the union of window A, B's old position and B's new position, x = 40, y = 40, w = 560, h = 390, so the transfer copies 218,400 of 307,200 pixels (R2). A real compositor keeps a list of rectangles instead of one bounding box. <sup class="src"><a href="#F4-43-src-R2">R2</a></sup></p>
+<p>Notice what is <i>not</i> in the protocol: vertical blank. QEMU's virtio-gpu takes the flushed rectangle and updates the host's display whenever its display backend next renders; the guest neither waits for nor learns about the host's refresh. Tearing is the host's problem here. On real hardware it is the driver's (F4-46). <sup class="src"><a href="#F4-43-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That QEMU's virtio-gpu has no vertical-blank event visible to a 2D guest is the author's reading of the UAPI header (D2 defines no such command or event; the only config event bit is <code>VIRTIO_GPU_EVENT_DISPLAY</code>) and of the trace events in <code>trace-events-all</code> (D3); it was not confirmed in QEMU's source or in D1.</p></div>
+
+<h3>Display changes</h3>
+<p>The device's configuration space has <code>events_read</code> and <code>events_clear</code>. When the host changes the display (a resized window, a new resolution), the device sets <code>VIRTIO_GPU_EVENT_DISPLAY</code> in <code>events_read</code> and raises a configuration-change interrupt; the driver writes the bit to <code>events_clear</code>, calls <code>GET_DISPLAY_INFO</code> again, and recreates its resource and scan-out at the new size. G2's acceptance test asks for exactly this. The lab driver reads <code>events_read</code> at start and end (both 0 in R2) but does not handle the event: with <code>-display none</code> there is no host window to resize, and the build had no way to trigger it. What the lab does show is the driver adapting to a different size at start: R5 runs the same kernel on a device configured for 800 × 600, and both frames match their references. <sup class="src"><a href="#F4-43-src-D2">D2</a></sup> <sup class="src"><a href="#F4-43-src-R5">R5</a></sup></p>
+<div class="co warning"><span class="lbl">Untested in this build</span><p>Two parts of milestone G2's acceptance test were not run: "changing the virtual display resolution from QEMU is handled through a display-change event" (no event was triggered; the handler is the second lab extension) and "cursor moves with the C8 USB mouse" (the cursor commands were checked through QEMU's trace, R4, without a USB mouse driver and without a screen dump of the cursor, which QEMU draws in its user interface and not in the guest's resource). The screen-dump part of the test passed at 640 × 480 and 800 × 600 (R3, R5). Nothing was run on a physical GPU; virtio-gpu has no physical form.</p></div>
+
+<h2 id="F4-43-hardware">How the hardware actually does it</h2>
+<p>There is no hardware: virtio-gpu is QEMU code. That is its value for the course. On a real GPU, the job "show these pixels" means programming a display engine to read a framebuffer from VRAM or system memory at the pixel clock's rhythm (F4-46), and the job "draw these pixels" means rendering with the GPU's engines (F4-42). virtio-gpu 2D replaces both with copies done by the host CPU: <code>TRANSFER_TO_HOST_2D</code> is a memory copy inside QEMU from guest RAM to a host image, and <code>RESOURCE_FLUSH</code> tells QEMU's display layer to repaint a region. The guest's commands travel the virtqueue path of F4-05: descriptors in guest RAM, a notification write to the device's notify region in a PCI BAR, and QEMU's device code reading the guest's memory directly. <sup class="src"><a href="#F4-43-src-D2">D2</a></sup> <sup class="src"><a href="#F4-43-src-D3">D3</a></sup></p>
+<p>R2's first lines show the transport facts for this device in QEMU 8.2.2: it offered features <code>0x10130000002</code>, the driver accepted <code>0x100000002</code> (bit 1, EDID, plus bit 32, <code>VIRTIO_F_VERSION_1</code> from F4-05); the control queue has 64 entries and the cursor queue 16; there is one scan-out. <sup class="src"><a href="#F4-43-src-R2">R2</a></sup></p>
+
+<h2 id="F4-43-worked">Worked example</h2>
+<p><b>The frame-2 transfer, by hand.</b> Screen 640 × 480, format <code>B8G8R8X8</code>, stride 640 × 4 = 2560 bytes.</p>
+<ol>
+<li><b>Windows.</b> A = (x 40, y 40, w 300, h 200), so its box is x 40–340, y 40–240. B in frame 1 = (200, 150, 320, 220): x 200–520, y 150–370. B in frame 2 = (280, 210, 320, 220): x 280–600, y 210–430.</li>
+<li><b>Union.</b> x from min(40, 200, 280) = 40 to max(340, 520, 600) = 600; y from min(40, 150, 210) = 40 to max(240, 370, 430) = 430. Damage = (40, 40, 560, 390), inside the 640 × 480 screen, so clipping changes nothing.</li>
+<li><b>Pixels.</b> 560 × 390 = 218,400 of 640 × 480 = 307,200 (71 %). R2 prints the same numbers.</li>
+<li><b>Offset.</b> 40 × 2560 + 40 × 4 = 102,400 + 160 = 102,560 bytes into the backing memory.</li>
+<li><b>Check against the forensic run.</b> If the transfer is skipped, the device's copy keeps frame 1 inside the damage; the pixels that differ between frame 1 and frame 2 are where B was and where B now is and where A now covers B. R6 reports the differing pixels inside x 200–599, y 150–429: B's old left and top edges (200, 150) and B's new right and bottom edges (599 = 280 + 320 − 1, 429 = 210 + 220 − 1). Window A's region outside B's two positions is identical in both frames, so it does not appear.</li>
+</ol>
+
+<h2 id="F4-43-code">Code walk-through</h2>
+<p>All files are in <code>university/labs/F4-43/</code>. The kernel is the DR301 kernel (<code>../F4-01</code>: boot, serial, <code>kprintf</code>; <code>../F4-02</code>: PCI) with the F4-05 virtio transport (<code>../F4-05/virtio.h</code>, <code>virtio.cc</code>); those files belong to DR301 and are used unchanged. The run script drives QEMU through <code>../F4-03/qmp_drive.py</code> (also DR301), which waits for lines on the serial log and sends monitor commands.</p>
+
+<p><b>Listing 1</b> — <code>vgpu_proto.h</code>, the protocol subset</p>
+<pre class="listing" data-src="F4-43/vgpu_proto.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–12</td><td>ids and bits</td><td>The PCI device id, the EDID feature bit, the display-change event bit.</td><td>The device id is computed from the virtio rule (0x1040 + type), not copied.</td></tr>
+<tr><td>14–29</td><td>command and response codes</td><td>Commands 0x01xx (2D), 0x03xx (cursor); responses 0x11xx (OK), 0x12xx (errors).</td><td>A response type below 0x1200 means success; the driver checks the exact one it expects.</td></tr>
+<tr><td>30–31</td><td>formats</td><td>The two formats used, with their byte order.</td><td>Byte order is the first thing to get wrong on a new display path.</td></tr>
+<tr><td>34–48</td><td>structures</td><td>Every request and response the driver sends or reads.</td><td>Field order and padding must match the device exactly.</td></tr>
+<tr><td>50–54</td><td><code>static_assert</code></td><td>Sizes checked at compile time.</td><td>The kernel build fails if a field is added by mistake.</td></tr>
+</tbody></table></div>
+<p>The host check, <code>vgpu_check.cpp</code>, includes this file and Linux's header side by side (build: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined vgpu_check.cpp -o vgpu_check</code>). Output (R1):</p>
+<pre class="output" data-run="F4-43/vgpu_check"></pre>
+
+<p><b>Listing 2</b> — <code>virtio_gpu.cc</code>, the driver</p>
+<pre class="listing" data-src="F4-43/virtio_gpu.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–14</td><td>static state</td><td>One device, two queues, one request and one response buffer.</td><td>One command in flight keeps the driver simple; the buffers are sized for the largest response (EDID, 1056 bytes).</td></tr>
+<tr><td>21–41</td><td><code>command</code></td><td>Two-descriptor chain, notify, poll, free, return the response type.</td><td>Every control command goes through these 20 lines.</td></tr>
+<tr><td>33</td><td><code>DESC_WRITE</code></td><td>Marks the response descriptor as device-writable.</td><td>Without it the device must refuse to write the response.</td></tr>
+<tr><td>43–56</td><td><code>cursor_command</code></td><td>One descriptor, no response.</td><td>The cursor queue's commands are fire-and-forget.</td></tr>
+<tr><td>60–69</td><td><code>init</code></td><td>F4-05 transport set-up, asking for feature EDID, two queues, <code>DRIVER_OK</code>.</td><td>The order follows the virtio initialisation sequence of F4-05.</td></tr>
+<tr><td>83–90</td><td><code>edid</code></td><td>Refuses if the feature was not negotiated.</td><td>A command for an unnegotiated feature is a driver bug.</td></tr>
+<tr><td>98–105</td><td><code>attach_backing</code></td><td>One memory entry for the whole buffer.</td><td>Correct only with paging off (the comment says so).</td></tr>
+<tr><td>113–119</td><td><code>transfer_2d</code></td><td>Computes the offset of the rectangle's first pixel.</td><td>The worked example's number 102,560 comes from line 116.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>f443_main.cc</code>, the kernel's main program</p>
+<pre class="listing" data-src="F4-43/f443_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–11</td><td>buffers</td><td>Framebuffer up to 1024 × 768 and the cursor image, page-aligned.</td><td>Static memory: the lab kernel has no allocator.</td></tr>
+<tr><td>26–35</td><td><code>wait_key</code></td><td>Polls the PS/2 controller for a press and a release.</td><td>The run script sends a key after each screen dump, so each frame is captured while it is on screen.</td></tr>
+<tr><td>41–43</td><td><code>F443_SKIP_TRANSFER_ON_UPDATE</code></td><td>The forensic build skips the damage transfer.</td><td>One preprocessor flag, so the forensic kernel differs from the good one in nothing else.</td></tr>
+<tr><td>59–66</td><td>display info</td><td>Takes the size from scan-out 0 and checks it fits.</td><td>The driver does not assume 640 × 480; R5 depends on this.</td></tr>
+<tr><td>68–78</td><td>EDID</td><td>Prints the base block and its extensions as hex.</td><td>F4-46 parses these bytes on the host.</td></tr>
+<tr><td>80–90</td><td>set-up and frame 1</td><td>Create, attach, scan-out, draw, full transfer and flush.</td><td>The order of Figure 1.</td></tr>
+<tr><td>92–100</td><td>frame 2</td><td>Draw, compute the damage, transfer and flush only it.</td><td>Lines 92 and 98's comments state the trap of the forensic lab.</td></tr>
+<tr><td>102–109</td><td>cursor</td><td>A second resource with alpha, then the two cursor commands.</td><td>Checked through QEMU's trace (R4).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>scene.h</code> and <code>refimg.cc</code>, the reference renderer</p>
+<pre class="listing" data-src="F4-43/scene.h"></pre>
+<pre class="listing" data-src="F4-43/refimg.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>File: lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>scene.h: 8–10</td><td>types</td><td>A framebuffer, a window, a half-open box.</td><td>Half-open boxes make "width = x1 − x0" exact.</td></tr>
+<tr><td>scene.h: 33–38</td><td><code>compose</code></td><td>Background, then windows bottom to top.</td><td>The painter's algorithm: the order is the stacking.</td></tr>
+<tr><td>scene.h: 68</td><td><code>damage_1_to_2</code></td><td>Union of the three window boxes.</td><td>The worked example by code.</td></tr>
+<tr><td>refimg.cc: 18–28</td><td>PPM reader</td><td>Reads QEMU's P6 dump: header, then RGB bytes.</td><td>The dump is RGB; the framebuffer is BGRX in memory; line 37 converts.</td></tr>
+<tr><td>refimg.cc: 32–50</td><td>compare</td><td>Counts differing pixels and their bounding box.</td><td>A bounding box turns "it looks wrong" into a rectangle you can explain.</td></tr>
+</tbody></table></div>
+
+<p><b>Build commands</b> (from <code>build.log</code>; <code>KFLAGS</code> are the DR301 freestanding flags): <code>g++ $KFLAGS -c &lt;each file&gt;; ld -m elf_i386 -nostdlib -static -T kernel.ld -o k443.elf *.o</code>. Output (R0):</p>
+<pre class="output" data-run="F4-43/build"></pre>
+<p><b>Run</b> at 640 × 480 (R2): the serial log, then the monitor steps.</p>
+<pre class="output" data-run="F4-43/vgpu"></pre>
+<p>The acceptance comparison (R3):</p>
+<pre class="output" data-run="F4-43/screens"></pre>
+<p>QEMU's trace of the same run (R4), with timestamps removed. This is the device's view, independent of the driver's log:</p>
+<pre class="output" data-run="F4-43/trace"></pre>
+<p>The same kernel on a device configured for 800 × 600 (R5):</p>
+<pre class="output" data-run="F4-43/res800"></pre>
+
+<h2 id="F4-43-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The "slide store" is in the same building.</b> The device's resource is host memory inside the QEMU process, and the "copy" is a memcpy on the same machine. On a real GPU the analogous copy crosses PCIe or does not happen at all, because the display engine reads the framebuffer directly (F4-46).</li>
+<li><b>There is no dark moment between showings.</b> The analogy's projector changes slides at a fixed rhythm. virtio-gpu has no vertical blank the guest can see; the host updates its window when it likes.</li>
+<li><b>Orders are not read by a person.</b> The device reads the guest's memory directly, including the backing memory, at any time after <code>ATTACH_BACKING</code>. A teacher's drawing in her classroom is private; the guest's backing memory is not.</li>
+</ul>
+
+<h2 id="F4-43-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Flush without transfer.</b> Symptom: the screen does not change, or changes only where an earlier transfer happened. Find: the device trace shows <code>res_flush</code> with no <code>res_xfer_toh_2d</code> before it (forensic lab). Fix: always transfer the same rectangle you flush.</li>
+<li><b>Wrong offset.</b> Symptom: the updated area shows the right shapes in the wrong place, or a sheared copy. Find: the bounding box of differing pixels equals the damage rectangle. Fix: offset = y × stride + x × bytes per pixel.</li>
+<li><b>Red and blue swapped.</b> Symptom: blue windows are orange. Cause: the format says BGRX but the drawing code assumes RGBX bytes. Find: compare one known pixel in the dump. Fix: pick the format that matches your pixel layout.</li>
+<li><b>Response descriptor without WRITE.</b> Symptom: the response stays zero or the device reports an error (not tried in this build). Fix: mark the response descriptor device-writable (Listing 2 line 33).</li>
+<li><b>Resource id 0.</b> Symptom: an error response. Cause: id 0 used as "no resource" (as <code>MOVE_CURSOR</code> does). Fix: start ids at 1 (unverified rule, see the box in Layer 3).</li>
+<li><b>Unchecked response types.</b> Symptom: a black screen and no clue. Fix: check every response against the expected type and stop with its name, as <code>expect()</code> does.</li>
+</ul>
+
+<div class="co transition" id="F4-43-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F4-05, where virtqueues carried block and network requests; F4-42, where a GPU driver's jobs were mapped. <b>What carries over:</b> the virtio transport unchanged, two-descriptor request/response chains, feature negotiation, and the habit of checking a hand-written protocol against the real header <sup class="src"><a href="#F4-43-src-D2">D2</a></sup> <sup class="src"><a href="#F4-43-src-R1">R1</a></sup>. <b>What changes:</b> the payload is pixels, the result is something you see, so you need a verification method that is not your eyes (the screen dump and the reference renderer); and pixels now live twice, so "the data is in memory" no longer means "the device has it". <b>What comes next:</b> F4-44 leaves the virtual device behind and looks at a real GPU's PCI identity and video ROM, read-only, without the help of a friendly open protocol.</p></div>
+
+<h2 id="F4-43-check">Check yourself</h2>
+<ol>
+<li>List the eight commands of a minimal 2D driver in order. Which two repeat every frame?</li>
+<li>Why does a control command use two descriptors and a cursor command only one?</li>
+<li>Explain in your own words why the forensic kernel's screen dump of frame 2 differs from the reference, although its own log shows <code>RESOURCE_FLUSH -&gt; OK_NODATA</code>.</li>
+<li>Compute the transfer offset for a damage rectangle at x = 100, y = 20 on an 800 × 600 screen with format B8G8R8X8.</li>
+<li>Predict: what changes in R2 and R3 if the driver used <code>FORMAT_R8G8B8X8</code> with the same drawing code? (Do not run it; reason from Layer 2.)</li>
+<li>Why does the lab compare against a reference renderer built from the same <code>scene.h</code>, and what kind of bug can this method not find?</li>
+<li>The device offered <code>0x10130000002</code>. Which bit did the driver ask for besides <code>VERSION_1</code>, and what would happen if it called <code>GET_EDID</code> without it?</li>
+<li>Apply to a new case: your kernel enables paging and the framebuffer is allocated page by page. What changes in <code>attach_backing</code>?</li>
+<li>Where would you add handling for a display-change event, and what must the handler do?</li>
+</ol>
+
+<h2 id="F4-43-lab">Lab</h2>
+<p><b>Goal.</b> Milestone G2, "A display driver for a virtual GPU": "A virtio-gpu driver in your C7 kernel: query displays, create a framebuffer resource, attach backing memory, set the scan-out, flush damaged rectangles, and handle a hardware cursor; a small compositor that draws two windows" (curriculum G2). This is one of the two course project options.</p>
+<p><b>Hardware and software needed.</b> QEMU with <code>virtio-gpu-pci</code> (8.2.2 used here), the DR301 kernel tool chain (g++ 13.3 freestanding, GNU ld), Python 3 for <code>qmp_drive.py</code>. No physical GPU.</p>
+<p><b>Safety.</b> None beyond normal computer use; everything runs inside QEMU.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F4-43</code> from the repository root; check that <code>vgpu.log</code> shows exit code 33 and <code>screens.out</code> says MATCH twice.</li>
+<li>Read <code>trace.out</code> next to Figure 1 and label each line with its arrow or box.</li>
+<li>Change window B's position in <code>scene.h</code> for frame 2 and predict the new damage rectangle before running; check it against the kernel's <code>damage:</code> line.</li>
+<li>Run the kernel with a visible display (<code>-display gtk</code> or <code>sdl</code> instead of <code>none</code>) on your own machine and watch the two frames and the cursor (untested in this build: no display).</li>
+<li>Read the device's <code>events_read</code> after resizing the QEMU window, then write the handler (extension 2).</li>
+</ol>
+<p><b>Expected observations.</b> The serial log of R2; two MATCH lines in R3; in R4, one transfer before each flush of resource 1 and both cursor commands; in R5, the same MATCH at 800 × 600 with a different full-frame hash and the same damage rectangle.</p>
+<p><b>Verification</b> (curriculum G2, verbatim): "QEMU screen dump matches a reference image; changing the virtual display resolution from QEMU is handled through a display-change event; cursor moves with the C8 USB mouse." The first part passes in this build (R3, R5); the second and third are untested (box in Layer 3).</p>
+<p><b>Troubleshooting.</b> The run waits forever: the kernel panicked before "frame 1 ready"; read the serial log. MISMATCH in frame 1: format or stride. MISMATCH in frame 2 only: the damage path. QEMU exits with code 1 instead of 33: <code>panic</code> was called; the message names the command.</p>
+<p><b>Extension.</b> (1) Replace polling with the configuration and used-buffer interrupts of DR302. (2) Handle <code>VIRTIO_GPU_EVENT_DISPLAY</code>: re-read the display information, create a resource of the new size, set the scan-out, redraw, and unreference the old resource with <code>RESOURCE_UNREF</code>. (3) Move the cursor from a USB mouse driver (C8) and draw a third window under it.</p>
+
+<h2 id="F4-43-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A classmate's compositor works perfectly for the first frame. After the first window move, the screen shows a mixture: parts of window B still where it used to be, parts of window A missing. Their kernel log shows every command answered with <code>OK_NODATA</code>. They are sure the drawing code is right, because the framebuffer's hash in their log changes as expected between frames.</p>
+<p><b>Evidence pack</b> (R6: their serial log from the first command on, the screen-dump comparison, and QEMU's trace of every command for resource 1):</p>
+<pre class="output" data-run="F4-43/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare frame 2's serial lines with the same lines in R2. What is missing?</li>
+<li>Hypotheses: (a) the drawing code is wrong; (b) the flush rectangle is wrong; (c) the device never received the new pixels. Which evidence rules out (a) and (b)?</li>
+<li>Root cause: explain why <code>OK_NODATA</code> for the flush is not evidence that the screen shows the new frame.</li>
+<li>Fix: the one-line change.</li>
+<li>Prevention: an assertion or a test that would catch this class of bug on the first run.</li>
+</ol>
+<p><b>Method hints.</b> The trace is the device's own record and does not depend on what the driver logs. Count transfers and flushes per frame. Compare the bounding box of differing pixels with the windows' positions.</p>
+
+<h2 id="F4-43-project">Mini-project</h2>
+<p><b>Course project option G2.</b> Complete the milestone: display-change handling (extension 2), a cursor driven by your USB mouse driver, and a compositor that redraws only damaged rectangles of several windows. Deliver the kernel, a run script in the style of this lab that checks screen dumps against references at two resolutions and after a resize, and a one-page design note.</p>
+<p><b>Rubric</b> (20 points): screen dumps match references at two resolutions, automated (5); display-change event handled, with evidence from the trace or serial log (4); cursor follows a real USB mouse, with a recorded demonstration (3); damage tracked as a list of rectangles, and the transfer count per frame logged (3); interrupts instead of polling (2); design note with a figure of the command flow and every unverified point marked (3).</p>
+
+<h2 id="F4-43-summary">Summary</h2>
+<ul>
+<li>virtio-gpu 2D keeps two copies of every image: the guest's backing memory and the device's resource.</li>
+<li>Set-up: display info, EDID, create resource, attach backing, set scan-out. Every frame: transfer the damage, then flush it.</li>
+<li>A control command is a two-descriptor chain, request then device-writable response; cursor commands use a separate queue and one descriptor.</li>
+<li>A hand-written protocol header is fine if a host program checks it against the real one (0 differences, R1).</li>
+<li>Display drivers are verified by comparing screen dumps with a reference renderer; a device trace is independent evidence of what was received.</li>
+<li>A successful flush response does not mean the new pixels are on screen: only a transfer moves them to the device.</li>
+</ul>
+
+<h2 id="F4-43-sources">Sources</h2>
+<ol>
+<li id="F4-43-src-D1">OASIS, "Virtual I/O Device (VIRTIO) Version 1.2" (or later), section "GPU Device" (curriculum Track G, G2 sources; guide registry). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-43-src-D2">Linux UAPI header <code>&lt;linux/virtio_gpu.h&gt;</code> and <code>&lt;linux/virtio_ids.h&gt;</code> (<code>VIRTIO_ID_GPU</code> 16), as installed in the build container by linux-libc-dev 6.8.0-146.146. <i>Opened and read in this build (tier 4); every constant and layout used is compared by Listing 1's check (R1).</i></li>
+<li id="F4-43-src-D3">QEMU 8.2.2 as installed in the build container: the trace-event list <code>trace-events-all</code> (the <code>virtio_gpu_*</code> events) and the monitor commands <code>screendump</code> and <code>sendkey</code> as used in the runs. <i>Trace-event list opened in this build; QEMU's documentation and source were not opened.</i></li>
+<li id="F4-43-src-D4">VESA, "Enhanced Extended Display Identification Data Standard (E-EDID)", Release A, Revision 2 (curriculum G5 sources). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-43-src-D5">Systems Curriculum (this project), milestone G2 (a map to sources, AH-4; opened in this build).</li>
+<li id="F4-43-src-R0">R0 — <code>run.sh</code> step <code>build</code>: <code>build.out</code>, <code>build.log</code> (g++ 13.3.0 freestanding, GNU ld).</li>
+<li id="F4-43-src-R1">R1 — lab run of <code>vgpu_check.cpp</code>: <code>vgpu_check.out</code>, <code>vgpu_check.log</code>.</li>
+<li id="F4-43-src-R2">R2 — <code>run.sh</code> step <code>vgpu</code>: <code>vgpu.out</code>, <code>vgpu.log</code> (QEMU 8.2.2, TCG, q35, <code>virtio-gpu-pci,xres=640,yres=480</code>).</li>
+<li id="F4-43-src-R3">R3 — <code>run.sh</code> step <code>screens</code>: <code>screens.out</code>, <code>screens.log</code>.</li>
+<li id="F4-43-src-R4">R4 — <code>run.sh</code> step <code>trace</code>: <code>trace.out</code>, <code>trace.log</code> (QEMU trace events of the R2 run).</li>
+<li id="F4-43-src-R5">R5 — <code>run.sh</code> step <code>res800</code>: <code>res800.out</code>, <code>res800.log</code>.</li>
+<li id="F4-43-src-R6">R6 — <code>run.sh</code> step <code>forensic</code>: <code>forensic.out</code>, <code>forensic.log</code>.</li>
+</ol>
+
+<h2 id="F4-43-glossary">Glossary links</h2>
+<p><a href="#gl-virtio-gpu">virtio-gpu</a> · <a href="#gl-resource-virtio-gpu">Resource (virtio-gpu)</a> · <a href="#gl-backing-memory">Backing memory</a> · <a href="#gl-scan-out">Scan-out</a> · <a href="#gl-damage-rectangle">Damage rectangle</a> · <a href="#gl-edid">EDID</a> · <a href="#gl-screen-dump">Screen dump</a> · <a href="#gl-virtio">virtio</a> · <a href="#gl-virtqueue">virtqueue</a> · <a href="#gl-descriptor-virtio">Descriptor (virtio)</a> · <a href="#gl-framebuffer">Framebuffer</a></p>
+
+<h2 id="F4-43-next">Next chapter</h2>
+<p>Next: <a href="#F4-44">F4-44 Probing a real GPU read-only</a>. Previous: <a href="#F4-42">F4-42</a>. Back to the course: <a href="#DR405">DR405</a>. Related: <a href="#F4-05">F4-05</a> (the virtio transport this driver uses). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackG">Track G</a> (milestone G2).</p>
+
+<h2 id="F4-43-answers">Answers to Check yourself</h2>
+<ol>
+<li><code>GET_DISPLAY_INFO</code>, <code>GET_EDID</code>, <code>RESOURCE_CREATE_2D</code>, <code>RESOURCE_ATTACH_BACKING</code>, <code>SET_SCANOUT</code>, <code>TRANSFER_TO_HOST_2D</code>, <code>RESOURCE_FLUSH</code>, then the cursor commands. Transfer and flush repeat.</li>
+<li>A control command has a response the device must write, so it needs a second, device-writable buffer; cursor commands have no response.</li>
+<li>The flush shows the device's copy of the rectangle; the transfer that would have updated that copy was never sent, so the device shows frame-1 pixels. <code>OK_NODATA</code> means the flush itself succeeded.</li>
+<li>Stride 800 × 4 = 3200; 20 × 3200 + 100 × 4 = 64,000 + 400 = 64,400 bytes.</li>
+<li>The serial log in R2 is unchanged (the device accepts the format, if it supports it), but R3 reports MISMATCH for both frames over almost the whole screen, because red and blue bytes swap places; grey pixels (equal R and B) would still match. Distractor: "the device rejects it" is possible only if the device does not support that format; this is a prediction, not a run.</li>
+<li>So that the reference is exactly what the driver meant to draw; any difference is the driver's or the device's doing. It cannot find bugs in <code>scene.h</code> itself (both sides share them); separate unit tests of the drawing code are needed for that.</li>
+<li>Bit 1, <code>VIRTIO_GPU_F_EDID</code> (0x2). Without it, <code>vgpu::edid</code> returns an error without sending the command (Listing 2 line 85); a driver that sent it anyway would be using an unnegotiated feature.</li>
+<li>It must translate the framebuffer's virtual pages to physical addresses and send one memory entry per physically contiguous run, with <code>nr_entries</code> set to their number; the request structure becomes variable-length.</li>
+<li>In the configuration-change interrupt handler (or a poll of <code>events_read</code>): clear the event, call <code>GET_DISPLAY_INFO</code>, create and attach a resource of the new size, <code>SET_SCANOUT</code>, redraw and transfer the full frame, flush, and unreference the old resource.</li>
+</ol>
+<h3 id="F4-43-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>The line <code>TRANSFER_TO_HOST_2D damage -&gt; OK_NODATA</code> is missing before frame 2's <code>RESOURCE_FLUSH</code>.</li>
+<li>(a) is ruled out by the hash: the framebuffer's fnv1a for frame 2, 0x05e8e1a5, is the same as in the good run R2, so the guest memory holds the correct frame. (b) is ruled out by the trace: the flush rectangle is w 560, h 390, x 40, y 40, the correct damage. (c) is confirmed: the trace has one <code>res_xfer_toh_2d</code> for resource 1 (frame 1) and two flushes.</li>
+<li>The flush only repaints from the device's resource. The response says the command was valid, not that the resource holds what the guest drew.</li>
+<li>Send <code>TRANSFER_TO_HOST_2D</code> for the damage rectangle before <code>RESOURCE_FLUSH</code> (remove the <code>#ifdef</code> in <code>show()</code>).</li>
+<li>Make transfer-then-flush one driver function that takes the rectangle once (so they cannot diverge), and keep the screen-dump comparison in the automated test for every frame, not only the first. How the fault was injected: the forensic kernel is built with <code>-DF443_SKIP_TRANSFER_ON_UPDATE</code>, which skips the transfer for the damage rectangle only.</li>
+</ol>
