@@ -1,0 +1,306 @@
+<!--meta
+id: F5-32
+title: Virtualization in the data centre
+course: DS304
+level: L3–L4
+prereqs: F5-28 (NUMA), F5-31; DR404 (F4-38 guest's view of a hypervisor) recommended; OS301 (UEFI applications)
+time: 6–8 hours including the lab
+hardware: a Linux computer with clang 18 and LLD, QEMU 8.2 and OVMF, g++ 13; KVM (/dev/kvm) is NOT available in this build's container, so every KVM-accelerated step is untested here
+maps: Curriculum section 12 (virtualization, milestone V1: "The boot log names the hypervisor correctly under QEMU/KVM, QEMU/TCG and, if available, Hyper-V; on bare metal it reports none."), Track H 17.1 (servers), DS303 placement (packing and spreading)
+analogy: F5 — friends in different towns; proposal in NOTES.md: "a hypervisor host = a large guesthouse whose owner rents out flats; each flat looks like a whole house to its tenant; overcommit = renting more beds than rooms, betting that not all tenants are home at once"
+-->
+
+<h2 id="F5-32-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>Hiro owns a big old house in a busy town and turns it into a guesthouse. Each tenant gets a flat with a front door, a kitchen and a letterbox, and inside it feels like a whole house. Hiro keeps the keys, the boiler and the fuse box. Because most tenants are at work all day, he promises more hot-water capacity than the boiler could deliver if everybody showered at once, and it works, most days. One evening a tenant complains that her flat has become slow at everything: the kettle takes ages, but only for tea, not for washing up. She asks the right question: "Am I even in the house I rented, or did you move me to the old annex?"</p>
+</div>
+<p>Most servers in a data centre run virtual machines (VMs). A hypervisor on each physical server (the host) runs many guests, each believing it owns a computer. This chapter is about the operator's view: how guests find out they are virtual, how many VMs fit on a host, what "overcommit" buys and costs, how VMs move between hosts, and what happens when acceleration silently disappears. Your guest program asks the processor "who is my hypervisor?" in three different QEMU configurations, and a forensic lab finds out why a VM became about six times slower at floating point but much less at integers.</p>
+
+<h2 id="F5-32-able">What you will be able to do</h2>
+<ul>
+<li><b>Describe</b> the layers of a data-centre virtualization host: hardware, host kernel with hypervisor, a VM process per guest, virtual devices.</li>
+<li><b>Detect</b> a hypervisor from inside a guest with CPUID, and explain when the answer can be hidden or misleading.</li>
+<li><b>Place</b> VMs on hosts under vCPU overcommit, memory limits and NUMA locality, and explain why a VM may not fit although enough total capacity is free.</li>
+<li><b>Explain</b> live migration, device passthrough and the noisy-neighbour problem at an operator's level.</li>
+<li><b>Diagnose</b> a VM that runs without hardware acceleration from its start-up log and timing evidence.</li>
+</ul>
+
+<div class="co jargon" id="F5-32-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>vCPU</dt><dd><b>Simple words:</b> a processor that a VM sees, which is really a share of a real processor. <b>Analogy:</b> a bed in a flat, which may share a room with others when the guesthouse is full. <b>Precise:</b> a virtual processor of a guest, in KVM-based hypervisors implemented as a thread of the VM's process that the host scheduler runs on a physical CPU (pCPU) and that enters guest mode to execute guest instructions. <sup class="src"><a href="#F5-32-src-D1">D1</a></sup> <sup class="src"><a href="#F5-32-src-D2">D2</a></sup></dd>
+<dt>Overcommit</dt><dd><b>Simple words:</b> promising VMs more processors or memory in total than the host really has, betting they will not all use it at once. <b>Analogy:</b> renting more beds than rooms. <b>Precise:</b> allocating virtual resources beyond the physical ones, expressed as a ratio (for example vCPUs per pCPU); CPU overcommit costs waiting time (steal time) when guests are busy together; memory overcommit needs reclaiming mechanisms (ballooning, page sharing, swapping) and risks severe slowdowns or failures when guests use what they were promised. <sup class="src"><a href="#F5-32-src-D2">D2</a></sup> <sup class="src"><a href="#F5-32-src-D3">D3</a></sup></dd>
+<dt>TCG (Tiny Code Generator)</dt><dd><b>Simple words:</b> QEMU's way of running a guest without hardware help: it translates the guest's instructions into the host's instructions in software. <b>Analogy:</b> a tenant whose every instruction is read aloud by an interpreter. <b>Precise:</b> QEMU's dynamic binary translator: guest code is translated block by block into host code and cached; it works on any host and for other architectures, but is slower than hardware-assisted virtualization, by an amount that depends strongly on the kind of instructions (R4, R5). <sup class="src"><a href="#F5-32-src-D1">D1</a></sup> <sup class="src"><a href="#F5-32-src-R5">R5</a></sup></dd>
+<dt>Live migration</dt><dd><b>Simple words:</b> moving a running VM to another host without switching it off. <b>Analogy:</b> moving a tenant to another guesthouse while she sleeps, so she wakes up in the same-looking flat. <b>Precise:</b> transferring a VM's memory, device state and vCPU state to another host while it runs: commonly pre-copy, which copies memory in rounds while the guest keeps writing, tracks dirtied pages, then pauses the guest briefly to copy the rest and resumes it on the destination. <sup class="src"><a href="#F5-32-src-D4">D4</a></sup> <sup class="src"><a href="#F5-32-src-D1">D1</a></sup></dd>
+<dt>Device passthrough</dt><dd><b>Simple words:</b> giving a VM a real device (a network card, a GPU) for itself instead of an imitation. <b>Analogy:</b> a flat with its own private entrance and its own boiler. <b>Precise:</b> assigning a physical PCI device or a virtual function of an SR-IOV device to a guest, with the IOMMU translating and confining the device's DMA to the guest's memory; fast and isolated, but it ties the VM to the host's hardware and complicates live migration. <sup class="src"><a href="#F5-32-src-D2">D2</a></sup> <sup class="src"><a href="#F5-32-src-D5">D5</a></sup></dd>
+<dt>Noisy neighbour</dt><dd><b>Simple words:</b> another VM on the same host that slows yours down by using shared parts heavily. <b>Analogy:</b> the tenant who takes hour-long showers. <b>Precise:</b> interference between co-located guests through resources the hypervisor does not partition fully: CPU time under overcommit, last-level cache, memory bandwidth, the inter-socket link, network and storage queues. <sup class="src"><a href="#F5-32-src-D3">D3</a></sup> <sup class="src"><a href="#F5-32-src-D6">D6</a></sup></dd>
+</dl>
+<p>Terms from earlier chapters: <a href="#gl-hypervisor-virtual-machine-monitor-vmm">Hypervisor</a>, <a href="#gl-hypervisor-present-bit">Hypervisor-present bit</a>, <a href="#gl-hypervisor-signature">Hypervisor signature</a>, <a href="#gl-steal-time">Steal time</a>, <a href="#gl-balloon-device">Balloon device</a> (<a href="#F4-38">F4-38</a>, DR404); <a href="#gl-virtio">virtio</a> (DR301); <a href="#gl-iommu">IOMMU</a> (HW204); <a href="#gl-numa-node-proximity-domain">NUMA node</a> (<a href="#F5-28">F5-28</a>); <a href="#gl-packing-and-spreading-placement-policy">Packing and spreading</a> (DS303).</p>
+</div>
+
+<h2 id="F5-32-pictures">The idea in pictures</h2>
+<p>Figure 1 is a KVM-based host as a stack. Figure 2 is the placement result of the worked example.</p>
+<figure id="F5-32-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 320" role="img" aria-labelledby="F5-32-f1t F5-32-f1d">
+<title id="F5-32-f1t">Layers of a KVM-based virtualization host</title>
+<desc id="F5-32-f1d">Bottom: hardware with two sockets (two NUMA nodes), memory, network card and IOMMU. Above it: the host Linux kernel with the KVM module, the scheduler and memory management. Above that, three VM processes (QEMU or another VMM), each with vCPU threads and virtual devices (virtio), and inside each a guest OS and applications. One VM has a passed-through network function drawn as a direct line to the network card through the IOMMU. On the right, a management layer (orchestrator) talking to the host through an agent. Labels: guest mode executes guest instructions on the real CPU with hardware assistance; without KVM, QEMU's TCG translates them in software.</desc>
+<rect class="sv-b5" x="20" y="260" width="600" height="50"/><text class="sv-tb" x="32" y="280">Hardware</text><text class="sv-ts" x="32" y="298">2 sockets / NUMA nodes · memory · NIC · IOMMU · VT-x or AMD-V</text>
+<rect class="sv-b4" x="20" y="200" width="600" height="50"/><text class="sv-tb" x="32" y="220">Host kernel (Linux) + KVM module</text><text class="sv-ts" x="32" y="238">scheduler runs vCPU threads · memory management · drivers</text>
+<rect class="sv-b1" x="20" y="40" width="190" height="150"/><text class="sv-tb" x="32" y="60">VM process 1</text><text class="sv-ts" x="32" y="80">vCPU threads ×4</text><text class="sv-ts" x="32" y="96">virtio disk, net</text>
+<rect class="sv-b8" x="32" y="110" width="166" height="70"/><text class="sv-t" x="44" y="132">guest OS</text><text class="sv-ts" x="44" y="152">applications</text>
+<rect class="sv-b1" x="225" y="40" width="190" height="150"/><text class="sv-tb" x="237" y="60">VM process 2</text><text class="sv-ts" x="237" y="80">vCPU threads ×8</text><text class="sv-ts" x="237" y="96">virtio disk</text>
+<rect class="sv-b8" x="237" y="110" width="166" height="70"/><text class="sv-t" x="249" y="132">guest OS</text><text class="sv-ts" x="249" y="152">applications</text>
+<rect class="sv-b1" x="430" y="40" width="190" height="150"/><text class="sv-tb" x="442" y="60">VM process 3</text><text class="sv-ts" x="442" y="80">vCPU threads ×2</text><text class="sv-ts" x="442" y="96">passthrough NIC VF</text>
+<rect class="sv-b8" x="442" y="110" width="166" height="70"/><text class="sv-t" x="454" y="132">guest OS</text><text class="sv-ts" x="454" y="152">applications</text>
+<line class="sv-line2" x1="600" y1="190" x2="600" y2="258"/><polygon class="sv-head" points="600,260 594,248 606,248"/>
+<text class="sv-ts" x="606" y="230">DMA via IOMMU</text>
+<rect class="sv-b6" x="650" y="40" width="100" height="150"/><text class="sv-tb" x="660" y="62">manager</text><text class="sv-ts" x="660" y="84">placement</text><text class="sv-ts" x="660" y="100">migration</text><text class="sv-ts" x="660" y="116">lifecycle</text>
+<line class="sv-line" x1="650" y1="225" x2="622" y2="225"/><polygon class="sv-head" points="620,225 632,219 632,231"/>
+<text class="sv-ts" x="20" y="24">Each VM is an ordinary host process; its vCPUs are threads that the host scheduler places on pCPUs.</text>
+</svg></div><figcaption><b>Figure 1.</b> A KVM-based host, after D1 and D2 (title only, pending verification). Arrows: management requests from the manager to the host (left arrow) and the passed-through device's DMA confined by the IOMMU (right). Without KVM, the same VM process runs guest code through TCG instead of guest mode. <sup class="src"><a href="#F5-32-src-D1">D1</a></sup> <sup class="src"><a href="#F5-32-src-D2">D2</a></sup></figcaption></figure>
+
+<figure id="F5-32-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 270" role="img" aria-labelledby="F5-32-f2t F5-32-f2d">
+<title id="F5-32-f2t">Placement of eight VMs on two hosts with two NUMA nodes each</title>
+<desc id="F5-32-f2d">Four boxes for hostA node 0, hostA node 1, hostB node 0 and hostB node 1, each with 16 pCPUs (32 vCPUs allowed at ratio 2) and 128 GiB. hostA node 0 holds cache1 and web1: 12 vCPUs, 128 GiB, memory full. hostA node 1 holds db1, web2, web3: 24 vCPUs, 128 GiB, memory full. hostB node 0 holds db2: 16 vCPUs, 96 GiB. hostB node 1 holds batch1: 24 vCPUs, 64 GiB. Outside, batch2 with 24 vCPUs and 64 GiB is not placed: the nodes with free memory have only 16 and 8 vCPUs of room.</desc>
+<rect class="sv-b1" x="20" y="20" width="170" height="170"/><text class="sv-tb" x="30" y="40">hostA node 0</text><text class="sv-ts" x="30" y="60">cache1 8 vCPU 112 GiB</text><text class="sv-ts" x="30" y="78">web1 4 vCPU 16 GiB</text><text class="sv-tm" x="30" y="150">vCPU 12/32</text><text class="sv-tm" x="30" y="170">mem 128/128</text>
+<rect class="sv-b1" x="200" y="20" width="170" height="170"/><text class="sv-tb" x="210" y="40">hostA node 1</text><text class="sv-ts" x="210" y="60">db1 16 vCPU 96 GiB</text><text class="sv-ts" x="210" y="78">web2 4 vCPU 16 GiB</text><text class="sv-ts" x="210" y="96">web3 4 vCPU 16 GiB</text><text class="sv-tm" x="210" y="150">vCPU 24/32</text><text class="sv-tm" x="210" y="170">mem 128/128</text>
+<rect class="sv-b2" x="390" y="20" width="170" height="170"/><text class="sv-tb" x="400" y="40">hostB node 0</text><text class="sv-ts" x="400" y="60">db2 16 vCPU 96 GiB</text><text class="sv-tm" x="400" y="150">vCPU 16/32</text><text class="sv-tm" x="400" y="170">mem 96/128</text>
+<rect class="sv-b2" x="570" y="20" width="170" height="170"/><text class="sv-tb" x="580" y="40">hostB node 1</text><text class="sv-ts" x="580" y="60">batch1 24 vCPU 64 GiB</text><text class="sv-tm" x="580" y="150">vCPU 24/32</text><text class="sv-tm" x="580" y="170">mem 64/128</text>
+<rect class="sv-dash" x="390" y="210" width="350" height="50"/><text class="sv-tb" x="400" y="230">batch2 24 vCPU 64 GiB: NOT PLACED</text><text class="sv-ts" x="400" y="250">room: hostB node 0 16 vCPUs, node 1 8 vCPUs</text>
+<line class="sv-dash" x1="475" y1="210" x2="475" y2="192"/><line class="sv-dash" x1="655" y1="210" x2="655" y2="192"/>
+</svg></div><figcaption><b>Figure 2.</b> The placement computed by Listing 3 (R6) with vCPU overcommit 2.0, no memory overcommit and the rule "one VM per NUMA node". hostB has 96 GiB of memory and 24 vCPUs of room free in total, but no single node has room for batch2. Exercise values, not a real product. <sup class="src"><a href="#F5-32-src-R6">R6</a></sup></figcaption></figure>
+
+<h2 id="F5-32-layer1">Layer 1 — the kid explanation</h2>
+<p>A big computer can pretend to be many small computers at once. Each pretend computer is called a virtual machine, and it thinks it is a real one. A special program, the hypervisor, shares out the big computer's parts between them.</p>
+<p>A virtual machine can ask the processor: "Am I real?" The processor usually answers honestly and even says the hypervisor's name. In this chapter you ask that question, and you find out what happens when the helper hardware is missing and everything must be done slowly in software.</p>
+
+<h2 id="F5-32-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F5-32-l2-why">Why data centres virtualize</h3>
+<p>Analogy first: a guesthouse earns more from one building than a single tenant would pay. A data-centre server is big (<a href="#F5-28">F5-28</a>: two sockets, many cores, much memory), while many services need a small part of it. Virtual machines let operators consolidate several services on one server, give each its own operating system and isolation, size each to its need, move it between hosts for maintenance, and create or delete it in minutes through software instead of a purchase. <sup class="src"><a href="#F5-32-src-D2">D2</a></sup> <sup class="src"><a href="#F5-32-src-D3">D3</a></sup> Containers (DS303) share one kernel and isolate less; VMs isolate whole operating systems and are often combined with containers (containers inside VMs).</p>
+<h3 id="F5-32-l2-stack">The stack on one host</h3>
+<p>In a KVM-based host (Figure 1), the Linux kernel's KVM module uses the processor's virtualization extensions to run guest instructions directly on the real CPU in a special guest mode; whenever the guest does something the hypervisor must handle (an I/O access, some privileged instructions), the CPU leaves guest mode (a VM exit, <a href="#F4-38">F4-38</a>) and KVM or the VM's user-space process deals with it. <sup class="src"><a href="#F5-32-src-D1">D1</a></sup> <sup class="src"><a href="#F5-32-src-D2">D2</a></sup> The VM process (QEMU, or another virtual machine monitor) provides the virtual devices, usually virtio (DR301) for disks and networks. Each vCPU is a thread; the host scheduler decides which pCPU runs it and when. Without KVM, QEMU can still run the same guest with TCG, translating every instruction in software. <sup class="src"><a href="#F5-32-src-D1">D1</a></sup></p>
+<h3 id="F5-32-l2-detect">How a guest knows</h3>
+<p>The x86 CPUID instruction answers questions about the processor. In a VM, the hypervisor controls the answers. By convention, bit 31 of ECX for leaf 1 says "a hypervisor is present", and leaf 0x40000000 returns a 12-character vendor signature (<a href="#F4-38">F4-38</a>). <sup class="src"><a href="#F5-32-src-D7">D7</a></sup> This build's results (R1–R3):</p>
+<ul>
+<li>The build container itself: bit 1, signature "KVMKVMKVM". The container is a VM on a KVM-based hypervisor (which user-space monitor runs it was not identified).</li>
+<li>Our UEFI program under QEMU TCG: bit 1, signature "TCGTCGTCGTCG".</li>
+<li>The same under TCG with <code>-cpu qemu64,hypervisor=off</code>: bit 0, yet leaf 0x40000000 still returns "TCGTCGTCGTCG". A guest that trusts bit 31 sees bare metal; the signature is still there for anyone who asks. Software must check the bit first (Listing 2 does) and should treat both as hints, not proof.</li>
+<li>KVM in QEMU: not possible here, "Could not access KVM kernel module: No such file or directory" (R3). The V1 milestone's QEMU/KVM case is therefore untested in this build, as are Hyper-V and bare metal.</li>
+</ul>
+<h3 id="F5-32-l2-overcommit">Sizing and overcommit</h3>
+<p>Operators decide how many vCPUs and how much memory to promise per host. CPU overcommit is common because most VMs are idle most of the time; when several become busy together, their vCPUs wait for pCPUs, which the guest sees as steal time (DR404). Memory overcommit is riskier: memory a guest has touched cannot be shared out again without the guest's help (ballooning) or the host's tricks (merging identical pages, swapping), and running out is far more disruptive than waiting for a CPU. <sup class="src"><a href="#F5-32-src-D2">D2</a></sup> <sup class="src"><a href="#F5-32-src-D3">D3</a></sup> Add NUMA (<a href="#F5-28">F5-28</a>): a VM whose vCPUs and memory sit on one node gets local latency; one spread over two nodes pays the remote factor on some of its accesses. The worked example combines all three rules.</p>
+<h3 id="F5-32-l2-migration">Live migration and maintenance</h3>
+<p>To repair or update a host without stopping its guests, operators live-migrate them away. Pre-copy migration sends all guest memory while the guest runs, then resends pages the guest wrote meanwhile, round after round, until the remainder is small enough to send during a short pause. <sup class="src"><a href="#F5-32-src-D4">D4</a></sup> A guest that writes memory faster than the network can send it never converges; migration then needs a longer pause, throttling of the guest, or another method. Passed-through devices (Figure 1, VM 3) hold state the hypervisor cannot copy, which is why such VMs are harder to migrate. <sup class="src"><a href="#F5-32-src-D4">D4</a></sup> <sup class="src"><a href="#F5-32-src-D5">D5</a></sup></p>
+
+<h2 id="F5-32-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F5-32-l3-cost">Where the cost of virtualization goes</h3>
+<p>With hardware assistance, ordinary computation in guest mode runs on the real CPU. The costs are concentrated: VM exits for I/O and certain instructions, address translation through two levels of page tables (guest and host, nested paging) on TLB misses, interrupts delivered through the hypervisor, and device emulation in the VM process. <sup class="src"><a href="#F5-32-src-D1">D1</a></sup> <sup class="src"><a href="#F5-32-src-D2">D2</a></sup> virtio reduces exits with shared-memory queues; passthrough removes the VM process from the data path. Without hardware assistance (TCG), every instruction is translated, and the cost depends on how well the host can express the guest instruction. The forensic lab measures this: on this build's machine, the same 200 million integer multiply-add steps took 0.29 s natively and about 0.53 s under TCG (about 1.8×), but the same 50 million double-precision steps took 0.13 s natively and about 0.80 s under TCG (about 6.4×) in the final run (R4, R5). TCG has to reproduce the guest's floating-point behaviour exactly; for integers it can map guest instructions to host ones more directly. Why the floating-point gap is this large in QEMU 8.2.2 was not investigated here (QEMU's source would tell). The lesson is in the shape: a VM without acceleration is not uniformly slower, so "everything is a bit slower" is not the symptom to look for. <sup class="src"><a href="#F5-32-src-R4">R4</a></sup> <sup class="src"><a href="#F5-32-src-R5">R5</a></sup></p>
+<div class="co note"><span class="lbl">Note</span>
+<p>These times were measured in a shared cloud container that is itself a virtual machine; the host loop timed with <code>std::chrono</code>, the guest loops from host-side time stamps on console lines, which include console output. They differ between runs: an earlier run during authoring gave 0.25 s and 0.09 s on the host and 0.31 s and 0.54 s in the guest (ratios about 1.2× and 5.7×). The integer ratio moved between 1.2× and 1.8×, the floating-point ratio stayed between 5.7× and 6.4×. Use the ratio between kinds of work, not the absolute numbers.</p>
+</div>
+<h3 id="F5-32-l3-place">Placement is bin packing with extra rules</h3>
+<p>Placing VMs on hosts is a multi-dimensional bin-packing problem: each VM needs vCPUs and memory, each host node offers them, and rules add constraints (fit in one NUMA node, keep replicas on different hosts, keep some hosts empty for maintenance). <sup class="src"><a href="#F5-32-src-D3">D3</a></sup> Exact solutions are expensive, so placers use heuristics; Listing 3 uses first-fit decreasing by memory, which places the largest memory requests first because memory is the resource that cannot be overcommitted here. Its result (Figure 2) shows fragmentation: 96 GiB and 24 vCPUs are free on hostB in total, but batch2 needs 24 vCPUs and 64 GiB on one node, and no node has both. Options are a different policy (spread instead of pack; DS303's two policies), relaxing the NUMA rule for that VM and accepting remote memory, a higher overcommit ratio, or another host. Each is a trade-off an operator decides explicitly. <sup class="src"><a href="#F5-32-src-D3">D3</a></sup> <sup class="src"><a href="#F5-32-src-R6">R6</a></sup></p>
+<h3 id="F5-32-l3-neighbour">Isolation is not complete</h3>
+<p>The hypervisor partitions CPU time and memory capacity, but VMs on one host still share caches, memory bandwidth, the inter-socket link, the network card's queues and storage. A VM can be slowed by its neighbours without any change in its own configuration; its signs are steal time, lower instructions per cycle, and latency that varies with time of day. <sup class="src"><a href="#F5-32-src-D3">D3</a></sup> <sup class="src"><a href="#F5-32-src-D6">D6</a></sup> Mitigations: dedicated (pinned) pCPUs for latency-sensitive VMs, NUMA-aware placement, cache and bandwidth partitioning features where the processor has them, and placement rules that keep heavy VMs apart. Shared hardware is also a security boundary: side channels between VMs are a reason to separate tenants by host. <sup class="src"><a href="#F5-32-src-D6">D6</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span>
+<p>Untested in this build: everything that needs KVM (QEMU with <code>-accel kvm</code>, the "KVMKVMKVM" signature inside our own guest, VM-exit costs, nested paging, live migration, passthrough, ballooning, CPU pinning), and the V1 cases for Hyper-V and bare metal. Written from memory: the QEMU options <code>-accel kvm -accel tcg</code> as a fallback list (the run shows QEMU's own message "falling back to tcg", so the behaviour is confirmed for QEMU 8.2.2, not its documentation), <code>-cpu qemu64,hypervisor=off</code> (confirmed by the run's effect), the CPUID leaf and bit conventions (confirmed only by the answers in R1–R2), the signatures listed in Listing 1 for Hyper-V, Xen and VMware (not observed), the statement that CPUID always causes a VM exit under VT-x, the description of pre-copy migration, SR-IOV, KSM-style page merging and nested paging. Check them in the KVM and QEMU documentation, the processor vendors' manuals and the hypervisor vendors' documentation.</p>
+</div>
+
+<h2 id="F5-32-hardware">How the hardware actually does it</h2>
+<p>Intel VT-x and AMD-V add a guest mode to the processor: the hypervisor prepares a control structure per vCPU (VMCS or VMCB, DR404) that says which events cause exits, then executes an instruction that enters the guest; the CPU runs guest code at full speed until an event listed in the structure happens, saves the guest state and returns to the hypervisor. <sup class="src"><a href="#F5-32-src-D7">D7</a></sup> <sup class="src"><a href="#F5-32-src-D1">D1</a></sup> CPUID is one of the instructions that always exits under VT-x, which is how the hypervisor gets to answer it, and why it can set bit 31 and return a signature. Second-level address translation (EPT on Intel, NPT on AMD) lets the hardware walk the guest's page tables and the host's in one TLB fill. The IOMMU translates device DMA addresses so that a passed-through device can write only the guest's memory. <sup class="src"><a href="#F5-32-src-D5">D5</a></sup> None of this was observable in the container (no <code>/dev/kvm</code>); the container's own CPUID answer shows that a KVM hypervisor below it intercepts CPUID. Untested on hardware.</p>
+<div class="co warning"><span class="lbl">Watch out</span>
+<p>Guests on one host trust the hypervisor and the host completely: whoever controls the host can read every guest's memory. Keep the host management network as protected as the BMC network (<a href="#F5-29">F5-29</a>), keep hypervisor and firmware updated, and place tenants that must not share hardware on different hosts. <sup class="src"><a href="#F5-32-src-D6">D6</a></sup></p>
+</div>
+
+<h2 id="F5-32-worked">Worked example</h2>
+<p>Place the eight VMs of <code>consolidate.in</code> by hand, then compare with Listing 3. Two hosts, each with two NUMA nodes of 16 pCPUs and 128 GiB; vCPU ratio 2.0 (32 vCPUs per node); memory not overcommitted; a VM must fit in one node. Sort by memory, largest first (ties keep file order): cache1 112, db1 96, db2 96, batch1 64, batch2 64, web1 16, web2 16, web3 16.</p>
+<ol>
+<li>cache1 (8, 112) → hostA node 0 (first node that fits). Node 0: 8 vCPU, 112 GiB.</li>
+<li>db1 (16, 96): hostA node 0 has 16 GiB left, no. hostA node 1: yes. Node 1: 16, 96.</li>
+<li>db2 (16, 96): hostA full for 96 GiB on both nodes; hostB node 0. </li>
+<li>batch1 (24, 64): hostA nodes have 16 and 32 GiB free, no; hostB node 0 has 32 GiB free, no; hostB node 1: yes (24 ≤ 32 vCPUs).</li>
+<li>batch2 (24, 64): memory fits only on hostB node 1 (64 free), but 24 + 24 = 48 &gt; 32 vCPUs. hostB node 0 has 32 GiB: no. Not placed.</li>
+<li>web1, web2, web3 (4, 16 each): web1 → hostA node 0 (12 vCPU, 128 GiB: full); web2 and web3 → hostA node 1 (24 vCPU, 128 GiB).</li>
+</ol>
+<p>This matches R6, including the exit status 3 that signals an unplaced VM to a calling script. Notice that the three small VMs filled the first host because first-fit looks at hosts in order: a "pack" policy. Try the check question on what changes if batch2 is allowed to span both nodes of hostB.</p>
+
+<h2 id="F5-32-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>hvdetect.cpp</code>: hypervisor detection as an ordinary Linux program, run in the build container.</p>
+<pre class="listing" data-src="F5-32/hvdetect.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">15–17</td><td><code>__cpuid(1, …)</code></td><td>Leaf 1; bit 31 of ECX.</td><td>The "hypervisor present" convention. <sup class="src"><a href="#F5-32-src-D7">D7</a></sup></td></tr>
+<tr><td class="n">18–21</td><td>no hypervisor</td><td>Stops if the bit is 0.</td><td>The signature leaf is meaningless without the bit (R2 shows why).</td></tr>
+<tr><td class="n">22–28</td><td>leaf 0x40000000</td><td>EBX, ECX, EDX as 12 characters; EAX is the highest hypervisor leaf.</td><td>The signature identifies the hypervisor family.</td></tr>
+<tr><td class="n">29–36</td><td>name table</td><td>Maps known signatures to names.</td><td>Only KVM and TCG were observed in this build.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F5-32/hvdetect"></pre>
+
+<p><b>Listing 2</b> — <code>guest_cpuid.cc</code>: the same question inside a QEMU guest, then a fixed amount of integer and floating-point work between printed lines.</p>
+<pre class="listing" data-src="F5-32/guest_cpuid.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">12–15</td><td><code>cpuid</code></td><td>The instruction with inline assembly (no C library in UEFI).</td><td>Executed by the guest; answered by the hypervisor (or TCG).</td></tr>
+<tr><td class="n">27</td><td><code>_fltused</code></td><td>A symbol the Windows-style target expects when floating point is used.</td><td>Without it, LLD reports "undefined symbol _fltused" (seen while writing the lab).</td></tr>
+<tr><td class="n">33–50</td><td>detection</td><td>Bit 31, then the signature; non-printable bytes as dots; a warning when the bit is 0.</td><td>Same logic as Listing 1.</td></tr>
+<tr><td class="n">51–58</td><td>integer loop</td><td>200 million 64-bit multiply-add steps; the empty <code>asm</code> keeps each step from being optimised away.</td><td>The host prints time stamps on the "start" and "end" lines.</td></tr>
+<tr><td class="n">59–67</td><td>floating-point loop</td><td>50 million double-precision multiply-add steps.</td><td>The kind of work where TCG's cost shows (R5).</td></tr>
+<tr><td class="n">68</td><td><code>qemu_exit(0x10)</code></td><td>QEMU exit status 33.</td><td>The run script checks it.</td></tr>
+</tbody></table></div>
+<p>Under TCG:</p>
+<pre class="output" data-run="F5-32/guest_tcg"></pre>
+<p>Under TCG with <code>-cpu qemu64,hypervisor=off</code>:</p>
+<pre class="output" data-run="F5-32/guest_nohv"></pre>
+<p>With <code>-accel kvm</code> only (expected failure in this container, exit code 1):</p>
+<pre class="output" data-run="F5-32/accel_kvm"></pre>
+
+<p><b>Listing 3</b> — <code>consolidate.cpp</code> with input <code>consolidate.in</code>: the worked example's placement.</p>
+<pre class="listing" data-src="F5-32/consolidate.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">13–32</td><td><code>Node</code>, <code>Host</code>, <code>Vm</code></td><td>Capacity per NUMA node; requests per VM.</td><td>Placement is per node, not per host (F5-28).</td></tr>
+<tr><td class="n">36–52</td><td>input</td><td>Ratio, hosts with their nodes, then VMs until end of input.</td><td>Change the file to try other cases.</td></tr>
+<tr><td class="n">53</td><td><code>stable_sort</code></td><td>Largest memory first; ties keep file order.</td><td>First-fit decreasing.</td></tr>
+<tr><td class="n">61–62</td><td><code>cpu_ok</code>, <code>mem_ok</code></td><td>vCPUs within pCPUs × ratio; memory within the node.</td><td>The two rules: CPU overcommitted, memory not.</td></tr>
+<tr><td class="n">56–81</td><td>first fit</td><td>First host, first node with room; otherwise "NOT PLACED".</td><td>A "pack" policy.</td></tr>
+<tr><td class="n">82–92</td><td>report</td><td>Per-node use and ratio; exit status 3 if any VM is unplaced.</td><td>A script can stop on 3.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F5-32/consolidate"></pre>
+<p>The run record shows exit code 3: the expected result for this input (batch2 unplaced), not a failure of the program.</p>
+
+<h2 id="F5-32-breaks">Where the analogy breaks</h2>
+<ol>
+<li><b>A tenant can look out of the window; a guest sees only what the hypervisor shows.</b> CPUID, devices and even time are the hypervisor's answers, and can be hidden or changed (R2).</li>
+<li><b>Moving a sleeping tenant takes one trip; live migration copies memory repeatedly</b> while the guest keeps changing it, and may not converge.</li>
+<li><b>Hot water is one shared resource; a host has many</b> (CPU time, caches, memory bandwidth, network queues), and they run out at different times.</li>
+</ol>
+
+<h2 id="F5-32-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>A VM is several times slower at floating point, a little slower at integer work</td><td>Running without hardware acceleration (TCG fallback)</td><td>The VM process's start-up log ("falling back to tcg"); the guest's hypervisor signature (TCG instead of KVM)</td><td>Make <code>/dev/kvm</code> available (module, permissions, BIOS setting); do not allow a silent fallback in production</td></tr>
+<tr><td>A guest claims it runs on bare metal</td><td>The hypervisor hides bit 31 (R2), or it really is bare metal</td><td>Check the signature leaf anyway, and the platform (SMBIOS, devices)</td><td>Treat CPUID as a hint, not proof</td></tr>
+<tr><td>A VM does not fit although the cluster has free capacity</td><td>Fragmentation per node or host (Figure 2)</td><td>Per-node free vCPUs and memory, not cluster totals</td><td>Change the policy, the NUMA rule for that VM, or migrate others</td></tr>
+<tr><td>Latency varies by time of day with no change in the VM</td><td>Noisy neighbour, CPU overcommit</td><td>Guest steal time; host per-VM CPU and memory-bandwidth counters</td><td>Pin or move the VM; lower the overcommit ratio</td></tr>
+<tr><td>Live migration never finishes</td><td>The guest dirties memory faster than it can be sent</td><td>Migration statistics: dirty rate versus transfer rate</td><td>Throttle the guest during migration, a faster network, or a planned pause</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F5-32-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F4-38">F4-38</a> taught the guest's view of a hypervisor; <a href="#F5-28">F5-28</a> taught NUMA; DS303 taught placement policies. <b>What carries over:</b> CPUID detection, local versus remote memory, packing versus spreading. <sup class="src"><a href="#F5-32-src-D7">D7</a></sup> <b>What changes:</b> one physical server now hosts many tenants, so capacity, isolation and maintenance become questions about shared hardware, and performance depends on configuration you cannot see from the guest. <sup class="src"><a href="#F5-32-src-D3">D3</a></sup> <b>What comes next:</b> <a href="#F5-33">F5-33</a> looks at the physical limits under all of this: power, cooling and how often parts fail.</p></div>
+
+<h2 id="F5-32-check">Check yourself</h2>
+<ol>
+<li>Name the layers of Figure 1 from the bottom up, and say where a vCPU runs.</li>
+<li>Why does a guest see "TCGTCGTCGTCG" under <code>hypervisor=off</code>, and why should it ignore that?</li>
+<li>In Listing 3, which line makes memory non-overcommittable, and what would you change to allow 1.2× memory overcommit?</li>
+<li>Predict: run Listing 3 with ratio 3.0. Is batch2 placed? Where? Run it.</li>
+<li>Explain in your own words why CPU overcommit is more common than memory overcommit.</li>
+<li>What prevents a VM with a passed-through network function from being live-migrated in the simple way?</li>
+<li>Apply to a new case: a tenant reports that their database VM's latency doubled every night at 02:00 for a week, while their own load is constant. List three hypotheses and the evidence you would ask the host operator for.</li>
+<li>Multiple choice: in R5, which evidence alone shows that the VM ran without KVM? (a) the integer loop took 0.53 s; (b) "falling back to tcg" in QEMU's start-up output; (c) the result 0x19ec7595d3969201; (d) the hypervisor bit is 1.</li>
+</ol>
+
+<h2 id="F5-32-lab">Lab</h2>
+<h3 id="F5-32-lab-goal">Goal</h3>
+<p>Detect the hypervisor from inside guests started in different ways, measure what missing acceleration costs for two kinds of work, and place VMs on hosts under explicit rules.</p>
+<h3 id="F5-32-lab-hw">Hardware and software needed</h3>
+<p>clang 18.1.3 and LLD 18.1.3, QEMU 8.2.2 with OVMF 2024.02-2ubuntu0.10, g++ 13.3.0 (from the run records). For the KVM steps: a Linux machine with <code>/dev/kvm</code>, not available in this build.</p>
+<h3 id="F5-32-lab-safety">Safety</h3>
+<p>None beyond normal computer use. On shared hosts, ask before running heavy benchmarks: you become someone's noisy neighbour.</p>
+<h3 id="F5-32-lab-steps">Steps</h3>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F5-32</code>; read every <code>.out</code> file.</li>
+<li>Compute the guest-to-host time ratio for each loop from <code>forensic_accel.out</code> and <code>work_host.out</code>. Run the lab twice more and record how much the ratios vary.</li>
+<li>On a machine with KVM (not this build), run the guest with <code>-accel kvm</code> and record the signature and the loop times. This completes the V1 acceptance case "QEMU/KVM".</li>
+<li>Run <code>hvdetect</code> on a computer without a hypervisor, if you have one, for the V1 "bare metal" case.</li>
+<li>Change <code>consolidate.in</code> to place all eight VMs with ratio 2.0 by changing only the order of the hosts or the sort rule. Explain why it works.</li>
+</ol>
+<h3 id="F5-32-lab-expect">Expected observations</h3>
+<p>As above for steps 1–2 (ratios close to 1.8 for integers and 6.4 for floating point in the final recorded run, 1.2 and 5.7 in an earlier one). Step 3: signature "KVMKVMKVM" and loop times close to the host's; untested here.</p>
+<h3 id="F5-32-lab-verify">Verification</h3>
+<p>The four PASS lines of <code>check_guest.out</code>: the guest's and host's results are identical (so they did the same work), TCG is named, and <code>hypervisor=off</code> hides the bit. For V1 ("The boot log names the hypervisor correctly under QEMU/KVM, QEMU/TCG and, if available, Hyper-V; on bare metal it reports none."), this build covers QEMU/TCG only; record which cases you covered. <sup class="src"><a href="#F5-32-src-S1">S1</a></sup></p>
+<h3 id="F5-32-lab-trouble">Troubleshooting</h3>
+<ul>
+<li>"undefined symbol: _fltused" when linking → keep line 27 of Listing 2.</li>
+<li>"Could not access KVM kernel module" → no <code>/dev/kvm</code>: the KVM module is not loaded, virtualization is disabled in firmware, you lack permission, or you are inside a VM without nested virtualization.</li>
+<li>Guest and host results differ → the loops are not the same code; compare the two files.</li>
+</ul>
+<h3 id="F5-32-lab-ext">Extension</h3>
+<p>Add a memory-bound loop (a large array walked with a stride) to both programs and measure it under TCG. Or extend Listing 3 with a "spread" policy and an anti-affinity rule (db1 and db2 on different hosts) and compare the results.</p>
+
+<h2 id="F5-32-forensic">Forensic lab</h2>
+<p><b>Scenario: "The VM that became slow at sums".</b> After a host was reinstalled, Priya's analytics VM runs its numeric reports about six times slower than before, while its text processing is less than twice as slow. The host team says nothing changed in the VM's configuration: "it is started with the same options as always, <code>-accel kvm -accel tcg</code>". Priya has the VM's start-up output with host time stamps (her test program is Listing 2) and a timing of the same work on a reference machine.</p>
+<p><b>Evidence pack:</b> real runs (R5 and R4) in this build's container, where KVM is not available, which is the injected condition.</p>
+<pre class="output" data-run="F5-32/forensic_accel"></pre>
+<pre class="output" data-run="F5-32/work_host"></pre>
+<pre class="output" data-run="F5-32/check_guest"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Compute the guest times for both loops from the time stamps and the ratios to the host's times.</li>
+<li>Give two hypotheses (one about acceleration, one about the host's load or the guest's work) and the evidence for and against each.</li>
+<li>Which line is the decisive evidence, and which other line confirms it independently?</li>
+<li>What is the root cause, and what should the host team fix?</li>
+<li>How do you prevent a silent fallback in the future?</li>
+</ol>
+<p><b>Method hints.</b> First confirm the guest did the same work (results). Then compare the shape of the slowdown, not only its size. Finally, read the very first lines of the log.</p>
+
+<h2 id="F5-32-project">Mini-project</h2>
+<p>Write a "host report" tool for a virtualization host: from inside one guest and from the host, collect the hypervisor signature, the acceleration in use, the number of vCPUs, the NUMA layout seen by the guest (SRAT from <a href="#F5-28">F5-28</a>) and a short benchmark of integer, floating-point and memory work; print a verdict "accelerated / not accelerated" with the evidence. Rubric: detection follows bit-then-signature order and reports hidden bits honestly (1); the verdict is based on at least two independent pieces of evidence (1); benchmark results are checked to be the same computation (1); run in at least two configurations and the differences explained (1); every claim about hypervisor behaviour cites a source or is marked unverified (1).</p>
+
+<h2 id="F5-32-summary">Summary</h2>
+<ul>
+<li>A data-centre host runs many VMs: hypervisor in the host kernel (KVM), one VM process per guest, vCPUs as threads, virtio devices, optional passthrough through the IOMMU.</li>
+<li>Guests detect a hypervisor with CPUID: the bit, then the signature. In this build: container "KVMKVMKVM"; QEMU guest "TCGTCGTCGTCG"; <code>hypervisor=off</code> hides the bit but not the signature.</li>
+<li>CPU overcommit trades waiting time for density; memory overcommit is riskier; NUMA adds a per-node constraint.</li>
+<li>Placement is bin packing with rules; free capacity in total does not mean room for one VM (Figure 2).</li>
+<li>Without acceleration, the slowdown depends on the work: in the final recorded run about 1.8× for integer and 6.4× for floating-point loops (1.2× and 5.7× in an earlier run).</li>
+<li>KVM itself, live migration and passthrough were not testable in this container.</li>
+</ul>
+
+<h2 id="F5-32-sources">Sources</h2>
+<ol>
+<li id="F5-32-src-D1">D1 — QEMU project, "QEMU System Emulation User's Guide" (accelerators KVM and TCG, CPU models and features, migration) and the Linux kernel documentation, "The Definitive KVM API Documentation". Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</li>
+<li id="F5-32-src-D2">D2 — James E. Smith, Ravi Nair, "Virtual Machines: Versatile Platforms for Systems and Processes" (Morgan Kaufmann): system virtual machines, resource virtualization, binary translation. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F5-32-src-D3">D3 — Luiz André Barroso, Urs Hölzle, Parthasarathy Ranganathan, "The Datacenter as a Computer: Designing Warehouse-Scale Machines" (Synthesis Lectures on Computer Architecture): consolidation, resource sharing, interference. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F5-32-src-D4">D4 — Christopher Clark et al., "Live Migration of Virtual Machines" (NSDI 2005): pre-copy migration. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F5-32-src-D5">D5 — PCI-SIG, "Single Root I/O Virtualization and Sharing Specification", and the IOMMU specifications of Intel (VT-d) and AMD: device assignment. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F5-32-src-D6">D6 — Thomas Ristenpart, Eran Tromer, Hovav Shacham, Stefan Savage, "Hey, You, Get Off of My Cloud: Exploring Information Leakage in Third-Party Compute Clouds" (CCS 2009): co-residence and side channels. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F5-32-src-D7">D7 — Intel Corporation, "Intel 64 and IA-32 Architectures Software Developer's Manual" (curriculum item 1): CPUID, VMX; and the Linux kernel documentation "KVM CPUID bits": the hypervisor leaf range and signature. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F5-32-src-S1">S1 — Systems Curriculum (this project): section 12, milestone V1 (acceptance quoted in the lab). Opened in this build (local file); a map, not a source (AH-4).</li>
+<li id="F5-32-src-R1">R1 — Lab run <code>F5-32/hvdetect.log</code>: Listing 1, g++ 13.3.0, in the build container (itself a VM).</li>
+<li id="F5-32-src-R2">R2 — Lab runs <code>F5-32/guest_tcg.log</code> and <code>F5-32/guest_nohv.log</code>: Listing 2, clang 18.1.3 and LLD 18.1.3, QEMU 8.2.2 q35 (TCG), OVMF 2024.02-2ubuntu0.10; exit code 33 each; untested on hardware.</li>
+<li id="F5-32-src-R3">R3 — Lab run <code>F5-32/accel_kvm.log</code>: QEMU with <code>-accel kvm</code>; exit code 1, expected (no <code>/dev/kvm</code>).</li>
+<li id="F5-32-src-R4">R4 — Lab run <code>F5-32/work_host.log</code>: <code>work_host.cc</code>, g++ 13.3.0 <code>-O2</code>, in the shared container.</li>
+<li id="F5-32-src-R5">R5 — Lab runs <code>F5-32/forensic_accel.log</code> and <code>F5-32/check_guest.log</code>: <code>-accel kvm -accel tcg</code>, time-stamped console; exit code 33.</li>
+<li id="F5-32-src-R6">R6 — Lab run <code>F5-32/consolidate.log</code>: Listing 3 with <code>consolidate.in</code>, g++ 13.3.0; exit code 3 (one VM unplaced, the expected result).</li>
+</ol>
+
+<h2 id="F5-32-glossary">Glossary links</h2>
+<p><a href="#gl-vcpu">vCPU</a> · <a href="#gl-overcommit">Overcommit</a> · <a href="#gl-tcg-tiny-code-generator">TCG</a> · <a href="#gl-live-migration">Live migration</a> · <a href="#gl-device-passthrough">Device passthrough</a> · <a href="#gl-noisy-neighbour">Noisy neighbour</a> · <a href="#gl-hypervisor-virtual-machine-monitor-vmm">Hypervisor</a> · <a href="#gl-hypervisor-present-bit">Hypervisor-present bit</a> · <a href="#gl-hypervisor-signature">Hypervisor signature</a> · <a href="#gl-steal-time">Steal time</a> · <a href="#gl-balloon-device">Balloon device</a> · <a href="#gl-virtio">virtio</a> · <a href="#gl-iommu">IOMMU</a> · <a href="#gl-packing-and-spreading-placement-policy">Packing and spreading</a></p>
+
+<h2 id="F5-32-next">Next chapter</h2>
+<p>Next: <a href="#F5-33">F5-33 Power, cooling and reliability</a>. Previous: <a href="#F5-31">F5-31</a>. Back to the course: <a href="#DS304">DS304</a>.</p>
+
+<h2 id="F5-32-answers">Answers to Check yourself</h2>
+<ol>
+<li>Hardware; host kernel with KVM; VM processes (vCPU threads, virtual devices); guest OS; applications. A vCPU runs as a host thread on whichever pCPU the host scheduler chooses, in guest mode while executing guest code.</li>
+<li>The option removes only the leaf-1 bit; QEMU still answers leaf 0x40000000. By convention the leaf has a meaning only when the bit is set, so a careful guest ignores it.</li>
+<li>Line 62 (<code>mem_ok</code>): compare with <code>n.mem_gib * 1.2</code> instead of <code>n.mem_gib</code>.</li>
+<li>Yes: with 48 vCPUs per node, batch2 (24) fits on hostB node 1 (24 + 24 = 48, memory 64 + 64 = 128).</li>
+<li>CPU time not used by one VM can be given to another instantly and taken back; memory a guest has filled holds its data and cannot be taken back without its cooperation or slow mechanisms, and running out stops guests.</li>
+<li>The device's internal state lives in the hardware and the guest's driver, not in the hypervisor, so it cannot be copied page by page like memory; the destination also needs a matching device.</li>
+<li>A noisy neighbour's nightly job (host CPU, memory bandwidth); a host-level task (backup, scrub, migration) at 02:00; a placement change that moved the VM to a busier or remote-NUMA position. Ask for: host CPU and steal time per VM, the VM's NUMA placement history, the host's scheduled tasks and migration logs.</li>
+<li>(b). (a) needs a reference; (c) shows the work was the same; (d) is true under KVM and TCG alike.</li>
+</ol>
+<h3 id="F5-32-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Integer: 3.929 − 3.403 = 0.526 s versus 0.294 s on the host, about 1.8×. Floating point: 4.726 − 3.929 = 0.797 s versus 0.125 s, about 6.4×. (Your run's numbers will differ; compute the ratios.)</li>
+<li>H1: no hardware acceleration. For: QEMU's first lines at 0.057 s say KVM could not be opened and it is "falling back to tcg"; the signature is "TCGTCGTCGTCG"; the slowdown depends on the kind of work. H2: the host is overloaded, or the guest does more work. Against: the results are identical to the host's (same work), and a busy host would slow both loops by similar factors, while here the factors differ by more than three times.</li>
+<li>Decisive: "qemu-system-x86_64: falling back to tcg". Independent confirmation: the guest's own CPUID signature "TCGTCGTCGTCG" instead of "KVMKVMKVM".</li>
+<li>Root cause: the reinstalled host has no usable <code>/dev/kvm</code> ("No such file or directory"): KVM module not loaded or virtualization disabled; the option list <code>-accel kvm -accel tcg</code> made QEMU fall back silently. Fix: enable KVM on the host (firmware setting, module, permissions) and restart the VM.</li>
+<li>Start production VMs with <code>-accel kvm</code> only, so they fail loudly (R3); monitor the guest's hypervisor signature or the VMM's acceleration status; include a KVM check in the host's post-installation tests.</li>
+</ol>
+<p><b>How the evidence was produced:</b> run.sh step 4 starts the guest with <code>-accel kvm -accel tcg</code> in this container, which has no <code>/dev/kvm</code>; <code>qemu_run.py --stamp</code> adds host time stamps; <code>work_host.cc</code> runs the same loops natively.</p>

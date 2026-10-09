@@ -1,0 +1,354 @@
+<!--meta
+id: F5-28
+title: Inside a server: sockets, NUMA, memory channels
+course: DS304
+level: L3
+prereqs: HW203 (F1-39 DRAM, channels and NUMA; F1-36 cache coherence); OS301 (F3-10 UEFI programs, F3-12 ACPI and SMBIOS tables); F5-22 (what a cluster is) recommended
+time: 6–8 hours including the lab
+hardware: a Linux computer with clang 18 and LLD, QEMU 8.2 and OVMF (the build used exactly these); no real multi-socket server is needed for the lab, and none was available to this build
+maps: Curriculum 2.4 (the SRAT/SLIT row: "Others worth knowing … SRAT/SLIT (NUMA)"), 1.3 (computer architecture, NUMA), B6 (SMBIOS inventory: types 4 and 17 here); BR-10 ("NUMA inside each server")
+analogy: F5 — friends in different towns; proposal in NOTES.md: "NUMA node = a town with its own library; the interconnect = the bridge between towns; SLIT distance = the travel-time sign on the road"
+-->
+
+<h2 id="F5-28-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>Amara and Kenji live in two towns joined by one bridge. Each town has its own library. When Amara needs a book from her own library she walks round the corner; when the book sits in Kenji's library it must cross the bridge, and on busy days the bridge has a queue. Both towns share one catalogue, so any friend can borrow any book, and nobody is ever told "no". They are only told "later". The friends' reading club works fastest when each member's books live in the member's own town, and slowest when a newcomer's whole shelf was, by accident, put in the other town.</p>
+</div>
+<p>A modern server is two (or more) of those towns. Each processor socket has its own memory, attached through its own memory channels; the sockets are joined by an interconnect; and every core can read every byte, some faster than others. This is non-uniform memory access, NUMA, which you met in <a href="#F1-39">F1-39</a> from the hardware side. This chapter looks at it the way a data-centre engineer and an operating system meet it: the firmware describes the towns in ACPI tables (SRAT and SLIT) and the inventory in SMBIOS, the OS reads those tables, and placement decisions that ignore them make a server mysteriously slow. You will build a UEFI program that reads those tables on a two-socket virtual server, check every line against the QEMU command line, and then diagnose a server whose second town has no library at all.</p>
+
+<h2 id="F5-28-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the anatomy of a multi-socket server: sockets, cores, memory controllers and channels, the inter-socket interconnect, I/O attached to sockets, and the management controller beside them.</li>
+<li><b>Read</b> the firmware's description of a server's NUMA layout: the SRAT (which processors and memory ranges belong to which proximity domain) and the SLIT (relative distances), plus the SMBIOS processor and memory-device inventory.</li>
+<li><b>Verify</b> those tables against an independent source of truth, and explain what differs and why (the legacy hole in node 0).</li>
+<li><b>Compute</b> the mean relative distance of a thread's memory accesses for a given page placement, and say what the number does and does not mean.</li>
+<li><b>Diagnose</b> a NUMA misconfiguration (a node with processors but no memory) from table dumps.</li>
+</ul>
+
+<div class="co jargon" id="F5-28-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Socket (processor package)</dt><dd><b>Simple words:</b> the place on a server's main board where one processor chip sits; a "two-socket server" has two processors. <b>Analogy:</b> one town. <b>Precise:</b> a physical processor package with its cores, caches, memory controllers and links; SMBIOS describes each populated or empty socket with one processor information structure (type 4). <sup class="src"><a href="#F5-28-src-D1">D1</a></sup> <sup class="src"><a href="#F5-28-src-D3">D3</a></sup></dd>
+<dt>NUMA node (proximity domain)</dt><dd><b>Simple words:</b> a group of processors and the memory that is nearest to them. <b>Analogy:</b> a town with its own library. <b>Precise:</b> a set of processors, memory ranges (and possibly devices) that the firmware declares to be close to each other; ACPI calls it a proximity domain and numbers it in the SRAT; the OS turns proximity domains into its NUMA nodes. <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> <sup class="src"><a href="#F5-28-src-D4">D4</a></sup> Not to be confused with a "node" in distributed systems (<a href="#F5-08">F5-08</a>), which is a whole machine.</dd>
+<dt>SRAT</dt><dd><b>Simple words:</b> the firmware table that says which processors and which memory belong to which NUMA node. <b>Analogy:</b> the town register: who lives where, which library holds which shelves. <b>Precise:</b> the ACPI System Resource Affinity Table (signature "SRAT"): after the common header, a list of affinity structures, among them processor local APIC affinity (APIC ID → proximity domain) and memory affinity (base, length → proximity domain, with an "enabled" flag). <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> <sup class="src"><a href="#F5-28-src-R2">R2</a></sup></dd>
+<dt>SLIT</dt><dd><b>Simple words:</b> the firmware table that says how far apart the NUMA nodes are. <b>Analogy:</b> the travel-time signs on the roads between towns. <b>Precise:</b> the ACPI System Locality Information Table (signature "SLIT"): a count <i>n</i> of localities followed by an <i>n</i> × <i>n</i> matrix of one-byte relative distances, where the distance of a locality to itself is normalised to 10. <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> <sup class="src"><a href="#F5-28-src-R2">R2</a></sup></dd>
+<dt>Interconnect (inter-socket link)</dt><dd><b>Simple words:</b> the wires and protocol that join the processors so they can reach each other's memory and keep caches consistent. <b>Analogy:</b> the bridge between the towns. <b>Precise:</b> point-to-point links between sockets that carry remote memory requests, responses and cache-coherence traffic; their names and properties are vendor-specific and come from the vendor's documentation for a named processor (AH-21). <sup class="src"><a href="#F5-28-src-D1">D1</a></sup></dd>
+<dt>Memory-less node</dt><dd><b>Simple words:</b> a NUMA node that has processors but no memory of its own. <b>Analogy:</b> a town with houses but no library: every book comes over the bridge. <b>Precise:</b> a proximity domain to which the SRAT assigns processors but no enabled memory range; every memory access from its processors is remote. <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> <sup class="src"><a href="#F5-28-src-R6">R6</a></sup></dd>
+</dl>
+<p>Terms from earlier chapters used here: <a href="#gl-numa">NUMA</a>, <a href="#gl-memory-channel">memory channel</a>, <a href="#gl-memory-controller">memory controller</a> and <a href="#gl-first-touch-policy">first-touch policy</a> (<a href="#F1-39">F1-39</a>); <a href="#gl-acpi">ACPI</a>, <a href="#gl-madt">MADT</a> and <a href="#gl-smbios">SMBIOS</a> (<a href="#F3-12">F3-12</a>).</p>
+</div>
+
+<h2 id="F5-28-pictures">The idea in pictures</h2>
+<p>Figure 1 is the anatomy of a two-socket server at block level. Figure 2 is what the firmware of this chapter's virtual server says about the same shape, drawn from the lab run.</p>
+<figure id="F5-28-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 360" role="img" aria-labelledby="F5-28-f1t F5-28-f1d">
+<title id="F5-28-f1t">Block diagram of a two-socket server</title>
+<desc id="F5-28-f1d">Two large boxes, socket 0 on the left and socket 1 on the right. Each socket contains a row of cores with private caches, a shared last-level cache, a memory controller and I/O links. From each socket's memory controller, four lines labelled channel 0 to channel 3 go outward to memory modules (DIMMs); the memory attached to socket 0 forms NUMA node 0 and the memory attached to socket 1 forms NUMA node 1. Between the two sockets a thick double line is labelled interconnect: remote memory requests and cache coherence. Below each socket a box labelled PCIe devices (NIC, NVMe) is attached to that socket. At the bottom a separate small box labelled BMC, management controller, on standby power, is connected by thin dashed lines to both sockets and to its own network port. A note says: not to scale; counts of cores and channels are examples, not a product.</desc>
+<rect class="sv-b1" x="20" y="40" width="300" height="190"/>
+<text class="sv-tb" x="34" y="62">Socket 0</text>
+<rect class="sv-box" x="34" y="74" width="60" height="40"/><text class="sv-ts" x="42" y="98">core</text>
+<rect class="sv-box" x="104" y="74" width="60" height="40"/><text class="sv-ts" x="112" y="98">core</text>
+<rect class="sv-box" x="174" y="74" width="60" height="40"/><text class="sv-ts" x="182" y="98">core</text>
+<rect class="sv-box" x="244" y="74" width="60" height="40"/><text class="sv-ts" x="252" y="98">core</text>
+<rect class="sv-b3" x="34" y="124" width="270" height="26"/><text class="sv-ts" x="44" y="142">shared last-level cache</text>
+<rect class="sv-b5" x="34" y="160" width="170" height="30"/><text class="sv-t" x="44" y="180">memory controller</text>
+<rect class="sv-b4" x="214" y="160" width="90" height="30"/><text class="sv-t" x="224" y="180">I/O links</text>
+<text class="sv-ts" x="34" y="216">cores, caches, controller in one package</text>
+<rect class="sv-b1" x="440" y="40" width="300" height="190"/>
+<text class="sv-tb" x="454" y="62">Socket 1</text>
+<rect class="sv-box" x="454" y="74" width="60" height="40"/><text class="sv-ts" x="462" y="98">core</text>
+<rect class="sv-box" x="524" y="74" width="60" height="40"/><text class="sv-ts" x="532" y="98">core</text>
+<rect class="sv-box" x="594" y="74" width="60" height="40"/><text class="sv-ts" x="602" y="98">core</text>
+<rect class="sv-box" x="664" y="74" width="60" height="40"/><text class="sv-ts" x="672" y="98">core</text>
+<rect class="sv-b3" x="454" y="124" width="270" height="26"/><text class="sv-ts" x="464" y="142">shared last-level cache</text>
+<rect class="sv-b5" x="554" y="160" width="170" height="30"/><text class="sv-t" x="564" y="180">memory controller</text>
+<rect class="sv-b4" x="454" y="160" width="90" height="30"/><text class="sv-t" x="464" y="180">I/O links</text>
+<line class="sv-line2" x1="320" y1="120" x2="440" y2="120"/><line class="sv-line2" x1="320" y1="128" x2="440" y2="128"/>
+<text class="sv-ts" x="330" y="110">interconnect</text>
+<text class="sv-ts" x="326" y="148">remote memory +</text><text class="sv-ts" x="326" y="162">cache coherence</text>
+<line class="sv-line" x1="34" y1="175" x2="10" y2="175"/>
+<line class="sv-line" x1="10" y1="175" x2="10" y2="268"/>
+<rect class="sv-b6" x="20" y="250" width="170" height="40"/><text class="sv-t" x="30" y="268">DIMMs, channels 0–3</text><text class="sv-ts" x="30" y="284">= NUMA node 0 memory</text>
+<line class="sv-line" x1="10" y1="268" x2="20" y2="268"/>
+<line class="sv-line" x1="724" y1="175" x2="750" y2="175"/>
+<line class="sv-line" x1="750" y1="175" x2="750" y2="268"/>
+<rect class="sv-b6" x="570" y="250" width="170" height="40"/><text class="sv-t" x="580" y="268">DIMMs, channels 0–3</text><text class="sv-ts" x="580" y="284">= NUMA node 1 memory</text>
+<line class="sv-line" x1="750" y1="268" x2="740" y2="268"/>
+<line class="sv-line" x1="259" y1="190" x2="259" y2="250"/>
+<rect class="sv-b4" x="210" y="250" width="110" height="40"/><text class="sv-t" x="220" y="268">PCIe devices</text><text class="sv-ts" x="220" y="284">NIC, NVMe</text>
+<line class="sv-line" x1="499" y1="190" x2="499" y2="250"/>
+<rect class="sv-b4" x="440" y="250" width="110" height="40"/><text class="sv-t" x="450" y="268">PCIe devices</text><text class="sv-ts" x="450" y="284">NIC, NVMe</text>
+<rect class="sv-b7" x="330" y="300" width="100" height="40"/><text class="sv-tb" x="346" y="318">BMC</text><text class="sv-ts" x="340" y="334">standby power</text>
+<line class="sv-dash" x1="330" y1="320" x2="300" y2="230"/><line class="sv-dash" x1="430" y1="320" x2="460" y2="230"/>
+<text class="sv-ts" x="440" y="352">own network port (F5-29)</text>
+<text class="sv-ts" x="20" y="352">not to scale; 4 cores and 4 channels are drawing choices</text>
+</svg></div><figcaption><b>Figure 1.</b> A two-socket server. Memory hangs off each socket's memory controller through its channels; the memory of one socket is one NUMA node. Arrows are omitted: requests can travel in both directions over the interconnect. Structure after D1 (multiprocessor and memory-system chapters); the BMC is the subject of <a href="#F5-29">F5-29</a>. <sup class="src"><a href="#F5-28-src-D1">D1</a></sup></figcaption></figure>
+
+<figure id="F5-28-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 270" role="img" aria-labelledby="F5-28-f2t F5-28-f2d">
+<title id="F5-28-f2t">The NUMA layout of the lab's virtual server, as read from SRAT and SLIT</title>
+<desc id="F5-28-f2d">Two boxes. Node 0 contains CPUs with APIC IDs 0 and 1 and two memory ranges: 0x0 plus 640 KiB, and 0x100000 plus 261,120 KiB; a gap between 640 KiB and 1 MiB is marked "not in any node: legacy hole". Node 1 contains CPUs with APIC IDs 2 and 3 and one memory range 0x10000000 plus 262,144 KiB. A line between the nodes is labelled SLIT distance 21; a loop on each node is labelled 10, local. Below, the source of truth: the QEMU options -smp 4,sockets=2, two memory backends of 256M, -numa node cpus=0-1 and cpus=2-3, -numa dist val=21.</desc>
+<rect class="sv-b1" x="20" y="20" width="320" height="150"/>
+<text class="sv-tb" x="34" y="44">Node 0 (proximity domain 0)</text>
+<text class="sv-t" x="34" y="68">CPUs: APIC ID 0, 1</text>
+<text class="sv-tm" x="34" y="94">0x000000000 + 640 KiB</text>
+<text class="sv-tm" x="34" y="114">0x000100000 + 261,120 KiB</text>
+<text class="sv-ts" x="34" y="138">640 KiB – 1 MiB: in no node</text>
+<text class="sv-ts" x="34" y="154">(the legacy hole, 384 KiB)</text>
+<rect class="sv-b1" x="420" y="20" width="320" height="150"/>
+<text class="sv-tb" x="434" y="44">Node 1 (proximity domain 1)</text>
+<text class="sv-t" x="434" y="68">CPUs: APIC ID 2, 3</text>
+<text class="sv-tm" x="434" y="94">0x010000000 + 262,144 KiB</text>
+<line class="sv-line2" x1="340" y1="95" x2="420" y2="95"/>
+<text class="sv-tb" x="352" y="86">SLIT 21</text>
+<text class="sv-ts" x="196" y="44">to itself: 10</text>
+<text class="sv-ts" x="596" y="44">to itself: 10</text>
+<rect class="sv-box" x="20" y="190" width="720" height="62"/>
+<text class="sv-ts" x="32" y="210">source of truth (QEMU command line of the run):</text>
+<text class="sv-tm" x="32" y="228">-smp 4,sockets=2,cores=2 -m 512M  memory-backend-ram m0=256M, m1=256M</text>
+<text class="sv-tm" x="32" y="244">-numa node,nodeid=0,cpus=0-1,memdev=m0  -numa node,nodeid=1,cpus=2-3,memdev=m1  -numa dist,src=0,dst=1,val=21</text>
+</svg></div><figcaption><b>Figure 2.</b> What the firmware told the OS about the lab's virtual server (run R2), next to the QEMU options that configured it. The numbers are this run's, not a real server's. Table layouts: D2 (SRAT, SLIT), pending verification; every line checked in R4. <sup class="src"><a href="#F5-28-src-R2">R2</a></sup> <sup class="src"><a href="#F5-28-src-R4">R4</a></sup></figcaption></figure>
+
+<h2 id="F5-28-layer1">Layer 1 — the kid explanation</h2>
+<p>A big server is several computers' worth of processors glued into one machine. Each processor chip has its own memory next to it. Any processor can use any memory, but memory next to a different chip takes a trip across a bridge. The machine still looks like one computer to your program. Nobody tells your program which memory is near and which is far, unless the operating system asks the firmware and then places things carefully.</p>
+<p>So a server has a map: which processors live in which "town", which memory belongs to which town, and how long the trip between towns is. The firmware writes that map when the machine starts. In this chapter you read the map yourself and check that it is true.</p>
+
+<h2 id="F5-28-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F5-28-l2-anatomy">Anatomy, from the outside in</h3>
+<p>Analogy first: the towns, the libraries and the bridge. A rack-mounted server holds one or more processor packages in sockets, memory modules (DIMMs) in slots grouped into channels, storage and network devices on PCI Express, power supplies, fans, and a baseboard management controller (BMC) that runs whenever the server has standby power. <sup class="src"><a href="#F5-28-src-D1">D1</a></sup> <sup class="src"><a href="#F5-28-src-D6">D6</a></sup> Inside each package are cores with private caches, a shared last-level cache, one or more memory controllers and the links to other packages and to I/O. <sup class="src"><a href="#F5-28-src-D1">D1</a></sup> Since the memory controller is in the package, each socket owns the DIMMs on its channels; a core that needs a line from the other socket's DIMMs sends the request over the interconnect, and the other socket's controller answers. <sup class="src"><a href="#F5-28-src-D1">D1</a></sup> That is the hardware reason for NUMA (<a href="#F1-39">F1-39</a>).</p>
+<p>Channels matter twice. They add bandwidth when they work in parallel, and they decide how much memory a node has. A socket whose channels are empty has no local memory, however many cores it has. <sup class="src"><a href="#F5-28-src-D1">D1</a></sup> Which slots must be filled, in which order, and with which module types is a rule of the specific main board and processor; it comes from the board vendor's manual, not from general principles (see the unverified box in "How the hardware actually does it").</p>
+<h3 id="F5-28-l2-tables">How the OS learns the layout</h3>
+<p>The OS cannot discover NUMA by itself in a general way; the firmware describes it. On ACPI systems that description is two tables you have not decoded before. <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> <sup class="src"><a href="#F5-28-src-S1">S1</a></sup></p>
+<ul>
+<li>The <b>SRAT</b> lists affinity structures. A processor local APIC affinity structure says "the processor with this APIC ID belongs to proximity domain <i>d</i>"; a memory affinity structure says "this physical range belongs to proximity domain <i>d</i>", with flags (bit 0: enabled). <sup class="src"><a href="#F5-28-src-D2">D2</a></sup></li>
+<li>The <b>SLIT</b> is a square matrix of relative distances. Entry (<i>i</i>, <i>j</i>) is the relative cost for locality <i>i</i> to reach memory of locality <i>j</i>; the diagonal is 10. A value of 21 means "about 2.1 times the local cost" only in the loose sense the specification gives it: the numbers are relative and unitless, not nanoseconds. <sup class="src"><a href="#F5-28-src-D2">D2</a></sup></li>
+</ul>
+<p>The MADT (from <a href="#F3-12">F3-12</a>) still lists the processors; the SRAT adds where they live. SMBIOS adds inventory for humans and management tools: one type 4 structure per processor socket and one type 17 structure per memory device. <sup class="src"><a href="#F5-28-src-D3">D3</a></sup> If there is no SRAT, an OS treats the machine as one node; the lab's second boot shows exactly that case. <sup class="src"><a href="#F5-28-src-D4">D4</a></sup> <sup class="src"><a href="#F5-28-src-R3">R3</a></sup></p>
+<h3 id="F5-28-l2-os">What the OS does with it</h3>
+<p>Linux turns proximity domains into NUMA nodes and shows them in sysfs, one directory per node, with the node's CPU list, its memory counters and its row of the distance table; by default it allocates a page on the node of the CPU that first touches it (<a href="#F1-39">F1-39</a>, first-touch policy), and it offers memory policies and CPU affinity so that programs and administrators can bind threads and memory to nodes. <sup class="src"><a href="#F5-28-src-D4">D4</a></sup> Listing 1 reads those sysfs files on the build container: it is a virtual machine with one node, four CPUs in one package, and a distance row of "10". <sup class="src"><a href="#F5-28-src-R1">R1</a></sup></p>
+
+<h2 id="F5-28-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F5-28-l3-srat">The SRAT and SLIT byte by byte</h3>
+<p>Both tables start with the 36-byte ACPI header you checksum in <a href="#F3-12">F3-12</a>. In Listing 2 the SRAT body is walked from offset 48 (the header plus 12 reserved bytes), entry by entry using each entry's length byte, and the SLIT's locality count is read as a 64-bit value at offset 36 with the matrix following at offset 44. <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> These offsets were written from memory of the ACPI Specification; what supports them in this build is that the checksums pass and every decoded value equals the QEMU configuration (R4). That is evidence the parser agrees with QEMU's table generator, not proof that both agree with the specification; the Source Researcher must confirm the section "System Resource Affinity Table" and "System Locality Distance Information Table" in the specification. <sup class="src"><a href="#F5-28-src-R4">R4</a></sup></p>
+<p>Three details from the run are worth reading closely:</p>
+<ol>
+<li><b>The proximity domain of a processor entry is split.</b> The low 8 bits sit at byte 2 of the entry and the upper 24 bits at bytes 9–11 (a later extension of an older 8-bit field), so Listing 2 assembles them. <sup class="src"><a href="#F5-28-src-D2">D2</a></sup></li>
+<li><b>Node 0 has two ranges and a gap.</b> Node 0's memory is reported as 640 KiB at 0 and 261,120 KiB from 1 MiB, 384 KiB short of the 256 MiB backend. The missing range is the legacy area between 640 KiB and 1 MiB that PCs reserve for video memory and option ROMs; it is in no node. <sup class="src"><a href="#F5-28-src-R2">R2</a></sup> <sup class="src"><a href="#F5-28-src-D6">D6</a></sup> The check in R4 therefore tests node 1 for exactly 262,144 KiB and reports node 0's difference instead of hiding it.</li>
+<li><b>A disabled entry.</b> The last memory affinity entry has flags 0 and length 0. The specification lets firmware include entries that are not enabled (for example, reserved for hot-plug); an OS must skip them, and Listing 2 does. <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> <sup class="src"><a href="#F5-28-src-R2">R2</a></sup> Why QEMU emits this one was not investigated (QEMU source <code>hw/i386/acpi-build.c</code> would answer it; not opened).</li>
+</ol>
+<h3 id="F5-28-l3-beyond">What SRAT and SLIT do not say</h3>
+<p>A SLIT value is one number per pair of nodes. It does not separate latency from bandwidth, reads from writes, or idle from loaded. For that, newer ACPI versions define a Heterogeneous Memory Attribute Table (HMAT), and QEMU's own help lists matching <code>-numa hmat-lb</code> and <code>hmat-cache</code> options (run R7). <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> <sup class="src"><a href="#F5-28-src-R7">R7</a></sup> Real latency and bandwidth between nodes are measured with a benchmark on the named machine and recorded as a measurement (AH-23); this chapter has no such machine and quotes no such number.</p>
+<p>Devices have locality too. A network card or NVMe drive attached to socket 1's PCI Express links is closer to node 1; DMA from it into node 0 memory crosses the interconnect. Linux reports a PCI device's node in sysfs, and ACPI can attach proximity information to devices. <sup class="src"><a href="#F5-28-src-D4">D4</a></sup> <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> In practice this decides which cores should run a NIC's interrupt handlers and the threads that consume its data: the topic returns with GPUs and RDMA NICs in DS401 and F8.</p>
+<h3 id="F5-28-l3-tradeoffs">Placement trade-offs</h3>
+<p>There are three standard policies, and each fits a different workload. <sup class="src"><a href="#F5-28-src-D4">D4</a></sup> <sup class="src"><a href="#F5-28-src-D1">D1</a></sup></p>
+<ul>
+<li><b>Local (bind or first touch):</b> threads and their data on one node. Best mean distance (10); the node's channels limit bandwidth, and one node's memory limits capacity.</li>
+<li><b>Interleave:</b> pages spread round-robin over nodes. Every thread sees the same mean distance (15.5 in the worked example), and all channels of all sockets are used; it suits shared data that every thread reads.</li>
+<li><b>Accidental remote:</b> data first touched by an initialisation thread on the wrong node, or a node without memory (the forensic lab). Mean distance 21 for every access, and the interconnect carries all of it.</li>
+</ul>
+<p>Hypervisors face the same choice for whole virtual machines; <a href="#F5-32">F5-32</a> places VMs so that each fits in one node.</p>
+
+<h2 id="F5-28-hardware">How the hardware actually does it</h2>
+<p>A request from a core first misses in its private caches and the shared cache; the package's logic then decides, from the physical address, which memory controller owns the line. If it is local, the controller schedules DRAM commands on the right channel (<a href="#F1-39">F1-39</a>). If it is remote, the request travels over the interconnect, the other package's controller reads DRAM, and the data comes back the same way, while the coherence protocol makes sure no cache anywhere holds a newer copy (<a href="#F1-36">F1-36</a>). <sup class="src"><a href="#F5-28-src-D1">D1</a></sup> The extra hops are the physical meaning of the SLIT's larger number. The firmware learns the topology while it trains memory and brings up the links during early boot (PEI phase, <a href="#F3-11">F3-11</a>), and it writes SRAT and SLIT for the OS during DXE. <sup class="src"><a href="#F5-28-src-D6">D6</a></sup> In QEMU, none of this hardware exists: QEMU's ACPI generator writes the tables from the command line, which is exactly why the command line is a good source of truth for the lab.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span>
+<p>Everything product-specific is outside this build: the number of memory channels per socket, the number of DIMM slots per channel, the slot population order and module mixing rules, the name and speed of the inter-socket links (vendor names exist for Intel and AMD links), the real SLIT values a given server reports, and its measured local and remote latency and bandwidth. Take them from the processor vendor's datasheet and the board vendor's manual for the exact model, and from your own measurement on that machine; record the document and section in the dossier (AH-21 to AH-23).</p>
+</div>
+
+<h2 id="F5-28-worked">Worked example</h2>
+<p>Use the SLIT the lab printed: 10 on the diagonal, 21 between nodes. A thread runs on a CPU of node 0. What is the mean relative distance of its memory accesses for four placements? Weight each node's distance by the share of accesses that go to it:</p>
+<p>mean distance = Σ<sub>j</sub> share<sub>j</sub> × SLIT[cpu node][j]</p>
+<ol>
+<li><b>All local:</b> 1.00 × 10 = 10.00, which is 1.00 times the all-local value.</li>
+<li><b>Interleaved over both nodes:</b> 0.5 × 10 + 0.5 × 21 = 5 + 10.5 = 15.50, or 1.55 times.</li>
+<li><b>Everything on the other node</b> (the data was first touched by a thread on node 1): 1.00 × 21 = 21.00, or 2.10 times.</li>
+<li><b>A thread on node 1 with 90 % of its accesses local:</b> 0.1 × 21 + 0.9 × 10 = 2.1 + 9 = 11.10, or 1.11 times.</li>
+</ol>
+<p>Listing 3 computes the same four cases from <code>placement.in</code> (output below it). Read the results carefully: they are ratios of SLIT numbers, which the specification defines as relative. They do not predict that the program will run 2.1 times slower; caches hide some remote accesses, bandwidth limits may dominate instead of distance, and the hardware may not match its own table exactly. Use the number to rank placements; measure to know the cost. <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> <sup class="src"><a href="#F5-28-src-R5">R5</a></sup></p>
+
+<h2 id="F5-28-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>topology.cpp</code>: what the Linux kernel of the machine you are on says about nodes and packages (built with the course's host flags by <code>run_lab.sh</code>).</p>
+<pre class="listing" data-src="F5-28/topology.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">13–21</td><td><code>first_line</code></td><td>Reads the first line of a sysfs file, or "(unreadable)".</td><td>sysfs files are small text files; missing ones are reported, not fatal.</td></tr>
+<tr><td class="n">23–40</td><td><code>numbered</code></td><td>Lists <code>node0</code>, <code>node1</code>, … (or <code>cpu0</code>, …) and sorts them by number.</td><td>Plain string order would put <code>cpu10</code> before <code>cpu2</code>.</td></tr>
+<tr><td class="n">44–50</td><td>node loop</td><td>Prints each node's <code>cpulist</code>, <code>distance</code> row and first <code>meminfo</code> line.</td><td>The distance row is the kernel's copy of the SLIT row for that node (10 alone when there is one node). <sup class="src"><a href="#F5-28-src-D4">D4</a></sup></td></tr>
+<tr><td class="n">51–59</td><td>CPU loop</td><td>Prints package (socket), core and the CPUs that share the core.</td><td>Distinguishes sockets from cores from hardware threads.</td></tr>
+<tr><td class="n">60</td><td><code>return nodes.empty() ? 1 : 0;</code></td><td>Fails if no node directory exists.</td><td>A kernel built without NUMA support has no <code>node*</code> directories.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F5-28/topology"></pre>
+<p>The build container is itself a virtual machine (<a href="#F5-32">F5-32</a> shows how to tell): one node, one package of four cores, no SMT. Its memory total is the container's, not a server's. <sup class="src"><a href="#F5-28-src-R1">R1</a></sup></p>
+
+<p><b>Listing 2</b> — <code>numa.cc</code>: a UEFI application (the build route of <a href="#F3-10">F3-10</a>, sharing its <code>efi.hpp</code> and <code>console.hpp</code>) that prints the SMBIOS socket and memory inventory, the MADT processor count, the SRAT and the SLIT, and a per-node summary.</p>
+<pre class="listing" data-src="F5-28/numa.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">12–14</td><td><code>u16</code>, <code>u32</code>, <code>u64</code></td><td>Little-endian reads byte by byte.</td><td>ACPI fields are unaligned (F3-12).</td></tr>
+<tr><td class="n">16–19</td><td><code>ptr</code></td><td>Physical address to pointer.</td><td>Valid only while the firmware's identity map is active (F3-09).</td></tr>
+<tr><td class="n">35–37</td><td><code>g_node_bytes</code>, <code>g_node_cpus</code></td><td>Per-node totals, for up to eight nodes.</td><td>The summary lines that the checks compare with QEMU's options.</td></tr>
+<tr><td class="n">39–46</td><td>SRAT loop header</td><td>Starts at offset 48 and advances by each entry's length byte; stops at a zero length.</td><td>Never trust a length you have not checked: a zero would loop forever.</td></tr>
+<tr><td class="n">47–57</td><td>type 0</td><td>Processor local APIC affinity: assembles the domain from bytes 2 and 9–11; counts enabled CPUs.</td><td>The split domain field (Layer 3, item 1). <sup class="src"><a href="#F5-28-src-D2">D2</a></sup></td></tr>
+<tr><td class="n">58–79</td><td>type 1</td><td>Memory affinity: domain at offset 2, base at 8, length at 16, flags at 28; skips disabled entries; adds to the node's total.</td><td>The disabled entry in the run is skipped and reported, not counted.</td></tr>
+<tr><td class="n">87–101</td><td><code>slit</code></td><td>Reads <i>n</i> at offset 36 and prints the <i>n</i> × <i>n</i> bytes from offset 44.</td><td>Rows are "from", columns are "to"; the matrix need not be symmetric in general.</td></tr>
+<tr><td class="n">103–116</td><td><code>smbios_string</code></td><td>String number <i>k</i> after a structure's formatted area.</td><td>The same rule as F3-12.</td></tr>
+<tr><td class="n">118–145</td><td><code>smbios</code></td><td>Counts type 4 structures; prints type 17 device names and the size field (bit 15 chooses KiB or MiB).</td><td>Inventory as a management tool sees it (<a href="#F5-31">F5-31</a> reuses it). <sup class="src"><a href="#F5-28-src-D3">D3</a></sup></td></tr>
+<tr><td class="n">172–197</td><td>XSDT loop</td><td>Counts MADT processor entries; decodes SRAT and SLIT with checksums.</td><td>MADT says "how many"; SRAT says "where".</td></tr>
+<tr><td class="n">198–211</td><td><code>!have_srat</code> and the summary</td><td>Says so when the firmware gives no NUMA description.</td><td>The one-node case is a valid answer, not an error.</td></tr>
+<tr><td class="n">213</td><td><code>qemu_exit(0x10)</code></td><td>Ends QEMU with status 33.</td><td>A defined end, so the run is a test.</td></tr>
+</tbody></table></div>
+<p>Build and run (the commands actually used are in each run record; abbreviated): <code>clang++ --target=x86_64-unknown-windows -std=c++20 -ffreestanding … -c numa.cc</code>, <code>lld-link /subsystem:efi_application /entry:efi_main …</code>, then QEMU with the options of Figure 2. The two-node boot:</p>
+<pre class="output" data-run="F5-28/numa_2s"></pre>
+<p>The same processors and memory without any <code>-numa</code> option:</p>
+<pre class="output" data-run="F5-28/numa_flat"></pre>
+<p>The checks against the command lines (<code>run.sh</code> step 3):</p>
+<pre class="output" data-run="F5-28/check_numa"></pre>
+<p>QEMU's own help text for the options used (run R7):</p>
+<pre class="output" data-run="F5-28/qemu_numa_help"></pre>
+
+<p><b>Listing 3</b> — <code>placement.cpp</code>: the worked example as a program; its input <code>placement.in</code> holds the SLIT and the four placements.</p>
+<pre class="listing" data-src="F5-28/placement.cpp"></pre>
+<pre class="listing" data-src="F5-28/placement.in"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">10–15</td><td><code>struct Placement</code></td><td>A case: name, the CPU's node, and the share of accesses per node.</td><td>Shares, not page counts: what matters is where accesses go.</td></tr>
+<tr><td class="n">19–27</td><td>reading the matrix</td><td><i>n</i>, then <i>n</i> × <i>n</i> distances.</td><td>The same layout as the SLIT.</td></tr>
+<tr><td class="n">38–46</td><td>weighted sum</td><td>Σ share × distance from the CPU's node, divided by the total share.</td><td>Normalising by the total tolerates shares that do not add up to exactly 1.</td></tr>
+<tr><td class="n">47–51</td><td>output</td><td>Local share, mean distance, and the ratio to 10.</td><td>The ratio is relative, unitless (worked example).</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F5-28/placement"></pre>
+
+<h2 id="F5-28-breaks">Where the analogy breaks</h2>
+<ol>
+<li><b>Libraries hand out the only copy; memory systems copy.</b> A remote line, once read, can sit in the local caches, so repeated remote reads may cost little; but a write by one socket must invalidate copies in the other socket's caches, a cost the towns do not have.</li>
+<li><b>The bridge is not the only shared road.</b> Bandwidth is limited inside a town too: all threads of one node share that node's channels. A placement with perfect locality can still be slow if every thread is in one town and the other town's channels sit idle.</li>
+<li><b>The travel-time sign is not a clock.</b> A SLIT value is a relative number written by firmware; the analogy's "travel time" suggests a measured duration, which it is not.</li>
+</ol>
+
+<h2 id="F5-28-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Half of the threads of a job are slower on one server only</td><td>A node without memory, or with fewer filled channels than its twin</td><td>Compare SRAT memory per node and SMBIOS type 17 devices between servers (forensic lab)</td><td>Populate the channels by the board manual's rules; until then, bind the job to the node that has memory</td></tr>
+<tr><td>Node 0's memory "is wrong" by a few hundred KiB</td><td>The legacy hole below 1 MiB, or other reserved ranges</td><td>Print every range, not only the total (Listing 2)</td><td>Compare ranges with the memory map (F3-10), not totals with the DIMM size</td></tr>
+<tr><td>The program sees one node on a two-socket machine</td><td>No SRAT (firmware option, or a hypervisor that exposes one node), or a kernel without NUMA support</td><td>Listing 2 prints "no SRAT"; Listing 1 shows one <code>node*</code> directory</td><td>Enable the firmware's NUMA option or configure the VM's virtual NUMA; check the kernel configuration</td></tr>
+<tr><td>Parser prints garbage domains above 255</td><td>Reading only byte 2 of a processor entry, or reading bytes 9–11 as something else</td><td>Compare with the QEMU options</td><td>Assemble the domain from both parts (Listing 2, line 48)</td></tr>
+<tr><td>Data initialised by one thread is slow for all others</td><td>First touch placed every page on the initialising thread's node</td><td>Per-node memory counters before and after initialisation (<code>numastat</code>-style counters in sysfs) <sup class="src"><a href="#F5-28-src-D4">D4</a></sup></td><td>Initialise in parallel from the threads that will use the data, or interleave</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F5-28-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F1-39">F1-39</a> explained channels and NUMA as hardware; <a href="#F3-12">F3-12</a> taught you to find and checksum ACPI tables and to read SMBIOS. <sup class="src"><a href="#F5-28-src-D1">D1</a></sup> <b>What carries over:</b> the same configuration-table lookup, header checksum and entry walk; the habit of checking tables against an independent source. <sup class="src"><a href="#F5-28-src-D2">D2</a></sup> <b>What changes:</b> you now read the machine as an operator does: a server is a set of nodes whose layout decides performance, the firmware's description can be wrong or incomplete, and a placement that works on a laptop (one node) can halve throughput on a server. <sup class="src"><a href="#F5-28-src-R6">R6</a></sup> <b>What comes next:</b> <a href="#F5-29">F5-29</a> introduces the small computer drawn at the bottom of Figure 1, the BMC, and talks to it in IPMI from a UEFI program.</p></div>
+
+<h2 id="F5-28-check">Check yourself</h2>
+<ol>
+<li>Name the parts of Figure 1 that belong to one NUMA node.</li>
+<li>Which ACPI table says which processors belong to which node, and which says how far apart nodes are?</li>
+<li>Why does node 0 in the lab report 384 KiB less than its 256 MiB backend, while node 1 reports exactly 256 MiB?</li>
+<li>A SLIT says 10 and 32. A colleague concludes that remote memory is 3.2 times slower. What is right and what is wrong in that conclusion?</li>
+<li>Explain in your own words why first-touch placement can make a program slow even though it "always allocates locally".</li>
+<li>Predict: boot Listing 2 with <code>-numa dist,src=0,dst=1,val=31</code>. Which lines change? Then run it.</li>
+<li>Apply to a new case: a four-socket server's SLIT row for node 0 is "10 16 16 22". A thread on node 0 has 40 % of its accesses local and 20 % on each other node. Compute its mean distance.</li>
+<li>Which SMBIOS structure types does Listing 2 use, and why are they not enough to find NUMA problems on their own?</li>
+<li>Multiple choice: a server has two sockets, but Listing 1 shows one node. Which is the most likely first thing to check? (a) the CPU's cache size; (b) whether the firmware publishes an SRAT; (c) the network card's driver; (d) the SMBIOS type 0 vendor string.</li>
+</ol>
+
+<h2 id="F5-28-lab">Lab</h2>
+<h3 id="F5-28-lab-goal">Goal</h3>
+<p>Read the NUMA description of a virtual two-socket server from its firmware tables, verify every value against the QEMU configuration, and record the inventory a management tool would see.</p>
+<h3 id="F5-28-lab-hw">Hardware and software needed</h3>
+<p>A Linux computer with clang 18.1.3 and LLD 18.1.3, QEMU 8.2.2 and OVMF 2024.02-2ubuntu0.10 (the versions this build used, from the run records), the shared headers of <a href="#F3-10">F3-10</a>; g++ 13.3 for Listings 1 and 3. No real server. Optional: if you have access to a real multi-socket Linux server, run Listing 1 there too (untested in this build).</p>
+<h3 id="F5-28-lab-safety">Safety</h3>
+<p>None beyond normal computer use: the programs only read. On a real server, do not change firmware NUMA or memory settings on a machine others depend on.</p>
+<h3 id="F5-28-lab-steps">Steps</h3>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F5-28</code>. It builds Listings 1–3 and runs <code>run.sh</code>, which builds <code>numa.cc</code> and boots it twice.</li>
+<li>Read <code>numa_2s.out</code> line by line and draw your own version of Figure 2 from it.</li>
+<li>Change the configuration to three nodes: <code>-smp 6,sockets=3,cores=2</code>, three 256M backends, nodes with <code>cpus=0-1</code>, <code>2-3</code>, <code>4-5</code>, and distances 0–1 = 21, 0–2 = 31, 1–2 = 21. Boot and record the SLIT.</li>
+<li>Extend the checks of step 3 of <code>run.sh</code> to the three-node case.</li>
+<li>Run Listing 3 with your three-node SLIT for a thread on node 0 with interleaved memory over all three nodes.</li>
+</ol>
+<h3 id="F5-28-lab-expect">Expected observations</h3>
+<p>For the two-node configuration, the output above: CPUs 0–1 in node 0, 2–3 in node 1, SLIT rows "10 21" and "21 10", two SMBIOS type 4 structures, one type 17 device of 512 MiB, all checksums ok (R2). Without <code>-numa</code>: "no SRAT" (R3). In step 3, three sockets and a 3 × 3 SLIT with your values.</p>
+<h3 id="F5-28-lab-verify">Verification</h3>
+<p>Every line of your extended <code>check_numa</code> prints PASS, and the reported node memory sums equal the backends except for documented holes. The curriculum's B6 acceptance item for SMBIOS, "The banner prints QEMU's SMBIOS strings; overriding them with QEMU's SMBIOS options changes the banner accordingly", is applied to the inventory in <a href="#F5-31">F5-31</a>. <sup class="src"><a href="#F5-28-src-S1">S1</a></sup></p>
+<h3 id="F5-28-lab-trouble">Troubleshooting</h3>
+<ul>
+<li>QEMU refuses to start with "-numa node … memdev": every node must name a backend if one does, unless it is meant to be memory-less (as in the forensic run); and the backends must sum to <code>-m</code>.</li>
+<li>"no SRAT" with <code>-numa</code> options present → check that the program found the ACPI 2.0 RSDP (the configuration-table loop) and that your XSDT walk does not stop early.</li>
+<li>CPU lines show the wrong node for APIC IDs above 255 in large configurations → you read only the low byte of the domain.</li>
+</ul>
+<h3 id="F5-28-lab-ext">Extension</h3>
+<p>Decode the SRAT's other entry types if your configuration produces them (for example x2APIC affinity for large CPU counts, or generic-initiator affinity, whose QEMU option appears in the help text as <code>initiator=</code>); look the layouts up in the ACPI Specification rather than guessing.</p>
+
+<h2 id="F5-28-forensic">Forensic lab</h2>
+<p><b>Scenario: "Same server, half the speed on half the cores".</b> Two servers were bought and configured identically, as far as the purchase order says. On server B, a numerical job runs normally on CPUs 0–1 but noticeably slower whenever the scheduler puts its threads on CPUs 2–3. The administrator, Diego, has already swapped the job's input files and reinstalled the OS: no change. Kofi from the hardware team asks for the firmware's view of both machines. Server A's dump is the lab run above (<code>numa_2s.out</code>). Server B's is below.</p>
+<p><b>Evidence pack:</b> Listing 2's output on server B (produced by the Lab Engineer from a deliberately misconfigured virtual server; what was changed is in the answer key).</p>
+<pre class="output" data-run="F5-28/forensic_numa"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>List every line that differs between server A's and server B's dumps.</li>
+<li>State two hypotheses for the slowness on CPUs 2–3, and the evidence that would separate them.</li>
+<li>What is the mean relative distance of every memory access made by a thread on CPU 2 of server B? Use the SLIT.</li>
+<li>Why does SMBIOS look the same on both servers, and what would you expect a real server's type 17 structures to show in this situation?</li>
+<li>Give a fix, a workaround until the fix, and a check that would have caught this at installation.</li>
+</ol>
+<p><b>Method hints.</b> Compare the two dumps structurally (sections, counts), then numerically (per-node totals). Ask what a processor in a node needs in order to have local memory. Remember that a NUMA problem shows only for threads on the affected node.</p>
+
+<h2 id="F5-28-project">Mini-project</h2>
+<p>Write <code>numacheck</code>: a host tool that takes two of Listing 2's outputs (two servers, or one server before and after a change) and prints a structured comparison: per node, CPUs and memory; the SLIT; SMBIOS sockets and memory devices; with a final verdict "same shape" or a list of differences. Rubric: parses both files without a sanitizer error (1); reports the forensic difference correctly (1); ignores differences that do not matter (table addresses) and explains why in a comment (1); has a test with a three-node dump from lab step 3 (1); a half-page note explains how you would collect the same data from a fleet of real servers (1).</p>
+
+<h2 id="F5-28-summary">Summary</h2>
+<ul>
+<li>A server is sockets with their own memory controllers and channels, joined by an interconnect, with I/O attached to sockets and a BMC beside them.</li>
+<li>The memory of one socket forms one NUMA node; remote accesses cross the interconnect.</li>
+<li>The firmware describes the layout in the ACPI SRAT (who belongs to which proximity domain) and SLIT (relative distances, 10 = local), and the inventory in SMBIOS types 4 and 17.</li>
+<li>Check tables against an independent source: in the lab every value matched QEMU's options, and node 0's 384 KiB difference is the legacy hole.</li>
+<li>Mean SLIT distance ranks placements (10, 15.5, 21 for local, interleaved, all-remote); measurements, not SLIT values, give costs.</li>
+<li>A node with CPUs and no memory makes every access of its CPUs remote: a configuration fault that SMBIOS alone may not reveal.</li>
+</ul>
+
+<h2 id="F5-28-sources">Sources</h2>
+<ol>
+<li id="F5-28-src-D1">D1 — John L. Hennessy, David A. Patterson, "Computer Architecture: A Quantitative Approach" (guide registry 4.2): chapters on memory-hierarchy design and on multiprocessors with distributed shared memory and directory-based coherence. Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</li>
+<li id="F5-28-src-D2">D2 — UEFI Forum, "Advanced Configuration and Power Interface (ACPI) Specification" (curriculum item 20): the System Resource Affinity Table (processor local APIC affinity, memory affinity, flags), the System Locality Distance Information Table (normalised value 10), and the Heterogeneous Memory Attribute Table. Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</li>
+<li id="F5-28-src-D3">D3 — DMTF, "System Management BIOS (SMBIOS) Reference Specification" (curriculum item 21): processor information (type 4) and memory device (type 17, size field and its unit bit). Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</li>
+<li id="F5-28-src-D4">D4 — The Linux kernel documentation (kernel.org): NUMA memory policy (default local allocation, bind, interleave), and the sysfs description of NUMA nodes (cpulist, distance, meminfo) and of a PCI device's node. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F5-28-src-D5">D5 — QEMU project, "QEMU System Emulation User's Guide": the <code>-numa</code>, <code>-smp</code> and memory-backend options. Title only — not opened; the options' syntax shown in this chapter is QEMU's own help output (R7).</li>
+<li id="F5-28-src-D6">D6 — Vincent Zimmer, Michael Rothman, Suresh Marisetty, "Beyond BIOS" (curriculum item 14): platform initialisation, memory initialisation and the legacy address regions below 1 MiB. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F5-28-src-S1">S1 — Systems Curriculum (this project): section 2.4 (table row "Others worth knowing … SRAT/SLIT (NUMA)"), section 1.3, milestone B6 (acceptance item quoted in the lab). Opened in this build (local file); a map, not a source (AH-4).</li>
+<li id="F5-28-src-R1">R1 — Lab run <code>F5-28/topology.log</code>: Listing 1, g++ 13.3.0 with the course flags, in the build container; 2026-10-09.</li>
+<li id="F5-28-src-R2">R2 — Lab run <code>F5-28/numa_2s.log</code>: Listing 2 built with clang 18.1.3 and LLD 18.1.3, booted in QEMU 8.2.2 q35 with the two-node options of Figure 2 and OVMF 2024.02-2ubuntu0.10; exit code 33; untested on hardware.</li>
+<li id="F5-28-src-R3">R3 — Lab run <code>F5-28/numa_flat.log</code>: the same without <code>-numa</code> options; exit code 33.</li>
+<li id="F5-28-src-R4">R4 — Lab run <code>F5-28/check_numa.log</code>: the checks of <code>run.sh</code> step 3.</li>
+<li id="F5-28-src-R5">R5 — Lab run <code>F5-28/placement.log</code>: Listing 3 with <code>placement.in</code>.</li>
+<li id="F5-28-src-R6">R6 — Lab run <code>F5-28/forensic_numa.log</code>: the forensic configuration; exit code 33.</li>
+<li id="F5-28-src-R7">R7 — Lab run <code>F5-28/qemu_numa_help.log</code>: QEMU 8.2.2's own help lines for <code>-numa</code>.</li>
+</ol>
+
+<h2 id="F5-28-glossary">Glossary links</h2>
+<p><a href="#gl-socket-processor-package">Socket (processor package)</a> · <a href="#gl-numa-node-proximity-domain">NUMA node (proximity domain)</a> · <a href="#gl-srat">SRAT</a> · <a href="#gl-slit">SLIT</a> · <a href="#gl-interconnect-inter-socket-link">Interconnect (inter-socket link)</a> · <a href="#gl-memory-less-node">Memory-less node</a> · <a href="#gl-numa">NUMA</a> · <a href="#gl-memory-channel">Memory channel</a> · <a href="#gl-first-touch-policy">First-touch policy</a> · <a href="#gl-smbios">SMBIOS</a></p>
+
+<h2 id="F5-28-next">Next chapter</h2>
+<p>Next: <a href="#F5-29">F5-29 BMCs, IPMI and Redfish</a>: the management controller beside the sockets, and your first IPMI conversation with it. Previous: <a href="#F5-27">F5-27</a>. Back to the course: <a href="#DS304">DS304</a>.</p>
+
+<h2 id="F5-28-answers">Answers to Check yourself</h2>
+<ol>
+<li>One socket's cores and caches, its memory controller, its channels and the DIMMs on them (and, for locality, the PCIe devices attached to that socket). The interconnect joins nodes; the BMC belongs to none.</li>
+<li>The SRAT (affinity of processors and memory ranges to proximity domains); the SLIT (relative distances).</li>
+<li>Node 0's memory starts at physical address 0, so the range 640 KiB–1 MiB (384 KiB, reserved on PCs for legacy uses) falls inside its backend but is in no node; node 1's range starts at 256 MiB, above any such hole.</li>
+<li>Right: the firmware says remote is "farther", by a relative factor of 3.2 in its own units. Wrong: SLIT values are relative and unitless; the real slowdown depends on caching, bandwidth and load, and must be measured on that machine.</li>
+<li>The page goes to the node of the thread that touches it first. If one thread initialises all data (or the data is touched before threads are spread), every page lands on one node and all other threads access it remotely, and that node's channels carry all the traffic.</li>
+<li>Only the SLIT rows change, to "10 31" and "31 10"; SRAT, MADT and SMBIOS stay the same. (Run it to confirm and keep the output.)</li>
+<li>0.4 × 10 + 0.2 × 16 + 0.2 × 16 + 0.2 × 22 = 4 + 3.2 + 3.2 + 4.4 = 14.8.</li>
+<li>Types 4 (processor sockets) and 17 (memory devices). They say what is installed, not which memory belongs to which socket or how far apart nodes are; and in QEMU type 17 does not follow the NUMA layout at all (the forensic run shows the same single 512 MiB device in both configurations).</li>
+<li>(b). Without an SRAT the OS sees one node. (a) and (d) do not affect node discovery; (c) is unrelated to how memory is described.</li>
+</ol>
+<h3 id="F5-28-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Server B: "MEM 0x000100000 + 0x01ff00000 (523264 KiB) -> node 0", two disabled memory entries instead of one, no memory line for node 1, and the summary "node 0: 2 CPUs, 523904 KiB" and "node 1: 2 CPUs, 0 KiB of memory". SMBIOS, MADT, the processor affinity lines and the SLIT are identical.</li>
+<li>Hypothesis 1: node 1 has no local memory, so threads on CPUs 2–3 make only remote accesses. Hypothesis 2: CPUs 2–3 are slower themselves (a throttled socket, a firmware power setting). The SRAT supports 1 directly; to separate them, run a compute-only test without memory traffic on CPUs 2–3 (hypothesis 2 predicts slowness, 1 does not), or bind the job's memory to node 0 explicitly and compare CPUs 0–1 with 2–3.</li>
+<li>All accesses go to node 0: 1.00 × 21 = 21, 2.1 times the all-local value in SLIT units, against 10 for threads on CPUs 0–1.</li>
+<li>QEMU builds its SMBIOS memory devices from the total memory, independently of the NUMA options, so both show one 512 MiB "DIMM 0" (this is QEMU's behaviour in this build, observed in R2 and R6). On a real server, the type 17 structures of the empty slots belonging to socket 1 would report no module installed (size 0), and the slot names would show which socket's channels are empty. <sup class="src"><a href="#F5-28-src-D3">D3</a></sup></li>
+<li>Fix: install memory in socket 1's channels following the board manual's population rules (here: give node 1 its own backend). Workaround: bind the job (CPUs and memory) to node 0, accepting half the cores. Prevention: an installation test that compares each server's per-node memory (from the SRAT, or the OS's node directories) with the expected layout, like the mini-project.</li>
+</ol>
+<p><b>How the evidence was produced:</b> <code>run.sh</code> step 4 boots the same two-socket configuration with one 512M backend attached to node 0 and node 1 declared with CPUs 2–3 but no <code>memdev</code>.</p>
