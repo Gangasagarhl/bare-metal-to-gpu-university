@@ -1,0 +1,327 @@
+<!--meta
+id: F3-44
+title: Complete ext2 writing and a crash harness
+course: OS401
+level: L4
+prereqs: F3-43; OS304 (F3-33 ext2)
+time: 16–22 hours including the lab and the forensic lab
+hardware: none required (g++ 13.3.0, e2fsprogs 1.47.0 and Python 3 in the build container); QEMU or a disk you may erase for the in-kernel version, untested in this build
+maps: Curriculum FS1 (Complete ext2 writing and a crash-consistency harness); course practical exam P (explain an e2fsck report)
+analogy: F3 — the school; registered: file system = library catalogue and shelves; proposed: write stream = the porter's delivery list (see NOTES.md)
+-->
+
+<h2 id="F3-44-hook">Story hook</h2>
+<p>The school library has a new rule after last term's power cut. Every move of a book now follows the same order: book on the shelf, then the free-place chart, then the card. And every evening, the porter hands in a list of everything he carried that day, in the order he carried it, with a line drawn each time he had the head librarian sign that the trolley was empty.</p>
+<p>Ms Okafor wants to know whether the rule works. She cannot wait for the next power cut, so she uses the porter's list. She takes a photograph of the library from the morning, replays the list on it up to some random point, and, for the moves after the last signed line, flips a coin for each one: carried, or still on the trolley. Then she asks the strictest librarian in the district to inspect the result. She does this five hundred times.</p>
+<p>This chapter does the same with ext2. We complete the write side of the driver from OS304, record every block write and flush it makes, and replay the recording five hundred times to the disk a power cut could have left, with <code>e2fsck</code> as the strict inspector.</p>
+
+<h2 id="F3-44-able">What you will be able to do</h2>
+<ul>
+<li><b>Implement</b> the ext2 write paths that FS1 names (create, write with direct, single and double indirect blocks, sparse files, truncate, unlink, rename, hard and symbolic links, mkdir) and <b>order</b> their block writes so that a crash leaves only leaks.</li>
+<li><b>Record</b> a write stream from your block layer and <b>build</b> crash images from it under the device model of F3-43.</li>
+<li><b>Run</b> the FS1 acceptance test: 500 power cuts, <code>e2fsck</code> findings classified against a list written in advance, and every fsynced file compared byte for byte.</li>
+<li><b>Read</b> an <code>e2fsck</code> report line by line and <b>explain</b> which lost write caused each line (practical exam P).</li>
+<li><b>Show</b> that the harness can fail: run it against a deliberately careless build and see it report damage.</li>
+</ul>
+
+<div class="co jargon" id="F3-44-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Write stream</dt><dd><b>Simple words:</b> a recording of every block a file system wrote and every flush it asked for, in order. <b>Analogy:</b> the porter's list of everything he carried, with the signed lines. <b>Precise:</b> a log of (block number, block contents) write records and flush records taken at the block-device interface; together with the starting image it determines every crash state. <sup class="src"><a href="#F3-44-src-D5">D5</a></sup></dd>
+<dt>Power-cut harness</dt><dd><b>Simple words:</b> a test program that fakes many power failures and checks the disk after each one. <b>Analogy:</b> replaying the porter's list to a random point, 500 times, with an inspector after each replay. <b>Precise:</b> a test that builds crash images (by replaying a write stream with unflushed writes randomly dropped, or by killing an emulator), runs recovery and an independent checker, and verifies the application-level promises. <sup class="src"><a href="#F3-44-src-D5">D5</a></sup> <sup class="src"><a href="#F3-44-src-C1">C1</a></sup></dd>
+<dt>Indirect block</dt><dd><b>Simple words:</b> a block that holds no file data, only a list of block numbers of the file. <b>Analogy:</b> an index card that lists more shelf places for a very long book series. <b>Precise:</b> in ext2, inode pointers 12, 13 and 14 point to single, double and triple indirect blocks, each holding block-size/4 32-bit block numbers. <sup class="src"><a href="#F3-44-src-D1">D1</a></sup></dd>
+<dt>Sparse file (hole)</dt><dd><b>Simple words:</b> a file with ranges that were never written and take no disk space; they read as zeros. <b>Analogy:</b> a numbered series with empty places that are not reserved on any shelf. <b>Precise:</b> logical blocks whose pointer is 0; reads return zeros, and <code>i_blocks</code> counts only allocated blocks (including indirect blocks), in 512-byte units. <sup class="src"><a href="#F3-44-src-D1">D1</a></sup></dd>
+<dt>Hard link</dt><dd><b>Simple words:</b> a second name for the same file. <b>Analogy:</b> two catalogue cards for one book. <b>Precise:</b> a directory entry pointing to an existing inode; the inode's <code>i_links_count</code> counts its names, and the inode is freed when the count reaches 0 (and no process holds it open). <sup class="src"><a href="#F3-44-src-D1">D1</a></sup></dd>
+<dt>Fast symbolic link</dt><dd><b>Simple words:</b> a small file whose content is a path to another file, stored inside the inode itself. <b>Analogy:</b> a card that says "see the card for the atlas". <b>Precise:</b> an ext2 symlink whose target (under 60 bytes) is stored in the inode's block-pointer area instead of a data block, with <code>i_blocks</code> = 0. <sup class="src"><a href="#F3-44-src-D1">D1</a></sup></dd>
+<dt>Orphan inode</dt><dd><b>Simple words:</b> a file that exists on disk but has no name in any directory. <b>Analogy:</b> a book on a shelf with no card anywhere. <b>Precise:</b> an inode with a non-zero link count and no directory entry; <code>e2fsck</code> reports it as "Unattached inode" and offers to connect it to <code>lost+found</code>. <sup class="src"><a href="#F3-44-src-D2">D2</a></sup></dd>
+<dt>Acceptable damage list</dt><dd><b>Simple words:</b> the kinds of checker complaints your design allows after a crash, written down before testing. <b>Analogy:</b> "a free place marked taken is fine; a card pointing to the wrong book is not". <b>Precise:</b> the categories, declared in the FS1 plan, of <code>e2fsck</code> findings that do not lose, mix or expose data: leaked blocks and inodes, counters, link counts and <code>i_blocks</code> too high. <sup class="src"><a href="#F3-44-src-C1">C1</a></sup></dd>
+<dt>Promise (fsync record)</dt><dd><b>Simple words:</b> a note in the recording that says "the program was told this file is safe". <b>Analogy:</b> the librarian's signature under one move. <b>Precise:</b> a record appended to the write stream after an <code>fsync</code> returned, naming the file and its expected contents; the harness checks every promise issued before the cut. <sup class="src"><a href="#F3-44-src-R6">R6</a></sup></dd>
+</dl></div>
+
+<h2 id="F3-44-pictures">The idea in pictures</h2>
+<p>Figure 1 is the harness. The workload runs once, on an in-memory image, and its block layer records the write stream. Every power cut is then a replay of that stream onto the starting image, cut at a random record, with a coin toss for each write after the last flush. Two independent judges look at the result: <code>e2fsck</code> in read-only mode for the structure, and <code>debugfs</code> for the bytes of every file whose <code>fsync</code> had returned.</p>
+<figure id="F3-44-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 290" role="img" aria-labelledby="F3-44-f1t F3-44-f1d">
+<title id="F3-44-f1t">Figure 1: the FS1 power-cut harness</title>
+<desc id="F3-44-f1d">Top row: base.img made by mke2fs, then the random workload (300 operations, our ext2 writer) producing a write stream of block writes W, flushes F and promises P. Middle: for each of 500 seeds, the crash tool takes base.img and the stream, picks a cut point, applies every write before the last flush before the cut, and applies each later write with probability one half. Bottom: the crash image goes to two judges: e2fsck -fn, whose findings are sorted into acceptable categories or damage, and debugfs dump, whose output for every promised file is compared with the expected bytes. The run passes if no damage and no wrong file appear in any of the 500 runs.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="290"/>
+<rect class="sv-b2" x="20" y="20" width="130" height="50" rx="6"/><text class="sv-tb" x="34" y="42">base.img</text><text class="sv-ts" x="34" y="60">mke2fs (host)</text>
+<line class="sv-line" x1="150" y1="45" x2="186" y2="45"/><polygon class="sv-head" points="180,39 180,51 190,45"/>
+<rect class="sv-b1" x="190" y="20" width="200" height="50" rx="6"/><text class="sv-tb" x="204" y="42">workload: our ext2 writer</text><text class="sv-ts" x="204" y="60">300 random operations</text>
+<line class="sv-line" x1="390" y1="45" x2="426" y2="45"/><polygon class="sv-head" points="420,39 420,51 430,45"/>
+<rect class="sv-b3" x="430" y="20" width="310" height="50" rx="6"/><text class="sv-tb" x="444" y="42">write stream</text><text class="sv-tm" x="444" y="60">W W W F W P W W F W …</text>
+<line class="sv-line" x1="380" y1="70" x2="380" y2="104"/><polygon class="sv-head" points="374,98 386,98 380,108"/>
+<rect class="sv-b4" x="150" y="108" width="460" height="64" rx="6"/>
+<text class="sv-tb" x="164" y="130">crash tool, seed 1 … 500</text>
+<text class="sv-ts" x="164" y="150">cut at a random record; writes before the last flush land;</text>
+<text class="sv-ts" x="164" y="166">each later write lands with probability ½ (volatile cache)</text>
+<line class="sv-line" x1="280" y1="172" x2="200" y2="204"/><polygon class="sv-head" points="198,196 206,202 196,208"/>
+<line class="sv-line" x1="480" y1="172" x2="560" y2="204"/><polygon class="sv-head" points="554,202 562,196 564,208"/>
+<rect class="sv-b5" x="40" y="208" width="320" height="64" rx="6"/>
+<text class="sv-tb" x="54" y="230">e2fsck -fn (structure)</text>
+<text class="sv-ts" x="54" y="250">each finding: acceptable category</text>
+<text class="sv-ts" x="54" y="266">(leak, counter, count too high) or DAMAGE</text>
+<rect class="sv-b6" x="400" y="208" width="320" height="64" rx="6"/>
+<text class="sv-tb" x="414" y="230">debugfs dump (contents)</text>
+<text class="sv-ts" x="414" y="250">every file promised before the cut</text>
+<text class="sv-ts" x="414" y="266">must equal its fsynced bytes</text>
+</svg></div><figcaption><b>Figure 1.</b> The harness: record once, cut 500 times, judge twice. <sup class="src"><a href="#F3-44-src-C1">C1</a></sup> <sup class="src"><a href="#F3-44-src-R7">R7</a></sup></figcaption></figure>
+<p>Figure 2 is the order of writes for creating a file, in the careful build and in the careless build that the forensic lab uses. The careful build makes the inode complete and durable before any directory names it; the careless one writes the name first and does not flush at all.</p>
+<figure id="F3-44-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 230" role="img" aria-labelledby="F3-44-f2t F3-44-f2d">
+<title id="F3-44-f2t">Figure 2: creating a file, careful and careless</title>
+<desc id="F3-44-f2d">Two rows of boxes. Careful: inode bitmap block 67, group descriptor 2, superblock 1, inode table block 69 with the new inode, then FLUSH, then directory block 196 with the new name. A crash before the flush can lose the inode but never leave the name. Careless: 67, 2, 1, then directory block 196 with the name, then inode block 69, with no flush. A crash can keep 196 and lose 69: the name points to an inode that is not in use.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="230"/>
+<text class="sv-tb" x="20" y="34">careful</text>
+<rect class="sv-box" x="110" y="16" width="84" height="30"/><text class="sv-ts" x="118" y="36">67 i-bitmap</text>
+<rect class="sv-box" x="200" y="16" width="64" height="30"/><text class="sv-ts" x="208" y="36">2 GDT</text>
+<rect class="sv-box" x="270" y="16" width="64" height="30"/><text class="sv-ts" x="278" y="36">1 super</text>
+<rect class="sv-b2" x="340" y="16" width="92" height="30"/><text class="sv-ts" x="348" y="36">69 inode 12</text>
+<rect class="sv-b8" x="440" y="10" width="10" height="42"/><text class="sv-ts" x="424" y="70">FLUSH</text>
+<rect class="sv-b1" x="458" y="16" width="120" height="30"/><text class="sv-ts" x="466" y="36">196 dir: "s0" → 12</text>
+<text class="sv-ts" x="110" y="96">a cut before the flush: the inode may be lost, the name never exists → at worst a leak</text>
+<text class="sv-tb" x="20" y="146">careless</text>
+<rect class="sv-box" x="110" y="128" width="84" height="30"/><text class="sv-ts" x="118" y="148">67 i-bitmap</text>
+<rect class="sv-box" x="200" y="128" width="64" height="30"/><text class="sv-ts" x="208" y="148">2 GDT</text>
+<rect class="sv-box" x="270" y="128" width="64" height="30"/><text class="sv-ts" x="278" y="148">1 super</text>
+<rect class="sv-b1" x="340" y="128" width="120" height="30"/><text class="sv-ts" x="348" y="148">196 dir: "s0" → 12</text>
+<rect class="sv-b2" x="466" y="128" width="92" height="30"/><text class="sv-ts" x="474" y="148">69 inode 12</text>
+<text class="sv-ts" x="566" y="148">(no flush)</text>
+<text class="sv-ts" x="110" y="196">196 may land while 69 does not → a name pointing to an unused inode: DAMAGE</text>
+</svg></div><figcaption><b>Figure 2.</b> The same create, two orders; block numbers are those of the lab's 16 MiB image. <sup class="src"><a href="#F3-44-src-R4">R4</a></sup> <sup class="src"><a href="#F3-44-src-R8">R8</a></sup></figcaption></figure>
+
+<h2 id="F3-44-layer1">Layer 1 — the kid explanation</h2>
+<p>To keep the library honest, always do the moves in the same safe order: the book on the shelf first, the card last. Taking a book away goes the other way round: the card first, the book last. Then a power cut can only leave a book without a card, never a card without its book.</p>
+<p>To check the rule, you do not need a real power cut. Keep a list of every move in order, and replay the list to a random point, pretending some of the last moves never happened. Then let a strict inspector walk the shelves. If you do this many times and the inspector only ever finds books without cards, the rule works.</p>
+
+<h2 id="F3-44-layer2">Layer 2 — the student explanation</h2>
+<p>OS304's ext2 driver could create and write files. FS1 asks for every common write operation and for proof of what a power cut does. The operations are: creating files and directories, writing (including files large enough to need indirect blocks, and sparse files with holes), truncating, unlinking, renaming, hard links and symbolic links. Each one changes several blocks: bitmaps, the group descriptor and superblock counters, inode table blocks, directory blocks and indirect blocks. <sup class="src"><a href="#F3-44-src-C1">C1</a></sup> <sup class="src"><a href="#F3-44-src-D1">D1</a></sup></p>
+<p>F3-43 gave the rules for ordering. Applied to ext2 they become: allocate (bitmap bit set) before pointing; write a new block's contents before the pointer to it; write a new inode before the directory entry that names it; remove a name before decrementing the link count; clear a pointer before freeing the block. Each "before" is a flush, because only a flush orders writes on a device with a write cache. <sup class="src"><a href="#F3-44-src-D3">D3</a></sup></p>
+<p>With those rules, a crash can leave only a few kinds of finding: a free-space or directory counter that is wrong, a block or inode marked used that nothing uses, an inode with no name, a link count that is too high, and an <code>i_blocks</code> count that is too high. Those are the lab's acceptable damage list. Everything else, such as a name pointing to an unused inode, a block used by two files, or a link count that is too low, is damage. <sup class="src"><a href="#F3-44-src-D2">D2</a></sup> <sup class="src"><a href="#F3-44-src-R7">R7</a></sup></p>
+<p>The harness runs a random workload once and records the write stream. For each of 500 seeds it builds a crash image from the stream, runs <code>e2fsck -fn</code> (force a full check, change nothing) and classifies every line it prints, then dumps every file whose <code>fsync</code> had returned before the cut and compares its bytes. Run against the careful build, it found no damage and no lost file. Run against a careless build, it found damage in 65 of 100 runs. Both numbers matter: the second shows the harness can see what it claims to look for. <sup class="src"><a href="#F3-44-src-R7">R7</a></sup> <sup class="src"><a href="#F3-44-src-R8">R8</a></sup></p>
+
+<h2 id="F3-44-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-44-l3-store">One seam for every block</h3>
+<p>All block traffic of the writer goes through a small interface, <code>Store</code>, with five operations: read a block, write a metadata block, write a data block, <code>order()</code>, and <code>sync()</code>. <code>order()</code> means "everything written so far must be on the medium before anything written later"; in this chapter's <code>DirectStore</code> it is a cache flush, in F3-45's <code>JournalStore</code> it becomes something cheaper. Separating metadata from data writes costs nothing here and is exactly what ordered-mode journaling needs next. The block device itself (<code>BlockDev</code>) holds the image in memory and appends every write and flush to the write stream, which is the role a recording layer in your kernel's block cache plays when the harness runs your OS. <sup class="src"><a href="#F3-44-src-R4">R4</a></sup></p>
+
+<h3 id="F3-44-l3-paths">The write paths and their order</h3>
+<p><b>Create</b> (and <code>mkdir</code>, symlinks): allocate the inode (inode bitmap, group descriptor, superblock), write the complete inode (and for a directory its first block with <code>.</code> and <code>..</code>), flush, then add the directory entry. For <code>mkdir</code>, the parent's link count (for the child's <code>..</code>) is raised and flushed before the name appears, so a crash can leave the count too high (acceptable) but never too low. Fast symlinks store targets under 60 bytes in the inode's pointer area and need no data block. <sup class="src"><a href="#F3-44-src-D1">D1</a></sup></p>
+<p><b>Write</b>: map each logical block, allocating data blocks and any new indirect blocks; write the data and the new indirect blocks; flush; write the inode (size, <code>i_blocks</code>, direct pointers); then, after another flush, rewrite any <i>existing</i> indirect block that gained a pointer. New indirect blocks are written before anything points to them; an existing one is updated only after the new data it points to is durable. With 1 KiB blocks, 12 direct pointers cover 12 KiB, the single indirect block 256 more blocks (to 268 KiB), the double indirect block 65,536 more (to about 64 MiB). The workload's large files are 270,000 to 320,000 bytes, so they always use the double indirect block. A write at an offset beyond the end leaves pointers at 0: a hole. <sup class="src"><a href="#F3-44-src-D1">D1</a></sup> <sup class="src"><a href="#F3-44-src-R4">R4</a></sup></p>
+<p><b>Truncate</b>: zero the tail of the new last block, clear pointers in kept indirect blocks, flush, write the inode with the new size and pointers, flush, and only then free the blocks in the bitmap. Freeing first would let a crash leave a block that is both free and still pointed to; the next allocation would give it to a second file. <b>Unlink</b>: remove the name, flush, decrement the link count (and, at zero, set the deletion time), flush, then free the blocks and the inode. <sup class="src"><a href="#F3-44-src-D3">D3</a></sup></p>
+<p><b>Link</b>: raise the link count, flush, add the name. <b>Rename</b> within or across directories: raise the link count, flush, add the new name, flush, remove the old name, flush, lower the count. At every cut the file has at least one name and a link count at least as high as its number of names. ext2 itself does not raise the count during a rename; this writer does so on purpose so that the in-between state (two names) is a valid ext2 state with a correct count. <sup class="src"><a href="#F3-44-src-D3">D3</a></sup></p>
+<div class="co note"><span class="lbl">Note</span><p>What this writer does not do, so you know what your own driver must add: triple indirect blocks (the curriculum's "files above 4 GiB" need them, and the large-file feature for sizes over 2 GiB); renaming over an existing name (POSIX <code>rename</code> replaces the target atomically); renaming and removing directories; long symlinks in a data block; hashed directory indexes (the writer clears the index flag it does not maintain). The image is 16 MiB with 1 KiB blocks, chosen so 500 checks run in about two minutes.</p></div>
+
+<h3 id="F3-44-l3-harness">The harness, precisely</h3>
+<p>The crash tool applies the F3-43 model to a recorded stream. For a seed it draws a cut point uniformly among the stream's records, finds the last flush before the cut, applies every write before that flush, and applies each write after it with probability one half. It also prints every promise recorded before the cut: a promise is written by the workload right after an <code>fsync</code> of a newly written file returned, and names the file and the expected bytes. To keep the check simple, promised files are never modified, renamed or removed afterwards. <sup class="src"><a href="#F3-44-src-R6">R6</a></sup></p>
+<p>The judge for structure is <code>e2fsck -fn</code>: it reads everything and changes nothing, so its report describes the crash state, not a half-repaired one. The harness compares every line with regular expressions for the declared categories; "count too high" lines are accepted only if the stored number is larger than the counted one. Any other line is damage. The judge for contents is <code>debugfs</code>, which reads the image with e2fsprogs' own library and dumps each promised file. Neither judge shares code with the writer. <sup class="src"><a href="#F3-44-src-D2">D2</a></sup> <sup class="src"><a href="#F3-44-src-R7">R7</a></sup></p>
+<p>The careful run's statistics also tell you what the design costs. The 300-operation workload issued 18,456 block writes and 596 flushes. In 484 of 500 crash images, <code>e2fsck</code> found acceptable leftovers (free counters in 425, leaked blocks or inodes in 467, orphan inodes in 166); in 16 it found nothing. A real system would reclaim those leaks with a background scan or at the next check. A journal (F3-45) removes even those, because replay makes every multi-block update atomic. <sup class="src"><a href="#F3-44-src-R5">R5</a></sup> <sup class="src"><a href="#F3-44-src-R7">R7</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The ext2 field offsets and rules used by the writer (inode fields, directory entry layout, <code>i_blocks</code> in 512-byte units including indirect blocks, the 60-byte fast symlink limit, the index flag) are from the author's memory of Poirier's document, not opened in this build. They are confirmed in this build only as far as <code>e2fsck</code> 1.47.0 accepts 10,000 random operations without a finding and <code>debugfs</code> reads back all 540 files exactly <sup class="src"><a href="#F3-44-src-R2">R2</a></sup> <sup class="src"><a href="#F3-44-src-R3">R3</a></sup>. Fields that neither tool checks (for example time stamps and the generation number) are not verified.</p></div>
+
+<h3 id="F3-44-l3-gaps">How this differs from the milestone as written</h3>
+<p>FS1's harness "runs a random workload in your OS, cuts QEMU off at a random moment, then runs e2fsck on the image". This build ran the writer as a host program on an in-memory image and replayed its recorded write stream instead of killing QEMU. The replay is stricter in one way (the cache is assumed to reorder anything between flushes, which QEMU's default cache modes may not do) and weaker in another (it tests the writer, not your block driver's flush path). When you port the writer into your kernel, keep the recording layer in your block cache and run both: replay for reproducible failures, a real QEMU kill for the flush path. <sup class="src"><a href="#F3-44-src-C1">C1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware, and not run inside a kernel.</b> No QEMU instance was killed and no disk lost power in this build. The FS1 acceptance clause "Files above 4 GiB and sparse files read back identically on the Linux host" is only half done: sparse files of this writer are read back by <code>debugfs</code> (no mount was possible in the container), and files above 4 GiB were not attempted. To complete it: add triple indirect blocks and the large-file feature, make a larger image, and mount it read-only on a Linux host.</p></div>
+
+<h2 id="F3-44-hardware">How the hardware actually does it</h2>
+<p>The writer's <code>order()</code> becomes, in your kernel, "flush the block cache's dirty blocks written so far, then send the device's flush command and wait for it to complete". With virtio-blk (DR301, milestone C4) that is a request of the flush type, issued after the earlier write requests have completed. With AHCI it is the ATA FLUSH CACHE EXT command; with NVMe, the Flush command. Two details catch people: the block cache must not reorder writes across an <code>order()</code> (a cache that writes dirty blocks back in block-number order breaks every rule above), and the driver must wait for the earlier writes to complete before issuing the flush, because a flush covers completed writes. <sup class="src"><a href="#F3-44-src-D4">D4</a></sup> <sup class="src"><a href="#F3-44-src-C1">C1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The statement that a flush covers only writes that completed before it is the author's reading from memory of the NVMe and VIRTIO specifications (not opened). Check the "Flush" command description in the NVMe Base Specification and the block device section of the VIRTIO specification, and the AHCI and ATA documents for FLUSH CACHE EXT, for the device you drive.</p></div>
+<div class="co safety"><span class="lbl">Safety</span><p>A bug in a write path or in the flush path corrupts the disk it runs on. Run your kernel's version in QEMU on an image file first; on real hardware, only on a disk whose contents you may lose, with every other disk disconnected.</p></div>
+
+<h2 id="F3-44-worked">Worked example</h2>
+<p>Read one crash image the way practical exam P asks: what does each line of the report mean, and which lost write explains it? The image comes from the careless build: three operations, cut after 10 records, of which 5 cached writes landed. Here is the start of the stream <sup class="src"><a href="#F3-44-src-R9">R9</a></sup>:</p>
+<pre class="output" data-run="F3-44/forensic_stream"></pre>
+<p>Records 0 to 4 are the first create: inode bitmap (67), group descriptor (2), superblock (1), then, in the careless order, the root directory block (196) with the name, then the inode table block (69) holding inode 12. There is no flush at all before the cut, so every one of the ten writes was a coin toss. The report <sup class="src"><a href="#F3-44-src-R10">R10</a></sup>:</p>
+<pre class="output" data-run="F3-44/forensic_fsck"></pre>
+<ul>
+<li><code>Entry 's0' in / (2) has deleted/unused inode 12</code>: block 196 landed, so the root directory names <code>s0</code>; the inode bitmap (67) or the inode block (69) did not, so inode 12 is not in use. A name points at nothing. <b>Damage.</b></li>
+<li><code>incorrect filetype (was 1, should be 0)</code>: the entry says "regular file" (1); the inode has no type. Same cause.</li>
+<li><code>Block bitmap differences: -(210--211)</code>: blocks 210 and 211 are marked used in the bitmap (one of the block-bitmap writes, record 5 or 9, landed) but no inode points to them (the inode writes did not). <b>Leak, acceptable.</b></li>
+<li>Free blocks and free inodes count wrong: the superblock and group descriptor copies that landed were from different steps. <b>Counters, acceptable.</b></li>
+</ul>
+<p>The <code>debugfs</code> view of the same image confirms it: the root lists <code>s0</code> as inode 12, and inode 12 has mode 0, no links and no blocks <sup class="src"><a href="#F3-44-src-R11">R11</a></sup>.</p>
+
+<h2 id="F3-44-code">Code walk-through</h2>
+<p>The lab has six files. Listings 1 and 2 are the heart; the others are shown for completeness and summarised in one table.</p>
+<p><b>Listing 1</b> — <code>ext2w.h</code>: the writer.</p>
+<pre class="listing" data-src="F3-44/ext2w.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>23–48</td><td><code>Store</code>, <code>DirectStore</code></td><td>The seam: metadata, data, <code>order()</code>, <code>sync()</code>; here <code>order()</code> is a flush unless the build is careless.</td><td>F3-45 swaps in a journal without touching the write paths.</td></tr>
+<tr><td>50–67</td><td><code>Inode</code></td><td>A 128-byte inode with accessors for the fields the writer changes.</td><td>Only fields the writer needs; <code>e2fsck</code> checks the rest stay sane.</td></tr>
+<tr><td>72–98</td><td>constructor</td><td>Reads the superblock and group descriptors, refuses unknown incompatible features.</td><td>A writer must never modify a file system it does not fully understand.</td></tr>
+<tr><td>117–149</td><td><code>create</code>, <code>symlink</code>, <code>mkdir</code></td><td>Inode complete, flush, parent link count, flush, name last (careless: name first).</td><td>Figure 2 in code.</td></tr>
+<tr><td>151–181</td><td><code>write</code></td><td>Data and new indirect blocks; flush; inode; flush; old indirect blocks.</td><td>Nothing ever points at a block whose contents are not yet durable.</td></tr>
+<tr><td>196–230</td><td><code>truncate</code></td><td>Pointers dropped and inode written before blocks are freed.</td><td>Prevents a free block that is still pointed to: the double-allocation bug.</td></tr>
+<tr><td>232–285</td><td><code>unlink</code>, <code>link</code>, <code>rename</code></td><td>Names and counts changed in the order that keeps count ≥ names.</td><td>Only "count too high" can appear after a crash.</td></tr>
+<tr><td>334–371</td><td><code>allocBit</code>, <code>freeBit</code></td><td>Bitmap bit plus group and superblock counters.</td><td>The counters are the most frequent acceptable finding; they are cheap to recompute.</td></tr>
+<tr><td>441–536</td><td>block mapping</td><td><code>bmap</code>, <code>mapForWrite</code> with pending indirect blocks, <code>cutIndirect</code>, <code>allBlocks</code>.</td><td>Holes are pointers equal to 0; indirect blocks are counted in <code>i_blocks</code>.</td></tr>
+<tr><td>538–619</td><td>directories</td><td>Entry layout, lookup, add (split a record's slack), remove (merge into the previous record).</td><td>The classic ext2 directory format, without the hash index.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>harness.py</code>: 500 cuts and two judges.</p>
+<pre class="listing" data-src="F3-44/harness.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>16–27</td><td><code>ACCEPTABLE</code>, <code>COUNT_HIGH</code></td><td>The plan's acceptable categories as regular expressions.</td><td>Written before the first run; a new kind of line is damage by default.</td></tr>
+<tr><td>31–48</td><td><code>classify</code></td><td>Sorts each <code>e2fsck</code> line into a category or the damage list.</td><td>"Count too high" passes only if stored &gt; counted.</td></tr>
+<tr><td>51–75</td><td><code>one_run</code></td><td>Builds a crash image, runs <code>e2fsck -fn</code>, dumps promised files with <code>debugfs</code>, compares bytes.</td><td>Two judges that share no code with the writer.</td></tr>
+<tr><td>78–106</td><td><code>main</code></td><td>Four runs in parallel; totals per category; exit 3 on damage or a broken promise.</td><td>The exit code makes it a test, not a report.</td></tr>
+</tbody></table></div>
+<p><b>Listings 3–6</b> — the block device with recording, the stream tools, the workload and the driver program.</p>
+<pre class="listing" data-src="F3-44/blockdev.h"></pre>
+<pre class="listing" data-src="F3-44/stream.h"></pre>
+<pre class="listing" data-src="F3-44/workload.h"></pre>
+<pre class="listing" data-src="F3-44/fs1tool.cc"></pre>
+<pre class="listing" data-src="F3-44/run.sh"></pre>
+<div class="tw"><table>
+<thead><tr><th>File, lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td><code>blockdev.h</code> 52–111</td><td><code>BlockDev</code></td><td>In-memory image; <code>write</code> appends a 'W' record with the block, <code>flush</code> an 'F', <code>promise</code> a 'P'.</td><td>The recording layer your kernel's block cache needs.</td></tr>
+<tr><td><code>stream.h</code> 57–87</td><td><code>crashImage</code></td><td>Cut, last flush, coin toss per later write (line 75), promises before the cut.</td><td>The F3-43 device model applied to a real stream.</td></tr>
+<tr><td><code>workload.h</code> 50–151</td><td><code>runWorkload</code></td><td>Random mix of the FS1 operations; files to be fsynced get a promise after <code>fsync</code> returns.</td><td>A model of expected contents makes the byte comparison possible.</td></tr>
+<tr><td><code>fs1tool.cc</code> 16–41</td><td><code>main</code></td><td>Three commands: <code>workload</code>, <code>crash</code>, <code>show</code>.</td><td>Small tools the harness can call 500 times.</td></tr>
+<tr><td><code>run.sh</code></td><td>steps 1–7</td><td>Build; <code>mke2fs</code>; 10,000-operation stress with <code>e2fsck</code> and <code>debugfs</code>; recorded workload; 500 careful cuts; 100 careless cuts; forensic image.</td><td>Every number in this chapter comes from one run of this script.</td></tr>
+</tbody></table></div>
+<p>The real outputs. The empty file system made by the host's <code>mke2fs</code> <sup class="src"><a href="#F3-44-src-R1">R1</a></sup>:</p>
+<pre class="output" data-run="F3-44/mkfs"></pre>
+<p>10,000 random operations, then <code>e2fsck</code> and a byte comparison of every file <sup class="src"><a href="#F3-44-src-R2">R2</a></sup> <sup class="src"><a href="#F3-44-src-R3">R3</a></sup>:</p>
+<pre class="output" data-run="F3-44/stress"></pre>
+<pre class="output" data-run="F3-44/fsck_stress"></pre>
+<pre class="output" data-run="F3-44/contents"></pre>
+<p>The recorded workload and the start of its stream <sup class="src"><a href="#F3-44-src-R5">R5</a></sup> <sup class="src"><a href="#F3-44-src-R6">R6</a></sup>:</p>
+<pre class="output" data-run="F3-44/workload"></pre>
+<pre class="output" data-run="F3-44/stream_careful"></pre>
+<p>The FS1 acceptance run, 500 power cuts <sup class="src"><a href="#F3-44-src-R7">R7</a></sup>:</p>
+<pre class="output" data-run="F3-44/harness_careful"></pre>
+<p>The same workload from the careless build: its stream, then 100 cuts (exit code 3 expected) <sup class="src"><a href="#F3-44-src-R8">R8</a></sup>:</p>
+<pre class="output" data-run="F3-44/stream_careless"></pre>
+<pre class="output" data-run="F3-44/harness_careless"></pre>
+<p>Notice in the stress output that 286 of the 10,000 random draws were skipped (a <code>mkdir</code> when 30 directories already existed), so 9,714 operations ran. The careless run's "fsynced files ... wrong or missing: 0" is not a contradiction: its <code>fsync</code> still flushes, so files that were complete and synced survive; what the careless order breaks is the structure around them.</p>
+
+<h2 id="F3-44-breaks">Where the analogy breaks</h2>
+<ul>
+<li>The porter's list in the story is written by the porter. The write stream is written by the file system's own block layer; if that layer has a bug (writes missing from the recording, or a flush recorded but never sent), the replay tests a different file system from the one that runs. In your kernel, record as close to the driver as you can.</li>
+<li>A librarian inspecting a library notices that a card is "wrong" only by comparing it with the shelf. <code>e2fsck</code> can only compare structures with each other; a file whose data blocks are all present but hold the wrong bytes passes the check. That is why the harness has a second judge for contents.</li>
+<li>Coin tosses for "carried or not" treat every unflushed write alike. Real devices drain caches with patterns (by position on a disk, by flash page), so some states are far more likely than others; the replay covers them evenly, including rare ones.</li>
+</ul>
+
+<h2 id="F3-44-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>A block cache that writes back in its own order.</b> Sorting dirty blocks by number before writing them is a common optimisation; across an <code>order()</code> it destroys the design. Keep a barrier: everything dirtied before <code>order()</code> is written and flushed first.</li>
+<li><b>Freeing before unlinking pointers.</b> The most damaging single mistake: a crash leaves a block free and pointed to, and the next allocation shares it between two files. <code>e2fsck</code> reports "multiply-claimed blocks" much later.</li>
+<li><b>Forgetting the indirect blocks in <code>i_blocks</code>.</b> <code>e2fsck</code> reports "i_blocks is X, should be Y". Count every allocated block of the file, data and indirect, in 512-byte units.</li>
+<li><b>Running <code>e2fsck</code> without <code>-f</code>.</b> A file system marked clean is not checked at all; the harness then reports success for every image.</li>
+<li><b>Running <code>e2fsck -y</code> or <code>-p</code> in the harness.</b> The report then mixes findings with repairs and the image is changed; use <code>-n</code> on a copy.</li>
+<li><b>A harness that cannot fail.</b> If the careless build passes too, the harness is broken (wrong image, wrong exit code handling, flushes ignored). Always keep a known-bad build in the test suite.</li>
+<li><b>Accepting "ref count is 1, should be 2".</b> A link count that is too <i>low</i> is damage: the file will be freed while a name still points to it. The harness accepts only counts that are too high.</li>
+</ul>
+
+<div class="co transition" id="F3-44-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F3-43">F3-43</a> gave the device model, the ordering rules and the record-cut-check method; <a href="#F3-33">F3-33</a> gave ext2's layout and a writer checked by <code>e2fsck</code> after clean unmounts. <b>What carries over:</b> the on-disk format, the 10,000-operation regression test, and <code>e2fsck</code> as the judge. <b>What changes:</b> every write path now has a deliberate order with flushes, and the test is no longer one image but 500 images that a power cut could have produced, judged against a list written before testing. <sup class="src"><a href="#F3-44-src-C1">C1</a></sup> <b>What comes next:</b> <a href="#F3-45">F3-45</a> keeps these write paths and puts a JBD2 journal underneath, so that the same harness finds nothing at all, not even leaks.</p></div>
+
+<h2 id="F3-44-check">Check yourself</h2>
+<ol>
+<li>List the block writes and flushes of <code>truncate</code> for a file that shrinks from 300 KiB to 10 KiB, in order, and say which blocks are freed and when.</li>
+<li>Why does the writer write <i>new</i> indirect blocks before the inode but <i>existing</i> ones after it?</li>
+<li>Explain in your own words why the harness uses <code>e2fsck -fn</code> rather than <code>e2fsck -fy</code>.</li>
+<li>An <code>e2fsck</code> report contains "Inode 57 ref count is 1, should be 2". Is that acceptable under this chapter's plan? Which write order could cause it?</li>
+<li>Which of these findings are acceptable: (a) "Block bitmap differences: +300"; (b) "Block bitmap differences: -300"; (c) "Unattached inode 40"; (d) "Entry 'x' in / (2) has deleted/unused inode 40"? Explain each.</li>
+<li>The careless run reports 0 wrong or missing fsynced files. Does that mean the careless build is safe for applications that use <code>fsync</code>?</li>
+<li>Apply it to a new case: your kernel's block cache sorts dirty blocks by number before writing. Which write path of Listing 1 breaks first, and what would the harness report?</li>
+<li>How many block writes and flushes did the recorded 300-operation workload issue, and what does the ratio tell you about the cost of careful ordering?</li>
+<li>Why are promised files never modified after their promise in this workload, and what kind of bug could that restriction hide?</li>
+</ol>
+
+<h2 id="F3-44-lab">Lab</h2>
+<p><b>Goal (milestone FS1, quoted).</b> "Extend your B16 ext2 driver to every common write operation, and prove what happens when the power is cut." <b>Acceptance (quoted):</b> "After 500 random power cuts, e2fsck never reports damage beyond the categories you declared acceptable in the plan (for example leaked blocks or inodes), and every file whose fsync had completed before the cut has exactly its fsynced contents. The B16 10,000-operation test still passes, now including renames, truncates and links. Files above 4 GiB and sparse files read back identically on the Linux host." <sup class="src"><a href="#F3-44-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> No hardware. The build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>e2fsck 1.47.0 (5-Feb-2023)</code>, <code>debugfs 1.47.0</code>, <code>mke2fs 1.47.0</code> and Python 3, as printed in the logs. Run <code>university/labs/run_lab.sh university/labs/F3-44</code> from the repository root (about two minutes).</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Write your plan first: the acceptable categories, the workload mix, how promises are recorded. Compare it with <code>ACCEPTABLE</code> in Listing 2.</li>
+<li>Run the lab. Check that the careful harness prints 0 damage and 0 wrong files, and that the careless one fails with exit code 3.</li>
+<li>Break the writer on purpose, one rule at a time: free blocks before writing the inode in <code>truncate</code>; drop the flush between the inode and the name in <code>create</code>; remove the name after the count in <code>unlink</code>. For each, predict the finding, rerun the harness and read the first damage example.</li>
+<li>Port the writer into your kernel on top of your block cache, with a recording layer that sends the stream to the host, and run the same harness on your kernel's stream.</li>
+<li>Close the gaps listed in Layer 3: triple indirect blocks, rename over an existing name, files above 4 GiB on a larger image, and a read-only mount on a Linux host.</li>
+</ol>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware; the in-kernel and QEMU-kill parts were not run.</b> This build ran the writer on the host and replayed write streams. Steps 4 and 5 are the work that remains for the milestone as written; nothing in this chapter shows they pass.</p></div>
+
+<h2 id="F3-44-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A classmate's ext2 driver passed every test with clean unmounts. After a power cut in the lab, the image fails <code>e2fsck</code>. The classmate says: "My create is correct, look, the file has a name." The block layer's recording of the last seconds survived. This is the format of practical exam P: explain the report.</p>
+<p><b>Evidence pack.</b> The recorded stream and the cut <sup class="src"><a href="#F3-44-src-R9">R9</a></sup>:</p>
+<pre class="output" data-run="F3-44/forensic_stream"></pre>
+<p>The checker's report on the image <sup class="src"><a href="#F3-44-src-R10">R10</a></sup>:</p>
+<pre class="output" data-run="F3-44/forensic_fsck"></pre>
+<p>Two <code>debugfs</code> commands on the image <sup class="src"><a href="#F3-44-src-R11">R11</a></sup>:</p>
+<pre class="output" data-run="F3-44/forensic_debugfs"></pre>
+<p>The mkfs layout of the empty file system is in the lab output above (block bitmap 66, inode bitmap 67, inode table from 68; the root directory's block is 196).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which blocks were written in records 0 to 9, and how many flushes are there before the cut?</li>
+<li>Which inode table block holds inode 12 (128-byte inodes, 1 KiB blocks, table starting at 68)? Show the arithmetic.</li>
+<li>Explain each line of the report: which write landed and which did not.</li>
+<li>Which lines are acceptable under this chapter's plan, and which are damage?</li>
+<li>Name the ordering rule the driver breaks, and the change to its <code>create</code> that fixes it.</li>
+<li>The classmate's tests used clean unmounts. Why could they never find this bug?</li>
+</ol>
+<p><b>Method hints.</b> Compare the order of records 0–4 with Figure 2. An inode's table block is 68 + (inode − 1) × 128 / 1024.</p>
+
+<h2 id="F3-44-project">Mini-project</h2>
+<p><b>FS1 in your kernel.</b> Your OS304 ext2 driver with every write path of this chapter (plus triple indirect blocks and rename over an existing name), a recording layer in the block cache, and the harness run on your kernel's write stream: 500 cuts with zero damage and zero broken promises, plus the careless build failing. Then the same workload with a QEMU kill: start your kernel with the workload, kill QEMU after a random delay, run <code>e2fsck -fn</code> on the image, 50 times.</p>
+<p><b>Rubric.</b> Write paths complete with a written order for each (2). Recording layer in the kernel, stream verified against a known workload (2). 500 replay cuts, zero damage, zero broken promises, real logs (3). Known-bad build fails the harness (1). QEMU-kill runs with their results and the cache mode used, stated honestly (1). The "files above 4 GiB" and Linux-host read-back clauses done, or marked open with the reason (1).</p>
+
+<h2 id="F3-44-summary">Summary</h2>
+<ul>
+<li>Every ext2 write path has a safe order: allocate and write before pointing; unpoint before freeing; add the new name before removing the old; keep link counts at least the number of names.</li>
+<li>Each "before" is a flush on a device with a write cache; a block cache must not reorder across it.</li>
+<li>With that order, a crash leaves only leaks, wrong counters, orphans and counts that are too high: the acceptable list.</li>
+<li>A write stream plus the F3-43 model gives reproducible crash images; <code>e2fsck -fn</code> judges structure and <code>debugfs</code> judges the bytes of fsynced files.</li>
+<li>The careful build passed 500 cuts with no damage and 9,787 promise checks; the careless build failed 65 of 100.</li>
+<li>Reading an <code>e2fsck</code> report means mapping each line to a lost or landed write.</li>
+</ul>
+
+<h2 id="F3-44-sources">Sources</h2>
+<ol>
+<li id="F3-44-src-D1">Dave Poirier, "The Second Extended File System: Internal Layout" (tier 2, project documentation), superblock, group descriptors, inode (block pointers, <code>i_blocks</code>, links count, deletion time), directory entries, symbolic links. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i> Behaviour checked against e2fsprogs in R2, R3.</li>
+<li id="F3-44-src-D2">e2fsprogs manual pages <code>e2fsck(8)</code> and <code>debugfs(8)</code> (tier 2). Used for: the options <code>-f</code>, <code>-n</code>, <code>-y</code>; the meaning of the report lines; <code>dump</code>, <code>ls</code>, <code>stat</code>. <i>Title only — not opened during this build; the Source Researcher must confirm the version (dossier gate G1 open).</i> The report lines quoted are real output (R7, R8, R10).</li>
+<li id="F3-44-src-D3">Marshall Kirk McKusick, Gregory R. Ganger, "Soft Updates: A Technique for Eliminating Most Synchronous Writes in the Fast Filesystem" (tier 5), and Remzi H. and Andrea C. Arpaci-Dusseau, "Operating Systems: Three Easy Pieces" (tier 3), "Crash Consistency: FSCK and Journaling". Used for: the ordering rules. <i>Title only — not opened during this build; the Source Researcher must confirm the editions and sections (dossier gate G1 open).</i></li>
+<li id="F3-44-src-D4">NVM Express Base Specification (Flush); OASIS VIRTIO Specification (block device flush); INCITS T13 ATA/ATAPI Command Set (FLUSH CACHE EXT) (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the revisions and sections (dossier gate G1 open).</i></li>
+<li id="F3-44-src-D5">Jayashree Mohan et al., "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing" (OSDI 2018) (tier 5); Linux kernel documentation on the device-mapper log-writes target (tier 2). Used for: recording and replaying write streams. <i>Title only — not opened during this build; the Source Researcher must confirm the publication and kernel version (dossier gate G1 open).</i></li>
+<li id="F3-44-src-C1">Systems Curriculum (this project), milestone FS1 (local file <code>SYSTEMS_CURRICULUM.html</code>): goal, reading list, build list and acceptance test quoted verbatim. A map, not a source (AH-4).</li>
+<li id="F3-44-src-R1">R1 — the empty file system: <code>mkfs.log</code>; mke2fs 1.47.0; exit code 0.</li>
+<li id="F3-44-src-R2">R2 — 10,000 random draws (9,714 operations) and <code>e2fsck -fn</code>: <code>stress.log</code>, <code>fsck_stress.log</code>; g++ 13.3.0, e2fsck 1.47.0; exit codes 0.</li>
+<li id="F3-44-src-R3">R3 — every file dumped with <code>debugfs</code> and compared: <code>contents.log</code>; debugfs 1.47.0; 540 files, 0 different.</li>
+<li id="F3-44-src-R4">R4 — build of the writer and tools: <code>build.log</code>; g++ 13.3.0 with AddressSanitizer and UBSan; exit code 0.</li>
+<li id="F3-44-src-R5">R5 — the recorded 300-operation workload: <code>workload.log</code>; exit code 0.</li>
+<li id="F3-44-src-R6">R6 — the start of its write stream: <code>stream_careful.log</code>; exit code 0.</li>
+<li id="F3-44-src-R7">R7 — FS1 acceptance, 500 power cuts: <code>harness_careful.log</code>; Python 3.13.16, e2fsck 1.47.0; exit code 0.</li>
+<li id="F3-44-src-R8">R8 — the careless build: <code>stream_careless.log</code>, <code>harness_careless.log</code>; exit code 3, expected.</li>
+<li id="F3-44-src-R9">R9 — forensic stream and cut: <code>forensic_stream.log</code>; exit code 0.</li>
+<li id="F3-44-src-R10">R10 — forensic <code>e2fsck -fn</code>: <code>forensic_fsck.log</code>; exit code 4, expected (errors found, nothing changed).</li>
+<li id="F3-44-src-R11">R11 — forensic <code>debugfs</code>: <code>forensic_debugfs.log</code>; exit code 0.</li>
+</ol>
+
+<h2 id="F3-44-glossary">Glossary links</h2>
+<p><a href="#gl-write-stream">Write stream</a> · <a href="#gl-power-cut-harness">Power-cut harness</a> · <a href="#gl-indirect-block">Indirect block</a> · <a href="#gl-sparse-file-hole">Sparse file (hole)</a> · <a href="#gl-hard-link">Hard link</a> · <a href="#gl-fast-symbolic-link">Fast symbolic link</a> · <a href="#gl-orphan-inode">Orphan inode</a> · <a href="#gl-acceptable-damage-list">Acceptable damage list</a> · <a href="#gl-promise-fsync-record">Promise (fsync record)</a> · <a href="#gl-crash-consistency">Crash consistency</a></p>
+
+<h2 id="F3-44-next">Next chapter</h2>
+<p><a href="#F3-45">F3-45 A journal compatible with JBD2</a> puts a journal under these write paths and reruns this harness. Previous: <a href="#F3-43">F3-43 Crash consistency: the discipline</a>. Back to the course: <a href="#OS401">OS401</a>.</p>
+
+<h2 id="F3-44-answers">Answers to Check yourself</h2>
+<ol>
+<li>Zero the tail of the new last block (data write); clear the pointers in the kept part of the indirect structure (here the single indirect block is freed entirely and the double indirect block too, since 10 KiB fits in the direct pointers) and rewrite any kept indirect block (none here: both indirect blocks go away entirely, so no flush is needed at this point); write the inode with size 10 KiB, direct pointers 10 and 11 cleared, pointers 12 and 13 cleared, <code>i_blocks</code> reduced; flush; then free the data blocks and the indirect blocks in the bitmap (with the counters). Freed last, after the inode no longer points to them.</li>
+<li>A new indirect block is pointed to by the inode (or a higher indirect block) that is written later, so it must be complete first. An existing indirect block is already pointed to; adding a pointer to it makes new data reachable, so it must wait until that data is durable, i.e. after the flush.</li>
+<li>Good answers say: <code>-n</code> leaves the image unchanged, so the report describes exactly the crash state; <code>-y</code> repairs as it goes, so later lines describe a half-repaired image and the evidence is gone. The harness also needs the same image for the <code>debugfs</code> check.</li>
+<li>Not acceptable: the stored count (1) is lower than the number of names (2). The inode would be freed when one name is removed while the other still points to it. It comes from adding a name before raising the count (the opposite of <code>link</code>'s order) or lowering the count before removing a name.</li>
+<li>(a) "+300": block 300 is used by a file but free in the bitmap: damage (it will be allocated twice). (b) "-300": marked used, used by nobody: a leak, acceptable. (c) An inode with no name: a leak, acceptable. (d) A name pointing to an unused inode: damage.</li>
+<li>No. Promised files were complete and synced, and <code>fsync</code> flushes, so they survived. But the structure around them was damaged in 65 runs; a repair by <code>e2fsck</code> could delete names, and files created or renamed without <code>fsync</code> can be left pointing to nothing.</li>
+<li><code>write</code> or <code>create</code> break first: after sorting, the inode (low block number) may be written before the new data or name (higher numbers) across what should have been a barrier, or the directory before the inode. The harness would report names pointing to unused inodes, "+" bitmap differences, and files with stale contents in the byte check.</li>
+<li>18,456 block writes and 596 flushes, about 31 writes per flush; and 300 operations needed about 2 flushes each on average. Each flush waits for the device, so careful ordering is expensive on real hardware; journaling groups many operations per flush.</li>
+<li>So that the expected contents of a promised file never change and the check is a simple byte comparison. It hides bugs in later operations on synced files: for example a rename of a synced file that loses it, or a truncate that exposes stale data. A fuller harness tracks the latest synced state of each file across operations.</li>
+</ol>
+<h3 id="F3-44-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Records 0–4: 67 (inode bitmap), 2 (group descriptor), 1 (superblock), 196 (root directory block), 69 (inode table); records 5–9: 66 (block bitmap), 2, 1, 210 (a data block), 66. No flush at all: "durable writes 0; cached writes 10, of which landed 5".</li>
+<li>(12 − 1) × 128 = 1408 bytes into the table; 1408 / 1024 = 1 remainder 384, so block 68 + 1 = 69, at offset 384.</li>
+<li>Block 196 landed (the name <code>s0</code> → 12 exists); the inode bitmap 67 or the inode block 69 did not (inode 12 unused, mode 0, as <code>debugfs stat &lt;12&gt;</code> shows): hence "deleted/unused inode 12" and the wrong file type. The block bitmap with blocks 210–211 marked landed but nothing points to them: "-(210--211)". Counter copies from different steps: the free counts.</li>
+<li>Acceptable: block bitmap "−" differences and the free counts. Damage: the entry with a deleted/unused inode and its file type.</li>
+<li>"Never point to a structure before it has been initialised": the directory entry is written before the inode it names, with no flush in between. Fix: write the inode (and its bitmap), flush, then add the entry, as the careful <code>makeNode</code> does.</li>
+<li>After a clean unmount every write has landed, so the order of writes never matters. Only a state in which some later write landed and an earlier one did not exposes an ordering bug, and only crash tests produce such states.</li>
+</ol>

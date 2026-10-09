@@ -1,0 +1,304 @@
+<!--meta
+id: F3-45
+title: A journal compatible with JBD2
+course: OS401
+level: L4
+prereqs: F3-43, F3-44
+time: 16–22 hours including the lab and the forensic lab
+hardware: none required (g++ 13.3.0, e2fsprogs 1.47.0 and Python 3 in the build container); QEMU or a disk you may erase for the in-kernel version, untested in this build
+maps: Curriculum FS2 (A journal: ext3-compatible JBD2 replay and writing); course forensic lab "Lost after power cut"; course project (FS2 passing 500 power-cut runs)
+analogy: F3 — the school; registered: file system = library catalogue and shelves; proposed: journal = the librarian's day book, commit block = the tick under a finished entry (see NOTES.md)
+-->
+
+<h2 id="F3-45-hook">Story hook</h2>
+<p>After term's tests, the library's safe order works, but every morning after a power cut someone still has to walk the shelves and fix the free-place chart. Ms Okafor wants mornings without that walk. She starts a day book at the desk. Before she touches a shelf, a card or the chart, she copies the new card and the new chart page into the day book, and when the entry is complete she draws a tick under it. Only then does she go and change the real card and chart.</p>
+<p>After a power cut, the rule is simple. Open the day book. Every entry with a tick is copied out again onto the cards and the chart, whether or not that had been done before. Every entry without a tick is ignored. The walk around the shelves is no longer needed.</p>
+<p>One evening the porter, in a hurry, carries the tick to the desk before the pages it belongs to. The power goes. In the morning, the day book shows a ticked entry, but the pages above the tick are last week's. Following the rule, the librarian copies last week's pages onto this week's cards. This chapter builds the day book (a journal that Linux's tools can read), and its forensic lab is that hurried evening.</p>
+
+<h2 id="F3-45-able">What you will be able to do</h2>
+<ul>
+<li><b>Describe</b> the JBD2 on-disk format: journal superblock, descriptor blocks with tags, logged block copies with escaping, commit blocks, revoke blocks, sequence numbers and the circular log.</li>
+<li><b>Implement</b> replay at mount (scan, collect committed transactions, apply revokes, write in place, mark the log empty) and check it against <code>e2fsck</code>'s replay of a journal written by e2fsprogs.</li>
+<li><b>Implement</b> ordered-mode transactions with the correct flush order (data and log, flush, commit, flush, checkpoint, flush, log reset) under the F3-44 writer.</li>
+<li><b>Pass</b> the FS2 acceptance test: the FS1 harness with zero repairs in 500 runs, with both <code>e2fsck</code> and your own recovery as the replayer.</li>
+<li><b>Diagnose</b> a lost-after-power-cut report from a write-stream recording, by finding the missing flush before the commit block.</li>
+</ul>
+
+<div class="co jargon" id="F3-45-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>JBD2</dt><dd><b>Simple words:</b> the journal format and code that ext3 and ext4 use on Linux. <b>Analogy:</b> the day book's standard layout, so any librarian can read it. <b>Precise:</b> Journaling Block Device version 2, Linux's generic block-level journal layer; its on-disk format (inside an ext3/ext4 file system, usually in inode 8) is shared by the kernel and by e2fsprogs. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></dd>
+<dt>Journal superblock</dt><dd><b>Simple words:</b> the first block of the journal, saying how big it is and where the log currently starts. <b>Analogy:</b> the day book's cover page with a bookmark. <b>Precise:</b> a block with the JBD2 magic number, block type 3 or 4 (v1/v2), journal block size and length, the first usable log block, the sequence number expected next (<code>s_sequence</code>) and the log start (<code>s_start</code>, 0 meaning the log is empty), plus feature flags and a UUID. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></dd>
+<dt>Descriptor block</dt><dd><b>Simple words:</b> a journal block that lists which file-system blocks the following log blocks are copies of. <b>Analogy:</b> the line in the day book that says "next pages: card 12, chart page 3". <b>Precise:</b> a block of type 1 with the transaction's sequence number, followed by tags; each tag holds a target block number and flags (escaped, same UUID, last tag), and the first tag carries a 16-byte UUID. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></dd>
+<dt>Commit block</dt><dd><b>Simple words:</b> the block that says "this transaction is complete". <b>Analogy:</b> the tick under a finished entry. <b>Precise:</b> a block of type 2 with the transaction's sequence number (and optionally a checksum and a time stamp); recovery replays a transaction only if its commit block is found. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></dd>
+<dt>Revoke block</dt><dd><b>Simple words:</b> a note in the journal that says "do not replay older copies of these blocks". <b>Analogy:</b> "ignore earlier entries about card 12: that card was thrown away and the slot reused". <b>Precise:</b> a block of type 5 listing block numbers; during replay, a logged copy of a listed block from a transaction with a sequence number not later than the revoke's is skipped, so a block freed and reused for data is not overwritten by stale metadata. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></dd>
+<dt>Escaping</dt><dd><b>Simple words:</b> hiding a data block that happens to look like a journal block, so recovery does not mistake it. <b>Analogy:</b> crossing out a tick that appears by accident on a copied page. <b>Precise:</b> if a logged block begins with the JBD2 magic number, its first four bytes are written as zero and its tag gets the escape flag; replay restores the magic number. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></dd>
+<dt>Checkpoint</dt><dd><b>Simple words:</b> writing the journaled blocks to their real places, after which their space in the journal can be reused. <b>Analogy:</b> copying the day book's pages onto the real cards and then turning the page. <b>Precise:</b> writing a committed transaction's blocks in place, making them durable, and then advancing <code>s_start</code> (or setting it to 0) in the journal superblock so that recovery no longer needs that part of the log. <sup class="src"><a href="#F3-45-src-D2">D2</a></sup></dd>
+<dt>Replay (recovery)</dt><dd><b>Simple words:</b> after a crash, redoing every complete transaction from the journal. <b>Analogy:</b> copying every ticked entry onto the cards again. <b>Precise:</b> scanning the log from <code>s_start</code> for blocks with the expected sequence numbers, collecting transactions that end in a commit block, applying revokes, writing the logged copies to their targets, flushing, and marking the log empty; it is idempotent. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></dd>
+<dt>needs_recovery</dt><dd><b>Simple words:</b> a flag in the file system's superblock that says "the journal may hold work that has not been replayed". <b>Analogy:</b> a sign on the desk: "read the day book before opening". <b>Precise:</b> the ext3/ext4 incompatible feature flag (0x4) set while the file system is mounted with a journal and cleared after a clean unmount or a replay; tools that cannot replay must refuse to mount. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F3-45-pictures">The idea in pictures</h2>
+<p>Figure 1 is the journal of the lab's image as one transaction leaves it: the superblock with <code>s_start</code> pointing at block 1, a descriptor whose tags name the targets, the copies, and the commit block. All numbers in JBD2 blocks are big-endian, unlike the rest of ext2.</p>
+<figure id="F3-45-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 270" role="img" aria-labelledby="F3-45-f1t F3-45-f1d">
+<title id="F3-45-f1t">Figure 1: a JBD2 transaction in the log</title>
+<desc id="F3-45-f1d">A row of journal blocks 0 to 7. Block 0: journal superblock, magic C03B3998, type 4, s_sequence 7, s_start 1. Block 1: descriptor, sequence 7, five tags: 66, 2, 1, 1256, 69. Blocks 2 to 6: copies of file-system blocks 66, 2, 1, 1256 and 69. Block 7: commit, sequence 7. Arrows from each tag to its copy, and from each copy down to its target block in the file system (block bitmap 66, group descriptors 2, superblock 1, a directory block 1256, inode table block 69). A note: every journal block header is magic, block type, sequence, all big-endian.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="270"/>
+<text class="sv-ts" x="20" y="22">journal (inode 8), blocks 0 … 7</text>
+<rect class="sv-b4" x="20" y="34" width="110" height="78" rx="4"/><text class="sv-tb" x="28" y="54">0 superblock</text><text class="sv-ts" x="28" y="72">s_sequence 7</text><text class="sv-ts" x="28" y="90">s_start 1</text>
+<rect class="sv-b1" x="136" y="34" width="120" height="78" rx="4"/><text class="sv-tb" x="144" y="54">1 descriptor</text><text class="sv-ts" x="144" y="72">seq 7, tags:</text><text class="sv-tm" x="144" y="90">66 2 1 1256 69</text>
+<rect class="sv-b3" x="262" y="34" width="62" height="78" rx="4"/><text class="sv-t" x="270" y="78">2: 66</text>
+<rect class="sv-b3" x="330" y="34" width="62" height="78" rx="4"/><text class="sv-t" x="338" y="78">3: 2</text>
+<rect class="sv-b3" x="398" y="34" width="62" height="78" rx="4"/><text class="sv-t" x="406" y="78">4: 1</text>
+<rect class="sv-b3" x="466" y="34" width="70" height="78" rx="4"/><text class="sv-t" x="472" y="78">5: 1256</text>
+<rect class="sv-b3" x="542" y="34" width="62" height="78" rx="4"/><text class="sv-t" x="550" y="78">6: 69</text>
+<rect class="sv-b2" x="610" y="34" width="120" height="78" rx="4"/><text class="sv-tb" x="618" y="54">7 commit</text><text class="sv-ts" x="618" y="72">seq 7</text><text class="sv-ts" x="618" y="90">"complete"</text>
+<line class="sv-dash" x1="293" y1="112" x2="80" y2="186"/>
+<line class="sv-dash" x1="361" y1="112" x2="200" y2="186"/>
+<line class="sv-dash" x1="429" y1="112" x2="320" y2="186"/>
+<line class="sv-dash" x1="501" y1="112" x2="460" y2="186"/>
+<line class="sv-dash" x1="573" y1="112" x2="610" y2="186"/>
+<text class="sv-ts" x="20" y="178">checkpoint / replay:</text>
+<rect class="sv-box" x="30" y="190" width="110" height="34"/><text class="sv-ts" x="38" y="212">66 block bitmap</text>
+<rect class="sv-box" x="150" y="190" width="110" height="34"/><text class="sv-ts" x="158" y="212">2 group desc.</text>
+<rect class="sv-box" x="270" y="190" width="110" height="34"/><text class="sv-ts" x="278" y="212">1 superblock</text>
+<rect class="sv-box" x="400" y="190" width="120" height="34"/><text class="sv-ts" x="408" y="212">1256 directory</text>
+<rect class="sv-box" x="540" y="190" width="140" height="34"/><text class="sv-ts" x="548" y="212">69 inode table</text>
+<text class="sv-ts" x="20" y="252">every journal block header: magic C03B3998, block type, sequence (big-endian)</text>
+</svg></div><figcaption><b>Figure 1.</b> One transaction (sequence 7) of the lab's workload in the journal, and where its copies go. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup> <sup class="src"><a href="#F3-45-src-R4">R4</a></sup></figcaption></figure>
+<p>Figure 2 is the forensic lab in one picture: the same journal slots, written by transaction 7 over the leftovers of transaction 6, with and without the flush before the commit block.</p>
+<figure id="F3-45-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F3-45-f2t F3-45-f2d">
+<title id="F3-45-f2t">Figure 2: a commit block that lands before its log blocks</title>
+<desc id="F3-45-f2d">Two rows of journal blocks 1 to 7 after a power cut. Top row, correct order with a flush before the commit: if the commit block for sequence 7 is on the medium, then the descriptor and all five copies of sequence 7 are too; replay writes correct blocks. Bottom row, flush missing: the descriptor of sequence 7 and the commit of sequence 7 landed, but journal block 6 still holds the old commit block of sequence 6 and block 5 an old copy; replay trusts the descriptor and copies the old commit block's bytes over file-system block 69, the inode table block holding inodes 9 to 16.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<text class="sv-tb" x="20" y="28">with the flush: commit on the medium ⇒ everything before it is too</text>
+<rect class="sv-b1" x="20" y="40" width="90" height="44"/><text class="sv-ts" x="26" y="66">1 desc 7</text>
+<rect class="sv-b3" x="116" y="40" width="90" height="44"/><text class="sv-ts" x="122" y="66">2 copy 66</text>
+<rect class="sv-b3" x="212" y="40" width="90" height="44"/><text class="sv-ts" x="218" y="66">3 copy 2</text>
+<rect class="sv-b3" x="308" y="40" width="90" height="44"/><text class="sv-ts" x="314" y="66">4 copy 1</text>
+<rect class="sv-b3" x="404" y="40" width="100" height="44"/><text class="sv-ts" x="410" y="66">5 copy 1256</text>
+<rect class="sv-b3" x="510" y="40" width="90" height="44"/><text class="sv-ts" x="516" y="66">6 copy 69</text>
+<rect class="sv-b2" x="606" y="40" width="110" height="44"/><text class="sv-ts" x="612" y="66">7 commit 7</text>
+<text class="sv-tb" x="20" y="128">without it: commit 7 landed, some slots still hold transaction 6</text>
+<rect class="sv-b1" x="20" y="140" width="90" height="44"/><text class="sv-ts" x="26" y="166">1 desc 7</text>
+<rect class="sv-b3" x="116" y="140" width="90" height="44"/><text class="sv-ts" x="122" y="166">2 copy 66</text>
+<rect class="sv-box" x="212" y="140" width="90" height="44"/><text class="sv-ts" x="218" y="166">3 old (tx 6)</text>
+<rect class="sv-b3" x="308" y="140" width="90" height="44"/><text class="sv-ts" x="314" y="166">4 copy 1</text>
+<rect class="sv-box" x="404" y="140" width="100" height="44"/><text class="sv-ts" x="410" y="166">5 old: 69 (tx 6)</text>
+<rect class="sv-b8" x="510" y="140" width="90" height="44"/><text class="sv-ts" x="516" y="166">6 COMMIT 6</text>
+<rect class="sv-b2" x="606" y="140" width="110" height="44"/><text class="sv-ts" x="612" y="166">7 commit 7</text>
+<line class="sv-line" x1="555" y1="184" x2="555" y2="212"/><polygon class="sv-head" points="549,206 561,206 555,216"/>
+<text class="sv-t" x="300" y="234">replay: "slot 6 is the copy of block 69" → a commit block over inodes 9–16</text>
+</svg></div><figcaption><b>Figure 2.</b> Why the flush before the commit block matters: replay cannot tell an old slot from a new one. Which old slots survive differs from cut to cut; the evidence pack shows one real case. <sup class="src"><a href="#F3-45-src-R9">R9</a></sup> <sup class="src"><a href="#F3-45-src-R10">R10</a></sup></figcaption></figure>
+
+<h2 id="F3-45-layer1">Layer 1 — the kid explanation</h2>
+<p>A day book makes a big job safe. First write everything you are going to change into the book. Then draw a tick. Then do the real changes. If the lights go out, read the book: do every ticked job again, skip every job without a tick.</p>
+<p>The tick must be the last thing written. If the tick gets into the book before the pages above it, a power cut can leave a tick under old pages, and the rule then copies old pages over new cards. That is why the librarian waits until the pages are really in the book before drawing the tick.</p>
+
+<h2 id="F3-45-layer2">Layer 2 — the student explanation</h2>
+<p>ext3 is ext2 plus a journal: an area of the disk (in the lab, the 1 MiB file of inode 8) where changes are written first. A <b>transaction</b> groups the metadata blocks of one or more operations. To commit it, the file system writes a descriptor block listing the targets, the new copies of those blocks, and finally a commit block. Once the commit block is on the medium, the transaction is durable, and the blocks can be written to their real places (the checkpoint) at leisure. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup> <sup class="src"><a href="#F3-45-src-D2">D2</a></sup></p>
+<p>After a crash, recovery reads the journal superblock, starts at <code>s_start</code>, and walks the log while it finds journal blocks with the expected sequence number. Each transaction with a commit block is replayed: its copies are written over their targets. Transactions without a commit block are ignored. Then the log is marked empty. Replay is idempotent: doing it twice gives the same disk, so a crash during recovery is harmless. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></p>
+<p>Ordered mode adds one rule for file data: data blocks that a transaction's metadata makes reachable are written in place before the commit block. The F3-44 writer already separates data writes from metadata writes, so the journal only has to send data straight to the disk and keep metadata in the transaction. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></p>
+<p>The flush order is: data blocks and log blocks, flush, commit block, flush, checkpoint, flush, then mark the log empty. FS2 asks that, with this journal under the writer, the FS1 harness finds a clean file system after replay in all 500 runs, and that journals are interchangeable with Linux: theirs replayed by you, yours replayed by them. In this build "them" is e2fsprogs: <code>debugfs</code> writes a journal and <code>e2fsck</code> replays ours. <sup class="src"><a href="#F3-45-src-C1">C1</a></sup> <sup class="src"><a href="#F3-45-src-R3">R3</a></sup></p>
+
+<h2 id="F3-45-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-45-l3-format">The format, field by field</h3>
+<p>Every JBD2 metadata block begins with a 12-byte header: magic 0xC03B3998, block type, sequence number, each a big-endian 32-bit value. The journal superblock (type 4 for version 2) continues with the journal's block size, total length in blocks and first log block, then <code>s_sequence</code> (the first sequence number expected in the log) and <code>s_start</code> (the log block where it begins; 0 = empty). After an errno field come three feature words (compatible, incompatible, read-only compatible) at offsets 36, 40 and 44, and the journal's UUID at 48. The lab's listing accepts only the incompatible "revoke" feature for reading and writes none, which matches the journal that <code>mke2fs</code> 1.47.0 made in this build ("Journal features: (none)"). <sup class="src"><a href="#F3-45-src-D1">D1</a></sup> <sup class="src"><a href="#F3-45-src-R2">R2</a></sup></p>
+<p>A descriptor block (type 1) is followed by tags. Without the 64-bit and checksum features, a tag is 8 bytes: a 32-bit target block number, a 16-bit checksum field (unused here) and 16-bit flags: 1 = escaped, 2 = same UUID as the previous tag, 8 = last tag in this descriptor. A tag without "same UUID" is followed by 16 bytes of UUID, which in practice means the first tag. Each tag corresponds, in order, to the next log block after the descriptor. A transaction larger than one descriptor's capacity uses several descriptors before its commit block. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></p>
+<p>A commit block (type 2) can carry a checksum type and checksum of the transaction, and a commit time; the lab writes the time only. A revoke block (type 5) holds, after the header, the number of bytes used and a list of 32-bit block numbers. During replay, a logged copy is skipped if its target was revoked by a transaction with a sequence number at least as large as the copy's. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The offsets, type numbers and tag flags above were written from the author's memory of the Linux kernel documentation "ext4 Data Structures and Algorithms" (journal section), which was not opened in this build. They are confirmed here only for the subset the lab exercises: a journal written by <code>debugfs</code> 1.47.0 (two transactions with a revoke) is read by our recovery code exactly as <code>e2fsck</code> replays it <sup class="src"><a href="#F3-45-src-R3">R3</a></sup>, and journals written by our code are accepted and replayed by <code>e2fsck</code> and listed by <code>debugfs logdump</code> <sup class="src"><a href="#F3-45-src-R4">R4</a></sup> <sup class="src"><a href="#F3-45-src-R6">R6</a></sup>. Not exercised at all: 64-bit block numbers in tags, the checksum features (v2, v3, commit-block checksums), asynchronous commit, fast commits, multiple descriptors per transaction, a log that wraps around, and the escape path with real data. Read the document before adding any of them.</p></div>
+
+<h3 id="F3-45-l3-recover">Recovery, as Listing 1 does it</h3>
+<p>Recovery reads the superblock; refuses features it does not know; and if <code>s_start</code> is 0, clears <code>needs_recovery</code> and stops. Otherwise it walks from <code>s_start</code> with the expected sequence number <code>s_sequence</code>. A block that lacks the magic number or carries a different sequence number ends the log; this is what makes old leftovers in the circular log harmless, as long as sequence numbers keep increasing. Descriptor tags are collected as "pending"; revokes as "pending revokes"; a commit block moves both into the committed set and increments the expected sequence number. Then every committed copy is written to its target, oldest transaction first, unless revoked by a later or equal sequence; the escape flag restores the magic number. Finally the superblock's <code>s_sequence</code> is set past the last replayed transaction, <code>s_start</code> to 0, and <code>needs_recovery</code> is cleared, with a flush before and after. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></p>
+<p>The real JBD2 recovery runs three passes (scan, revoke, replay); Listing 1 folds them into one scan and one replay loop over a small journal. The order matters: if revokes were applied while scanning without remembering their sequence numbers, a copy logged by a <i>later</i> transaction after the block was reused as metadata again would be wrongly skipped. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup></p>
+
+<h3 id="F3-45-l3-commit">Writing transactions</h3>
+<p><code>JournalStore</code> implements F3-44's <code>Store</code>. A metadata write is kept in memory in the current transaction (a later write of the same block replaces the copy); a data write goes straight to the device; <code>order()</code> does nothing, because the whole transaction becomes durable at once; <code>sync()</code> commits. The workload calls a commit after every operation, so each operation is one transaction. <code>commit()</code> then does, in this order: write the journal superblock with <code>s_start</code> = first log block and the new sequence; write the descriptor and the copies (escaping any copy that begins with the magic number); <b>flush</b>; write the commit block; <b>flush</b>; checkpoint every block in place; <b>flush</b>; write the journal superblock with <code>s_start</code> = 0 and the next sequence; <b>flush</b>. <sup class="src"><a href="#F3-45-src-R5">R5</a></sup></p>
+<p>The first flush covers both the data blocks (written earlier by the operation) and the log blocks: that is ordered mode. The second makes the commit durable before any checkpoint write, so a checkpoint never lands for a transaction that recovery would ignore. The third and fourth make the checkpoint durable before the log is declared empty and reused. In exchange, the in-place writes need no ordering among themselves at all: a crash in the middle of a checkpoint is repaired by replay. <sup class="src"><a href="#F3-45-src-D2">D2</a></sup></p>
+<p>This design is deliberately simpler than Linux's. Linux batches many operations into one transaction, commits on a timer or on <code>fsync</code>, lets several committed but not yet checkpointed transactions share the circular log, and checkpoints lazily. Two consequences matter for your kernel. First, with lazy checkpoints, revoke records become necessary: if a metadata block is freed and reused for file data while an older transaction that logged it is still in the log, replay would overwrite the data, unless the block is revoked. The lab's journal never needs revokes because it empties the log after every transaction. Second, a transaction must never be larger than the free log space; the lab simply refuses. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup> <sup class="src"><a href="#F3-45-src-D2">D2</a></sup></p>
+<div class="co note"><span class="lbl">Note</span><p>Notice the cost difference with F3-44. The same 300-operation workload issued 18,456 block writes and 596 flushes with careful ordering, and 7,853 block writes and 1,202 flushes with the journal (4 flushes per transaction, one transaction per operation) <sup class="src"><a href="#F3-44-src-R5">R5</a></sup> <sup class="src"><a href="#F3-45-src-R4">R4</a></sup>. Fewer writes, because the careful writer flushes and rewrites shared blocks such as the superblock and group descriptor many times per operation; more flushes, because of one-transaction-per-operation. Batching operations into one transaction, as Linux does, is what makes journaling cheap.</p></div>
+
+<h3 id="F3-45-l3-tests">What the tests show</h3>
+<p>The lab runs the F3-44 harness with two recoveries per crash image. Path A: <code>e2fsck -fy</code> replays the journal (it prints "recovering journal") and would repair anything else, then <code>e2fsck -fn</code> must be clean. Path B: our <code>recover</code>, then <code>e2fsck -fn</code> must be clean and every promised file must have its bytes. FS2's acceptance asks for "no repairs needed in all 500 runs". With random cut points, our recovery replayed a committed transaction in 120 runs (in the others, the cut fell where the log was empty or the transaction uncommitted); because random cuts rarely hit the critical window right after a commit, the lab adds 200 cuts placed right after a commit-block write, of which 99 replayed. Both sets: zero repairs, zero unclean checks, zero lost files. <sup class="src"><a href="#F3-45-src-R7">R7</a></sup> <sup class="src"><a href="#F3-45-src-R8">R8</a></sup></p>
+<p>The cross-check with e2fsprogs covers FS2's interchange clause as far as this container allows. <code>debugfs</code> 1.47.0 can open a journal, write blocks into it and commit (<code>jo</code>, <code>jw</code>, <code>jc</code>), including a revoke; <code>logdump</code> lists what it wrote. Image A is replayed by <code>e2fsck</code>, image B by our code; blocks 300 to 302 agree, block 301 keeps its old contents in both because the second transaction revoked it, and our recovery reports "2 transaction(s) replayed, 2 block(s) written, 1 revoked". <sup class="src"><a href="#F3-45-src-R3">R3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Not tested against the Linux kernel.</b> FS2's interchange test names "Linux stopped abruptly" and "replayed correctly by Linux". No Linux kernel could mount an image in this build; e2fsprogs (<code>debugfs</code> as the writer, <code>e2fsck</code> as the replayer) stood in for it. The kernel's jbd2 writes features that <code>debugfs</code> did not use here (for example checksums and possibly 64-bit tags on ext4); before claiming interchange, run the milestone's test with a real kernel in QEMU: make an ext3 image, mount it in a Linux guest, write, kill the guest, and replay the image with your code.</p></div>
+
+<h2 id="F3-45-hardware">How the hardware actually does it</h2>
+<p>JBD2's commit is where the device's flush semantics meet the file system. Linux traditionally issues the commit block as a write with "preflush" and FUA semantics: flush the cache before writing it (covering data and log blocks) and make the commit block itself durable before completion, which removes one round trip compared with write, flush, write, flush. With the asynchronous-commit option and a commit checksum, the first flush is dropped: a commit block that lands without its log blocks fails the checksum and is ignored. F3-43's model showed the limit of that trade: the checksum covers the log, not ordered-mode data. <sup class="src"><a href="#F3-45-src-D1">D1</a></sup> <sup class="src"><a href="#F3-45-src-D3">D3</a></sup> <sup class="src"><a href="#F3-45-src-R1">R1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The description of Linux's preflush/FUA commit and of the asynchronous-commit option is from memory and was not checked against the kernel source or documentation in this build. Check the Linux kernel's block-layer documentation on cache flushes and FUA ("writeback cache control") and the jbd2 commit code of the kernel version you compare with. Whether your device honours FUA or emulates it with a flush is a property of the device and driver.</p></div>
+<div class="co safety"><span class="lbl">Safety</span><p>A journal replay writes blocks wherever the log says. A bug in recovery (wrong target numbers, a wrong sequence check) can destroy a file system in one pass. Test on image copies in QEMU, never on a disk you need, and keep the image from before the replay so you can compare.</p></div>
+
+<h2 id="F3-45-worked">Worked example</h2>
+<p>Follow one transaction through the stream, using <code>showj</code>, which names each write by its role (the journal is located through inode 8 of the image) <sup class="src"><a href="#F3-45-src-R6">R6</a></sup>:</p>
+<pre class="output" data-run="F3-45/stream_journal"></pre>
+<p>Read it as the commit sequence of Layer 3. Records 122–125 are the end of transaction 6's copies, 126 the flush, 127 the commit block of sequence 6, 128 the flush, 129–132 the checkpoint of blocks 66, 2, 1 and 69, 133 the flush, 134 the journal superblock with <code>s_start</code> 0 and the next sequence 7, 135 the flush. Then operation 7 begins: records 136–142 write file data in place (blocks 1253–1260, except 1256, which is a directory block and therefore metadata), 143 sets <code>s_start</code> 1 for the new transaction, 144–149 the descriptor and five copies, 150 the flush, 151 the commit block of sequence 7, 152 the flush.</p>
+<p>Now place cuts. A cut after record 143 with the superblock landed: recovery starts at block 1, finds transaction 6's old descriptor with sequence 6, but expects 7, so the log ends immediately: nothing is replayed, and the data blocks written in place are simply not referenced by anything durable (leaks are impossible too, since no bitmap changed in place). A cut after record 151 with the commit landed: the flush at 150 guarantees blocks 144–149 are on the medium, so replay writes exactly transaction 7. A cut after 152: the same, durably.</p>
+
+<h2 id="F3-45-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>journal.h</code>: recovery and the journaling store.</p>
+<pre class="listing" data-src="F3-45/journal.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–17</td><td>constants</td><td>Magic number, block types, tag flags, the <code>needs_recovery</code> bit.</td><td>The whole vocabulary of the format.</td></tr>
+<tr><td>19–41</td><td><code>be32</code>, <code>header</code></td><td>Big-endian helpers and the 12-byte block header.</td><td>JBD2 is big-endian although ext2 is little-endian: the most common first bug.</td></tr>
+<tr><td>43–51</td><td><code>setRecoverFlag</code></td><td>Sets or clears incompatible feature 0x4 in the ext2 superblock.</td><td>Tools that cannot replay must refuse a file system with this flag.</td></tr>
+<tr><td>63–78</td><td><code>recover</code>: start</td><td>Checks magic and features; an empty log only clears the flag.</td><td>Refusing unknown features is safer than misreading them.</td></tr>
+<tr><td>79–114</td><td>scan</td><td>Walks the log while magic and sequence match; descriptors, revokes, commits.</td><td>Only transactions closed by a commit block are kept.</td></tr>
+<tr><td>116–134</td><td>replay</td><td>Writes copies (unescaped) unless revoked; then resets the log and the flag, with flushes.</td><td>Idempotent: a crash during recovery is repaired by the next recovery.</td></tr>
+<tr><td>137–179</td><td><code>JournalStore</code></td><td>Metadata kept in the transaction, data in place, <code>order()</code> empty.</td><td>The F3-44 writer runs unchanged on top.</td></tr>
+<tr><td>182–232</td><td><code>commit</code></td><td>Superblock, descriptor and copies, flush, commit, flush, checkpoint, flush, empty log, flush.</td><td>The flush before the commit is the line the forensic build leaves out.</td></tr>
+<tr><td>248–256</td><td><code>journalMap</code></td><td>Finds the journal's blocks through inode <code>s_journal_inum</code>.</td><td>The journal is a file; its blocks are not necessarily contiguous.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>fs2tool.cc</code>: the commands the harness calls (workload, recover, crash, commits, showj).</p>
+<pre class="listing" data-src="F3-45/fs2tool.cc"></pre>
+<p><b>Listing 3</b> — <code>harness.py</code>: two recoveries per crash image.</p>
+<pre class="listing" data-src="F3-45/harness.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>File, lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td><code>fs2tool.cc</code> 25–30</td><td><code>mapJournal</code></td><td>Opens the image read-only, allowing <code>needs_recovery</code>, to find the journal.</td><td>The tool must read a crashed image without changing it.</td></tr>
+<tr><td><code>fs2tool.cc</code> 32–79</td><td><code>showJournal</code></td><td>Names each recorded write: journal superblock, descriptor, copy, commit, in place.</td><td>Turns a raw stream into the evidence of the forensic lab.</td></tr>
+<tr><td><code>fs2tool.cc</code> 89–137</td><td><code>main</code></td><td>Workload with a commit after each operation; <code>nobarrier</code> builds the store without the first flush.</td><td>One switch separates the correct and the forensic build.</td></tr>
+<tr><td><code>harness.py</code> 29–66</td><td><code>one_run</code></td><td>Path A: <code>e2fsck -fy</code>, then <code>-fn</code>. Path B: our recovery, <code>-fn</code>, <code>debugfs</code> dumps.</td><td>Two independent replayers on the same crash image.</td></tr>
+<tr><td><code>harness.py</code> 72–75</td><td>"commits"</td><td>Uses cut points right after commit-block writes.</td><td>Random cuts rarely hit the critical moment; targeted cuts do.</td></tr>
+</tbody></table></div>
+<p>The run. The ext3 image made by <code>mke2fs</code>, with the journal inode's blocks <sup class="src"><a href="#F3-45-src-R2">R2</a></sup>:</p>
+<pre class="output" data-run="F3-45/mkfs"></pre>
+<p>A journal written by e2fsprogs, replayed by <code>e2fsck</code> (A) and by Listing 1 (B) <sup class="src"><a href="#F3-45-src-R3">R3</a></sup>:</p>
+<pre class="output" data-run="F3-45/linuxside"></pre>
+<p>The workload on the journal, with <code>e2fsck</code> and <code>logdump</code> after the clean unmount <sup class="src"><a href="#F3-45-src-R4">R4</a></sup>:</p>
+<pre class="output" data-run="F3-45/workload"></pre>
+<p>FS2 acceptance: 500 random cuts, then 200 cuts right after a commit block <sup class="src"><a href="#F3-45-src-R7">R7</a></sup> <sup class="src"><a href="#F3-45-src-R8">R8</a></sup>:</p>
+<pre class="output" data-run="F3-45/harness_random"></pre>
+<pre class="output" data-run="F3-45/harness_commits"></pre>
+
+<h2 id="F3-45-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A librarian reading the day book can see that a page is from last week. Replay cannot: it trusts the descriptor's list and copies whatever bytes sit in the slots. Only sequence numbers in headers, flush order and (optionally) checksums protect it.</li>
+<li>The day book in the story has a fresh page for every entry. The journal is a ring of a fixed number of blocks, constantly overwritten; old entries are always lying around, which is exactly what makes the missing flush dangerous.</li>
+<li>Copying an entry twice does no harm to a card. That is true of replay too (it is idempotent), but only because JBD2 logs whole block images; a journal of operations ("add 1 to the free count") would not be idempotent without extra care.</li>
+</ul>
+
+<h2 id="F3-45-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Little-endian journal fields.</b> ext2 is little-endian, JBD2 big-endian. A recovery that reads <code>s_start</code> little-endian sees a huge number and either crashes or reads garbage. <code>debugfs logdump</code> on your image is the quickest check.</li>
+<li><b>Forgetting the UUID after the first tag.</b> The next tag is then read 16 bytes too early; recovery replays copies onto random block numbers.</li>
+<li><b>Not escaping.</b> A file data block that begins with 0xC03B3998 (rare, but test it) ends the scan early or is parsed as a descriptor.</li>
+<li><b>Reusing log space before the checkpoint is durable.</b> If <code>s_start</code> is advanced (or set to 0) before the in-place writes are flushed, a crash loses the transaction both in place and in the log.</li>
+<li><b>Leaving <code>needs_recovery</code> set or clearing it too early.</b> Set it at mount before the first transaction; clear it only after the log is empty and flushed. <code>e2fsck</code> will replay (or complain) if it is left set.</li>
+<li><b>Testing only random cuts.</b> The lab's 500 random cuts replayed a transaction in only 120 runs; the bug of the forensic lab shows up mostly in cuts right after a commit block. Add targeted cut points.</li>
+</ul>
+
+<div class="co transition" id="F3-45-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F3-44">F3-44</a> ordered every write path with flushes and judged 500 crash images with <code>e2fsck</code>, accepting leaks; <a href="#F3-43">F3-43</a> showed, by counting states, why the commit needs a flush before it. <b>What carries over:</b> the writer, the recorded stream, the harness, and <code>e2fsck</code> plus <code>debugfs</code> as judges. <b>What changes:</b> the acceptable list shrinks to nothing (no repairs at all), and correctness now depends on a format shared with another implementation, so the other implementation becomes a second judge. <sup class="src"><a href="#F3-45-src-C1">C1</a></sup> <b>What comes next:</b> <a href="#F3-46">F3-46</a> reads ext4, the journal's descendant: extents, hashed directories and CRC32C checksums, with <code>debugfs</code> as the reference.</p></div>
+
+<h2 id="F3-45-check">Check yourself</h2>
+<ol>
+<li>Recovery finds, from <code>s_start</code>: descriptor (seq 9), 3 copies, commit (seq 9), descriptor (seq 10), 2 copies, then a block with the magic number and sequence 8. What is replayed, and why does the scan stop where it does?</li>
+<li>Why must the journal superblock's <code>s_start</code> be set to 0 only after a flush that follows the checkpoint?</li>
+<li>Explain in your own words what escaping is for and how replay undoes it.</li>
+<li>A transaction logged block 5000 (a directory block). Later the directory is deleted, block 5000 is freed and reused for file data, and the system crashes while the old transaction is still in the log. What goes wrong without a revoke record, and why did the lab's journal not need one?</li>
+<li>Why does <code>order()</code> do nothing in <code>JournalStore</code>, while it was a flush in F3-44's <code>DirectStore</code>?</li>
+<li>Apply it to a new case: a colleague moves the first flush to after the commit block ("the commit is tiny, it will be fast anyway"). Which crash states become possible?</li>
+<li>Random cuts replayed a transaction in 120 of 500 runs. What were most of the other 380 cuts doing, and why are targeted cuts needed?</li>
+<li>Why is replay idempotent, and why does that matter for a power cut during recovery?</li>
+<li>The cross-check used <code>debugfs</code> to write a journal. What does that prove about compatibility with the Linux kernel, and what does it not prove?</li>
+</ol>
+
+<h2 id="F3-45-lab">Lab</h2>
+<p><b>Goal (milestone FS2, quoted).</b> "Metadata journaling in "ordered" mode, on-disk compatible with Linux, so that a crash never needs a full check." <b>Acceptance (quoted):</b> "Rerun the FS1 power-cut harness: after replay, e2fsck reports a clean file system with no repairs needed in all 500 runs. An image whose journal was left un-replayed by Linux (Linux stopped abruptly) is replayed correctly by your kernel; an image your kernel left un-replayed is replayed correctly by Linux and passes e2fsck." <sup class="src"><a href="#F3-45-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> No hardware. The build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>mke2fs</code>, <code>e2fsck</code> and <code>debugfs</code> 1.47.0 (5-Feb-2023) and Python 3.13.16, as printed in the logs. Run <code>university/labs/run_lab.sh university/labs/F3-45</code> from the repository root (about three minutes).</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Read the journal of a fresh ext3 image with <code>debugfs -R logdump</code> and with your own dump of the superblock fields, and check that both agree.</li>
+<li>Write recovery first and test it against journals written by <code>debugfs</code> (<code>jo</code>, <code>jw</code>, <code>jc</code>, including <code>jw -r</code> for a revoke), comparing with <code>e2fsck</code>'s replay block by block, as step 3 of <code>run.sh</code> does.</li>
+<li>Write <code>JournalStore</code> under your F3-44 writer and run the workload; check the clean image with <code>e2fsck -fn</code> and <code>logdump</code>.</li>
+<li>Run the harness: 500 random cuts and at least 200 cuts right after commit blocks, both recoveries, zero repairs.</li>
+<li>Batch several operations per transaction (commit on <code>fsync</code> or every N operations) and rerun everything. Then add lazy checkpoints and revoke records, and a test in which a freed metadata block is reused for data while its old transaction is still in the log.</li>
+</ol>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware and not run in a kernel or against the Linux kernel.</b> The writer, journal and recovery ran as host programs; e2fsprogs replaced Linux in the interchange test. Step 5 (batched transactions, lazy checkpoints, revokes written by us) was not done in this build.</p></div>
+
+<h2 id="F3-45-forensic">Forensic lab</h2>
+<p><b>Scenario: "Lost after power cut".</b> A team's kernel passed the FS2 harness last month. This week a tester reports: after a power cut, the file <code>/p5</code>, which the test program had written and fsynced before the cut, is gone; <code>lost+found</code> is gone too, and <code>e2fsck</code> is unhappy even after the kernel replayed the journal. A colleague had recently "removed a redundant flush" from the commit path to speed up <code>fsync</code>. The block layer's recording of the last transactions before the cut survived.</p>
+<p><b>Evidence pack.</b> The recording around the cut, as <code>showj</code> names it (the power failed right after record 144) <sup class="src"><a href="#F3-45-src-R9">R9</a></sup>:</p>
+<pre class="output" data-run="F3-45/forensic_stream"></pre>
+<p>What the crash tool says about the cut, the kernel's recovery, and <code>e2fsck -fn</code> afterwards <sup class="src"><a href="#F3-45-src-R10">R10</a></sup>:</p>
+<pre class="output" data-run="F3-45/forensic_fsck"></pre>
+<p>The team's harness, rerun on the new build with cuts right after commit blocks (exit code 3) <sup class="src"><a href="#F3-45-src-R11">R11</a></sup>:</p>
+<pre class="output" data-run="F3-45/forensic_harness"></pre>
+<p>Layout facts: 1 KiB blocks, 128-byte inodes, the inode table starts at block 68; journal block <i>n</i> is a block of inode 8.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare records 115–127 (transaction 6) with records 137–144 (transaction 7). Where is the difference in the pattern of FLUSH records?</li>
+<li>Which records were durable at the cut, and which were only cached? (Use "cut after record 145; durable writes 109; cached writes 15".)</li>
+<li>Recovery "replayed 1 transaction, 5 blocks". Which transaction, and which blocks did it write?</li>
+<li>Which inodes live in block 69? Explain "Reserved inode 9 has invalid mode" and the three entries with deleted/unused inodes 11, 12 and 13.</li>
+<li>What did journal block 6 contain before transaction 7, and what ended up in block 69? Why is that a disaster and not just a lost update?</li>
+<li>Name the missing line in the commit path and explain why the commit checksum feature would have turned this into an ignored transaction, but would not have saved ordered-mode data in general.</li>
+<li>Why did last month's harness pass, and what should the team's test suite contain from now on?</li>
+</ol>
+<p><b>Method hints.</b> Redo F3-43's strategy 4 with these block numbers. The inode table block of inode <i>n</i> is 68 + (<i>n</i> − 1) × 128 / 1024. In transaction 6, journal block 5 held the copy of 69 and journal block 6 the commit block.</p>
+
+<h2 id="F3-45-project">Mini-project (course project)</h2>
+<p><b>FS2 passing 500 power-cut runs.</b> The course project. In your kernel: the ext2 driver with every write path of F3-44, a JBD2 journal in ordered mode under it with batched transactions and revoke records, replay at mount, and a recording block layer. Run the harness on your kernel's write stream: 500 random cuts and 200 commit-point cuts, with <code>e2fsck</code> and your own recovery as replayers, zero repairs and zero broken promises. Then the interchange test of FS2 with a Linux guest in QEMU, both directions. Include the known-bad build (no flush before commit) and show the harness catching it.</p>
+<p><b>Rubric.</b> Format compatibility shown with <code>logdump</code> and with <code>e2fsck</code> replaying your journals, including revokes (2). Recovery tested against journals written by e2fsprogs and by a Linux guest (2). 500 + 200 cuts, zero repairs, zero broken promises, real logs (3). Batched transactions and lazy checkpointing with revokes, with a reuse test (1). Known-bad build caught (1). Honest list of what remains untested on hardware (1).</p>
+
+<h2 id="F3-45-summary">Summary</h2>
+<ul>
+<li>JBD2: a journal superblock (sequence, start), descriptor blocks with tags, logged copies (escaped if needed), commit blocks and revoke blocks, all with big-endian headers.</li>
+<li>Recovery replays transactions that end in a commit block, in sequence order, skips revoked copies, then empties the log and clears <code>needs_recovery</code>; it is idempotent.</li>
+<li>Commit order: data and log, flush, commit, flush, checkpoint, flush, empty the log, flush.</li>
+<li>With the journal, the FS1 harness found no repairs in 500 random and 200 commit-point cuts, with both <code>e2fsck</code> and our code as replayers.</li>
+<li>Without the flush before the commit, replay copied a stale journal slot (an old commit block) over an inode table block: fsynced files lost.</li>
+<li>Interchange was checked against e2fsprogs only; the Linux-kernel test remains to be done.</li>
+</ul>
+
+<h2 id="F3-45-sources">Sources</h2>
+<ol>
+<li id="F3-45-src-D1">The Linux kernel documentation, "ext4 Data Structures and Algorithms" (tier 2), journal (jbd2) section: journal superblock, block header, descriptor and tags, commit, revoke, escaping, feature flags; the ext4 superblock's <code>s_journal_inum</code> and the <code>needs_recovery</code> feature. <i>Title only — not opened during this build; the Source Researcher must confirm the kernel version and sections (dossier gate G1 open).</i> The subset used is cross-checked with e2fsprogs in R3, R4.</li>
+<li id="F3-45-src-D2">Stephen C. Tweedie, "Journaling the Linux ext2fs Filesystem" (tier 5). Used for: transactions, commit, checkpointing, log reuse and the need for revokes. <i>Title only — not opened during this build; the Source Researcher must confirm the publication and section (dossier gate G1 open).</i></li>
+<li id="F3-45-src-D3">Remzi H. and Andrea C. Arpaci-Dusseau, "Operating Systems: Three Easy Pieces" (tier 3), "Crash Consistency: FSCK and Journaling" (the commit-block ordering problem and transaction checksums). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-45-src-D4">e2fsprogs manual pages <code>debugfs(8)</code> (journal commands <code>jo</code>, <code>jw</code>, <code>jc</code>, <code>logdump</code>) and <code>e2fsck(8)</code> (tier 2). <i>Title only — not opened during this build; the commands were used as shown in R3 and their output is real.</i></li>
+<li id="F3-45-src-C1">Systems Curriculum (this project), milestone FS2 (local file <code>SYSTEMS_CURRICULUM.html</code>): goal, reading list, build list and acceptance test quoted verbatim; the OS401 course card (forensic lab, project). A map, not a source (AH-4).</li>
+<li id="F3-45-src-R1">R1 — F3-43's crash model, strategies 3–5: <code>F3-43/crashsim.log</code>; exit code 0.</li>
+<li id="F3-45-src-R2">R2 — the ext3 image: <code>mkfs.log</code>; mke2fs 1.47.0; exit code 0.</li>
+<li id="F3-45-src-R3">R3 — journal written by <code>debugfs</code>, replayed by <code>e2fsck</code> and by Listing 1: <code>linuxside.log</code>; debugfs and e2fsck 1.47.0, g++ 13.3.0; exit code 0.</li>
+<li id="F3-45-src-R4">R4 — the workload on the journal: <code>workload.log</code>; exit code 0.</li>
+<li id="F3-45-src-R5">R5 — build: <code>build.log</code>; g++ 13.3.0 with AddressSanitizer and UBSan; exit code 0.</li>
+<li id="F3-45-src-R6">R6 — the stream around the seventh commit: <code>stream_journal.log</code>; exit code 0.</li>
+<li id="F3-45-src-R7">R7 — FS2 acceptance, 500 random cuts: <code>harness_random.log</code>; Python 3.13.16, e2fsck 1.47.0; exit code 0.</li>
+<li id="F3-45-src-R8">R8 — 200 cuts right after commit blocks: <code>harness_commits.log</code>; exit code 0.</li>
+<li id="F3-45-src-R9">R9 — forensic stream (build without the flush before the commit): <code>forensic_stream.log</code>; exit code 0.</li>
+<li id="F3-45-src-R10">R10 — forensic cut, recovery and <code>e2fsck -fn</code>: <code>forensic_fsck.log</code>; e2fsck exit code 4, expected.</li>
+<li id="F3-45-src-R11">R11 — forensic harness, 100 commit-point cuts: <code>forensic_harness.log</code>; exit code 3, expected.</li>
+</ol>
+
+<h2 id="F3-45-glossary">Glossary links</h2>
+<p><a href="#gl-jbd2">JBD2</a> · <a href="#gl-journal-superblock">Journal superblock</a> · <a href="#gl-descriptor-block">Descriptor block</a> · <a href="#gl-commit-block">Commit block</a> · <a href="#gl-revoke-block">Revoke block</a> · <a href="#gl-escaping">Escaping</a> · <a href="#gl-checkpoint">Checkpoint</a> · <a href="#gl-replay-recovery">Replay (recovery)</a> · <a href="#gl-needs-recovery">needs_recovery</a> · <a href="#gl-journaling-write-ahead-logging">Journaling (write-ahead logging)</a> · <a href="#gl-ordered-mode">Ordered mode</a></p>
+
+<h2 id="F3-45-next">Next chapter</h2>
+<p><a href="#F3-46">F3-46 ext4 read</a> reads the journal's descendant format: extents, hashed directories and metadata checksums. Previous: <a href="#F3-44">F3-44 Complete ext2 writing and a crash harness</a>. Back to the course: <a href="#OS401">OS401</a>.</p>
+
+<h2 id="F3-45-answers">Answers to Check yourself</h2>
+<ol>
+<li>Transaction 9 (3 copies) is replayed. Transaction 10 has a descriptor and copies but no commit block: ignored. The scan stops at the block with sequence 8 because it expects 10 (after replaying 9's commit, the expected sequence is 10; the descriptor of 10 matched, then the next header block found has 8): an old leftover from an earlier pass around the ring, which ends the log.</li>
+<li>Until the checkpoint writes are durable, the log is the only durable copy of the transaction. If <code>s_start</code> = 0 lands first and the power goes, recovery sees an empty log and the in-place writes may be missing: the transaction is lost although it was committed.</li>
+<li>Good answers say: a logged copy that happens to start with the journal's magic number would look like a journal block to the scanner; escaping zeroes those four bytes in the log and sets a flag in the tag, and replay writes the magic number back before copying the block to its target.</li>
+<li>Replay would write the old directory block's image over block 5000, destroying the file data now stored there. A revoke record for 5000, written when the block was freed, tells replay to skip older copies. The lab's journal empties the log after every transaction, so no older transaction is ever replayed after a block is reused.</li>
+<li>Because all metadata of a transaction becomes durable atomically at the commit: there is no intermediate on-disk state between the steps of one operation that could be seen after a crash, so the order within the transaction does not matter. In F3-44 every step reached the disk in place, so each "before" needed a flush.</li>
+<li>The commit block can reach the medium before some log blocks (and before the data blocks). A crash then leaves a valid-looking commit with stale slots (replay writes old contents or even old journal blocks over metadata), or committed metadata pointing to unwritten data (stale bytes in files). Exactly strategy 4 of F3-43 and this forensic lab.</li>
+<li>Many cuts fell while no transaction was open or between commits (log empty or transaction not committed), where there is nothing to replay; and the window between commit block and log reset is short compared with a whole stream. Targeted cuts put the power failure exactly in the window where replay must run and stale slots could matter.</li>
+<li>Replay writes full block images to fixed targets; writing the same image twice gives the same result. If the power fails during recovery, the log is still there (it is emptied only at the end, after a flush), so the next recovery simply replays again.</li>
+<li>It proves that our recovery reads the subset of the format that e2fsprogs writes (v2 superblock, 32-bit tags, revoke) and that e2fsprogs replays our journals. It does not prove compatibility with the kernel's jbd2, which may use features (checksums, 64-bit tags, other commit-block fields) that <code>debugfs</code> did not use here, and it does not test a journal left by a kernel that was stopped abruptly.</li>
+</ol>
+<h3 id="F3-45-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Transaction 6 has no FLUSH between its last copy (record 120) and its commit block (121) either; that is this build's bug throughout. Comparing with the correct build in the worked example, the FLUSH between the copies and the commit (record 126 there) is missing; only the flush after the commit remains (record 122 here). Transaction 7's records 137–144 end at the cut with no flush at all.</li>
+<li>Durable: everything before the last flush before the cut, record 129 (109 block writes). Cached: the 15 writes of records 130–144 (seven data blocks in place, the journal superblock, the descriptor, five copies, the commit block), of which 6 landed.</li>
+<li>Transaction 7: its descriptor (journal block 1, sequence 7) and commit block (journal block 7, sequence 7) both landed, so recovery replayed it and wrote the five targets 66, 2, 1, 1256 and 69 from journal blocks 2–6, whatever they contained.</li>
+<li>Block 69 holds inodes 9 to 16 ((9 − 1) × 128 / 1024 = 1, so block 68 + 1; eight inodes per block). Inode 9 is a reserved inode that now has garbage as its mode; inodes 11 (<code>lost+found</code>), 12 (<code>r4</code>) and 13 (<code>p5</code>) are zeroed or garbage, so their directory entries point to unused inodes; the bitmaps and counters then disagree.</li>
+<li>Journal block 6 held transaction 6's commit block (sequence 6, Figure 2). Transaction 7's copy of block 69 should have replaced it, but did not land. Replay wrote a commit block's bytes over the inode table block, wiping eight inodes: committed files (<code>/p5</code>, fsynced) are destroyed, not merely missing their last update.</li>
+<li>The flush between the last log copy and the commit block (<code>if (flushBeforeCommit_) dev_.flush();</code>, left out by the <code>nobarrier</code> build). A commit-block checksum over the transaction's log blocks would have failed (the slots do not match the descriptor's copies), so recovery would have ignored transaction 7 and kept the file system intact. It would not protect ordered-mode data blocks, which the checksum does not cover (F3-43, strategy 5).</li>
+<li>Random cuts rarely land in the short window between a commit block and the next flush, so 500 random cuts can pass by luck. The suite must include cuts right after each commit block (as <code>harness.py ... commits</code> does) and the known-bad build as a test that must fail.</li>
+</ol>
