@@ -1,0 +1,293 @@
+<!--meta
+id: F5-21
+title: Testing consensus
+course: DS302
+level: L4
+prereqs: F5-18; F5-19; F5-20
+time: 10–14 hours including the lab and the course project
+hardware: none (the lab is the deterministic Raft simulator of F5-18 plus a fuzzer and a linearizability checker)
+maps: Ongaro and Ousterhout, Raft paper (safety properties, client interaction and read-only operations); Kleppmann, "Designing Data-Intensive Applications" (linearizability, consensus)
+analogy: F5 — friends in different towns; a deliberately bad mail service for fault injection; reading the shared notebook in one order for linearizability (proposed new mappings, DS302 NOTES)
+-->
+
+<h2 id="F5-21-hook">Story hook</h2>
+<p>The friends' system has worked for months. Then Kofi asks Amara "what pizza did we order last?", and she answers "margherita" — although Kofi himself had changed the order to "funghi" an hour ago and got a "done". Nothing crashed. Amara simply had not heard that she was no longer the order-writer: the phone line to her town had been down, the others had picked a new writer, and she answered from her own copy of the notebook.</p>
+<p>Bugs like this one never show up while everything works. They need a partition at the right moment, a request to the wrong server, and somebody who compares the answers with what happened in real time. This chapter is about building that somebody: a test harness that injects faults on purpose, checks every safety property while the system runs, and decides whether the answers clients received could have come from one single copy. Then we turn it on the four bugs of this course and measure, honestly, which ones it finds.</p>
+
+<h2 id="F5-21-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> why consensus code needs fault-injection testing and why deterministic simulation makes failures replayable.</li>
+<li><b>Write</b> runtime checkers for Raft's safety properties.</li>
+<li><b>Define</b> linearizability and decide by hand whether a small history is linearizable.</li>
+<li><b>Implement and use</b> a linearizability checker for a single register.</li>
+<li><b>Measure</b> how often randomized testing finds a given bug, and design a targeted nemesis for a rare one.</li>
+<li><b>Diagnose</b> a stale read from a client history and fix it.</li>
+</ul>
+
+<div class="co jargon" id="F5-21-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Deterministic simulation</dt><dd><b>Simple words:</b> running the whole distributed system inside one program where time, the network and randomness are fake and controlled. <b>Analogy:</b> replaying the friends' week from a diary, letter by letter. <b>Precise:</b> executing all nodes, the network and the clock in a single process driven by a seeded pseudo-random generator, so that the same seed always produces the same execution. (Definition from this course's lab; no registry source.)</dd>
+<dt>Nemesis (fault injector)</dt><dd><b>Simple words:</b> the part of a test that breaks things on purpose. <b>Analogy:</b> a deliberately bad mail service that loses, delays and duplicates letters and sometimes knocks a friend out. <b>Precise:</b> a component that schedules crashes, restarts, partitions, message loss, delay and duplication during a test run, either at random or targeting specific nodes such as the current leader. (Term as used in this course's lab; no registry source.)</dd>
+<dt>History</dt><dd><b>Simple words:</b> the list of every client request with when it started, when it ended, and what came back. <b>Analogy:</b> each friend's list of questions asked and answers heard, with times. <b>Precise:</b> a record of operation invocations and responses as observed by clients; an operation without a response has an unknown outcome.</dd>
+<dt>Linearizability</dt><dd><b>Simple words:</b> the system behaves as if there were one copy of the data and each operation happened at one instant between its start and its end. <b>Analogy:</b> every answer fits one single notebook read in one order, consistent with the clock. <b>Precise:</b> a history is linearizable if there is a total order of its operations that respects the sequential specification of the object and in which an operation that completed before another began is ordered first. <sup class="src"><a href="#F5-21-src-D4">D4</a></sup></dd>
+<dt>Stale read</dt><dd><b>Simple words:</b> a read that returns an old value after a newer value was confirmed. <b>Analogy:</b> Amara saying "margherita" after Kofi's "funghi" got its "done". <b>Precise:</b> a read whose result could only be explained by ordering it before a write that completed before the read began; a violation of linearizability. <sup class="src"><a href="#F5-21-src-D4">D4</a></sup></dd>
+</dl></div>
+
+<h2 id="F5-21-pictures">The idea in pictures</h2>
+<p>Figure 1 is the test harness of the lab. Figure 2 draws the forensic history on a time axis.</p>
+<figure id="F5-21-fig1"><div class="svgbox">
+<svg viewBox="0 0 860 300" role="img" aria-labelledby="F5-21-f1t F5-21-f1d">
+<title id="F5-21-f1t">Figure 1: the deterministic test harness</title>
+<desc id="F5-21-f1d">A large box labelled "one process, one seed" contains: a simulated clock and scheduler at the top; five Raft servers in a row; a simulated network below them that delays, drops, duplicates and reorders messages; a nemesis on the left that crashes, restarts and partitions servers; clients on the right that send puts and gets and record a history. Arrows lead out of the box to two checkers: Raft safety checks (Election Safety, Leader Completeness, Log Matching, State Machine Safety) that watch every event, and a linearizability checker that reads the client history at the end. The result is pass or fail with the seed to replay.</desc>
+<rect class="sv-bg" x="0" y="0" width="860" height="300"/>
+<rect class="sv-box" x="20" y="20" width="560" height="260" rx="10"/>
+<text class="sv-tb" x="35" y="42">one process, one seed</text>
+<rect class="sv-b8" x="160" y="52" width="280" height="30" rx="5"/><text class="sv-ts" x="172" y="72">simulated clock and scheduler (1 ms steps)</text>
+<rect class="sv-b2" x="160" y="100" width="48" height="40" rx="5"/><text class="sv-tb" x="172" y="126">n1</text>
+<rect class="sv-b2" x="218" y="100" width="48" height="40" rx="5"/><text class="sv-tb" x="230" y="126">n2</text>
+<rect class="sv-b2" x="276" y="100" width="48" height="40" rx="5"/><text class="sv-tb" x="288" y="126">n3</text>
+<rect class="sv-b2" x="334" y="100" width="48" height="40" rx="5"/><text class="sv-tb" x="346" y="126">n4</text>
+<rect class="sv-b2" x="392" y="100" width="48" height="40" rx="5"/><text class="sv-tb" x="404" y="126">n5</text>
+<rect class="sv-b6" x="160" y="160" width="280" height="44" rx="5"/><text class="sv-ts" x="172" y="180">simulated network: delay 1–20 ms,</text><text class="sv-ts" x="172" y="196">drop 2%, duplicate 1%, reorder</text>
+<rect class="sv-b7" x="35" y="100" width="105" height="104" rx="5"/><text class="sv-tb" x="45" y="124">nemesis</text><text class="sv-ts" x="45" y="146">crash, restart,</text><text class="sv-ts" x="45" y="162">partition, heal;</text><text class="sv-ts" x="45" y="178">random or</text><text class="sv-ts" x="45" y="194">leader hunter</text>
+<rect class="sv-b3" x="460" y="100" width="105" height="104" rx="5"/><text class="sv-tb" x="470" y="124">clients</text><text class="sv-ts" x="470" y="146">3 processes,</text><text class="sv-ts" x="470" y="162">put / get x,</text><text class="sv-ts" x="470" y="178">timeouts;</text><text class="sv-ts" x="470" y="194">record history</text>
+<line class="sv-line" x1="140" y1="150" x2="158" y2="150"/><polygon class="sv-head" points="160,150 150,145 150,155"/>
+<line class="sv-line" x1="460" y1="150" x2="442" y2="150"/><polygon class="sv-head" points="440,150 450,145 450,155"/>
+<text class="sv-ts" x="160" y="235">every event goes to the trace and the checkers</text>
+<rect class="sv-b5" x="610" y="40" width="230" height="110" rx="8"/><text class="sv-tb" x="622" y="62">Raft safety checks</text><text class="sv-ts" x="622" y="84">Election Safety (on election)</text><text class="sv-ts" x="622" y="102">Leader Completeness (on election)</text><text class="sv-ts" x="622" y="120">State Machine Safety (on apply)</text><text class="sv-ts" x="622" y="138">Log Matching (every 50 ms)</text>
+<rect class="sv-b5" x="610" y="170" width="230" height="70" rx="8"/><text class="sv-tb" x="622" y="192">linearizability check</text><text class="sv-ts" x="622" y="212">on the client history,</text><text class="sv-ts" x="622" y="228">after the run</text>
+<line class="sv-line" x1="580" y1="95" x2="608" y2="95"/><polygon class="sv-head" points="610,95 600,90 600,100"/>
+<line class="sv-line" x1="580" y1="205" x2="608" y2="205"/><polygon class="sv-head" points="610,205 600,200 600,210"/>
+<text class="sv-ts" x="610" y="270">result: pass, or fail + seed to replay</text>
+</svg></div><figcaption><b>Figure 1.</b> The lab's harness: <code>cluster.h</code> (scheduler, network, servers, safety checks), <code>fuzz.h</code> (nemesis and clients) and <code>linearizability.h</code>. Settings as in <code>fuzzOne</code>. <sup class="src"><a href="#F5-21-src-R1">R1</a></sup></figcaption></figure>
+
+<figure id="F5-21-fig2"><div class="svgbox">
+<svg viewBox="0 0 860 240" role="img" aria-labelledby="F5-21-f2t F5-21-f2d">
+<title id="F5-21-f2t">Figure 2: the forensic history on a time axis</title>
+<desc id="F5-21-f2d">A time axis from 200 to 950 ms. Four bars, one per client process. Process 201: put x=1 from 200 to 220 ms. Process 202: put x=2 from 700 to 720 ms. Process 203: get x returned 1, from 800 to 810 ms. Process 204: get x returned 2, from 900 to 910 ms. A marker shows that the put x=2 ended before the get returning 1 began, so the get must be ordered after put x=2 and should have returned 2.</desc>
+<rect class="sv-bg" x="0" y="0" width="860" height="240"/>
+<line class="sv-line" x1="60" y1="200" x2="840" y2="200"/><polygon class="sv-head" points="842,200 831,195 831,205"/>
+<text class="sv-ts" x="60" y="222">200 ms</text><text class="sv-ts" x="565" y="222">700</text><text class="sv-ts" x="665" y="222">800</text><text class="sv-ts" x="765" y="222">900</text>
+<text class="sv-ts" x="10" y="45">201</text><rect class="sv-b2" x="60" y="30" width="20" height="22"/><text class="sv-ts" x="90" y="46">put x=1 (200–220 ms)</text>
+<text class="sv-ts" x="10" y="85">202</text><rect class="sv-b5" x="560" y="70" width="20" height="22"/><text class="sv-ts" x="590" y="86">put x=2 (700–720)</text>
+<text class="sv-ts" x="10" y="125">203</text><rect class="sv-b7" x="660" y="110" width="10" height="22"/><text class="sv-ts" x="680" y="126">get x → 1 (800–810), answered by n1</text>
+<text class="sv-ts" x="10" y="165">204</text><rect class="sv-b5" x="760" y="150" width="10" height="22"/><text class="sv-ts" x="780" y="166">get → 2</text>
+<line class="sv-dash" x1="580" y1="60" x2="580" y2="195"/>
+<text class="sv-ts" x="300" y="110">put x=2 ended (720) before</text><text class="sv-ts" x="300" y="126">get began (800): the get must</text><text class="sv-ts" x="300" y="142">see 2, but it returned 1</text>
+</svg></div><figcaption><b>Figure 2.</b> The client history of <code>stale_read.out</code>, not to scale. No single order of the four operations is consistent with both the answers and the real-time order. <sup class="src"><a href="#F5-21-src-R1">R1</a></sup> Definition of linearizability after Kleppmann. <sup class="src"><a href="#F5-21-src-D4">D4</a></sup></figcaption></figure>
+
+<h2 id="F5-21-layer1">Layer 1 — the kid explanation</h2>
+<p>To test a plan for agreeing, you hire a terrible mail service on purpose: it loses letters, delays them, delivers some twice, and sometimes cuts a town off. You let the friends run their plan through this mail service thousands of times, each time with a different dice roll, and you write down every question and every answer with the time. Then a checker asks: "could all these answers have come from one notebook, read one line at a time, never going back in time?" If not, there is a bug — and because you wrote down the dice roll, you can replay the exact same bad week as often as you like to find it.</p>
+
+<h2 id="F5-21-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F5-21-l2-why">Why ordinary tests are not enough</h3>
+<p>Every bug of this course needed a specific combination of events: a crash between a vote and its disk write (F5-18), a partition that left a follower behind (F5-19), four leader changes in a particular order (F5-20). Unit tests check what the author thought of. Consensus bugs live in the interleavings the author did not think of, so we generate interleavings automatically and check properties rather than expected outputs.</p>
+<p>Three ingredients make this work:</p>
+<ol>
+<li><b>Deterministic simulation.</b> All servers, the network and the clock run in one process driven by one seeded random generator (<code>sim.h</code>, <code>cluster.h</code>). A failing seed is a complete bug report: run it again and the same thing happens, as often as needed, with any amount of tracing.</li>
+<li><b>A nemesis.</b> A fault schedule derived from the seed: crashes, restarts, partitions, healing, plus a network that delays (1–20 ms), drops (2%), duplicates (1%) and therefore reorders messages (<code>fuzzOne</code>).</li>
+<li><b>Checkers.</b> Properties that must hold in every execution: Raft's own safety properties, checked inside the simulation where one can see every server (F5-20), and linearizability of what clients saw, checked from the outside.</li>
+</ol>
+
+<h3 id="F5-21-l2-lin">Linearizability</h3>
+<p>A key-value service built on Raft promises clients that it behaves like a single copy: once a write has completed, every read that begins afterwards sees it (or something newer). Formally, the history must be explainable by one total order of operations, each taking effect at an instant between its invocation and response. <sup class="src"><a href="#F5-21-src-D4">D4</a></sup> Listing 2 checks four small histories:</p>
+<pre class="output" data-run="F5-21/lin_demo"></pre>
+<p>H1: the get overlaps the put, so it may take effect before it: linearizable. H2: the get starts after the put ended and still returns 0: no valid order. H3 and H4 contain a put that never got a reply: its outcome is unknown, so it may have taken effect at any time after it was called, or never. In H4 that freedom explains everything ("get 0, then put 1, then get 1"); in H3 one reader saw 1 and a <i>later</i> reader saw 0, which no single order can explain. <sup class="src"><a href="#F5-21-src-R1">R1</a></sup></p>
+
+<h3 id="F5-21-l2-fuzz">The correct implementation under fire</h3>
+<pre class="output" data-run="F5-21/fuzz"></pre>
+<p>100 seeds, each 4,000 simulated ms with five servers and a random nemesis acting every 150 ms for the first 3,000 ms: no safety violation and no non-linearizable history. 4,994 client operations were started and 3,434 answered (the others timed out during faults, which is allowed); the runs elected 315 leaders in total. <sup class="src"><a href="#F5-21-src-R1">R1</a></sup> That is evidence, not proof: it says no bug was found by <i>these</i> schedules.</p>
+
+<h3 id="F5-21-l2-hunt">How good is the tester? Turn the bugs back on</h3>
+<pre class="output" data-run="F5-21/bug_hunt"></pre>
+<div class="tw"><table>
+<thead><tr><th>Fault (forensic lab)</th><th>Nemesis</th><th>Seeds that caught it</th><th>First symptom</th></tr></thead>
+<tbody>
+<tr><td>lazyPersist (F5-18)</td><td>random</td><td>3 of 100</td><td>Leader Completeness, seed 27</td></tr>
+<tr><td>skipPrevLogCheck (F5-19)</td><td>random</td><td>94 of 100</td><td>State Machine Safety, seed 2</td></tr>
+<tr><td>readFromLocalState (this chapter)</td><td>random</td><td>7 of 100</td><td>not linearizable, seed 5</td></tr>
+<tr><td>commitOldTermByCount (F5-20), no no-op</td><td>random</td><td>0 of 100</td><td>—</td></tr>
+<tr><td>commitOldTermByCount, no no-op</td><td>leader hunter</td><td>2 of 150</td><td>Leader Completeness, seed 33</td></tr>
+<tr><td>commitOldTermByCount, with no-op</td><td>leader hunter</td><td>0 of 150</td><td>—</td></tr>
+<tr><td>none (correct Raft)</td><td>leader hunter</td><td>0 of 150</td><td>—</td></tr>
+</tbody></table></div>
+<p>Read the numbers carefully. <sup class="src"><a href="#F5-21-src-R1">R1</a></sup> A bug on the common path (skipping the consistency check) shows up in almost every run. A bug that needs a crash in a short window (lazy persistence) or a partition plus a read at the wrong server (stale reads) shows up in a few percent — enough, if you run thousands of seeds. The Figure 8 bug was <i>never</i> found by the random nemesis in 100 seeds; it needs several leader changes in a specific order. A nemesis that targets whoever is leader every 50 ms found it twice in 150 seeds, and with the no-op entry on election it found nothing, because the no-op closes the window. Two lessons: a tester's power depends on its fault schedule, and you should measure that power by planting known bugs (mutation testing) before trusting a clean result.</p>
+
+<h2 id="F5-21-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F5-21-l3-checker">How the linearizability checker works</h3>
+<p>Listing 2's checker searches for a valid order in the style of Wing and Gong: repeatedly choose an operation that may take effect next — one that is not yet placed and that began before every unplaced operation's response — apply it to a model register, and backtrack when a get returns the wrong value. It remembers visited (set of placed operations, register value) pairs, so no state is explored twice. Two simplifications keep it small: gets without a reply are dropped (they constrain nothing), and so are unanswered puts whose value no get returned (they can always be explained as "never took effect", because each put writes a distinct value). The checker handles at most 63 operations (a 64-bit set) and is exponential in the worst case. That is fine for 50-operation runs; real checkers split histories by key and use smarter search.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The attribution of this search to Wing and Gong, and the original definition of linearizability by Herlihy and Wing, are recalled from memory; neither paper is in the F5 source registry. Industrial tools that test real databases with a nemesis and a linearizability checker (for example the Jepsen project) and the formal TLA+ specification of Raft are also outside the registry. The complexity claim (checking linearizability is NP-complete in general) is likewise unverified here. Add sources before publication (dossier gate G1).</p></div>
+
+<h3 id="F5-21-l3-reads">Linearizable reads in Raft</h3>
+<p>The forensic lab's bug is the classic one: a leader answering reads from its local state. A leader that has been partitioned away may not know that a newer leader exists and that newer writes have been committed. The Raft paper's remedy: a leader must have the latest committed entries (it commits a no-op at the start of its term) and must check that it has not been deposed before answering a read, by exchanging heartbeats with a majority; alternatively, it can rely on the heartbeat to grant a lease, which depends on bounded clock drift. <sup class="src"><a href="#F5-21-src-D1">D1</a></sup> The lab takes the simplest correct route: reads go through the log like writes, so a get is answered only after it is committed in the leader's term.</p>
+
+<h3 id="F5-21-l3-limits">What the harness cannot find</h3>
+<ul>
+<li><b>Bugs outside the model.</b> The simulated disk is perfect and instantaneous; a real file system can reorder, tear or lose writes that were not flushed. The network simulator does not corrupt messages.</li>
+<li><b>Bugs in code not simulated.</b> If production uses real sockets, threads and timers, the simulation tests a model of it; keeping the two in step needs the same code compiled against two environments (the lab's <code>Env</code> interface is that seam).</li>
+<li><b>Liveness.</b> The checkers test safety; a run in which nothing ever commits passes. Add progress checks: "after healing, a put completes within <i>T</i> ms".</li>
+<li><b>Rare schedules.</b> As the table shows, a clean result after 100 seeds says little about bugs that need five coordinated events.</li>
+</ul>
+
+<h2 id="F5-21-hardware">How the hardware actually does it</h2>
+<p>Deterministic simulation tests logic, not machines. The physical failure modes that matter for consensus — a disk that acknowledges a flush it has not made durable, a process paused by the operating system or the virtual machine host, a clock that jumps, a network card that drops packets under load, a partition that is asymmetric (A hears B, B does not hear A) — must be tested on real hardware too: by killing processes and cutting power, by pausing processes with signals, by adjusting clocks, by dropping packets with firewall rules. The simulator can model some (the lab's <code>block</code> makes one-way partitions); the disk and clock behaviours depend on the actual devices and must be measured there. This build ran no such hardware tests.</p>
+
+<h2 id="F5-21-worked">Worked example</h2>
+<p><b>Task.</b> Is this history on register x (initially 0) linearizable? A: put x=1 [0, 50]. B: get x → 1 [10, 20]. C: get x → 0 [30, 40]. If yes, give an order.</p>
+<ol>
+<li>Real-time constraints: B ended (20) before C began (30), so B precedes C. A overlaps both.</li>
+<li>B returned 1, so A must precede B: A, B, then C. But C returns 0 after A wrote 1, and there is no other put. Contradiction.</li>
+<li>Try A after B: then B would read 0, not 1. Contradiction.</li>
+<li>Not linearizable — the same shape as H3 in Listing 2, with the put answered this time. A system that produces this has let one reader see a write and a later reader miss it.</li>
+<li>Variation: if C had been [15, 40] instead, C overlaps B, and the order C(0), A(1), B(1) works: linearizable.</li>
+</ol>
+
+<h2 id="F5-21-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>fuzz.h</code>: one randomized run.</p>
+<pre class="listing" data-src="F5-21/fuzz.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>20–24</td><td><code>Nemesis</code></td><td>Random faults every 150 ms, or the leader hunter every 50 ms.</td><td>Two fault schedules with very different power (bug-hunt table).</td></tr>
+<tr><td>36–48</td><td>setup</td><td>5 servers; delays 1–20 ms, 2% loss, 1% duplicates; 3 clients, 50 operations in total.</td><td>Reordering, loss and duplication without scripting them.</td></tr>
+<tr><td>50</td><td><code>plan</code></td><td>A separate generator for the fault schedule.</td><td>The schedule does not change when the servers draw more random numbers.</td></tr>
+<tr><td>51–89</td><td>schedules</td><td>Crash, restart, isolate the leader, partition, heal.</td><td>The nemesis of Figure 1.</td></tr>
+<tr><td>90–98</td><td>end of run</td><td>Heal and restart everything at 3,000 ms; run to 4,000 ms.</td><td>Lets late commits and repairs happen before checking.</td></tr>
+<tr><td>100–110</td><td>results</td><td>Raft violations from the cluster; linearizability of the client history.</td><td>Both kinds of checker.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>linearizability.h</code> and <code>lin_demo.cpp</code>.</p>
+<pre class="listing" data-src="F5-21/linearizability.h"></pre>
+<pre class="listing" data-src="F5-21/lin_demo.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>27–40</td><td>constructor</td><td>Drops unanswered gets and unobserved unanswered puts.</td><td>Keeps the search small without changing the answer.</td></tr>
+<tr><td>62–72</td><td><code>firstEnd</code>, <code>finished</code></td><td>Earliest response among unplaced operations; success when only unknown puts remain.</td><td>An operation may go next only if it began before <code>firstEnd</code>.</td></tr>
+<tr><td>73–75</td><td>memo</td><td>Skip (placed set, value) states already explored.</td><td>Turns repeated subproblems into one visit each; added after a slow seed during this build.</td></tr>
+<tr><td>76–89</td><td>choice and backtracking</td><td>Try every eligible operation; a get must return the model's value.</td><td>The Wing–Gong style search.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>fuzz.cpp</code> and <code>bug_hunt.cpp</code>. They run for about a minute together under the sanitizers; <code>run_lab.sh</code> allows 120 s and 300 s (the <code>.timeout</code> files).</p>
+<pre class="listing" data-src="F5-21/fuzz.cpp"></pre>
+<pre class="listing" data-src="F5-21/bug_hunt.cpp"></pre>
+<p><b>Build commands</b> (from the logs): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined fuzz.cpp -o fuzz</code>, likewise for the other programs. <sup class="src"><a href="#F5-21-src-R1">R1</a></sup></p>
+
+<h2 id="F5-21-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A bad mail service is random.</b> The most valuable fault schedules are not random but adversarial: the leader hunter found what random faults never did.</li>
+<li><b>Replaying a diary needs a perfect diary.</b> Determinism holds only if every source of randomness and time goes through the simulator; one call to the real clock or one hash-ordered container iteration in the wrong place breaks replay.</li>
+<li><b>"One notebook read in order" is about clients.</b> Linearizability says nothing about the servers' internal notebooks; a system can have perfect logs and still give stale answers, as in the forensic lab.</li>
+</ul>
+
+<h2 id="F5-21-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> a failing seed does not fail again. <b>Cause:</b> non-determinism (real time, threads, unordered iteration, uninitialized memory). <b>How to find it:</b> run the same seed twice and diff the traces; the first difference points at it. <b>Fix:</b> route all time and randomness through the simulator.</li>
+<li><b>Symptom:</b> the linearizability checker never finishes. <b>Cause:</b> many concurrent operations with unknown outcomes. <b>Fix:</b> fewer clients per key, shorter runs, memoization, dropping unobserved puts.</li>
+<li><b>Symptom:</b> everything passes, always. <b>Cause:</b> a weak nemesis or a checker that checks nothing. <b>Fix:</b> plant known bugs and measure the catch rate (bug_hunt).</li>
+<li><b>Symptom:</b> client timeouts are recorded as failures. <b>Cause:</b> treating "no reply" as "did not happen". <b>Fix:</b> record an unknown outcome; the checker must allow both.</li>
+</ul>
+
+<div class="co transition" id="F5-21-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F5-18">F5-18</a> to <a href="#F5-20">F5-20</a>, Raft's rules and the safety properties they protect. <b>What carries over:</b> the deterministic simulator and its seeds, the five properties as runtime checks, and the four planted faults. <sup class="src"><a href="#F5-21-src-D1">D1</a></sup> <b>What changes:</b> we stop reasoning about one trace at a time and start generating thousands, judging them by properties and by what clients observed (linearizability). <sup class="src"><a href="#F5-21-src-D4">D4</a></sup> <b>What comes next:</b> the course project — a Raft-replicated key-value service that is the seed of MP2 — and then <a href="#DS303">DS303</a>.</p></div>
+
+<h2 id="F5-21-check">Check yourself</h2>
+<ol>
+<li>Name three ingredients of a deterministic fault-injection test and what each contributes.</li>
+<li>Why does a client timeout count as "unknown outcome" rather than "failed"?</li>
+<li>Which statement is true? (a) 100 passing random seeds prove a Raft implementation correct. (b) A history in which every get returns the latest committed value at the server that answered is linearizable. (c) A put without a reply may be placed anywhere after its invocation, or omitted. (d) Linearizability concerns only the order of operations, not real time.</li>
+<li>Explain in your own words why the random nemesis did not find the commitOldTermByCount bug.</li>
+<li>Is this history linearizable? A: put x=1 [0, 10]. B: put x=2 [5, 30]. C: get x → 1 [20, 25]. D: get x → 2 [35, 40].</li>
+<li>Why does the fuzzer use a separate random generator for the fault schedule?</li>
+<li>Predict, then run: in <code>bug_hunt.cpp</code>, run lazyPersist with the leader hunter for 150 seeds. More or fewer catches than the random nemesis?</li>
+<li>Name two failure modes the simulator cannot find, and how you would test them.</li>
+</ol>
+
+<h2 id="F5-21-lab">Lab</h2>
+<p><b>Goal.</b> Run the fuzzer and the bug hunt, add a liveness check, and strengthen the nemesis.</p>
+<p><b>Hardware and software needed.</b> None special; <code>g++</code> 13.3.0, C++20. Run <code>university/labs/run_lab.sh university/labs/F5-21</code> (about a minute or more; the folder ran in roughly 70 s in this build).</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab; compare <code>fuzz.out</code> and <code>bug_hunt.out</code> with Layer 2.</li>
+<li>Replay seed 27 of the lazyPersist hunt with tracing on (<code>traceLevel = Trace::Events</code>) and write a five-line explanation of the violation.</li>
+<li>Add a liveness check: after the final heal at 3,000 ms, a put submitted at 3,100 ms must complete by 3,800 ms. Run 100 seeds of correct Raft. Report failures and explain them.</li>
+<li>Add asymmetric partitions to the random nemesis (<code>block(a, b)</code> without <code>block(b, a)</code>). Rerun fuzz and bug_hunt.</li>
+<li>Do check-yourself question 7, and design a nemesis of your own that catches commitOldTermByCount more often than 2 in 150. Report your rate.</li>
+<li>Do the forensic lab.</li>
+</ol>
+<p><b>Expected observations.</b> Step 1 as in this build's run (table above). <sup class="src"><a href="#F5-21-src-R1">R1</a></sup> Steps 3–5 are yours; report seeds and rates, including zero.</p>
+<p><b>Verification.</b> Exit code 0 for <code>fuzz</code>; for each new nemesis, the catch table with the number of seeds.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The run is too slow → build without sanitizers for large experiments (<code>-O2</code>), but keep sanitizer runs for checking.</li>
+<li>Linearizability "fails" on correct Raft → check that unanswered operations are recorded with <code>response = -1</code>, not with the timeout time.</li>
+<li>Liveness failures after healing → a server may still be crashed, or elections may be slow with many terms; print the leader per 100 ms.</li>
+</ul>
+<p><b>Extension.</b> Make the simulator's disk realistic: a write is durable only after an explicit flush, and a crash loses unflushed writes. Add a <code>Faults</code> flag that skips the flush and measure how often the fuzzer catches it.</p>
+
+<h2 id="F5-21-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A customer reports: "I set x to 2 and got 'done'. A colleague read x a moment later and got 1." Support replies that all replicas agree and the safety checker is green. You get the server trace and the client history for the incident.</p>
+<p><b>Evidence pack.</b> Real output of <code>stale_read.cpp</code> (the deployed leader code):</p>
+<pre class="output" data-run="F5-21/stale_read"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which server answered each operation, and in which term was each of them leader?</li>
+<li>Is the client history linearizable? Draw it on a time axis.</li>
+<li>Why does the Raft safety checker report no violation?</li>
+<li>Hypotheses: (a) the put x=2 was not really committed; (b) n1 answered the get without checking that it was still leader; (c) the client clocks are wrong. Which evidence decides?</li>
+<li>Root cause and fix: which rule about read-only operations was violated? Name two correct ways to serve reads.</li>
+</ol>
+<p><b>Method hints.</b> Look for the line in which n1 learns about term 2, and compare its time with the get.</p>
+
+<h2 id="F5-21-project">Mini-project — course project: a Raft-replicated key-value service</h2>
+<p>This is DS302's project and the seed of MP2. Build a key-value service on the lab's Raft library with:</p>
+<ul>
+<li>many keys; put, get, and compare-and-set; per-client request numbers with duplicate detection;</li>
+<li>linearizable reads (through the log, or the read-index method of Layer 3);</li>
+<li>membership changes with joint consensus (F5-20);</li>
+<li>a test suite: the fuzzer of this chapter extended to many keys (check linearizability per key), a leader-hunting nemesis, a liveness check after healing, and a planted-bug table for at least the four faults of this course, with the catch rate of each.</li>
+</ul>
+<p>Deliver the code, a replay command for every failing seed you found during development, and a two-page report.</p>
+<p><b>Rubric.</b> Correctness: zero violations over at least 1,000 seeds with the full nemesis (4). Test power: planted-bug table with honest rates, including any bug you could not catch (3). Linearizable reads with an argument why they are linearizable (1). Report, including what the simulator cannot test (2).</p>
+
+<h2 id="F5-21-summary">Summary</h2>
+<ul>
+<li>Consensus bugs live in rare interleavings; test with generated fault schedules and property checks, not expected outputs.</li>
+<li>Deterministic simulation turns every failing seed into a replayable bug report.</li>
+<li>Check Raft's safety properties inside the simulation and linearizability of client histories from outside.</li>
+<li>Linearizable: one order of operations, consistent with each answer and with real time; unknown outcomes may be placed anywhere after their call, or omitted.</li>
+<li>Measure the tester: in this build the random nemesis caught skipPrevLogCheck in 94 of 100 seeds but commitOldTermByCount in 0 of 100; a leader hunter caught it in 2 of 150.</li>
+<li>Leaders must not answer reads from local state without confirming leadership; the lab sends reads through the log.</li>
+</ul>
+
+<h2 id="F5-21-sources">Sources</h2>
+<ol>
+<li id="F5-21-src-D1">D1 — Diego Ongaro, John Ousterhout, "In Search of an Understandable Consensus Algorithm (Extended Version)" (tier 5). Used: the safety properties, client interaction, read-only operations (no-op, heartbeat exchange before answering, leases). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-21-src-D4">D4 — Martin Kleppmann, "Designing Data-Intensive Applications" (tier 3; edition to be recorded): linearizability, its definition and stale reads; consensus. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-21-src-R1">R1 — lab runs of Listings 2 and 3 and of the forensic programs (<code>lin_demo.log</code>, <code>fuzz.log</code>, <code>bug_hunt.log</code>, <code>stale_read.log</code>, <code>stale_read_fixed.log</code>): <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, ASan and UBSan; exit codes 0, 0, 0, 1 (expected: the history is not linearizable), 0.</li>
+</ol>
+
+<h2 id="F5-21-glossary">Glossary links</h2>
+<p><a href="#gl-deterministic-simulation">Deterministic simulation</a> · <a href="#gl-nemesis">Nemesis</a> · <a href="#gl-history-of-operations">History (of operations)</a> · <a href="#gl-linearizability">Linearizability</a> · <a href="#gl-stale-read">Stale read</a> · <a href="#gl-safety-property">Safety property</a> · <a href="#gl-liveness-property">Liveness property</a></p>
+
+<h2 id="F5-21-next">Next chapter</h2>
+<p>Next course: <a href="#DS303">DS303</a>. Previous: <a href="#F5-20">F5-20 Raft: safety and membership changes</a>. Course: <a href="#DS302">DS302</a>.</p>
+
+<h2 id="F5-21-answers">Answers to Check yourself</h2>
+<ol>
+<li>Deterministic simulation (replayable failures); a nemesis (faults that ordinary runs never produce); checkers (decide pass or fail by properties, both inside the system and from the clients' view).</li>
+<li>The request may have been committed and applied, with only the reply lost or late; or it may never have reached a leader. A correct system may do either, so the checker must allow both.</li>
+<li>(c). (a) is false (the bug-hunt table). (b) is false: the forensic lab — n1's latest committed value was 1, yet the read was stale. (d) is false: real-time order is the heart of the definition.</li>
+<li>It needs several leader changes in a specific order: a leader that replicates an old-term entry to a majority and commits it by counting, followed by the election of a server with a different entry from a later old term. Random crashes every 150 ms rarely produce that sequence, and the no-op entry closes most remaining windows.</li>
+<li>Yes: A, C, B, D. A ends at 10 before C starts at 20, B overlaps C, so put 1, get → 1, put 2, get → 2 fits all answers and real-time constraints (B may take effect after C at time 26–30).</li>
+<li>So that the schedule of faults stays the same when a change in the servers draws more or fewer random numbers; otherwise any code change would move every fault.</li>
+<li>Run it and report the number; there is no measured answer in this build. A reasonable prediction: the leader hunter crashes leaders more often, and lazyPersist loses votes and log entries of whoever crashes, so more catches are plausible — but votes are cast by followers, which the hunter rarely crashes.</li>
+<li>Disk behaviour (lost unflushed writes, torn writes) — test by power-cutting or killing machines during writes; clock jumps and process pauses — test by pausing processes and adjusting clocks on real machines. Also asymmetric network faults on real networks, with firewall rules.</li>
+</ol>
+<h3 id="F5-21-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> n1 led term 1 from 110 ms; the partition {1,2} | {3,4,5} at 300 ms cut it off from the majority; n3 won term 2 at 570 ms. put x=2 was committed by n3 (term 2) at 715 ms. The get at 800 ms went to n1, which answered 1 at 810 ms, still believing it was leader of term 1. n1 learned about term 2 only at 1,010 ms, after healing ("n1 term 2 LEADER -> follower").</p>
+<p><b>Linearizable?</b> No (Figure 2): put x=2 completed at 720 ms, before the get began at 800 ms, so the get must follow it and return 2. The checker agrees: "NOT linearizable".</p>
+<p><b>Why the Raft checker is green.</b> The logs and state machines are all consistent: n1 never applied anything wrong; it answered from a correct but old state. The Raft properties concern logs; linearizability concerns what clients observed. You need both checkers.</p>
+<p><b>Hypotheses.</b> (a) ruled out: "715 ms n3 commits up to entry 4 (t2 put x=2)" with n4 and n5. (c) ruled out: the times come from the simulator's single clock. (b) confirmed: n1's get reply has no corresponding log entry; it was answered 10 ms after the request, the time of one round trip from the client, with no message to the other servers.</p>
+<p><b>Root cause and fix.</b> The leader answered a read-only request without first checking that it had not been deposed. The deployed code ran with <code>readFromLocalState</code> (raft_replication.h lines 170–175). Correct options: send reads through the log (the lab's default: the fixed run shows n1 appending "t1 get x" and never committing it, so that client gets no reply, which is allowed, while the get at n3 returns 2); or record the commit index, exchange heartbeats with a majority to confirm leadership, then answer once that index is applied; or leases, which depend on bounded clock drift. <sup class="src"><a href="#F5-21-src-D1">D1</a></sup></p>
+<pre class="output" data-run="F5-21/stale_read_fixed"></pre>
+<p><b>How the evidence was made.</b> <code>stale_read_story.h</code> fixes the timeouts, partitions {1,2} from the rest at 300 ms, sends put x=2 to n3 at 700 ms, get x to n1 at 800 ms and to n3 at 900 ms, heals at 1,000 ms, and checks the history; <code>stale_read.cpp</code> runs it with the fault, <code>stale_read_fixed.cpp</code> without.</p>
+<pre class="listing" data-src="F5-21/stale_read_story.h"></pre>
