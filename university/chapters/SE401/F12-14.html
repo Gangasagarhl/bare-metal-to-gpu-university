@@ -1,0 +1,337 @@
+<!--meta
+id: F12-14
+title: Profiling whole systems
+course: SE401
+level: L4
+prereqs: F12-13; SP302 (F2-55 profilers); DS402 (traces, spans, metrics) or CU303 (F6-32 GPU profilers); OS201 (system calls, blocking, context switches)
+time: 12–16 hours including the lab and the course forensic lab "The 99th percentile"
+hardware: none: one Linux computer with g++ and strace (the build used g++ 13.3 and strace 6.8 on a shared 4-CPU cloud virtual machine); Listing 1 is a real multi-threaded service measured on whatever machine runs it; GPU profiling of MP3 needs an NVIDIA GPU (untested on hardware)
+maps: Curriculum 13.4 (profile the whole system; explain the gap to the target); Gregg "Systems Performance" (USE method, off-CPU analysis; pending verification)
+analogy: F12 — building a house as a team (registered: design doc = the house blueprint); proposed in NOTES.md: whole-system profile = following one wheelbarrow of bricks from the lorry to the wall and writing down where it stopped; off-CPU time = a bricklayer standing idle waiting for mortar; snapshot lock hold = the site inspector closing the only gate for half an hour
+-->
+
+<h2 id="F12-14-hook">Story hook</h2>
+<p>Most days, a wheelbarrow of bricks takes three minutes from the lorry to the wall. A few times a day it takes twenty-five. Kwame watches the bricklayers: they are fast and never idle while they have bricks. He watches the lorry: it unloads on time. Ana suggests buying faster wheelbarrows.</p>
+<p>Ingrid does something different. She gives every wheelbarrow a card and asks each person who touches it to write the time: left the lorry, reached the gate, passed the gate, reached the wall. At the end of the day she sorts the cards by total time and reads the slowest ones. Every slow card has the same gap: thirty minutes between "reached the gate" and "passed the gate". The site has one gate, and twice a day the inspector closes it while he counts everything inside the fence. Nobody was slow. Everybody was waiting.</p>
+<p>Faster wheelbarrows would have changed nothing. This chapter teaches Ingrid's method for software: follow requests through the whole system, find where the slow ones waited, and connect that wait to whatever else was happening at the same moment.</p>
+
+<h2 id="F12-14-able">What you will be able to do</h2>
+<ul>
+<li><b>Instrument</b> a service so that every request carries a trace of timed spans, every thread reports its CPU time and context switches, and background tasks log what they did and when.</li>
+<li><b>Separate</b> on-CPU time from off-CPU time, and choose the tool that sees each: a sampling profiler for the first, traces, lock and I/O timing and system-call summaries for the second.</li>
+<li><b>Apply</b> the USE method (utilisation, saturation, errors) to every resource of a system, including locks, worker pools and the disk, not only the CPU.</li>
+<li><b>Attribute</b> a latency tail to its cause: compare the slowest requests with the rest, and correlate them in time with background events, distinguishing cause from coincidence.</li>
+<li><b>Plan</b> the next measurement when the evidence does not decide, and recognise the next bottleneck after a fix.</li>
+</ul>
+
+<div class="co jargon" id="F12-14-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Whole-system profile</dt><dd><b>Simple words:</b> a record of where every part of the system spent its time, collected together during one run. <b>Analogy:</b> Ingrid's cards on every wheelbarrow, plus the gatekeeper's diary and each worker's timesheet, for the same day. <b>Precise:</b> a set of time-aligned measurements of one run of a system under a defined load: per-request traces (where requests spent their time), per-thread or per-process resource use (CPU time, context switches), per-resource utilisation and saturation (locks, queues, disks, network) and an event log of background activity. It answers "where did the time go?" for the user-visible metric, not only "which function uses the CPU?" <sup class="src"><a href="#F12-14-src-D2">D2</a></sup></dd>
+<dt>On-CPU and off-CPU time</dt><dd><b>Simple words:</b> time a thread spends running instructions, and time it spends waiting. <b>Analogy:</b> a bricklayer laying bricks, and the same bricklayer standing at the gate. <b>Precise:</b> a thread's wall-clock time divides into time scheduled on a processor (on-CPU) and time blocked or runnable but not running (off-CPU: waiting for a lock, I/O, a condition variable, a timer, or for a processor). A sampling profiler of CPU use sees only on-CPU time; off-CPU time is seen through tracing of blocking events, per-thread CPU time against wall time, context-switch counts and system-call timing <sup class="src"><a href="#F12-14-src-D1">D1</a></sup> <sup class="src"><a href="#F12-14-src-R1">R1</a></sup>.</dd>
+<dt>USE method</dt><dd><b>Simple words:</b> for every resource, ask how busy it is, how much work waits for it, and whether it fails. <b>Analogy:</b> for the gate: how often is it closed or in use, how long is the queue in front of it, does anything get turned away? <b>Precise:</b> a checklist method attributed to Brendan Gregg: for each resource (processors, memory, disks, network, and software resources such as locks, queues and thread pools) check utilisation (fraction of time busy, or fraction of capacity used), saturation (extra work waiting, such as a queue length or wait time) and errors. It finds bottlenecks that function profiles miss because the waiting resource is not a CPU <sup class="src"><a href="#F12-14-src-D1">D1</a></sup>.</dd>
+<dt>Critical path (of a request)</dt><dd><b>Simple words:</b> the chain of steps that decides when a request finishes. <b>Analogy:</b> the wheelbarrow's route: lorry, gate, wall; making the lorry faster does not help if the gate is shut. <b>Precise:</b> the sequence of spans, including waits, on which the request's completion depends; time removed from a span off the critical path does not shorten the request. In a service, waits for queues, locks and durable writes are often on the critical path even when no thread uses the CPU.</dd>
+<dt>Lock hold time</dt><dd><b>Simple words:</b> how long one thread keeps a lock before letting go. <b>Analogy:</b> how long the inspector keeps the gate closed. <b>Precise:</b> the time between acquiring and releasing a lock in one critical section; every thread that needs the lock during that time waits at least until the release. Long holds by rare operations (snapshots, compaction, resizing) produce tail latency for frequent operations even when the lock's average utilisation is low.</dd>
+<dt>Tail attribution</dt><dd><b>Simple words:</b> finding out which cause made the slowest requests slow. <b>Analogy:</b> sorting the wheelbarrow cards by total time and checking what the slowest have in common. <b>Precise:</b> the analysis that compares the slowest requests (for example the slowest 1 %) with the rest: which spans grow, which events overlap them in time, and how much more often than for an ordinary request. A cause is supported when the slow requests share it far more often than the others and a change that removes it removes the tail; a single coincidence in time is not enough.</dd>
+</dl>
+<p>Terms from earlier courses used here: <a href="#gl-trace-and-span">trace and span</a>, <a href="#gl-metric-counter-gauge-histogram">metric</a>, <a href="#gl-percentile-p50-p99">percentile</a>, <a href="#gl-tail-latency">tail latency</a> (DS402); <a href="#gl-profiler">profiler</a>, <a href="#gl-sampling-profiler">sampling profiler</a>, <a href="#gl-instrumentation">instrumentation</a>, <a href="#gl-wall-clock-time">wall-clock time</a> (SP202); <a href="#gl-hot-spot">hot spot</a>, <a href="#gl-latency-histogram">latency histogram</a> (SP302); <a href="#gl-system-call">system call</a>, <a href="#gl-blocking-system-call">blocking (system call)</a>, <a href="#gl-context-switch">context switch</a>, <a href="#gl-strace">strace</a>, <a href="#gl-starvation">starvation</a> (OS201); <a href="#gl-mutex">mutex</a>, <a href="#gl-lock-contention">lock contention</a> (SP203); <a href="#gl-fsync">fsync</a>, <a href="#gl-journaling-write-ahead-logging">journaling (write-ahead logging)</a> (OS401); <a href="#gl-utilisation">utilisation</a>, <a href="#gl-head-of-line-blocking-queue">head-of-line blocking</a>; <a href="#gl-utilisation-law">utilisation law</a> and <a href="#gl-saturation-of-a-resource">saturation of a resource</a> (<a href="#F12-12">F12-12</a>).</p>
+</div>
+
+<h2 id="F12-14-pictures">The idea in pictures</h2>
+<p>Figure 1 is the service of Listing 1 with the measurement points drawn in. Every arrow a request crosses has a timestamp; every box that can make a request wait is a resource for the USE method.</p>
+<figure id="F12-14-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 290" role="img" aria-labelledby="F12-14-f1t F12-14-f1d">
+<title id="F12-14-f1t">Figure 1: the service of Listing 1 and where its trace spans are measured</title>
+<desc id="F12-14-f1d">Left to right: a load generator sends requests at intended times into a request queue; three worker threads take requests from the queue, parse them, take the store lock, read or write the store, and, for puts, wait for the write-ahead-log writer thread to write and fdatasync the batch to disk; then they format the reply. Below, two background tasks: a snapshot task that takes the same store lock every 300 ms, and a metrics task with its own lock every second. Dots mark the timestamps intended, dequeued, parsed, lock acquired, lock released, durable, done. Labels give the span names queue, parse, lock wait, store, wal wait, reply.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="290"/>
+<rect class="sv-b1" x="12" y="60" width="96" height="50"/><text class="sv-tb" x="22" y="82">generator</text><text class="sv-ts" x="22" y="98">open loop</text>
+<rect class="sv-b2" x="140" y="60" width="96" height="50"/><text class="sv-tb" x="150" y="82">request</text><text class="sv-ts" x="150" y="98">queue</text>
+<rect class="sv-b3" x="268" y="40" width="140" height="90"/><text class="sv-tb" x="278" y="62">3 workers</text><text class="sv-ts" x="278" y="80">parse (CPU)</text><text class="sv-ts" x="278" y="96">reply (CPU)</text>
+<rect class="sv-b4" x="440" y="60" width="110" height="50"/><text class="sv-tb" x="450" y="82">store lock</text><text class="sv-ts" x="450" y="98">+ store</text>
+<rect class="sv-b5" x="590" y="40" width="156" height="50"/><text class="sv-tb" x="600" y="62">WAL writer</text><text class="sv-ts" x="600" y="78">write + fdatasync</text>
+<rect class="sv-b7" x="590" y="110" width="156" height="34"/><text class="sv-tb" x="600" y="132">disk</text>
+<line class="sv-line" x1="108" y1="85" x2="134" y2="85"/><polygon class="sv-head" points="140,85 132,81 132,89"/>
+<line class="sv-line" x1="236" y1="85" x2="262" y2="85"/><polygon class="sv-head" points="268,85 260,81 260,89"/>
+<line class="sv-line" x1="408" y1="85" x2="434" y2="85"/><polygon class="sv-head" points="440,85 432,81 432,89"/>
+<line class="sv-dash" x1="408" y1="55" x2="584" y2="55"/><polygon class="sv-head" points="590,55 582,51 582,59"/>
+<line class="sv-line" x1="668" y1="90" x2="668" y2="104"/><polygon class="sv-head" points="668,110 664,102 672,102"/>
+<circle class="sv-dot1" cx="124" cy="85" r="5"/><circle class="sv-dot1" cx="252" cy="85" r="5"/><circle class="sv-dot2" cx="424" cy="85" r="5"/><circle class="sv-dot3" cx="560" cy="85" r="5"/><circle class="sv-dot4" cx="500" cy="55" r="5"/>
+<text class="sv-ts" x="96" y="44">intended</text><text class="sv-ts" x="224" y="44">dequeued</text>
+<text class="sv-ts" x="404" y="150">parsed → lock got → lock released</text><text class="sv-ts" x="470" y="40">durable (puts)</text>
+<rect class="sv-b6" x="268" y="190" width="200" height="50"/><text class="sv-tb" x="278" y="212">snapshot task</text><text class="sv-ts" x="278" y="228">takes the store lock every 300 ms</text>
+<line class="sv-dash" x1="468" y1="200" x2="495" y2="116"/><polygon class="sv-head" points="497,110 491,117 499,119"/>
+<rect class="sv-b8" x="500" y="190" width="200" height="50"/><text class="sv-tb" x="510" y="212">metrics task</text><text class="sv-ts" x="510" y="228">own lock, every 1 s</text>
+<text class="sv-ts" x="12" y="270">spans of a request: queue | parse | lock wait | store | wal wait (puts) | reply</text>
+<text class="sv-ts" x="12" y="286">every thread also reports wall time, CPU time and context switches at exit</text>
+</svg></div><figcaption><b>Figure 1.</b> The service of Listing 1, a stand-in for the MP2 replicated key-value service on one machine. Dots are the timestamps each request records; the dashed arrows are waits that use no CPU <sup class="src"><a href="#F12-14-src-R1">R1</a></sup>.</figcaption></figure>
+
+<p>Figure 2 shows what a whole-system profile adds: time-aligned lanes. Each lane is one thread or queue; the same 35 milliseconds of the recorded run are drawn in each. A function profile would show none of it, because during these milliseconds the workers use almost no CPU.</p>
+<figure id="F12-14-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 270" role="img" aria-labelledby="F12-14-f2t F12-14-f2d">
+<title id="F12-14-f2t">Figure 2: 35 milliseconds of the recorded run, one lane per thread</title>
+<desc id="F12-14-f2d">Time axis from 3120 ms to 3155 ms. Lane 1, snapshot task: holds the store lock from 3125.4 ms to about 3148.5 ms. Lane 2, worker A: request 6238 arrives at 3125.5 ms and waits for the lock until about 3148.4 ms. Lane 3, worker B: request 6239 waits for the lock over the same interval. Lane 4, worker C: busy until about 3129.3 ms, then request 6240 waits for the lock until about 3148.7 ms. Lane 5, request queue: requests 6241, 6242 and 6243 arrive at 3126.5, 3126.6 and 3127.9 ms and wait in the queue until about 3148.5 ms, because no worker is free. After the lock is released all of them finish within a fraction of a millisecond.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="270"/>
+<line class="sv-line" x1="110" y1="230" x2="710" y2="230"/>
+<text class="sv-ts" x="100" y="248">3120</text><text class="sv-ts" x="270" y="248">3130</text><text class="sv-ts" x="440" y="248">3140</text><text class="sv-ts" x="610" y="248">3150 ms</text>
+<line class="sv-line2" x1="110" y1="226" x2="110" y2="234"/><line class="sv-line2" x1="280" y1="226" x2="280" y2="234"/><line class="sv-line2" x1="450" y1="226" x2="450" y2="234"/><line class="sv-line2" x1="620" y1="226" x2="620" y2="234"/>
+<text class="sv-tb" x="8" y="42">snapshot</text>
+<rect class="sv-b6" x="202" y="28" width="392" height="22"/><text class="sv-ts" x="300" y="44">holds the store lock 23.07 ms</text>
+<text class="sv-tb" x="8" y="82">worker A</text>
+<rect class="sv-b4" x="204" y="68" width="389" height="22"/><text class="sv-ts" x="300" y="84">6238 get: lock wait 22.9 ms</text>
+<text class="sv-tb" x="8" y="122">worker B</text>
+<rect class="sv-b4" x="205" y="108" width="388" height="22"/><text class="sv-ts" x="300" y="124">6239 get: lock wait 22.8 ms</text>
+<text class="sv-tb" x="8" y="162">worker C</text>
+<rect class="sv-b3" x="200" y="148" width="66" height="22"/><text class="sv-ts" x="204" y="164">busy</text>
+<rect class="sv-b4" x="266" y="148" width="330" height="22"/><text class="sv-ts" x="300" y="164">6240 get: lock wait 19.4 ms</text>
+<text class="sv-tb" x="8" y="202">queue</text>
+<rect class="sv-b2" x="220" y="188" width="374" height="22"/><text class="sv-ts" x="300" y="204">6241, 6242, 6243: queue 20.6–22.0 ms</text>
+<line class="sv-dash" x1="594" y1="20" x2="594" y2="222"/><text class="sv-ts" x="600" y="216">release</text>
+</svg></div><figcaption><b>Figure 2.</b> Drawn to scale from the traces and the background log of the recorded run of Listing 1 (mode <code>whole</code>) <sup class="src"><a href="#F12-14-src-R1">R1</a></sup>. Lanes are labelled; shades only separate them. This figure is the answer to part of the forensic lab: read it after the lab if you want to work the evidence yourself.</figcaption></figure>
+
+<h2 id="F12-14-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Mapping (F12; proposed in NOTES.md): wheelbarrow = request; times written on its card = the request's trace; the gate = the store lock; the inspector closing the gate to count = the snapshot task holding the lock; bricklayers standing at the closed gate = workers blocked off-CPU; wheelbarrows piling up at the lorry because nobody is free to push them = requests waiting in the queue; each worker's timesheet = per-thread CPU time and context switches.</p></div>
+<p>When something is slow, people look for the slow worker. But often nobody is slow: somebody is waiting. To find the wait, you follow one job from start to end and write down the time at every step. Then you look at the slowest jobs and ask what they had in common: the same step, the same moment, the same thing happening nearby.</p>
+<p>And you check every shared thing, not only the busy people: the gate, the queue, the one mixer. A shared thing that is closed even for a short time makes everyone behind it wait.</p>
+
+<h2 id="F12-14-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F12-14-l2-why">Why function profiles are not enough</h3>
+<p>SP302 (<a href="#F2-55">F2-55</a>) used profilers that answer "which functions use the CPU?" That is the right question when a program is CPU-bound. A service's tail latency is usually something else: requests that waited. In the recorded run of Listing 1 the three worker threads together used about 212 ms of CPU in about 6,040 ms of wall time each, about 1.2 % of their lives; the whole process used about 1.19 CPU-seconds in 6 seconds on a 4-CPU machine <sup class="src"><a href="#F12-14-src-R1">R1</a></sup>. A sampling profile of that process would show the generator's spin loop, the snapshot's formatting and the parse loops — and nothing about the 22-millisecond waits that make the 99th percentile.</p>
+
+<h3 id="F12-14-l2-method">The method: seven steps</h3>
+<ol>
+<li><b>Start from the requirement.</b> The metric that matters is the one in the requirement (<a href="#F12-11">F12-11</a>): here, latency at the service entry, from the intended arrival to the reply, as percentiles. Measure it from the intended send so the generator cannot hide stalls (<a href="#F12-13">F12-13</a>).</li>
+<li><b>Trace every request.</b> Record a timestamp at each boundary: entering the queue, leaving it, before and after each lock, before and after each wait for I/O. The differences are spans. Cheap timestamps from a steady clock cost far less than the waits you are looking for <sup class="src"><a href="#F12-14-src-D3">D3</a></sup>.</li>
+<li><b>Read the slowest traces first.</b> Sort by total time and read the top few by hand. They show the shape of the problem: which span is large.</li>
+<li><b>Compare the slowest 1 % with the rest.</b> One slow trace is an anecdote. Sum each span over the slowest 1 % and over the fastest 99 %, and compare the shares. The span whose share grows is where the tail lives.</li>
+<li><b>USE every resource.</b> For the CPU, the store lock, the worker pool, the WAL disk and the request queue: utilisation, saturation, errors (Layer 3 has the table for Listing 1).</li>
+<li><b>Correlate with events.</b> Lay the slow requests' times next to the log of background tasks, deployments and other machines' jobs. Count how often the slow requests overlap an event, and how often all requests do: the comparison, not the overlap alone, is evidence.</li>
+<li><b>Test the hypothesis and look for the next bottleneck.</b> Change the suspected cause, rerun with the protocol of <a href="#F12-13">F12-13</a>, and profile again: the tail that remains has a new cause.</li>
+</ol>
+
+<h3 id="F12-14-l2-spans">Where the time shows up is not always where it is caused</h3>
+<p>Figure 2 shows a trap. Three requests waited on the lock: their traces say "lock wait". The next three waited in the queue: their traces say "queue". All six waited for the same reason — the snapshot held the lock — but the second three never touched the lock. They were stuck behind workers that were. With a fixed-size worker pool, a wait inside the workers becomes queueing in front of them; this is <a href="#gl-head-of-line-blocking-queue">head-of-line blocking</a> on the pool. In the recorded run, the slowest 1 % of requests spent 68.6 % of their time in the queue span and 22.6 % in lock wait <sup class="src"><a href="#F12-14-src-R2">R2</a></sup>. Someone reading only the span shares would blame the queue, and might add workers. More workers would also block on the lock; the waits would move, not vanish.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p>A large "queue" span means "no worker was free", not "the queue is slow". Ask what the workers were doing at that moment. The traces of requests that were <i>in</i> the workers at that time answer it.</p></div>
+
+<h3 id="F12-14-l2-tools">On-CPU and off-CPU tools</h3>
+<div class="tw"><table>
+<thead><tr><th>Question</th><th>Tool class</th><th>In this chapter</th></tr></thead>
+<tbody>
+<tr><td>Which code uses the CPU?</td><td>Sampling profiler (on-CPU)</td><td>Not run: <code>perf</code> did not work in the build container (Layer 3, untested box)</td></tr>
+<tr><td>How long did each request wait, and where?</td><td>Request traces with spans</td><td>Listing 1, sections 2 and 3 of its report</td></tr>
+<tr><td>How much of each thread's life was on the CPU?</td><td>Per-thread CPU time against wall time; context-switch counts</td><td>Listing 1, section 5 (<code>clock_gettime</code> with the thread CPU clock, <code>getrusage</code>)</td></tr>
+<tr><td>Which system calls, how often, how long?</td><td>System-call summary</td><td><code>strace -f -c</code>, Listing 1's strace run</td></tr>
+<tr><td>What else happened at that time?</td><td>Event logs with timestamps</td><td>Listing 1, section 4 (background log)</td></tr>
+<tr><td>On a GPU (MP3): kernels, copies, gaps on the timeline</td><td>System-level (timeline) profiler and kernel profiler</td><td>CU303 (<a href="#F6-32">F6-32</a>); untested on hardware in this build</td></tr>
+</tbody></table></div>
+
+<h2 id="F12-14-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F12-14-l3-use">The USE table for Listing 1</h3>
+<p>The USE method is described in Gregg's book on systems performance <sup class="src"><a href="#F12-14-src-D1">D1</a></sup>; the table applies it to the recorded <code>whole</code> run <sup class="src"><a href="#F12-14-src-R1">R1</a></sup> <sup class="src"><a href="#F12-14-src-R2">R2</a></sup>. For software resources, utilisation means time held or occupied, not CPU.</p>
+<div class="tw"><table>
+<thead><tr><th>Resource</th><th>Utilisation</th><th>Saturation</th><th>Errors</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>CPUs (4)</td><td>about 1.19 CPU-s used in about 6 s: about 5 % of 4 CPUs</td><td>Workers: 18–27 involuntary context switches each; the generator 1,666</td><td>none</td><td>Not the bottleneck; the generator was preempted at times (its lateness counts as queue time)</td></tr>
+<tr><td>Store lock</td><td>Held by the snapshot 3.48 % of the run; 19 holds, longest 23.07 ms</td><td>Lock-wait spans up to 22.9 ms; 7.3 % of all request time</td><td>none</td><td>Low average use, long holds: the tail's main suspect</td></tr>
+<tr><td>Worker pool (3)</td><td>Each worker on-CPU about 1.2 % of its life</td><td>Queue spans up to 22 ms in the slowest traces</td><td>none</td><td>Blocked, not busy: saturation caused by the lock and the WAL</td></tr>
+<tr><td>WAL and disk</td><td>One batch at a time, about every 2 ms or when data arrive</td><td>WAL wait 31.9 % of all request time; one batch took 23.0 ms</td><td>none logged</td><td>Main cause of put latency; one slow flush</td></tr>
+<tr><td>Metrics task's lock</td><td>About 1 ms per second</td><td>none (no request uses it)</td><td>none</td><td>Not involved</td></tr>
+</tbody></table></div>
+<p>The row that matters has low utilisation. An average of 3.48 % says the lock is mostly free; the saturation column says that, when it is not, waiters wait for tens of milliseconds. Averages of utilisation hide short, total blockages, which is exactly what produces tails (<a href="#F12-12">F12-12</a>: queueing near saturation, here saturation for 23 ms at a time).</p>
+
+<h3 id="F12-14-l3-attribution">Correlation, base rates and the second cause</h3>
+<p>The analysis part of Listing 1 (<code>--key</code>) counts requests whose lifetime overlaps a snapshot lock hold. Of the slowest 120 requests (1 %), 112 overlap one; of all 12,068 requests, 412 do (3.4 %) <sup class="src"><a href="#F12-14-src-R2">R2</a></sup>. If snapshot holds had nothing to do with slowness, about 3.4 % of the slowest requests would overlap one by chance, about 4 of 120. Finding 112 is the evidence. Without the base rate, "112 slow requests overlapped a snapshot" could be an artefact of snapshots happening all the time.</p>
+<p>Not all of the tail has this cause. The two slowest requests of the run are puts that waited 27.1 and 24.3 ms for the WAL; the background log shows a WAL batch at 3,004.2 ms whose write and fdatasync took 23.0 ms <sup class="src"><a href="#F12-14-src-R1">R1</a></sup>. In the slowest 1 %, WAL wait is 8.0 % of the time <sup class="src"><a href="#F12-14-src-R2">R2</a></sup>. A real tail usually has several causes with different shares; attribute each, and fix the largest first.</p>
+<p>Remember the eight requests that did <i>not</i> overlap a snapshot hold. They are where the next cause hides.</p>
+
+<h3 id="F12-14-l3-fixes">Testing a fix: three modes, one run each</h3>
+<p>Listing 1 has three snapshot modes, each run once in the build <sup class="src"><a href="#F12-14-src-R3">R3</a></sup>:</p>
+<div class="tw"><table>
+<thead><tr><th>Mode</th><th>What the snapshot does</th><th>all p99 (ms)</th><th>all max (ms)</th><th>Longest hold (ms)</th><th>Slowest 1 % overlapping a hold</th></tr></thead>
+<tbody>
+<tr><td><code>whole</code></td><td>One hold for all 100,000 entries</td><td>8.994</td><td>27.097</td><td>23.07</td><td>112 of 120</td></tr>
+<tr><td><code>chunked</code></td><td>1,000 entries per hold, holds back to back</td><td>18.714</td><td>64.873</td><td>2.12</td><td>88 of 120</td></tr>
+<tr><td><code>paced</code></td><td>1,000 entries per hold, 0.2 ms sleep between holds</td><td>4.656</td><td>10.450</td><td>4.55</td><td>17 of 120</td></tr>
+</tbody></table></div>
+<p>The <code>chunked</code> row is the lesson. Its holds are short, yet its tail is worse. Two things happened in that run. First, its slowest requests (arriving 2,163.9–2,192.7 ms) coincide with three slow WAL flushes logged at 2,129.5, 2,157.5 and 2,187.5 ms (27.3, 29.9 and 25.8 ms) <sup class="src"><a href="#F12-14-src-R3">R3</a></sup>: a disk episode, not the snapshot, dominates that run's tail. Second, releasing a lock and taking it again at once does not guarantee that a waiting thread gets in between: the standard mutex promises no fairness, so the snapshot thread may win the lock again and again while workers wait. Whether that happened here was not measured.</p>
+<p>The <code>paced</code> mode leaves a gap after each chunk, so waiting workers can take the lock. Its p99 is about half of <code>whole</code>'s, and only 17 of the slowest 120 requests overlap a hold, against a base rate of 704 of 12,068 (5.8 %): the snapshot is now a small contributor <sup class="src"><a href="#F12-14-src-R3">R3</a></sup>.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p>These are three single runs on a shared virtual machine, and one of them was hit by a disk episode. By <a href="#F12-13">F12-13</a>'s rules they are not a benchmark: they show what to look at, not by how much a mode is better. A real comparison interleaves several runs of each mode and reports intervals for p99.</p></div>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Two claims in this section are not verified in this build. (1) That the C++ standard library's <code>std::mutex</code> gives no fairness or ordering guarantee to waiting threads: this is stated from the design of the type, but the ISO C++ standard (title only — not opened during this build; the Source Researcher must confirm the clause on mutex requirements, dossier gate G1 open) was not opened. (2) That the <code>chunked</code> run's worse tail involved the snapshot thread re-taking the lock before waiting workers: the run did not record lock hand-offs. To check, record for each hold which thread acquired the lock next, or count consecutive snapshot holds without a worker acquisition in between.</p></div>
+
+<h3 id="F12-14-l3-syscalls">What the system calls say</h3>
+<p>The strace run of a 2-second <code>paced</code> run counted 13,772 <code>futex</code> calls (982 returning errors), 3,251 <code>clock_nanosleep</code>, 355 <code>write</code> and 349 <code>fdatasync</code> calls <sup class="src"><a href="#F12-14-src-R4">R4</a></sup>. Futex calls are how waits on mutexes and condition variables reach the kernel on Linux (OS201); their count shows how often threads blocked and woke each other. About 175 fdatasync calls per second against about 200 puts per second (10 % of 2,000 req/s) means one flush served one or two puts on average: group commit was doing little batching at this load, and each put paid nearly a full flush. The time column of a <code>-c</code> summary is harder to read: strace slows every system call it traces, and whether the column is system CPU time or wall time spent in the calls depends on options <sup class="src"><a href="#F12-14-src-D4">D4</a></sup>.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The meaning of the time columns of <code>strace -c</code> (system CPU time or wall-clock time, and the effect of the <code>-w</code> option), the meaning of the 982 futex "errors" (expected to be return values such as "try again" or a timeout, not failures), and the exact semantics of <code>fdatasync</code>, <code>getrusage(RUSAGE_THREAD)</code> and <code>CLOCK_THREAD_CPUTIME_ID</code> are written from general knowledge. Check them in the strace manual page and the Linux manual pages for these calls (titles only — not opened during this build; dossier gate G1 open).</p></div>
+
+<h3 id="F12-14-l3-sampling">On-CPU sampling and off-CPU analysis with real tools</h3>
+<p>On a machine where hardware and software events can be sampled, a sampling profiler of the whole system (all processes, kernel and user stacks) gives the on-CPU picture, and off-CPU analysis records the stacks of threads when they block and for how long. Both are described in Gregg's book <sup class="src"><a href="#F12-14-src-D1">D1</a></sup>. The rule from this chapter stands: for latency tails, start from request traces and resource saturation, and use stack profiles to explain what a resource holder was doing.</p>
+<div class="co unverified"><span class="lbl">Not verified — untested on hardware in this build</span><p>Linux <code>perf</code> did not work in the build container (it reported that no perf build matched the running kernel), so no on-CPU sampling profile, off-CPU profile or flame graph appears in this chapter, and no command line for them is given. Before adding such steps to the lab, the Source Researcher and Lab Engineer must take the commands from the perf manual pages and Gregg's book (titles only — not opened during this build; dossier gate G1 open) and run them on a machine with working perf. Expected result: Listing 1's on-CPU profile dominated by the generator's spin loop, the snapshot's formatting and the parse loops; its off-CPU profile dominated by condition-variable and mutex waits in the workers.</p></div>
+
+<h2 id="F12-14-hardware">How the hardware actually does it</h2>
+<p>A thread that finds a mutex taken does not stay on the processor for long. After a short attempt in user space, it asks the kernel to put it to sleep on that lock's address (the futex system call on Linux), and the scheduler runs something else; that is a voluntary context switch. When the holder releases the lock, it wakes one or more sleepers through the kernel, and they become runnable; they run again when a processor is free <sup class="src"><a href="#F12-14-src-D3">D3</a></sup>. Each worker in the recorded run made over 4,000 voluntary context switches in 6 seconds, about one per request it served, because every wait for the queue, the lock or the WAL put it to sleep <sup class="src"><a href="#F12-14-src-R1">R1</a></sup>. Off-CPU time is time spent in exactly these sleeps.</p>
+<p>A durable write is a different wait. <code>write</code> copies the data into the kernel's page cache and returns; <code>fdatasync</code> waits until the file's data have been sent to the storage device and the device reports them stored, including flushing the device's own volatile cache where it has one (OS401) <sup class="src"><a href="#F12-14-src-D3">D3</a></sup>. On a cloud virtual machine the "device" is a virtual disk whose latency depends on a storage system shared with other tenants: in the recorded runs most batches took less than 5 ms, but single batches took 23.0 ms and, in another run, 25.8–29.9 ms <sup class="src"><a href="#F12-14-src-R1">R1</a></sup> <sup class="src"><a href="#F12-14-src-R3">R3</a></sup>. Every put waits for its batch, so the disk's tail becomes the puts' tail.</p>
+<p>The snapshot's 23 ms hold is mostly formatting 100,000 entries with <code>snprintf</code> while holding the lock: CPU work done by one thread at a time when nobody else may touch the store. The length of a hold therefore depends on the CPU speed and on whether that thread is preempted while holding the lock — on a shared machine it can be, which may be one reason hold lengths in the background log vary from 7.18 to 23.07 ms <sup class="src"><a href="#F12-14-src-R1">R1</a></sup>.</p>
+
+<h2 id="F12-14-worked">Worked example</h2>
+<p><b>Task.</b> After switching to <code>paced</code> snapshots, the p99 is 4.656 ms. Find where the remaining tail comes from, using only the recorded <code>paced</code> report and its analysis <sup class="src"><a href="#F12-14-src-R3">R3</a></sup>.</p>
+<p><b>Step 1 — the table.</b> Gets: p99 3.358 ms, max 10.159. Puts: p99 8.452 ms, max 10.450. The tail of all requests is now set by the puts more than the gets: 1,249 puts are about 10 % of requests, so the slowest 1 % (120 requests) can be mostly puts.</p>
+<p><b>Step 2 — span shares.</b> Slowest 1 %: queue 45.2 %, WAL wait 54.5 %, lock wait 0.1 %. Fastest 99 %: queue 44.4 %, WAL wait 52.5 %. Lock wait has nearly vanished from the tail; the shares of the slowest and the fastest are almost the same, so the tail is not one span growing, but everything being longer.</p>
+<p><b>Step 3 — the slowest traces.</b> Four of the eight slowest are puts whose WAL wait is 6.7–8.1 ms. Four are gets that arrived at 5,356.9–5,357.3 ms and spent 9.8–10.2 ms in the queue with no lock wait.</p>
+<p><b>Step 4 — the background log.</b> Around these times the log shows WAL batches that took 5.9 ms (5,317.1 ms) and 5.7 ms (5,409.3 ms), and three others between 5,209 and 5,226 ms. Slow flushes cluster in this second of the run. No snapshot hold is longer than 4.55 ms.</p>
+<p><b>Step 5 — a hypothesis and what is missing.</b> Puts: the disk is the next bottleneck, supported by the WAL-wait span and the log. Gets at 5,357 ms: they waited for a free worker, but the report does not say what the three workers were doing. The most likely candidates are puts waiting for a slow flush (a worker waiting for durability is not available), or the workers being preempted on the shared machine. The evidence does not decide.</p>
+<p><b>Step 6 — the next measurement.</b> Add a per-worker state timeline (what each worker was doing at every moment: idle, parsing, waiting for the lock, waiting for the WAL), and log every WAL batch, not only those above 5 ms. Then decide between the hypotheses. A design change follows from the first: let a worker hand off a put that is waiting for durability and serve other requests (group commit with asynchronous completion), so a slow disk delays only puts.</p>
+
+<h2 id="F12-14-code">Code walk-through</h2>
+<p>Listing 1 is a real service, built at <code>-O2</code> and run by the lab folder's <code>run.sh</code> in all three modes, under strace and under ThreadSanitizer; <code>university/labs/run_lab.sh university/labs/F12-14</code> runs it all. The recorded outputs come from one run of that script on the build machine; they change from run to run.</p>
+<p><b>Listing 1</b> — <code>kvsvc.cc</code>: an instrumented key-value service.</p>
+<pre class="listing" data-src="F12-14/kvsvc.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>58–65</td><td><code>Request</code></td><td>Seven timestamps per request: intended, dequeued, parsed, lock got, lock released, durable, done.</td><td>The trace: six spans from seven points.</td></tr>
+<tr><td>68–86</td><td><code>record_thread</code></td><td>At thread exit: wall time, CPU time from the thread CPU clock, voluntary and involuntary context switches from <code>getrusage</code>.</td><td>On-CPU against off-CPU per thread, without a profiler.</td></tr>
+<tr><td>127–171</td><td><code>worker</code></td><td>Take a request, parse (CPU), lock the store, read or write, release; puts append to the WAL buffer and wait until durable; format the reply.</td><td>Every wait the request can suffer is between two timestamps.</td></tr>
+<tr><td>173–212</td><td><code>wal_writer</code></td><td>Swaps out the buffer, writes and fdatasyncs it as one batch, marks it durable, wakes waiters; logs batches slower than 5 ms.</td><td>Group commit: one flush serves many puts; the slow-flush log is evidence.</td></tr>
+<tr><td>214–266</td><td><code>snapshotter</code></td><td>Every 300 ms formats the store into text under the store lock: in one hold, in 1,000-entry holds, or 1,000-entry holds with 0.2 ms pauses; records every hold's start and end.</td><td>The background task under suspicion, and the three ways of holding the lock.</td></tr>
+<tr><td>268–288</td><td><code>metrics_task</code></td><td>Once a second, a few ms of CPU under its own lock.</td><td>A plausible suspect that is innocent: it shares no lock with requests.</td></tr>
+<tr><td>337–368</td><td>generator</td><td>Requests made in advance with a fixed seed (2,000 req/s, 10 % puts), released at their intended times by sleeping until 0.1 ms before and spinning.</td><td>Open loop, timed from the intended arrival (<a href="#F12-13">F12-13</a>).</td></tr>
+<tr><td>397–441</td><td>report 2–3</td><td>Percentile table per operation, a log-scale histogram, the eight slowest traces.</td><td>Steps 1 and 3 of the method.</td></tr>
+<tr><td>444–459</td><td>report 4–5</td><td>Background log sorted by time; per-thread table.</td><td>Steps 5 and 6: events and resources.</td></tr>
+<tr><td>461–528</td><td><code>--key</code> analysis</td><td>Span shares for all, slowest 1 % and fastest 99 %; overlap of request lifetimes with snapshot holds, for the slowest and for all.</td><td>Steps 4 and 6 with a base rate.</td></tr>
+</tbody></table></div>
+<p><b>Run of Listing 1, mode <code>paced</code></b> (measured on the shared build machine; not a specification):</p>
+<pre class="output" data-run="F12-14/kvsvc_paced"></pre>
+<pre class="output" data-run="F12-14/kvsvc_paced_key"></pre>
+<p><b>Run of Listing 1, mode <code>chunked</code></b>:</p>
+<pre class="output" data-run="F12-14/kvsvc_chunked"></pre>
+<pre class="output" data-run="F12-14/kvsvc_chunked_key"></pre>
+<p><b>System-call summary</b> of a 2-second <code>paced</code> run under <code>strace -f -c</code> (strace slows every system call; times are inflated):</p>
+<pre class="output" data-run="F12-14/kvsvc_strace"></pre>
+<p><b>ThreadSanitizer run</b> (data-race check only):</p>
+<pre class="output" data-run="F12-14/kvsvc_tsan"></pre>
+<p>The <code>whole</code> run's report is the evidence of the forensic lab below; its analysis is in the answer key.</p>
+
+<h2 id="F12-14-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Cards cost nothing to the wheelbarrow; timestamps cost the request.</b> Each timestamp takes some nanoseconds and memory, and logging inside a lock lengthens the hold. Measure the overhead of the instrumentation, and keep it outside critical sections.</li>
+<li><b>The gate is visible; a lock is not.</b> Anyone on site sees the inspector at the gate. In software, a lock hold leaves no trace unless the code records it; Listing 1 records snapshot holds because the author suspected them. Unsuspected locks need lock profiling or off-CPU stacks.</li>
+<li><b>Bricklayers can see the queue and walk away; threads cannot.</b> A worker blocked in <code>fdatasync</code> cannot decide to serve a get instead. The fix in software is a design change (asynchronous completion), not a decision by the worker.</li>
+<li><b>The inspector's count is slow because counting is slow; the snapshot is slow partly because of the machine.</b> Hold times varied from 7 to 23 ms between snapshots of the same size; on a shared machine, the holder itself can be paused.</li>
+</ul>
+
+<h2 id="F12-14-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>The CPU profile shows nothing wrong, but p99 is bad.</td><td>The tail is off-CPU: waits for locks, I/O, queues.</td><td>Per-thread CPU time against wall time; request traces.</td><td>Profile waits, not only CPU (this chapter's method).</td></tr>
+<tr><td>Adding workers did not help the tail.</td><td>Workers were blocked on a shared resource; the queue span was a symptom.</td><td>Traces of requests inside the workers at the slow moments.</td><td>Fix the shared resource (lock hold, flush).</td></tr>
+<tr><td>"The lock is only 3 % busy, so it is not the problem."</td><td>Average utilisation hides long holds.</td><td>Hold-time distribution; longest hold; saturation (wait spans).</td><td>Shorten holds; move work outside the lock.</td></tr>
+<tr><td>A suspect event coincides with one slow request, and the team blames it.</td><td>Coincidence without a base rate.</td><td>Count overlaps for the slow and for all requests.</td><td>Attribute only with the comparison; test by removing the suspect.</td></tr>
+<tr><td>The fix made the tail worse.</td><td>Unfair re-acquisition; a different cause in the run; one run is noise.</td><td>Record lock hand-offs; read the run's event log; repeat interleaved.</td><td>Leave room for waiters (pacing, fair lock), and benchmark properly.</td></tr>
+<tr><td>Timing results change when strace or a sanitizer is attached.</td><td>The tool slows system calls or memory accesses.</td><td>Compare with an uninstrumented run.</td><td>Use such tools for counts and correctness, not for times.</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F12-14-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> SP302 (<a href="#F2-55">F2-55</a>) profiled single programs for on-CPU hot spots; DS402 collected traces, spans and metrics in distributed systems; OS201 explained blocking system calls and context switches; <a href="#F12-13">F12-13</a> made measurements fair. <b>What carries over:</b> timestamps from a steady clock, percentiles, open-loop load from intended times, and the habit of a prediction before a measurement <sup class="src"><a href="#F12-14-src-D3">D3</a></sup>. <b>What changes:</b> most dangerous first: the cause of a tail is usually a wait, not a computation, and a CPU profile does not see it <sup class="src"><a href="#F12-14-src-R1">R1</a></sup>; the span where time shows up can be far from the cause (queue time caused by a lock) <sup class="src"><a href="#F12-14-src-R2">R2</a></sup>; and attribution needs a base rate, not a coincidence. <b>What comes next:</b> <a href="#F12-15">F12-15</a> turns measured limits into plans: how many machines are needed for next year's peak, and why a resource that is fine on average fails at the peak.</p></div>
+
+<h2 id="F12-14-check">Check yourself</h2>
+<ol>
+<li>Explain why a sampling profile of the CPU would not have found the cause of the recorded run's tail.</li>
+<li>In Figure 2, requests 6241–6243 show "queue" and no "lock wait". Why were they slow, and what would you look at to prove it?</li>
+<li>The store lock was held by the snapshot 3.48 % of the run. Using <a href="#F12-12">F12-12</a>'s ideas, explain why such a low utilisation can still give a p99 of almost 9 ms.</li>
+<li>112 of the slowest 120 requests overlapped a snapshot hold. What number do you compare it with, and why?</li>
+<li>Predict, then run: double the snapshot interval (600 ms instead of 300 ms) in <code>whole</code> mode. What do you expect to happen to p99, to p99.9 and to the maximum? Run it twice and compare.</li>
+<li>Apply to a new case: MP3's training step is slower than the model predicts, and the GPU's kernels each run at the expected speed. Name two off-GPU waits that could explain it and the evidence you would collect for each (CU303's timeline profiler; untested on hardware here).</li>
+<li>Why does Listing 1 keep the logging of snapshot holds outside the store lock's critical section?</li>
+<li>The <code>chunked</code> mode's p99 is worse than <code>whole</code>'s. Give two explanations consistent with the evidence, and one experiment that separates them.</li>
+</ol>
+
+<h2 id="F12-14-lab">Lab</h2>
+<p><b>Goal.</b> An end-to-end profile of your mega project under a defined load: MP2 (the replicated key-value service) or MP3 (the GPU training step). Learners without a running project use Listing 1 as a stand-in for MP2. The result is the profile section of the SE401 project report.</p>
+<p><b>Hardware and software needed.</b> Linux with g++ (C++20) and strace; the build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> and <code>strace -- version 6.8</code> on a shared 4-CPU cloud virtual machine. For MP2 across machines, two or three Linux machines or virtual machines on one network. For MP3, an NVIDIA GPU, the CUDA Toolkit and the GPU profilers of CU303. <b>MP3 profiling and any multi-machine MP2 profiling are untested on hardware in this university's build</b> (no GPU, no second machine); MP2 on one machine is covered by Listing 1. <b>Safety:</b> none beyond normal computer use; do not run load tests against systems you do not own.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F12-14</code>. Expect exit status 0 and six report files; read the <code>paced</code> report and check it has the five sections.</li>
+<li>Write the requirement you will profile against (from your <a href="#F12-11">F12-11</a> lab), and the load: rate, mix, open loop, duration.</li>
+<li>Instrument your project: a trace with spans for every request (MP2) or every training step (MP3: data load, host-to-device copy, kernels, synchronisation, device-to-host copy, optimiser step); per-thread CPU time and context switches; a timestamped log of background work (snapshots, compaction, replication, checkpointing, data loader refills).</li>
+<li>Run under the load. Produce: the percentile table, the slowest traces, span shares for the slowest 1 % and the rest, the USE table for every resource, and the event correlation with a base rate.</li>
+<li>Write a hypothesis for the largest contributor to the tail and a change that tests it. Run before and after with <a href="#F12-13">F12-13</a>'s protocol (interleaved, at least five runs each for a load test this long, intervals reported).</li>
+<li>Profile again after the change and name the next bottleneck.</li>
+</ol>
+<p><b>Expected observations.</b> For Listing 1, on the build machine: <code>paced</code> p99 about 4.7 ms with puts dominating, WAL wait the largest span in the slowest 1 % <sup class="src"><a href="#F12-14-src-R3">R3</a></sup>; your numbers will differ. Workers' CPU time a small percentage of their wall time. For your project: a tail whose largest share is a wait, and a USE table where the guilty resource's average utilisation is not the largest.</p>
+<p><b>Verification.</b> (1) The span shares add up to 100 % of the measured latency (no unmeasured gap; if they do not, a boundary is missing). (2) Your attribution names a base rate. (3) The change that tests the hypothesis moves the tail in the predicted direction across repeated, interleaved runs.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The tail differs a lot between runs → shared machine or a disk episode; read the event log of each run before comparing; repeat.</li>
+<li>Spans do not add up → a wait between two timestamps you did not instrument; add a boundary.</li>
+<li>The generator falls behind (its CPU near 100 %, involuntary switches high) → give it its own core or machine; its lateness is counted as queue time.</li>
+<li>strace changes the timings → use it only for counts, in a separate run (as Listing 1's run.sh does).</li>
+</ul>
+<p><b>Extension.</b> Add a per-worker state timeline to Listing 1 (Step 6 of the worked example) and decide what the workers were doing during the <code>paced</code> run's slowest gets.</p>
+
+<h2 id="F12-14-forensic">Forensic lab — "The 99th percentile" (course forensic)</h2>
+<p><b>Scenario.</b> The key-value service's dashboard shows a mean latency of about half a millisecond, well inside the requirement. But the requirement also says p99 ≤ 5 ms, and the 99th percentile is near 9 ms; some users report requests taking over 20 ms. The on-call engineer ran a CPU profile: nothing unusual, all processors mostly idle. A teammate points at the metrics task ("it runs every second, it must be that"); another at the disk ("I saw a slow fdatasync in the log"). You have one profiled run of the service at 2,000 req/s.</p>
+<p><b>Evidence pack.</b> The real report of Listing 1 in mode <code>whole</code>, measured on the build machine (one run; not a specification):</p>
+<pre class="output" data-run="F12-14/kvsvc_whole"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>From section 2, how much does the mean say about the tail? Compare mean, p50, p99 and max for gets and puts.</li>
+<li>From section 5, explain why the CPU profile found nothing.</li>
+<li>Read section 3. Group the eight slowest requests by their largest span. What different causes do the groups suggest?</li>
+<li>Use section 4 to test the teammates' two suspects and any other suspect you find. For each, give the time of the event and the requests it could explain.</li>
+<li>Requests 6241–6243 waited in the queue. Using the traces of the requests around them, explain why.</li>
+<li>Which further numbers would you need to claim the cause of the slowest 1 %, not only of the slowest eight? (The answer key gives them.)</li>
+<li>Propose a fix for the main cause, how you would test it, and what you expect the next bottleneck to be.</li>
+</ol>
+<p><b>Method hints.</b> Start from the slowest traces; turn each large span into a question about a resource; put the times of the slow requests next to the background log; then demand a base rate. The answer key is at the end of the page.</p>
+
+<h2 id="F12-14-project">Mini-project</h2>
+<p><b>A profiling kit for your mega project.</b> Build the instrumentation your project needs for a whole-system profile and keep it in the code: request or step traces with spans, per-thread resource records, a background-event log, and an analysis tool that produces the percentile table, slowest traces, span shares by tail, the USE table and event correlation with base rates. Run it at three load levels (50 %, 80 % and 95 % of the capacity you measured) and write the profile section of the SE401 project report, ending with the current bottleneck and the next one. <b>Rubric:</b> instrumentation complete, spans adding up, overhead measured (25 %); USE table covering software resources (20 %); tail attribution with base rates (25 %); a tested fix or a justified decision not to fix (20 %); clarity of the report (10 %).</p>
+
+<h2 id="F12-14-summary">Summary</h2>
+<ul>
+<li>Profile the whole system against the requirement's metric: traces with spans for requests, per-thread CPU and context switches, resource saturation, and a timestamped event log, all from the same run.</li>
+<li>Tail latency is usually off-CPU: waits for locks, I/O and queues, invisible to CPU profiles.</li>
+<li>Read the slowest traces, then compare the slowest 1 % with the rest, span by span.</li>
+<li>Apply USE to every resource, including locks and worker pools; low average utilisation can hide long blockages.</li>
+<li>Time often shows up in a different span from its cause: queue time behind blocked workers.</li>
+<li>Attribute with base rates, and test the attribution by changing the cause; one run is not a benchmark.</li>
+<li>After a fix, profile again: the tail has a new cause.</li>
+</ul>
+
+<h2 id="F12-14-sources">Sources</h2>
+<ol>
+<li id="F12-14-src-D1">D1 — Brendan Gregg, "Systems Performance" (tier 3): the USE method, off-CPU analysis, profiling and the observability tools chapters. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and sections (dossier gate G1 open).</i></li>
+<li id="F12-14-src-D2">D2 — Systems Curriculum (this project): section 13.4 (performance engineering: profiling, explaining the gap to the target). Opened in this build (local file).</li>
+<li id="F12-14-src-D3">D3 — This university: chapters <a href="#F2-55">F2-55</a> (profilers), <a href="#F6-32">F6-32</a> (GPU profilers), the OS201 chapters on system calls, blocking and context switches, the OS401 chapters on fsync and write-ahead logging, <a href="#F12-12">F12-12</a> and <a href="#F12-13">F12-13</a>, and <code>university/chapters/SP302/NOTES.md</code> (perf unavailable in the build container); opened in this build.</li>
+<li id="F12-14-src-D4">D4 — The strace manual page and the Linux manual pages for <code>futex</code>, <code>fdatasync</code>, <code>getrusage</code> and <code>clock_gettime</code> (tier 2). <i>Title only — not opened during this build; the Source Researcher must confirm the details named in the unverified boxes (dossier gate G1 open).</i></li>
+<li id="F12-14-src-R1">R1 — <code>university/labs/F12-14/kvsvc_whole.log</code>: Listing 1 mode <code>whole</code>, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>-O2 -pthread</code>, shared 4-CPU cloud virtual machine (Intel Xeon @ 2.80GHz), exit code 0; measured, varies between runs, not a specification (AH-23).</li>
+<li id="F12-14-src-R2">R2 — <code>university/labs/F12-14/kvsvc_whole_key.log</code>: the analysis of the same run (span shares, overlaps with snapshot holds), exit code 0; same label.</li>
+<li id="F12-14-src-R3">R3 — <code>university/labs/F12-14/kvsvc_chunked.log</code>, <code>kvsvc_chunked_key.log</code>, <code>kvsvc_paced.log</code>, <code>kvsvc_paced_key.log</code>: modes <code>chunked</code> and <code>paced</code>, same toolchain and machine, exit code 0; measured, one run each (AH-23).</li>
+<li id="F12-14-src-R4">R4 — <code>university/labs/F12-14/kvsvc_strace.log</code>: <code>strace -- version 6.8</code>, <code>strace -f -c</code> of a 2-second <code>paced</code> run, exit code 0; counts are real, times inflated by tracing (AH-23). <code>kvsvc_tsan.log</code>: ThreadSanitizer build, exit code 0, no warnings.</li>
+</ol>
+
+<h2 id="F12-14-glossary">Glossary links</h2>
+<p><a href="#gl-whole-system-profile">Whole-system profile</a> · <a href="#gl-on-cpu-and-off-cpu-time">On-CPU and off-CPU time</a> · <a href="#gl-use-method">USE method</a> · <a href="#gl-critical-path-of-a-request">Critical path (of a request)</a> · <a href="#gl-lock-hold-time">Lock hold time</a> · <a href="#gl-tail-attribution">Tail attribution</a> · <a href="#gl-trace-and-span">Trace and span</a> · <a href="#gl-sampling-profiler">Sampling profiler</a> · <a href="#gl-context-switch">Context switch</a> · <a href="#gl-strace">strace</a> · <a href="#gl-fsync">fsync</a> · <a href="#gl-lock-contention">Lock contention</a> · <a href="#gl-head-of-line-blocking-queue">Head-of-line blocking (queue)</a> · <a href="#gl-tail-latency">Tail latency</a></p>
+
+<h2 id="F12-14-next">Next chapter</h2>
+<p>Next: <a href="#F12-15">F12-15 Capacity planning</a>. Back to the course: <a href="#SE401">SE401</a>. Previous: <a href="#F12-13">F12-13 Benchmark methodology</a>.</p>
+
+<h2 id="F12-14-answers">Answers to Check yourself</h2>
+<ol>
+<li>During the slow periods the waiting threads were asleep (blocked on the store lock or on the queue's condition variable); a sampling profiler of CPU use takes samples only of threads that run, so it sees the snapshot thread formatting and other threads' short bursts, not the waits. The workers used about 1.2 % of their wall time on the CPU.</li>
+<li>All three workers were occupied: two were blocked on the store lock (6238, 6239) and the third was busy and then blocked (6240). No worker could take a request from the queue until the snapshot released the lock at about 3,148.5 ms. Proof: the traces of the requests in the workers at that moment (lock-wait spans ending at the release) and the snapshot hold at 3,125.4 ms lasting 23.07 ms.</li>
+<li>Utilisation is an average over the run. Queueing depends on the load during the busy periods: for 23 ms at a time the lock serves no requests at all, so every request that needs it during that interval waits, a queue builds, and it drains only after the release. About 3.4 % of requests overlap a hold, which is enough to set the 99th percentile.</li>
+<li>With the base rate: 412 of all 12,068 requests (3.4 %) overlap a hold. By chance about 4 of the slowest 120 would; 112 is far more, which supports a causal link. Without the base rate, a high count could come from holds being frequent or long.</li>
+<li>Expected: p99 drops somewhat (fewer holds, so fewer requests meet one), but p99.9 and the maximum change little, because each hold is as long as before. The run-to-run noise of this machine may hide the p99 change; compare two runs of each.</li>
+<li>Examples: the data loader not keeping up (gaps on the GPU timeline before each step, host thread busy reading or decoding; evidence: host-side spans and per-thread CPU); host-to-device copies from pageable memory serialising with kernels (copy spans on the timeline, no overlap; evidence: timeline profile showing copies and kernels on one stream). Also synchronisation after every step. All untested on hardware in this build.</li>
+<li>Because anything done inside the critical section lengthens the hold and delays all requests waiting for the lock; logging takes another lock and may allocate memory. The listing takes the log lock only after releasing the store lock.</li>
+<li>(1) A disk episode: three slow WAL flushes (25.8–29.9 ms) around the slowest requests block workers on puts and queue the gets. (2) Unfair re-acquisition: the snapshot thread takes the lock back immediately after each chunk, so workers can wait for much of the 100 chunks. Experiment: record lock hand-offs (which thread acquired after each snapshot release) and repeat the runs several times; if the tail follows WAL episodes and hand-offs to workers are frequent, (1) is supported; if workers rarely acquire between chunks, (2) is.</li>
+</ol>
+<h3 id="F12-14-forensic-key">Forensic lab answer key</h3>
+<p><b>Q1.</b> Mean of all requests 0.552 ms, p50 0.050 ms, p99 8.994 ms, max 27.097 ms. Gets: mean 0.380, p99 8.645. Puts: mean 2.045, p99 11.396. The mean is dominated by the many fast requests; the p99 is 180 times the median. The mean says nothing useful about the tail.</p>
+<p><b>Q2.</b> The whole process used about 1.19 CPU-seconds in about 6 seconds on 4 CPUs (about 5 %); each worker about 1.2 % of its life. The slow requests were waiting, off-CPU.</p>
+<p><b>Q3.</b> Two puts (5998, 6004) at 3,000–3,002 ms with WAL waits of 27.1 and 24.3 ms: a slow durable write. Three gets (6238–6240) at 3,125.5–3,125.7 ms with lock waits of 19.4–22.9 ms: the store lock. Three gets (6241–6243) at 3,126.5–3,127.9 ms with queue spans of 20.6–22.0 ms: no free worker.</p>
+<p><b>Q4.</b> Metrics task: flushes at 3,011.7 ms (0.75 ms) and other whole seconds, using its own lock; no slow request lines up with it, and it shares no lock with requests: not involved. WAL: the batch at 3,004.2 ms took 23.0 ms and explains the two slow puts: a real, second cause, not a decoy. Snapshot: at 3,125.4 ms the store lock was held for 23.07 ms, the longest hold of the run; it explains the six gets.</p>
+<p><b>Q5.</b> See Figure 2: the three workers were blocked on the store lock (two of them from 3,125.5 ms, the third after finishing earlier work), so no worker could dequeue.</p>
+<p><b>Q6.</b> The analysis of the same run <sup class="src"><a href="#F12-14-src-R2">R2</a></sup>:</p>
+<pre class="output" data-run="F12-14/kvsvc_whole_key"></pre>
+<p>Slowest 1 % (120 requests): queue 68.6 %, lock wait 22.6 %, WAL wait 8.0 %; 112 of 120 overlap a snapshot hold against a base rate of 412 of 12,068 (3.4 %). Conclusion: the snapshot's long store-lock holds are the main cause of the slowest 1 %, acting through lock waits and through queueing behind blocked workers; slow WAL flushes are a second, smaller cause, mostly for puts.</p>
+<p><b>Q7.</b> Fix: shorten the holds and let workers in between them (copy-on-write snapshot, or chunks with room for waiters as in mode <code>paced</code>); never format under the lock. Test: interleaved repeated runs of <code>whole</code> and the fix, comparing p99 with intervals (<a href="#F12-13">F12-13</a>). In the build's single <code>paced</code> run, p99 fell to 4.656 ms and the slowest 1 % were mostly puts waiting for the WAL: the next bottleneck is the disk flush, and with it gets queued behind workers waiting for durability (worked example) <sup class="src"><a href="#F12-14-src-R3">R3</a></sup>. A naive chunking without room for waiters (<code>chunked</code>) did not improve the tail in its one run.</p>
+<p><b>Wrong answers to rule out.</b> "Add workers": they would block on the same lock. "Faster CPUs": the CPUs are mostly idle. "The metrics task": no overlap and no shared lock. "The disk is the whole story": it explains 2 of the slowest 8 and 8 % of the slowest 1 %'s time.</p>
