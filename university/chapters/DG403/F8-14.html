@@ -1,0 +1,638 @@
+<!--meta
+id: F8-14
+title: Pipeline parallelism and the bubble
+course: DG403
+level: L4
+prereqs: F8-12 Data parallelism; F8-13 Tensor parallelism; F8-07 MPI basics (point-to-point send and receive); F1-24 (the five-stage CPU pipeline, as a contrast)
+time: 10–14 hours including the lab
+hardware: none for the listings: MPI processes on one Linux computer stand in for GPUs and sleeps stand in for GPU work (this build: g++ 13.3.0, Open MPI 4.1.6, no GPU). The real-hardware extension needs two or more GPUs, ideally on two machines with a network (course requirement), or cloud instances
+maps: Curriculum milestone F7 (optional) "Tensor and pipeline parallelism toy", part 2 (pipeline parallelism with micro-batches; acceptance test reused: bubble within 20 % of the GPipe formula); Track F 14.1 row "Parallelism strategies"; course card DG403 (guide 5.13)
+analogy: F8 — the great kitchen hall (registered: a chain of kitchen halls with a delivery service). Proposed in NOTES.md: "pipeline stage = a hall that does one course of the meal and hands the tray to the next hall"; "bubble = halls standing idle while the first trays travel down the line and the last ones travel back"
+-->
+
+<h2 id="F8-14-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>Four halls cook a banquet in a line. Hall 1 prepares the starter, hall 2 the soup, hall 3 the main course, hall 4 the dessert, and each tray travels down the line. At the end, the guests' comments travel back up the line, hall by hall, so that each hall can adjust its recipe for tomorrow.</p>
+<p>On the first evening, Mateo sends one enormous tray for all two hundred guests. Hall 1 works while the others wait; then hall 2 works while the others wait; and so on, down and back. Each hall is busy for a quarter of the evening at most. On the second evening, Ayasha cuts the banquet into eight smaller trays. While hall 2 works on tray 1, hall 1 already starts tray 2. The halls still wait at the beginning and at the end of the evening, but much less. How small should the trays be, and what does each hall have to keep on its shelves while the comments travel back?</p>
+</div>
+
+<h2 id="F8-14-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> pipeline parallelism: stages, micro-batches, activations sent forward and gradients sent back.</li>
+<li><b>Derive</b> the bubble fraction of the GPipe schedule, (S − 1)/(M + S − 1), and use it to choose the number of micro-batches.</li>
+<li><b>Compare</b> GPipe and 1F1B schedules: same bubble, different activation memory, shown by a schedule simulator.</li>
+<li><b>Build</b> a real pipeline with MPI, check its gradients against the single-process model and measure its bubble within 20 % of the formula (milestone F7, part 2).</li>
+<li><b>Diagnose</b> a slow pipeline from per-stage busy and idle times.</li>
+</ul>
+
+<div class="co jargon" id="F8-14-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Pipeline parallelism</dt><dd><b>Simple words:</b> putting different layers of the model on different GPUs and passing results from one to the next. <b>Analogy:</b> each hall does one course and passes the tray on. <b>Precise:</b> inter-layer model parallelism: the layers are partitioned into S consecutive stages, each on its own device (or group of devices); in the forward pass each stage receives activations from the previous stage and sends its outputs to the next; in the backward pass gradients flow the opposite way. <sup class="src"><a href="#F8-14-src-D1">D1</a></sup></dd>
+<dt>Micro-batch</dt><dd><b>Simple words:</b> a small piece of the batch that travels through the pipeline on its own. <b>Analogy:</b> one of Ayasha's eight smaller trays. <b>Precise:</b> one of M equal parts of a mini-batch; micro-batches enter the pipeline one after another so that different stages work on different micro-batches at the same time; their gradients are accumulated and the optimizer step is taken once, after all M (synchronous pipeline). <sup class="src"><a href="#F8-14-src-D1">D1</a></sup></dd>
+<dt>Pipeline bubble</dt><dd><b>Simple words:</b> the time GPUs in a pipeline sit idle at the start and end of each step. <b>Analogy:</b> halls waiting while the first trays travel down the line and the last comments travel back. <b>Precise:</b> the idle time of the stages during the fill and drain phases of a synchronous pipeline schedule; for S equal stages and M micro-batches under the GPipe schedule, the bubble is the fraction (S − 1)/(M + S − 1) of the step time. <sup class="src"><a href="#F8-14-src-D1">D1</a></sup> <sup class="src"><a href="#F8-14-src-R1">R1</a></sup></dd>
+<dt>GPipe schedule</dt><dd><b>Simple words:</b> every stage does all its forward passes first, then all its backward passes. <b>Analogy:</b> all trays go down the line before any comment comes back. <b>Precise:</b> the synchronous schedule of the GPipe paper: all M forward micro-batch steps, then all M backward steps, then one optimizer step; each stage holds the activations of all M micro-batches until their backward steps (unless it recomputes them). <sup class="src"><a href="#F8-14-src-D1">D1</a></sup></dd>
+<dt>1F1B schedule</dt><dd><b>Simple words:</b> after a short warm-up, every stage alternates one forward and one backward pass. <b>Analogy:</b> a hall sends a comment back up the line as soon as it can, instead of waiting for all trays to pass. <b>Precise:</b> "one forward, one backward": stage s (counting from 0) first runs S − 1 − s forward steps (warm-up), then alternates forward and backward steps, then finishes the remaining backward steps; with equal stages it has the same bubble as GPipe but holds at most S − s micro-batches of activations instead of M. <sup class="src"><a href="#F8-14-src-D2">D2</a></sup> <sup class="src"><a href="#F8-14-src-R1">R1</a></sup></dd>
+<dt>Activation memory (stash)</dt><dd><b>Simple words:</b> the results of the forward pass that a stage must keep until it does the backward pass. <b>Analogy:</b> trays kept on the hall's shelves until the guests' comments come back. <b>Precise:</b> the intermediate tensors saved during the forward pass of a micro-batch and needed by its backward pass; its size grows with the number of micro-batches in flight on the stage and with the micro-batch size, and it can be traded for computation by recomputing activations during backward. <sup class="src"><a href="#F8-14-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F8-14-pictures">The idea in pictures</h2>
+<p>Figure 1 is the GPipe schedule for S = 4 stages and M = 4 micro-batches, drawn cell by cell from the schedule simulator (Listing 1, R1). A forward step takes 1 time unit and a backward step 2. Capital letters are forward steps (A = micro-batch 0, B = micro-batch 1, …), small letters backward steps, empty cells idle time.</p>
+<figure id="F8-14-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 200" role="img" aria-labelledby="F8-14-f1t F8-14-f1d">
+<title id="F8-14-f1t">Figure 1: GPipe schedule, 4 stages, 4 micro-batches</title>
+<desc id="F8-14-f1d">Four rows, one per stage, 21 time units wide. Stage 0 runs forward steps A, B, C, D in units 0 to 3, is idle from 4 to 12, then runs backward steps a, b, c, d of two units each from 13 to 20. Each later stage starts one unit later and finishes its backward steps earlier: stage 3 runs forwards in units 3 to 6 and backwards from 7 to 14, then is idle to the end. The idle cells form two triangles, at the start and in the middle of the lower-left and upper-right: the bubble. Total time 21 units; useful work per stage 12 units; bubble fraction 0.429, equal to (4 − 1)/(4 + 4 − 1).</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="200"/>
+<text class="sv-tb" x="18" y="24">GPipe: S = 4, M = 4, tf = 1, tb = 2 (one cell = 1 unit)</text>
+<text class="sv-ts" x="18" y="57">stage 0</text>
+<rect class="sv-b3" x="80" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="89.0" y="57">A</text>
+<rect class="sv-b3" x="108" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="117.0" y="57">B</text>
+<rect class="sv-b3" x="136" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="145.0" y="57">C</text>
+<rect class="sv-b3" x="164" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="173.0" y="57">D</text>
+<rect class="sv-box" x="192" y="40" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="220" y="40" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="248" y="40" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="276" y="40" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="304" y="40" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="332" y="40" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="360" y="40" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="388" y="40" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="416" y="40" width="26" height="24" rx="2"/>
+<rect class="sv-b1" x="444" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="453.0" y="57">a</text>
+<rect class="sv-b1" x="472" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="481.0" y="57">a</text>
+<rect class="sv-b1" x="500" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="509.0" y="57">b</text>
+<rect class="sv-b1" x="528" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="537.0" y="57">b</text>
+<rect class="sv-b1" x="556" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="565.0" y="57">c</text>
+<rect class="sv-b1" x="584" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="593.0" y="57">c</text>
+<rect class="sv-b1" x="612" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="621.0" y="57">d</text>
+<rect class="sv-b1" x="640" y="40" width="26" height="24" rx="2"/><text class="sv-ts" x="649.0" y="57">d</text>
+<text class="sv-ts" x="18" y="87">stage 1</text>
+<rect class="sv-box" x="80" y="70" width="26" height="24" rx="2"/>
+<rect class="sv-b3" x="108" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="117.0" y="87">A</text>
+<rect class="sv-b3" x="136" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="145.0" y="87">B</text>
+<rect class="sv-b3" x="164" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="173.0" y="87">C</text>
+<rect class="sv-b3" x="192" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="201.0" y="87">D</text>
+<rect class="sv-box" x="220" y="70" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="248" y="70" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="276" y="70" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="304" y="70" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="332" y="70" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="360" y="70" width="26" height="24" rx="2"/>
+<rect class="sv-b1" x="388" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="397.0" y="87">a</text>
+<rect class="sv-b1" x="416" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="425.0" y="87">a</text>
+<rect class="sv-b1" x="444" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="453.0" y="87">b</text>
+<rect class="sv-b1" x="472" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="481.0" y="87">b</text>
+<rect class="sv-b1" x="500" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="509.0" y="87">c</text>
+<rect class="sv-b1" x="528" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="537.0" y="87">c</text>
+<rect class="sv-b1" x="556" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="565.0" y="87">d</text>
+<rect class="sv-b1" x="584" y="70" width="26" height="24" rx="2"/><text class="sv-ts" x="593.0" y="87">d</text>
+<rect class="sv-box" x="612" y="70" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="640" y="70" width="26" height="24" rx="2"/>
+<text class="sv-ts" x="18" y="117">stage 2</text>
+<rect class="sv-box" x="80" y="100" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="108" y="100" width="26" height="24" rx="2"/>
+<rect class="sv-b3" x="136" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="145.0" y="117">A</text>
+<rect class="sv-b3" x="164" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="173.0" y="117">B</text>
+<rect class="sv-b3" x="192" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="201.0" y="117">C</text>
+<rect class="sv-b3" x="220" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="229.0" y="117">D</text>
+<rect class="sv-box" x="248" y="100" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="276" y="100" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="304" y="100" width="26" height="24" rx="2"/>
+<rect class="sv-b1" x="332" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="341.0" y="117">a</text>
+<rect class="sv-b1" x="360" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="369.0" y="117">a</text>
+<rect class="sv-b1" x="388" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="397.0" y="117">b</text>
+<rect class="sv-b1" x="416" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="425.0" y="117">b</text>
+<rect class="sv-b1" x="444" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="453.0" y="117">c</text>
+<rect class="sv-b1" x="472" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="481.0" y="117">c</text>
+<rect class="sv-b1" x="500" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="509.0" y="117">d</text>
+<rect class="sv-b1" x="528" y="100" width="26" height="24" rx="2"/><text class="sv-ts" x="537.0" y="117">d</text>
+<rect class="sv-box" x="556" y="100" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="584" y="100" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="612" y="100" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="640" y="100" width="26" height="24" rx="2"/>
+<text class="sv-ts" x="18" y="147">stage 3</text>
+<rect class="sv-box" x="80" y="130" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="108" y="130" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="136" y="130" width="26" height="24" rx="2"/>
+<rect class="sv-b3" x="164" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="173.0" y="147">A</text>
+<rect class="sv-b3" x="192" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="201.0" y="147">B</text>
+<rect class="sv-b3" x="220" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="229.0" y="147">C</text>
+<rect class="sv-b3" x="248" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="257.0" y="147">D</text>
+<rect class="sv-b1" x="276" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="285.0" y="147">a</text>
+<rect class="sv-b1" x="304" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="313.0" y="147">a</text>
+<rect class="sv-b1" x="332" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="341.0" y="147">b</text>
+<rect class="sv-b1" x="360" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="369.0" y="147">b</text>
+<rect class="sv-b1" x="388" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="397.0" y="147">c</text>
+<rect class="sv-b1" x="416" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="425.0" y="147">c</text>
+<rect class="sv-b1" x="444" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="453.0" y="147">d</text>
+<rect class="sv-b1" x="472" y="130" width="26" height="24" rx="2"/><text class="sv-ts" x="481.0" y="147">d</text>
+<rect class="sv-box" x="500" y="130" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="528" y="130" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="556" y="130" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="584" y="130" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="612" y="130" width="26" height="24" rx="2"/>
+<rect class="sv-box" x="640" y="130" width="26" height="24" rx="2"/>
+<text class="sv-ts" x="18" y="190">capital = forward of micro-batch A–D; small = backward (2 cells each); empty = idle (bubble). Time 21 units, ideal 12, bubble 0.429.</text>
+</svg>
+</div><figcaption><b>Figure 1.</b> The bubble is the empty cells: S − 1 = 3 forward units of fill and 3 backward steps of drain on every stage. Computed by Listing 1 (R1); communication time is zero in this model. <sup class="src"><a href="#F8-14-src-R1">R1</a></sup> <sup class="src"><a href="#F8-14-src-D1">D1</a></sup></figcaption></figure>
+<p>Figure 2 compares GPipe and 1F1B for M = 8. The total time is the same; the number of micro-batches whose activations a stage holds at once is not.</p>
+<figure id="F8-14-fig2"><div class="svgbox">
+<svg viewBox="0 0 780 330" role="img" aria-labelledby="F8-14-f2t F8-14-f2d">
+<title id="F8-14-f2t">Figure 2: GPipe and 1F1B schedules, 4 stages, 8 micro-batches</title>
+<desc id="F8-14-f2d">Top: GPipe. Each stage runs all eight forward steps A to H, waits, then runs all eight backward steps; total 33 units. Every stage holds 8 micro-batches of activations at its peak. Bottom: 1F1B. Stage 0 runs four forwards A to D, waits, then alternates backward and forward steps (a, E, b, F, ...) and ends with backward steps; stage 3 alternates from the start (A, a, B, b, ...). Total also 33 units. Peak activations held: 4 on stage 0, 3 on stage 1, 2 on stage 2, 1 on stage 3.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="330"/>
+<text class="sv-tb" x="18" y="26">GPipe, M = 8: every stage holds up to 8 micro-batches</text>
+<text class="sv-tb" x="18" y="166">1F1B, M = 8: stage s holds up to 4 − s micro-batches</text>
+<text class="sv-ts" x="18" y="55">stage 0</text>
+<rect class="sv-b3" x="80" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="85.0" y="55">A</text>
+<rect class="sv-b3" x="100" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="105.0" y="55">B</text>
+<rect class="sv-b3" x="120" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="125.0" y="55">C</text>
+<rect class="sv-b3" x="140" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="145.0" y="55">D</text>
+<rect class="sv-b3" x="160" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="165.0" y="55">E</text>
+<rect class="sv-b3" x="180" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="185.0" y="55">F</text>
+<rect class="sv-b3" x="200" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="205.0" y="55">G</text>
+<rect class="sv-b3" x="220" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="225.0" y="55">H</text>
+<rect class="sv-box" x="240" y="40" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="260" y="40" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="280" y="40" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="300" y="40" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="320" y="40" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="340" y="40" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="360" y="40" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="380" y="40" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="400" y="40" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="420" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="425.0" y="55">a</text>
+<rect class="sv-b1" x="440" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="445.0" y="55">a</text>
+<rect class="sv-b1" x="460" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="465.0" y="55">b</text>
+<rect class="sv-b1" x="480" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="485.0" y="55">b</text>
+<rect class="sv-b1" x="500" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="505.0" y="55">c</text>
+<rect class="sv-b1" x="520" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="525.0" y="55">c</text>
+<rect class="sv-b1" x="540" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="545.0" y="55">d</text>
+<rect class="sv-b1" x="560" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="565.0" y="55">d</text>
+<rect class="sv-b1" x="580" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="585.0" y="55">e</text>
+<rect class="sv-b1" x="600" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="605.0" y="55">e</text>
+<rect class="sv-b1" x="620" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="625.0" y="55">f</text>
+<rect class="sv-b1" x="640" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="645.0" y="55">f</text>
+<rect class="sv-b1" x="660" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="665.0" y="55">g</text>
+<rect class="sv-b1" x="680" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="685.0" y="55">g</text>
+<rect class="sv-b1" x="700" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="705.0" y="55">h</text>
+<rect class="sv-b1" x="720" y="40" width="18" height="22" rx="2"/><text class="sv-ts" x="725.0" y="55">h</text>
+<text class="sv-ts" x="18" y="83">stage 1</text>
+<rect class="sv-box" x="80" y="68" width="18" height="22" rx="2"/>
+<rect class="sv-b3" x="100" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="105.0" y="83">A</text>
+<rect class="sv-b3" x="120" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="125.0" y="83">B</text>
+<rect class="sv-b3" x="140" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="145.0" y="83">C</text>
+<rect class="sv-b3" x="160" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="165.0" y="83">D</text>
+<rect class="sv-b3" x="180" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="185.0" y="83">E</text>
+<rect class="sv-b3" x="200" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="205.0" y="83">F</text>
+<rect class="sv-b3" x="220" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="225.0" y="83">G</text>
+<rect class="sv-b3" x="240" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="245.0" y="83">H</text>
+<rect class="sv-box" x="260" y="68" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="280" y="68" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="300" y="68" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="320" y="68" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="340" y="68" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="360" y="68" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="380" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="385.0" y="83">a</text>
+<rect class="sv-b1" x="400" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="405.0" y="83">a</text>
+<rect class="sv-b1" x="420" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="425.0" y="83">b</text>
+<rect class="sv-b1" x="440" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="445.0" y="83">b</text>
+<rect class="sv-b1" x="460" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="465.0" y="83">c</text>
+<rect class="sv-b1" x="480" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="485.0" y="83">c</text>
+<rect class="sv-b1" x="500" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="505.0" y="83">d</text>
+<rect class="sv-b1" x="520" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="525.0" y="83">d</text>
+<rect class="sv-b1" x="540" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="545.0" y="83">e</text>
+<rect class="sv-b1" x="560" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="565.0" y="83">e</text>
+<rect class="sv-b1" x="580" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="585.0" y="83">f</text>
+<rect class="sv-b1" x="600" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="605.0" y="83">f</text>
+<rect class="sv-b1" x="620" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="625.0" y="83">g</text>
+<rect class="sv-b1" x="640" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="645.0" y="83">g</text>
+<rect class="sv-b1" x="660" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="665.0" y="83">h</text>
+<rect class="sv-b1" x="680" y="68" width="18" height="22" rx="2"/><text class="sv-ts" x="685.0" y="83">h</text>
+<rect class="sv-box" x="700" y="68" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="720" y="68" width="18" height="22" rx="2"/>
+<text class="sv-ts" x="18" y="111">stage 2</text>
+<rect class="sv-box" x="80" y="96" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="100" y="96" width="18" height="22" rx="2"/>
+<rect class="sv-b3" x="120" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="125.0" y="111">A</text>
+<rect class="sv-b3" x="140" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="145.0" y="111">B</text>
+<rect class="sv-b3" x="160" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="165.0" y="111">C</text>
+<rect class="sv-b3" x="180" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="185.0" y="111">D</text>
+<rect class="sv-b3" x="200" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="205.0" y="111">E</text>
+<rect class="sv-b3" x="220" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="225.0" y="111">F</text>
+<rect class="sv-b3" x="240" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="245.0" y="111">G</text>
+<rect class="sv-b3" x="260" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="265.0" y="111">H</text>
+<rect class="sv-box" x="280" y="96" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="300" y="96" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="320" y="96" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="340" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="345.0" y="111">a</text>
+<rect class="sv-b1" x="360" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="365.0" y="111">a</text>
+<rect class="sv-b1" x="380" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="385.0" y="111">b</text>
+<rect class="sv-b1" x="400" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="405.0" y="111">b</text>
+<rect class="sv-b1" x="420" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="425.0" y="111">c</text>
+<rect class="sv-b1" x="440" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="445.0" y="111">c</text>
+<rect class="sv-b1" x="460" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="465.0" y="111">d</text>
+<rect class="sv-b1" x="480" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="485.0" y="111">d</text>
+<rect class="sv-b1" x="500" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="505.0" y="111">e</text>
+<rect class="sv-b1" x="520" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="525.0" y="111">e</text>
+<rect class="sv-b1" x="540" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="545.0" y="111">f</text>
+<rect class="sv-b1" x="560" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="565.0" y="111">f</text>
+<rect class="sv-b1" x="580" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="585.0" y="111">g</text>
+<rect class="sv-b1" x="600" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="605.0" y="111">g</text>
+<rect class="sv-b1" x="620" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="625.0" y="111">h</text>
+<rect class="sv-b1" x="640" y="96" width="18" height="22" rx="2"/><text class="sv-ts" x="645.0" y="111">h</text>
+<rect class="sv-box" x="660" y="96" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="680" y="96" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="700" y="96" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="720" y="96" width="18" height="22" rx="2"/>
+<text class="sv-ts" x="18" y="139">stage 3</text>
+<rect class="sv-box" x="80" y="124" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="100" y="124" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="120" y="124" width="18" height="22" rx="2"/>
+<rect class="sv-b3" x="140" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="145.0" y="139">A</text>
+<rect class="sv-b3" x="160" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="165.0" y="139">B</text>
+<rect class="sv-b3" x="180" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="185.0" y="139">C</text>
+<rect class="sv-b3" x="200" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="205.0" y="139">D</text>
+<rect class="sv-b3" x="220" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="225.0" y="139">E</text>
+<rect class="sv-b3" x="240" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="245.0" y="139">F</text>
+<rect class="sv-b3" x="260" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="265.0" y="139">G</text>
+<rect class="sv-b3" x="280" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="285.0" y="139">H</text>
+<rect class="sv-b1" x="300" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="305.0" y="139">a</text>
+<rect class="sv-b1" x="320" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="325.0" y="139">a</text>
+<rect class="sv-b1" x="340" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="345.0" y="139">b</text>
+<rect class="sv-b1" x="360" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="365.0" y="139">b</text>
+<rect class="sv-b1" x="380" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="385.0" y="139">c</text>
+<rect class="sv-b1" x="400" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="405.0" y="139">c</text>
+<rect class="sv-b1" x="420" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="425.0" y="139">d</text>
+<rect class="sv-b1" x="440" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="445.0" y="139">d</text>
+<rect class="sv-b1" x="460" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="465.0" y="139">e</text>
+<rect class="sv-b1" x="480" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="485.0" y="139">e</text>
+<rect class="sv-b1" x="500" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="505.0" y="139">f</text>
+<rect class="sv-b1" x="520" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="525.0" y="139">f</text>
+<rect class="sv-b1" x="540" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="545.0" y="139">g</text>
+<rect class="sv-b1" x="560" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="565.0" y="139">g</text>
+<rect class="sv-b1" x="580" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="585.0" y="139">h</text>
+<rect class="sv-b1" x="600" y="124" width="18" height="22" rx="2"/><text class="sv-ts" x="605.0" y="139">h</text>
+<rect class="sv-box" x="620" y="124" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="640" y="124" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="660" y="124" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="680" y="124" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="700" y="124" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="720" y="124" width="18" height="22" rx="2"/>
+<text class="sv-ts" x="18" y="195">stage 0</text>
+<rect class="sv-b3" x="80" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="85.0" y="195">A</text>
+<rect class="sv-b3" x="100" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="105.0" y="195">B</text>
+<rect class="sv-b3" x="120" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="125.0" y="195">C</text>
+<rect class="sv-b3" x="140" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="145.0" y="195">D</text>
+<rect class="sv-box" x="160" y="180" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="180" y="180" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="200" y="180" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="220" y="180" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="240" y="180" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="260" y="180" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="280" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="285.0" y="195">a</text>
+<rect class="sv-b1" x="300" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="305.0" y="195">a</text>
+<rect class="sv-b3" x="320" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="325.0" y="195">E</text>
+<rect class="sv-b1" x="340" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="345.0" y="195">b</text>
+<rect class="sv-b1" x="360" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="365.0" y="195">b</text>
+<rect class="sv-b3" x="380" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="385.0" y="195">F</text>
+<rect class="sv-b1" x="400" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="405.0" y="195">c</text>
+<rect class="sv-b1" x="420" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="425.0" y="195">c</text>
+<rect class="sv-b3" x="440" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="445.0" y="195">G</text>
+<rect class="sv-b1" x="460" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="465.0" y="195">d</text>
+<rect class="sv-b1" x="480" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="485.0" y="195">d</text>
+<rect class="sv-b3" x="500" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="505.0" y="195">H</text>
+<rect class="sv-b1" x="520" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="525.0" y="195">e</text>
+<rect class="sv-b1" x="540" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="545.0" y="195">e</text>
+<rect class="sv-box" x="560" y="180" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="580" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="585.0" y="195">f</text>
+<rect class="sv-b1" x="600" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="605.0" y="195">f</text>
+<rect class="sv-box" x="620" y="180" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="640" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="645.0" y="195">g</text>
+<rect class="sv-b1" x="660" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="665.0" y="195">g</text>
+<rect class="sv-box" x="680" y="180" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="700" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="705.0" y="195">h</text>
+<rect class="sv-b1" x="720" y="180" width="18" height="22" rx="2"/><text class="sv-ts" x="725.0" y="195">h</text>
+<text class="sv-ts" x="18" y="223">stage 1</text>
+<rect class="sv-box" x="80" y="208" width="18" height="22" rx="2"/>
+<rect class="sv-b3" x="100" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="105.0" y="223">A</text>
+<rect class="sv-b3" x="120" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="125.0" y="223">B</text>
+<rect class="sv-b3" x="140" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="145.0" y="223">C</text>
+<rect class="sv-box" x="160" y="208" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="180" y="208" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="200" y="208" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="220" y="208" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="240" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="245.0" y="223">a</text>
+<rect class="sv-b1" x="260" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="265.0" y="223">a</text>
+<rect class="sv-b3" x="280" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="285.0" y="223">D</text>
+<rect class="sv-b1" x="300" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="305.0" y="223">b</text>
+<rect class="sv-b1" x="320" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="325.0" y="223">b</text>
+<rect class="sv-b3" x="340" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="345.0" y="223">E</text>
+<rect class="sv-b1" x="360" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="365.0" y="223">c</text>
+<rect class="sv-b1" x="380" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="385.0" y="223">c</text>
+<rect class="sv-b3" x="400" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="405.0" y="223">F</text>
+<rect class="sv-b1" x="420" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="425.0" y="223">d</text>
+<rect class="sv-b1" x="440" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="445.0" y="223">d</text>
+<rect class="sv-b3" x="460" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="465.0" y="223">G</text>
+<rect class="sv-b1" x="480" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="485.0" y="223">e</text>
+<rect class="sv-b1" x="500" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="505.0" y="223">e</text>
+<rect class="sv-b3" x="520" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="525.0" y="223">H</text>
+<rect class="sv-b1" x="540" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="545.0" y="223">f</text>
+<rect class="sv-b1" x="560" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="565.0" y="223">f</text>
+<rect class="sv-box" x="580" y="208" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="600" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="605.0" y="223">g</text>
+<rect class="sv-b1" x="620" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="625.0" y="223">g</text>
+<rect class="sv-box" x="640" y="208" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="660" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="665.0" y="223">h</text>
+<rect class="sv-b1" x="680" y="208" width="18" height="22" rx="2"/><text class="sv-ts" x="685.0" y="223">h</text>
+<rect class="sv-box" x="700" y="208" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="720" y="208" width="18" height="22" rx="2"/>
+<text class="sv-ts" x="18" y="251">stage 2</text>
+<rect class="sv-box" x="80" y="236" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="100" y="236" width="18" height="22" rx="2"/>
+<rect class="sv-b3" x="120" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="125.0" y="251">A</text>
+<rect class="sv-b3" x="140" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="145.0" y="251">B</text>
+<rect class="sv-box" x="160" y="236" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="180" y="236" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="200" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="205.0" y="251">a</text>
+<rect class="sv-b1" x="220" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="225.0" y="251">a</text>
+<rect class="sv-b3" x="240" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="245.0" y="251">C</text>
+<rect class="sv-b1" x="260" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="265.0" y="251">b</text>
+<rect class="sv-b1" x="280" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="285.0" y="251">b</text>
+<rect class="sv-b3" x="300" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="305.0" y="251">D</text>
+<rect class="sv-b1" x="320" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="325.0" y="251">c</text>
+<rect class="sv-b1" x="340" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="345.0" y="251">c</text>
+<rect class="sv-b3" x="360" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="365.0" y="251">E</text>
+<rect class="sv-b1" x="380" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="385.0" y="251">d</text>
+<rect class="sv-b1" x="400" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="405.0" y="251">d</text>
+<rect class="sv-b3" x="420" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="425.0" y="251">F</text>
+<rect class="sv-b1" x="440" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="445.0" y="251">e</text>
+<rect class="sv-b1" x="460" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="465.0" y="251">e</text>
+<rect class="sv-b3" x="480" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="485.0" y="251">G</text>
+<rect class="sv-b1" x="500" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="505.0" y="251">f</text>
+<rect class="sv-b1" x="520" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="525.0" y="251">f</text>
+<rect class="sv-b3" x="540" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="545.0" y="251">H</text>
+<rect class="sv-b1" x="560" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="565.0" y="251">g</text>
+<rect class="sv-b1" x="580" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="585.0" y="251">g</text>
+<rect class="sv-box" x="600" y="236" width="18" height="22" rx="2"/>
+<rect class="sv-b1" x="620" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="625.0" y="251">h</text>
+<rect class="sv-b1" x="640" y="236" width="18" height="22" rx="2"/><text class="sv-ts" x="645.0" y="251">h</text>
+<rect class="sv-box" x="660" y="236" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="680" y="236" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="700" y="236" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="720" y="236" width="18" height="22" rx="2"/>
+<text class="sv-ts" x="18" y="279">stage 3</text>
+<rect class="sv-box" x="80" y="264" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="100" y="264" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="120" y="264" width="18" height="22" rx="2"/>
+<rect class="sv-b3" x="140" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="145.0" y="279">A</text>
+<rect class="sv-b1" x="160" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="165.0" y="279">a</text>
+<rect class="sv-b1" x="180" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="185.0" y="279">a</text>
+<rect class="sv-b3" x="200" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="205.0" y="279">B</text>
+<rect class="sv-b1" x="220" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="225.0" y="279">b</text>
+<rect class="sv-b1" x="240" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="245.0" y="279">b</text>
+<rect class="sv-b3" x="260" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="265.0" y="279">C</text>
+<rect class="sv-b1" x="280" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="285.0" y="279">c</text>
+<rect class="sv-b1" x="300" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="305.0" y="279">c</text>
+<rect class="sv-b3" x="320" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="325.0" y="279">D</text>
+<rect class="sv-b1" x="340" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="345.0" y="279">d</text>
+<rect class="sv-b1" x="360" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="365.0" y="279">d</text>
+<rect class="sv-b3" x="380" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="385.0" y="279">E</text>
+<rect class="sv-b1" x="400" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="405.0" y="279">e</text>
+<rect class="sv-b1" x="420" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="425.0" y="279">e</text>
+<rect class="sv-b3" x="440" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="445.0" y="279">F</text>
+<rect class="sv-b1" x="460" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="465.0" y="279">f</text>
+<rect class="sv-b1" x="480" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="485.0" y="279">f</text>
+<rect class="sv-b3" x="500" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="505.0" y="279">G</text>
+<rect class="sv-b1" x="520" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="525.0" y="279">g</text>
+<rect class="sv-b1" x="540" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="545.0" y="279">g</text>
+<rect class="sv-b3" x="560" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="565.0" y="279">H</text>
+<rect class="sv-b1" x="580" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="585.0" y="279">h</text>
+<rect class="sv-b1" x="600" y="264" width="18" height="22" rx="2"/><text class="sv-ts" x="605.0" y="279">h</text>
+<rect class="sv-box" x="620" y="264" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="640" y="264" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="660" y="264" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="680" y="264" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="700" y="264" width="18" height="22" rx="2"/>
+<rect class="sv-box" x="720" y="264" width="18" height="22" rx="2"/>
+<text class="sv-ts" x="18" y="318">both schedules: time 33 units, ideal 24, bubble 0.273 = (4 − 1)/(8 + 4 − 1)</text>
+</svg>
+</div><figcaption><b>Figure 2.</b> Same bubble, different memory. Computed by Listing 1 (R1), equal stages, communication time zero. <sup class="src"><a href="#F8-14-src-R1">R1</a></sup> <sup class="src"><a href="#F8-14-src-D2">D2</a></sup></figcaption></figure>
+
+<h2 id="F8-14-layer1">Layer 1 — the kid explanation</h2>
+<p>If a model has too many layers for one GPU, you can put the first layers on one GPU, the next layers on another, and so on, like stations on an assembly line. The trouble is that a single big batch makes every station wait for the one before it. So you cut the batch into small pieces. While the second station works on piece 1, the first station starts piece 2. The line still starts empty and ends empty, and those empty moments are wasted. More pieces make the waste smaller, but every station must remember more pieces until the corrections come back.</p>
+
+<h2 id="F8-14-layer2">Layer 2 — the student explanation</h2>
+<h3>Stages and messages</h3>
+<p>The halls pass trays forward and comments back. With S stages, stage s owns a consecutive group of layers. In the forward pass of one micro-batch, stage s receives the activation tensor from stage s − 1, runs its layers, and sends its output to stage s + 1. The last stage computes the loss. In the backward pass, stage s receives the gradient with respect to its output from stage s + 1, runs backpropagation through its layers, accumulates the gradients of its own weights, and sends the gradient with respect to its input to stage s − 1. Only the boundary tensors travel: no weights, no all-reduce inside the pipeline. <sup class="src"><a href="#F8-14-src-D1">D1</a></sup></p>
+<p>Listing 2 does exactly this with MPI: rank s is stage s and owns one layer, y = tanh(W<sub>s</sub> x + b<sub>s</sub>) of width 16; micro-batches of 2 samples travel with <code>MPI_Send</code> and <code>MPI_Recv</code>; the message tag is the micro-batch number (plus 1,000 for gradients), so a stage always receives the micro-batch it expects. <sup class="src"><a href="#F8-14-src-D3">D3</a></sup> <sup class="src"><a href="#F8-14-src-L1">L1</a></sup></p>
+<h3>Correctness: the same gradient</h3>
+<p>Because the optimizer step is taken once after all M micro-batches, and every stage sums its weight gradients over the micro-batches, the pipeline computes exactly the gradient of the whole mini-batch: the same mathematics as one GPU, split differently. Milestone F7 requires: "Outputs match the single-GPU model within tolerance". <sup class="src"><a href="#F8-14-src-M1">M1</a></sup> In Listing 2 each stage recomputes the whole model on its own and compares its weight gradient with the pipeline's; R2 shows a largest difference of 0 on every stage, for M = 1, 4, 8 and 16. Here the difference is exactly 0, not merely small, because every stage performs the same floating-point operations in the same order as the reference: the pipeline changes where the work runs, not how the sums are formed. <sup class="src"><a href="#F8-14-src-R2">R2</a></sup></p>
+<h3>The bubble, derived</h3>
+<p>Take S stages, each needing t<sub>f</sub> for a forward step and t<sub>b</sub> for a backward step of one micro-batch, and ignore communication time. Under the GPipe schedule:</p>
+<ol>
+<li>The last stage can start micro-batch 0's forward step only after S − 1 forward steps upstream: (S − 1) t<sub>f</sub> of fill.</li>
+<li>The last forward step on the last stage ends at (M + S − 1) t<sub>f</sub>.</li>
+<li>Symmetrically, the backward steps take (M + S − 1) t<sub>b</sub> from the first backward step on the last stage to the last backward step on the first stage.</li>
+<li>Step time: T = (M + S − 1)(t<sub>f</sub> + t<sub>b</sub>). Useful work per stage: M (t<sub>f</sub> + t<sub>b</sub>).</li>
+<li>Bubble fraction: 1 − M / (M + S − 1) = (S − 1)/(M + S − 1).</li>
+</ol>
+<p>The GPipe paper gives this overhead in the form O((K − 1)/(M + K − 1)) with K partitions. <sup class="src"><a href="#F8-14-src-D1">D1</a></sup> The schedule simulator computes it cell by cell; R1 prints 0.750 for M = 1, 0.429 for M = 4, 0.273 for M = 8 and 0.086 for M = 32 with S = 4, each equal to the formula. <sup class="src"><a href="#F8-14-src-R1">R1</a></sup> Note that t<sub>f</sub> and t<sub>b</sub> cancel: the fraction depends only on S and M.</p>
+<h3>The measured bubble</h3>
+<p>Listing 2 measures the bubble on a real (if tiny) pipeline: each forward step sleeps t<sub>f</sub> = 20 ms and each backward step 40 ms, standing in for GPU kernels, and each stage records how long it was busy. The measured bubble is 1 − (sum of busy times)/(S × step time). The milestone's acceptance test is that "the measured pipeline bubble fraction matches the formula from the GPipe paper within 20 %". <sup class="src"><a href="#F8-14-src-M1">M1</a></sup> R2's four runs printed "within 20 %" for M = 1, 4, 8 and 16; the exact milliseconds change a little from run to run (the container is shared), so read them in the outputs above rather than in this text. <sup class="src"><a href="#F8-14-src-R2">R2</a></sup></p>
+
+<h2 id="F8-14-layer3">Layer 3 — the engineer's depth</h2>
+<h3>Choosing M: the bubble against everything else</h3>
+<p>The formula says: more micro-batches, smaller bubble. Three forces push back:</p>
+<ul>
+<li><b>Global batch.</b> With a fixed micro-batch size, M micro-batches make the mini-batch M times larger, with the optimisation consequences of F8-12. With a fixed mini-batch, larger M means smaller micro-batches.</li>
+<li><b>Efficiency of small micro-batches.</b> A GPU runs a tiny micro-batch less efficiently than a large one (small GEMMs, fixed per-kernel costs), and every micro-batch pays the per-message cost α of its boundary transfers twice per stage boundary. Shrinking micro-batches to shrink the bubble eventually costs more than it saves.</li>
+<li><b>Activation memory.</b> Under GPipe, each stage holds the activations of all M micro-batches until their backward steps. R1's "holds at most" column: 8 for M = 8 and 32 for M = 32, on every stage. The GPipe paper reduces this by recomputing activations during backward (re-materialisation), paying extra forward computation. <sup class="src"><a href="#F8-14-src-D1">D1</a></sup> <sup class="src"><a href="#F8-14-src-R1">R1</a></sup></li>
+</ul>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not opened in this build: the GPipe paper reports that the bubble overhead is negligible when M is at least about four times K (the number of partitions), in its experiments with re-materialisation. Check the GPipe paper (D1), section on performance and the bubble, before using any such rule; this chapter uses only the formula, which it derives.</p></div>
+<h3>1F1B: the same bubble with bounded memory</h3>
+<p>The 1F1B ("one forward, one backward") schedule changes the order of steps on each stage, not the dependencies. Stage s runs S − 1 − s warm-up forwards, then alternates, then drains. In R1, for S = 4 and M = 8, both schedules take 33 units with a bubble of 0.273, but the peak number of micro-batches whose activations a stage holds falls from 8 on every stage (GPipe) to 4, 3, 2, 1 (1F1B, stages 0 to 3). With M = 32 the GPipe stages hold 32, the 1F1B stages still 4, 3, 2, 1. <sup class="src"><a href="#F8-14-src-R1">R1</a></sup> This schedule appears in the PipeDream line of work and in the later Megatron-LM paper on training at scale, which also describes an interleaved variant that gives each device several smaller stages to shrink the bubble at the price of more communication. <sup class="src"><a href="#F8-14-src-D2">D2</a></sup> <sup class="src"><a href="#F8-14-src-D4">D4</a></sup></p>
+<div class="co note"><span class="lbl">Note</span><p>Asynchronous pipeline schemes (some PipeDream variants) avoid the bubble altogether by not flushing the pipeline between optimizer steps, at the price of computing gradients on slightly stale weights, which changes the training mathematics. This course uses only synchronous schedules, whose result equals the single-GPU computation, because that is what the milestone's acceptance test can check.</p></div>
+<h3>Imbalance: the slowest stage sets the pace</h3>
+<p>The formula assumes equal stages. If one stage takes k times longer than the others, the pipeline's steady state runs at the pace of that stage: every other stage waits for it on every micro-batch. A rough model for GPipe with one stage of time k t and the others t (t = t<sub>f</sub> + t<sub>b</sub>): step time ≈ (S − 1) t + M k t. The bubble formula no longer predicts anything; per-stage busy and idle times do. The forensic lab is exactly this case. Balancing stages is a partitioning problem: equal compute per stage (not equal layer counts: embedding and output layers are often heavier), and equal memory per stage, which conflict when 1F1B makes the first stage hold the most activations.</p>
+<h3>Communication in the pipeline</h3>
+<p>Per micro-batch, each stage boundary carries one activation tensor forward and one gradient tensor back, of size (micro-batch tokens) × (width) × (bytes per value): point-to-point messages, not collectives. They are small compared with a data-parallel gradient all-reduce, which is why pipeline stages can be placed across machines connected by a slower network, while tensor parallelism stays inside the machine (F8-13). In a combined job, every pipeline stage is itself a tensor-parallel group, and each (stage, tensor rank) position has data-parallel replicas that all-reduce their weight gradients after the pipeline step. <sup class="src"><a href="#F8-14-src-D4">D4</a></sup></p>
+
+<h2 id="F8-14-hardware">How the hardware actually does it</h2>
+<p>In the halls, a tray waits on a cart between halls. On GPUs, a stage boundary is a send from one GPU's memory to another's: over a GPU-to-GPU link inside a machine, or through the network (with GPUDirect RDMA where available, DG402) between machines. The collective libraries provide point-to-point send and receive on GPU streams, and a stage overlaps them with its computation by using separate streams for communication; MPI can do the same with non-blocking calls. <sup class="src"><a href="#F8-14-src-D5">D5</a></sup> <sup class="src"><a href="#F8-14-src-D3">D3</a></sup> Activation memory lives in GPU memory (HBM on data-centre GPUs), and the "holds at most" column of R1 is, multiplied by the size of one micro-batch's activations, a direct estimate of how much of that memory the schedule needs. No GPU memory size is quoted here; read yours from the vendor's data sheet or from the device query of CU201.</p>
+
+<h2 id="F8-14-worked">Worked example</h2>
+<p>Choose M for a pipeline of S = 8 equal stages so that the bubble is at most 10 %.</p>
+<ol>
+<li>Require (S − 1)/(M + S − 1) ≤ 0.10, so 7 ≤ 0.10 (M + 7), so M + 7 ≥ 70, so M ≥ 63.</li>
+<li>Check M = 63: 7/69 = 0.101, slightly above; M = 64: 7/70 = 0.100. Take M = 64.</li>
+<li>Memory under GPipe: each stage holds 64 micro-batches of activations at its peak. Under 1F1B: stage 0 holds 8, stage 7 holds 1 (S − s).</li>
+<li>If one micro-batch's activations on a stage take a MiB (measure it on your model), GPipe needs 64 a MiB per stage for activations, 1F1B at most 8 a MiB.</li>
+<li>Check with the simulator: R1's last case, S = 8, M = 8, gives 0.467 = 7/15; adding the line <code>8 64 1 2 1f1b</code> to <code>pipe_sim.in</code> gives 7/70 = 0.100.</li>
+</ol>
+<p>The arithmetic in steps 1–2 is exact; the S = 8, M = 8 case is in R1. <sup class="src"><a href="#F8-14-src-R1">R1</a></sup> The engineering conclusion: a deep pipeline needs many micro-batches, and many micro-batches need 1F1B (or recomputation) to fit in memory.</p>
+
+<h2 id="F8-14-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>pipe_sim.cpp</code>: GPipe and 1F1B schedules computed step by step.</p>
+<pre class="listing" data-src="F8-14/pipe_sim.cpp"></pre>
+<p>Input <code>pipe_sim.in</code>:</p>
+<pre class="listing" data-src="F8-14/pipe_sim.in"></pre>
+<p><b>Build command</b> (by <code>run_lab.sh</code>): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined pipe_sim.cpp -o pipe_sim</code>; run with <code>./pipe_sim &lt; pipe_sim.in</code>.</p>
+<pre class="output" data-run="F8-14/pipe_sim"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">15–19</td><td><code>struct Op</code></td><td>One step: forward or backward, and which micro-batch.</td><td>A schedule is a list of these per stage.</td></tr>
+<tr><td class="n">21–38</td><td><code>order</code></td><td>GPipe: all forwards then all backwards. 1F1B: S − 1 − s warm-up forwards, then alternate, then drain.</td><td>The only difference between the schedules is this order.</td></tr>
+<tr><td class="n">45–49</td><td><code>fEnd</code>, <code>bEnd</code>, <code>free</code>, <code>held</code>, <code>peak</code></td><td>End times of every step; when each stage is free; activations held now and at most.</td><td>Dependencies plus one resource per stage: a tiny discrete-event simulation.</td></tr>
+<tr><td class="n">52–74</td><td>main loop</td><td>Repeatedly starts, on each stage, its next step whose input exists.</td><td>The dependency rules of the header comment, lines 57–63.</td></tr>
+<tr><td class="n">64</td><td><code>start = max(ready, free[s])</code></td><td>A step starts when its input exists and its stage is free.</td><td>Idle time appears exactly where an input is late: the bubble.</td></tr>
+<tr><td class="n">70–71</td><td><code>held</code>, <code>peak</code></td><td>+1 for a forward, −1 for a backward.</td><td>The activation stash, counted in micro-batches.</td></tr>
+<tr><td class="n">76–86</td><td>report</td><td>Draws the timelines, then the bubble fraction and the formula.</td><td>The formula is printed next to the count, so any disagreement would be visible.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>pipe_mpi.cc</code>: a four-stage GPipe pipeline with MPI, checked and timed.</p>
+<pre class="listing" data-src="F8-14/pipe_mpi.cc"></pre>
+<p><b>Build and run</b> (by <code>run.sh</code>): <code>mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -DOMPI_SKIP_MPICXX pipe_mpi.cc -o pipe_mpi</code>, then <code>mpirun --allow-run-as-root --oversubscribe -np 4 ./pipe_mpi M=8</code> (also M = 1, 4, 16). The flags are explained in F8-12.</p>
+<pre class="output" data-run="F8-14/pipe_M1"></pre>
+<pre class="output" data-run="F8-14/pipe_M4"></pre>
+<pre class="output" data-run="F8-14/pipe_M8"></pre>
+<pre class="output" data-run="F8-14/pipe_M16"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">19–20</td><td><code>kW</code>, <code>kMb</code></td><td>Width 16; 2 samples per micro-batch.</td><td>Boundary messages are 32 floats: communication time is negligible next to the sleeps, as the formula assumes.</td></tr>
+<tr><td class="n">40</td><td><code>layer(s)</code></td><td>Stage s's weights from a seed.</td><td>Every rank can rebuild every layer for the reference.</td></tr>
+<tr><td class="n">42–70</td><td><code>forward</code>, <code>backward</code></td><td>One tanh layer and its gradient; <code>backward</code> adds the weight gradient and returns dL/dx.</td><td>dL/dx is the message sent to the previous stage.</td></tr>
+<tr><td class="n">88</td><td><code>myTf</code></td><td>This stage's forward time; one stage can be made slower.</td><td>Used by the forensic lab.</td></tr>
+<tr><td class="n">93–97</td><td><code>work</code></td><td>Sleeps and adds the measured time to <code>busyMs</code>.</td><td>The stand-in for GPU kernels; busy time is measured, not assumed.</td></tr>
+<tr><td class="n">99–100</td><td><code>MPI_Barrier</code>, <code>start</code></td><td>All stages start the clock together.</td><td>The step time is measured from a common start.</td></tr>
+<tr><td class="n">101–108</td><td>forward loop</td><td>Receive from s − 1 (tag m), compute, work, send to s + 1.</td><td>Stage 0 reads the input instead; the last stage does not send.</td></tr>
+<tr><td class="n">109–120</td><td>backward loop</td><td>The last stage computes dL/dy from the target; others receive it (tag 1000 + m); backward; send dL/dx to s − 1.</td><td>Backward work is 2 t<sub>f</sub>, as in the simulator's t<sub>b</sub> = 2.</td></tr>
+<tr><td class="n">123–141</td><td>reference</td><td>The whole model for all micro-batches on one process; keeps the gradient of layer s.</td><td>The milestone's comparison with the single-GPU model.</td></tr>
+<tr><td class="n">144–146</td><td><code>MPI_Gather</code></td><td>Busy time, step time and gradient difference to rank 0.</td><td>One report for the whole pipeline.</td></tr>
+<tr><td class="n">156–159</td><td>bubble</td><td>Measured 1 − Σbusy/(S × time) against (S − 1)/(M + S − 1), with the 20 % test.</td><td>The milestone's acceptance test, printed by the program.</td></tr>
+</tbody></table></div>
+
+<h2 id="F8-14-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Trays move; activations are copied.</b> A stage sends a copy of its output and keeps the original (the stash) for its backward step. The hall in the story hands the tray away; the GPU cannot.</li>
+<li><b>Guests' comments are not gradients of the whole meal.</b> In backpropagation each stage needs the gradient from the next stage for the same micro-batch, in a strict order; there is no shortcut where a hall adjusts its recipe from its own tasting.</li>
+<li><b>Real halls can speed up when they see a queue.</b> A pipeline stage cannot: its time is fixed by its layers, and an unbalanced split slows every stage to the pace of the slowest one.</li>
+<li><b>The analogy hides that the optimizer waits for all trays.</b> In a synchronous pipeline no weights change until every micro-batch's backward step is done; that wait is what makes the drain bubble.</li>
+</ul>
+
+<h2 id="F8-14-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Deadlock at the boundary.</b> Symptom: stages stop with no error. Cause: both neighbours call a blocking send to each other first, or receive with the wrong tag or source. Find it: log every send and receive with micro-batch and tag; F8-16's watchdog finds the stall. Fix: a strict order (forward sends go down, backward sends go up) or non-blocking calls.</li>
+<li><b>Wrong gradients.</b> Symptom: the per-stage gradient check fails. Cause: gradients averaged over micro-batches on some stages and summed on others, or the stash of one micro-batch used for another. Fix: tag every stash entry with its micro-batch; compare with the single-process model as Listing 2 does.</li>
+<li><b>Out of memory only with more micro-batches.</b> Cause: GPipe holds all M stashes (R1). Fix: 1F1B, recomputation, or fewer micro-batches.</li>
+<li><b>Bubble far worse than the formula.</b> Cause: unbalanced stages (forensic lab) or boundary transfers not overlapped. Find it: per-stage busy and idle times.</li>
+<li><b>Measured bubble that cannot be trusted.</b> Cause: timing on a shared machine. Fix: repeat runs and report the median (MA202, curriculum 13.4), and state the machine.</li>
+</ul>
+
+<div class="co transition" id="F8-14-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F8-12 replicated the model and all-reduced gradients; F8-13 split each layer and all-reduced activations inside a group. <b>What carries over:</b> the result must equal the single-GPU computation within a tolerance; communication must be matched exactly on both sides; a model of the step predicts before you measure. <sup class="src"><a href="#F8-14-src-M1">M1</a></sup> <b>What changes:</b> communication becomes point-to-point between neighbours (MPI_Send/MPI_Recv, or the libraries' send and receive), and the main cost is not bytes but idle time: the bubble, and the activation memory of micro-batches in flight. <sup class="src"><a href="#F8-14-src-D1">D1</a></sup> <sup class="src"><a href="#F8-14-src-D3">D3</a></sup> <b>What comes next:</b> F8-15 attacks the memory that every data-parallel replica still duplicates: the optimizer state, the gradients and the parameters.</p></div>
+
+<h2 id="F8-14-check">Check yourself</h2>
+<ol>
+<li>Derive the GPipe bubble fraction for S stages and M micro-batches in four lines.</li>
+<li>Explain in your own words why t<sub>f</sub> and t<sub>b</sub> do not appear in the bubble formula.</li>
+<li>For S = 4, which M gives a bubble of at most 20 %? Show the inequality.</li>
+<li>Which statement is true: (a) 1F1B has a smaller bubble than GPipe for equal stages; (b) 1F1B holds fewer activations on stage 0 than GPipe when M &gt; S; (c) GPipe needs an all-reduce between stages; (d) increasing M always shortens the step?</li>
+<li>Apply to a new case: a pipeline of 6 stages where stage 0 also holds the embedding and takes 1.5 times as long as the others. Predict, with the rough model of Layer 3, the step time for M = 12 relative to balanced stages.</li>
+<li>Predict, then run: add <code>4 8 1 1 gpipe</code> to <code>pipe_sim.in</code>. Does the bubble fraction change compared with t<sub>b</sub> = 2? Why?</li>
+<li>Why can pipeline stages sit on different machines more comfortably than tensor-parallel ranks?</li>
+<li>Listing 2's gradients match the reference exactly (difference 0), while Listing 1 of F8-12 differed by 5.96 × 10<sup>−8</sup>. Explain the difference.</li>
+</ol>
+
+<h2 id="F8-14-lab">Lab</h2>
+<p><b>Goal.</b> Split layers across ranks with micro-batches (pipeline parallelism), show that gradients match the single-process model, and measure the bubble against the GPipe formula (milestone F7, part 2).</p>
+<p><b>Hardware and software.</b> Part A: any Linux computer with g++ and Open MPI (this build: g++ 13.3.0, Open MPI 4.1.6, 4 logical CPUs, no GPU; sleeps stand in for GPU work). Part B: two to four GPUs, ideally across two machines, with NCCL/RCCL point-to-point or GPU-aware MPI; <span class="tag">untested in this build</span>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F8-14</code>. Read Figure 1 in R1's output and find each part of the derivation in it.</li>
+<li>In R2, compare the measured bubble with the formula for M = 1, 4, 8, 16. Run <code>run.sh</code> five times and record the median measured bubble for M = 8.</li>
+<li>Implement 1F1B in Listing 2 (copy the order of Listing 1's <code>order</code> function). Hint: a stage must post the receive it will need next; with blocking calls, check that no two neighbours wait on each other. Verify gradients and measure the bubble.</li>
+<li>Add a stash counter to Listing 2 and print the peak per stage. Compare with R1's "holds at most".</li>
+<li>Part B: run the pipeline with real layers on GPUs, with the boundary transfers on a separate stream, and record a timeline.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: every measured bubble within 20 % of the formula (R2), with small run-to-run differences in the milliseconds. Step 3: the same bubble as GPipe and the same gradients. Step 4: peaks 4, 3, 2, 1 for 1F1B and M on every stage for GPipe.</p>
+<p><b>Verification.</b> Milestone F7 acceptance, verbatim: "Outputs match the single-GPU model within tolerance; the measured pipeline bubble fraction matches the formula from the GPipe paper within 20 %." <sup class="src"><a href="#F8-14-src-M1">M1</a></sup></p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The run hangs after your 1F1B change → two stages wait for each other; stop it with <code>timeout</code>, log sends and receives, and check the warm-up count S − 1 − s.</li>
+<li>Measured bubble far from the formula on a loaded machine → too many processes for the CPUs; use fewer stages or longer sleeps, and repeat.</li>
+<li>Gradient differences after your change → a stash entry used for the wrong micro-batch; key the stash by micro-batch number.</li>
+</ul>
+<p><b>Extension.</b> Implement the interleaved schedule (two stages per rank, each half as deep) in the simulator and compare its bubble and its number of boundary messages with 1F1B.</p>
+
+<h2 id="F8-14-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "The pipeline is twice as slow as the plan." Tomás planned a four-stage pipeline with M = 8 and expected a step of about 660 ms with a bubble of 27 %. The first real run takes much longer. The model was split by giving each stage the same number of layers. The team ran the pipeline with its per-stage timers.</p>
+<p><b>Evidence pack.</b> The run's report <sup class="src"><a href="#F8-14-src-R3">R3</a></sup>:</p>
+<pre class="output" data-run="F8-14/pipe_slow"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which stage is different, and how do the busy and idle times of the other stages compare with the balanced run in R2 (M = 8)?</li>
+<li>Hypotheses: list at least three (communication between stages; a slow machine; one heavy stage; too few micro-batches) and the evidence for or against each.</li>
+<li>Explain the step time with the rough model of Layer 3. What is k?</li>
+<li>Would more micro-batches fix it? Compute the step time for M = 16 with the same imbalance and compare with balanced stages.</li>
+<li>Fix: propose a repartition and predict its step time.</li>
+<li>Prevention: what should a planning tool check before a pipeline split is accepted?</li>
+</ol>
+<p><b>Method hints.</b> Compare busy times across stages first; idle time on a fast stage is a symptom, not a cause.</p>
+
+<h2 id="F8-14-project">Mini-project</h2>
+<p><b>Design review of a parallelism plan (practice for the course exam P).</b> Given: a model of 48 equal transformer layers with your measured (or labelled invented) per-layer time and activation size, 32 GPUs in 4 machines of 8, and a target global batch. Write a two-page plan: tensor-parallel size, pipeline stages and schedule, micro-batch count, data-parallel size; predict the bubble (Listing 1), the tensor-parallel traffic (F8-13 Listing 2), the data-parallel gradient traffic and overlap (F8-12 Listing 2) and the memory per GPU (F8-15 Listing 1). State every assumption and which number would change your plan.</p>
+<p><b>Rubric</b> (10 points): factorisation consistent with the hardware (tensor-parallel group inside a machine) (2); bubble and memory predictions computed with the course's tools, shown (3); every input value labelled measured or invented (2); at least two alternatives considered and rejected with reasons (2); clear risks section (1).</p>
+
+<h2 id="F8-14-summary">Summary</h2>
+<ul>
+<li>Pipeline parallelism splits the layers into stages; activations go forward, gradients come back, point-to-point.</li>
+<li>Micro-batches let stages work at the same time; the step still has a fill and a drain: the bubble.</li>
+<li>For equal stages under GPipe, the bubble fraction is (S − 1)/(M + S − 1); R1 reproduces it exactly and R2 measured it within 20 % on a real MPI pipeline.</li>
+<li>GPipe holds the activations of all M micro-batches; 1F1B has the same bubble and holds at most S − s.</li>
+<li>Gradients equal the single-process computation: the pipeline changes where the work runs, not the mathematics.</li>
+<li>An unbalanced stage sets the pace of the whole pipeline; per-stage busy times reveal it.</li>
+</ul>
+
+<h2 id="F8-14-sources">Sources</h2>
+<ol>
+<li id="F8-14-src-D1">D1 — Yanping Huang et al., "GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism", 2019 (tier 5; curriculum item 85): micro-batching, the bubble overhead, re-materialisation. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-14-src-D2">D2 — Deepak Narayanan et al., "PipeDream: Generalized Pipeline Parallelism for DNN Training", SOSP 2019 (tier 5; not in the guide's registry, proposed in NOTES.md): the one-forward-one-backward schedule. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-14-src-D3">D3 — MPI Forum, "MPI: A Message-Passing Interface Standard", chapter "Point-to-Point Communication" (tier 1; curriculum item 77). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-14-src-D4">D4 — Deepak Narayanan et al., "Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM", SC 2021 (tier 5; not in the guide's registry, proposed in NOTES.md): combining tensor, pipeline and data parallelism; the interleaved schedule. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-14-src-D5">D5 — NVIDIA, NCCL documentation (point-to-point communication, CUDA stream semantics); AMD, RCCL documentation (tier 1; guide 4.6). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-14-src-M1">M1 — Systems Curriculum (repository file <code>SYSTEMS_CURRICULUM.html</code>), milestone F7 (goal, build and acceptance test quoted verbatim). A map, not a source for technical claims (AH-4).</li>
+<li id="F8-14-src-L1">L1 — Open MPI 4.1.6 header in the build container (tier 4, opened): <code>/usr/lib/x86_64-linux-gnu/openmpi/include/mpi.h</code> lines 1808 (<code>MPI_Send</code>), 1747 (<code>MPI_Recv</code>), 1367 (<code>MPI_Barrier</code>), 1577 (<code>MPI_Gather</code>).</li>
+<li id="F8-14-src-R1">R1 — lab run of Listing 1 on <code>pipe_sim.in</code>: <code>F8-14/pipe_sim.out</code>, <code>pipe_sim.log</code> (g++ 13.3.0 with ASan and UBSan, exit code 0).</li>
+<li id="F8-14-src-R2">R2 — lab runs of Listing 2 with 4 processes and M = 1, 4, 8, 16: <code>F8-14/pipe_M1.out</code> … <code>pipe_M16.out</code> with logs (Open MPI 4.1.6, g++ 13.3.0, exit code 0; times measured with sleeps on a shared container, they vary between runs).</li>
+<li id="F8-14-src-R3">R3 — lab run of Listing 2 with <code>M=8 slow=2:3</code> (forensic evidence): <code>F8-14/pipe_slow.out</code>, <code>pipe_slow.log</code> (exit code 0).</li>
+</ol>
+
+<h2 id="F8-14-glossary">Glossary links</h2>
+<p><a href="#gl-pipeline-parallelism">Pipeline parallelism</a> · <a href="#gl-micro-batch">Micro-batch</a> · <a href="#gl-pipeline-bubble">Pipeline bubble</a> · <a href="#gl-gpipe-schedule">GPipe schedule</a> · <a href="#gl-1f1b-schedule">1F1B schedule</a> · <a href="#gl-activation-memory-stash">Activation memory (stash)</a> · <a href="#gl-tensor-parallelism">Tensor parallelism</a> · <a href="#gl-data-parallelism">Data parallelism</a></p>
+
+<h2 id="F8-14-next">Next chapter</h2>
+<p>Next: <a href="#F8-15">F8-15 Sharded optimizer states (reading)</a>. Previous: <a href="#F8-13">F8-13 Tensor parallelism</a>. Back to the course: <a href="#DG403">DG403</a>. Contrast: <a href="#F1-24">F1-24</a> (the CPU pipeline). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackF">Track F</a>.</p>
+
+<h2 id="F8-14-answers">Answers to Check yourself</h2>
+<ol>
+<li>Last forward on the last stage ends at (M + S − 1) t<sub>f</sub>; the backward sweep takes (M + S − 1) t<sub>b</sub>; step time (M + S − 1)(t<sub>f</sub> + t<sub>b</sub>); useful work per stage M (t<sub>f</sub> + t<sub>b</sub>); bubble = 1 − M/(M + S − 1) = (S − 1)/(M + S − 1).</li>
+<li>Both the step time and the useful work are multiples of (t<sub>f</sub> + t<sub>b</sub>) under GPipe with equal stages, so the ratio depends only on how many slots are filled (M) out of how many exist (M + S − 1).</li>
+<li>3/(M + 3) ≤ 0.2 ⇔ M + 3 ≥ 15 ⇔ M ≥ 12.</li>
+<li>(b). (a) equal for equal stages (R1); (c) only point-to-point messages between neighbours; (d) more, smaller micro-batches shrink the bubble but lower GPU efficiency and add per-message costs.</li>
+<li>Balanced: (M + S − 1) t = 17 t. Unbalanced, rough model: (S − 1) t + M k t = 5 t + 12 × 1.5 t = 23 t, about 35 % slower.</li>
+<li>No: 0.273 again, because the fraction depends only on S and M. Run it to confirm; the drawn timeline changes (backward cells are single).</li>
+<li>Pipeline boundaries carry one activation and one gradient per micro-batch between two neighbours, point-to-point and overlappable; tensor-parallel ranks all-reduce in every layer on the critical path.</li>
+<li>Listing 2's reference performs the same operations in the same order for each stage's gradient (sums over micro-batches in the same order, no change of summation grouping), so the floating-point results are identical; in F8-12 the data-parallel sum was regrouped into per-rank partial sums.</li>
+</ol>
+<h3 id="F8-14-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Stage 2 is busy about three times as long as the others (roughly 1,440 ms against roughly 480 ms; the exact milliseconds change a little from run to run). The other stages are busy as long as in the balanced run (roughly 480–500 ms) but idle roughly 1,140 ms instead of roughly 190 ms; the measured bubble is about 0.55 and the program prints "NOT within 20 %". (Exact milliseconds vary slightly between runs.)</li>
+<li>Communication: no, boundary messages are 32 floats, and the fast stages' busy time is unchanged. Slow machine: no, only one stage is slower, by a clean factor. Too few micro-batches: M = 8 matches the plan, and the formula predicts 27 %. Heavy stage: yes, stage 2's busy time is three times the others.</li>
+<li>k = 3, t = t<sub>f</sub> + t<sub>b</sub> = 60 ms: (S − 1) t + M k t = 3 × 60 + 8 × 180 = 1,620 ms, against the measured pipeline time of roughly 1,620–1,630 ms (read the exact value in the evidence; it varies slightly between runs).</li>
+<li>M = 16: 3 × 60 + 16 × 180 = 3,060 ms for 16 micro-batches, against (16 + 3) × 60 = 1,140 ms balanced: still about 2.7 times slower. More micro-batches shrink the fill and drain, not the steady-state pace set by the slow stage.</li>
+<li>Move work out of stage 2 so that all stages take equal time (by measured time, not by layer count); if stage 2's work cannot be split, give it fewer layers and the others more. Balanced, the plan's step of (M + S − 1)(t<sub>f</sub> + t<sub>b</sub>) = 660 ms, measured within a few per cent in R2 (M = 8), is reachable.</li>
+<li>Profile every layer's time (and memory) first, partition by measured cost, and reject a plan whose largest stage exceeds the mean by more than a stated margin; run the per-stage timer on a short job before the real one.</li>
+</ol>
+<p>How the evidence was produced: Listing 2 run with <code>M=8 slow=2:3</code>, which multiplies stage 2's sleep by 3; the output is unedited.</p>

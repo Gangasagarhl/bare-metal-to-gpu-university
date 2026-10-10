@@ -1,0 +1,293 @@
+<!--meta
+id: F8-15
+title: Sharded optimizer states (reading)
+course: DG403
+level: L4
+prereqs: F8-12 Data parallelism; F8-02 Reduce-scatter and all-gather (the ring algorithms); F7 chapters on optimizers (Adam) or equivalent
+time: 6–9 hours (a reading chapter with two short listings)
+hardware: none: a calculator program and MPI processes on one Linux computer (this build: g++ 13.3.0, Open MPI 4.1.6, no GPU)
+maps: Track F 14.1 row "Parallelism strategies" (sharded optimizer states; Rajbhandari et al., "ZeRO"); curriculum item 85; course card DG403 (guide 5.13); supports milestone F7 (memory side of a parallelism plan) and the course exam P (design review)
+analogy: F8 — the great kitchen hall (registered: a chain of kitchen halls with a delivery service; ring all-reduce = passing bowls around a round table). Proposed in NOTES.md: "sharded optimizer state = each hall keeps only its own pages of the shared recipe notebook and reads the others' pages aloud when they are needed"
+-->
+
+<h2 id="F8-15-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>Eight halls of the kitchen cook the same menu from the same recipe book. Each hall also keeps a thick notebook next to the book: for every line of every recipe, two running notes on how the line has been changing lately. Every evening, all eight halls agree on the same corrections, and every hall updates every line of its own notebook in exactly the same way. Eight identical notebooks, eight times the same work.</p>
+<p>Imani, the head cook, notices that the notebooks now fill more shelves than the food. "Each hall keeps one eighth of the notebook," she says. "Hall 1 keeps the notes for pages 1 to 50, hall 2 for pages 51 to 100. Each hall corrects only its own pages and then reads the corrected recipe lines aloud to the others." The shelves empty. Nobody tastes any difference in the food. But one evening, a hall loses its pages, and the next morning the food from seven halls tastes slightly wrong.</p>
+</div>
+
+<h2 id="F8-15-able">What you will be able to do</h2>
+<ul>
+<li><b>Count</b> the memory of the model states (parameters, gradients, optimizer state) per GPU for plain data parallelism, with a stated number of bytes per parameter.</li>
+<li><b>Explain</b> the three levels of sharding described in the ZeRO paper: optimizer states, gradients, parameters; and what each costs in communication.</li>
+<li><b>Show</b>, with an MPI program, that sharding the optimizer state with reduce-scatter and all-gather gives the same weights as plain data parallelism.</li>
+<li><b>Recognise</b> the checkpointing consequence: a sharded state must be saved and restored per rank.</li>
+<li><b>Use</b> the calculator in a design review: which level of sharding a model needs on a given number of GPUs.</li>
+</ul>
+
+<div class="co jargon" id="F8-15-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Model states</dt><dd><b>Simple words:</b> everything training keeps about the model itself: the weights, their gradients and the optimizer's notes. <b>Analogy:</b> the recipe book, tonight's corrections and the notebook of running notes. <b>Precise:</b> the parameters, the gradients and the optimizer state, as distinct from the activations (which depend on the batch) and temporary buffers; the ZeRO paper uses this term for the memory it partitions. <sup class="src"><a href="#F8-15-src-D1">D1</a></sup></dd>
+<dt>Optimizer state</dt><dd><b>Simple words:</b> the extra numbers an optimizer keeps for every weight between steps. <b>Analogy:</b> the two running notes for every recipe line. <b>Precise:</b> per-parameter tensors an optimizer carries from step to step; Adam keeps a first-moment (moving average of the gradient) and a second-moment (moving average of its square) estimate for every parameter, so two values per parameter, plus, in mixed-precision training, an FP32 master copy of the parameters. <sup class="src"><a href="#F8-15-src-D2">D2</a></sup> <sup class="src"><a href="#F8-15-src-D3">D3</a></sup></dd>
+<dt>Sharded optimizer state</dt><dd><b>Simple words:</b> each data-parallel GPU keeps the optimizer state for only its own part of the weights. <b>Analogy:</b> each hall keeps only its own pages of the notebook. <b>Precise:</b> the optimizer state of P parameters is partitioned into N disjoint slices of P/N parameters across the N data-parallel ranks; each rank updates only its slice and the updated parameters are then all-gathered; the first of the ZeRO paper's three stages. <sup class="src"><a href="#F8-15-src-D1">D1</a></sup></dd>
+<dt>ZeRO stages</dt><dd><b>Simple words:</b> three levels of how much is split among the data-parallel GPUs. <b>Analogy:</b> first the notebook, then also tonight's corrections, then also the recipe book itself, read aloud page by page when needed. <b>Precise:</b> in the ZeRO paper's terms, partitioning of the optimizer states (P<sub>os</sub>), additionally of the gradients (P<sub>os+g</sub>), and additionally of the parameters (P<sub>os+g+p</sub>); this course calls them stages 1, 2 and 3, as implementations commonly do. <sup class="src"><a href="#F8-15-src-D1">D1</a></sup></dd>
+<dt>Reduce-scatter</dt><dd><b>Simple words:</b> add up everyone's arrays and give each rank only its own part of the sum. <b>Analogy:</b> passing bowls around the round table, each cook keeping only the bowl for their own pages. <b>Precise:</b> the collective that reduces N equal-length inputs element-wise and scatters the result in N equal blocks, block r to rank r; in MPI <code>MPI_Reduce_scatter_block</code>; with a ring, each rank sends (N − 1)/N of the data, half of an all-reduce (F8-02). <sup class="src"><a href="#F8-15-src-D4">D4</a></sup> <sup class="src"><a href="#F8-15-src-L1">L1</a></sup></dd>
+</dl></div>
+
+<h2 id="F8-15-pictures">The idea in pictures</h2>
+<p>Figure 1 shows one training step of four data-parallel ranks, plain and with the optimizer state sharded (stage 1). The bars are model states per rank, drawn to scale for the 16 bytes per parameter used in this chapter's example (2 for an FP16 parameter, 2 for an FP16 gradient, 12 for the optimizer state).</p>
+<figure id="F8-15-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F8-15-f1t F8-15-f1d">
+<title id="F8-15-f1t">Figure 1: plain data parallelism and sharded optimizer state on four ranks</title>
+<desc id="F8-15-f1d">Left half: plain data parallelism. Four ranks each hold a full bar: parameters 2 units, gradients 2 units, optimizer state 12 units, total 16 per parameter. An arrow labelled all-reduce connects the gradients; every rank runs Adam on everything. Right half: sharded optimizer state. Four ranks each hold full parameters (2), full gradients (2) and one quarter of the optimizer state (3), total 7 per parameter. Steps: reduce-scatter of gradients gives each rank the summed gradient of its quarter; Adam on that quarter; all-gather of the updated parameters.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="26">plain data parallelism: 16 bytes per parameter on every rank</text>
+<text class="sv-tb" x="400" y="26">stage 1: optimizer state sharded, 2 + 2 + 12/4 = 7</text>
+<text class="sv-ts" x="20" y="62">rank 0</text><rect class="sv-b1" x="80" y="48" width="24" height="22"/><rect class="sv-b2" x="104" y="48" width="24" height="22"/><rect class="sv-b4" x="128" y="48" width="144" height="22"/>
+<text class="sv-ts" x="20" y="92">rank 1</text><rect class="sv-b1" x="80" y="78" width="24" height="22"/><rect class="sv-b2" x="104" y="78" width="24" height="22"/><rect class="sv-b4" x="128" y="78" width="144" height="22"/>
+<text class="sv-ts" x="20" y="122">rank 2</text><rect class="sv-b1" x="80" y="108" width="24" height="22"/><rect class="sv-b2" x="104" y="108" width="24" height="22"/><rect class="sv-b4" x="128" y="108" width="144" height="22"/>
+<text class="sv-ts" x="20" y="152">rank 3</text><rect class="sv-b1" x="80" y="138" width="24" height="22"/><rect class="sv-b2" x="104" y="138" width="24" height="22"/><rect class="sv-b4" x="128" y="138" width="144" height="22"/>
+<text class="sv-ts" x="400" y="62">rank 0</text><rect class="sv-b1" x="460" y="48" width="24" height="22"/><rect class="sv-b2" x="484" y="48" width="24" height="22"/><rect class="sv-b4" x="508" y="48" width="36" height="22"/><rect class="sv-dash" x="544" y="48" width="108" height="22"/>
+<text class="sv-ts" x="400" y="92">rank 1</text><rect class="sv-b1" x="460" y="78" width="24" height="22"/><rect class="sv-b2" x="484" y="78" width="24" height="22"/><rect class="sv-dash" x="508" y="78" width="36" height="22"/><rect class="sv-b4" x="544" y="78" width="36" height="22"/><rect class="sv-dash" x="580" y="78" width="72" height="22"/>
+<text class="sv-ts" x="400" y="122">rank 2</text><rect class="sv-b1" x="460" y="108" width="24" height="22"/><rect class="sv-b2" x="484" y="108" width="24" height="22"/><rect class="sv-dash" x="508" y="108" width="72" height="22"/><rect class="sv-b4" x="580" y="108" width="36" height="22"/><rect class="sv-dash" x="616" y="108" width="36" height="22"/>
+<text class="sv-ts" x="400" y="152">rank 3</text><rect class="sv-b1" x="460" y="138" width="24" height="22"/><rect class="sv-b2" x="484" y="138" width="24" height="22"/><rect class="sv-dash" x="508" y="138" width="108" height="22"/><rect class="sv-b4" x="616" y="138" width="36" height="22"/>
+<rect class="sv-b1" x="80" y="182" width="14" height="12"/><text class="sv-ts" x="100" y="192">parameters (2 B)</text>
+<rect class="sv-b2" x="220" y="182" width="14" height="12"/><text class="sv-ts" x="240" y="192">gradients (2 B)</text>
+<rect class="sv-b4" x="360" y="182" width="14" height="12"/><text class="sv-ts" x="380" y="192">optimizer state (12 B)</text>
+<rect class="sv-dash" x="540" y="182" width="14" height="12"/><text class="sv-ts" x="560" y="192">not stored on this rank</text>
+<rect class="sv-box" x="20" y="214" width="340" height="96" rx="6"/>
+<text class="sv-tb" x="34" y="236">plain step</text>
+<text class="sv-ts" x="34" y="258">1. all-reduce the full gradient</text>
+<text class="sv-ts" x="34" y="278">2. every rank: Adam on all P parameters</text>
+<text class="sv-ts" x="34" y="298">sent per rank: 2 (N − 1)/N × gradient bytes</text>
+<rect class="sv-box" x="400" y="214" width="340" height="96" rx="6"/>
+<text class="sv-tb" x="414" y="236">sharded step</text>
+<text class="sv-ts" x="414" y="258">1. reduce-scatter: rank r gets its slice's sum</text>
+<text class="sv-ts" x="414" y="278">2. Adam on P/N parameters; 3. all-gather them</text>
+<text class="sv-ts" x="414" y="298">sent per rank: the same 2 (N − 1)/N × bytes</text>
+</svg>
+</div><figcaption><b>Figure 1.</b> Sharding the optimizer state removes three quarters of its copies on four ranks while sending the same number of bytes: an all-reduce is a reduce-scatter followed by an all-gather (F8-02). Byte counts per parameter as in the ZeRO paper's mixed-precision Adam example (from memory: see the unverified box in Layer 2). <sup class="src"><a href="#F8-15-src-D1">D1</a></sup></figcaption></figure>
+
+<h2 id="F8-15-layer1">Layer 1 — the kid explanation</h2>
+<p>When many computers train the same model, each one usually keeps a complete copy of everything: the model, its corrections and the optimizer's notes. The notes are often the biggest part, and every computer works out exactly the same notes. That is wasteful. Instead, each computer can keep the notes for only its own piece of the model, update only that piece, and then tell everyone the new values. The answer is the same; the memory is much smaller; and the amount of talking stays the same. The price: when you save your work, each computer has to save its own piece, and every piece is needed to start again.</p>
+
+<h2 id="F8-15-layer2">Layer 2 — the student explanation</h2>
+<h3>Where the memory goes</h3>
+<p>The halls' notebooks are the optimizer state. To count it, fix how many bytes each parameter needs. This chapter uses one configuration throughout, from the ZeRO paper's analysis of mixed-precision training with Adam: 2 bytes for the FP16 parameter, 2 bytes for the FP16 gradient, and 12 bytes of optimizer state (an FP32 master copy of the parameter, and Adam's two FP32 moments), 16 bytes per parameter. <sup class="src"><a href="#F8-15-src-D1">D1</a></sup> <sup class="src"><a href="#F8-15-src-D3">D3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not opened in this build: that the ZeRO paper writes the optimizer-state cost as K bytes per parameter with K = 12 for mixed-precision Adam, arriving at 16Ψ bytes for Ψ parameters, and that it uses a 7.5-billion-parameter model on 64 GPUs as its running example. The calculator below makes the 2 + 2 + 12 split an input, so the arithmetic does not depend on these memories; check D1 (section on model states) before quoting the paper's figures.</p></div>
+<p>With Ψ parameters, plain data parallelism stores 16Ψ bytes on every GPU, however many GPUs there are, because every rank is a full replica (F8-12). For Ψ = 10<sup>10</sup>, Listing 1 prints 149.01 GiB per GPU, more than the invented 64 GiB budget of the example, and computes that no model larger than 4.29 × 10<sup>9</sup> parameters fits that budget with plain data parallelism, whatever N is. <sup class="src"><a href="#F8-15-src-R1">R1</a></sup> Activations come on top of this and are not counted here.</p>
+<h3>Stage 1: shard the optimizer state</h3>
+<p>Every rank computes the same Adam update for every parameter, from the same averaged gradient and the same moments. That work and memory can be divided: rank r keeps the moments (and master weights) of slice r only, P/N parameters. One step becomes:</p>
+<ol>
+<li>Each rank computes its local gradient for all P parameters (its shard of the batch, as in F8-12).</li>
+<li><b>Reduce-scatter</b>: rank r receives the sum over all ranks of slice r of the gradient, and nothing else.</li>
+<li>Rank r runs Adam on its slice: P/N parameters, with its P/N moments.</li>
+<li><b>All-gather</b>: every rank receives every updated slice, so all ranks again hold the same full parameters for the next forward pass.</li>
+</ol>
+<p>Reduce-scatter followed by all-gather is exactly how the ring all-reduce of F8-02 works internally, so the bytes sent per rank are the same as for plain data parallelism: 2 (N − 1)/N times the gradient size. The ZeRO paper makes this point: the first two stages cost no extra communication. <sup class="src"><a href="#F8-15-src-D1">D1</a></sup> Listing 1's "sent per GPU per step" column shows equal values for stages 0, 1 and 2. <sup class="src"><a href="#F8-15-src-R1">R1</a></sup></p>
+<h3>The same weights</h3>
+<p>Listing 2 runs both trainers side by side on a linear model with 1,024 parameters and Adam: the plain one (all-reduce, Adam on everything, 8,192 bytes of moments per rank) and the sharded one (reduce-scatter, Adam on 256 parameters, all-gather, 2,048 bytes at N = 4). After 50 steps the largest difference between their weights is 0 on 1 and 2 processes and 7.45 × 10<sup>−8</sup> on 4, within the tolerance of 10<sup>−5</sup>; both reach the same distance to the true weights, 11.5682. <sup class="src"><a href="#F8-15-src-R2">R2</a></sup> The small difference at N = 4 is the floating-point effect of F8-12: Open MPI's reduce-scatter and all-reduce may add the four contributions in different orders. Adam itself is applied element by element, so splitting it into slices changes nothing.</p>
+<h3>Stages 2 and 3</h3>
+<p>Each rank, after the reduce-scatter, needs only its own slice of the summed gradient. <b>Stage 2</b> keeps only that slice, so gradients drop from 2Ψ to 2Ψ/N bytes per rank (in a real implementation, buckets of gradient are reduce-scattered and dropped during the backward pass). Communication is still the same. <b>Stage 3</b> also shards the parameters: each rank stores only its slice, and before each layer's forward (and again before its backward) the layer's parameters are all-gathered from the ranks that own them, used, and dropped. Memory per rank becomes 16Ψ/N; communication rises to about 1.5 times that of plain data parallelism in the ZeRO paper's analysis, because the parameters are gathered twice per step. <sup class="src"><a href="#F8-15-src-D1">D1</a></sup> Listing 1's example B: 149.01, 39.00, 20.66 and 2.33 GiB per GPU for stages 0 to 3 on 64 GPUs; 36.67 GiB sent per GPU per step for stages 0 to 2 and 55.01 GiB for stage 3. <sup class="src"><a href="#F8-15-src-R1">R1</a></sup></p>
+
+<h2 id="F8-15-layer3">Layer 3 — the engineer's depth</h2>
+<h3>Reading the formula, not the slogan</h3>
+<p>Per rank, with b<sub>p</sub>, b<sub>g</sub>, b<sub>o</sub> bytes per parameter for parameters, gradients and optimizer state:</p>
+<div class="tw"><table>
+<thead><tr><th>Stage</th><th>Model states per rank</th><th>Sent per rank per step (ring)</th></tr></thead>
+<tbody>
+<tr><td>0 plain</td><td>(b<sub>p</sub> + b<sub>g</sub> + b<sub>o</sub>) Ψ</td><td>2 (N − 1)/N · b<sub>g</sub> Ψ</td></tr>
+<tr><td>1 optimizer states</td><td>(b<sub>p</sub> + b<sub>g</sub>) Ψ + b<sub>o</sub> Ψ/N</td><td>2 (N − 1)/N · b<sub>g</sub> Ψ</td></tr>
+<tr><td>2 + gradients</td><td>b<sub>p</sub> Ψ + (b<sub>g</sub> + b<sub>o</sub>) Ψ/N</td><td>2 (N − 1)/N · b<sub>g</sub> Ψ</td></tr>
+<tr><td>3 + parameters</td><td>(b<sub>p</sub> + b<sub>g</sub> + b<sub>o</sub>) Ψ/N</td><td>3 (N − 1)/N · b<sub>g</sub> Ψ</td></tr>
+</tbody></table></div>
+<p>These are the formulas of Listing 1, lines 17–30. <sup class="src"><a href="#F8-15-src-R1">R1</a></sup> Two consequences matter in a design review:</p>
+<ul>
+<li><b>Stages 1 and 2 have a floor.</b> As N grows, their memory tends to (b<sub>p</sub> + b<sub>g</sub>) Ψ and b<sub>p</sub> Ψ: the replicated part. Doubling the GPUs does not halve it. Stage 3 alone scales as 1/N.</li>
+<li><b>The optimizer matters.</b> Listing 1's third case, FP32 weights with plain SGD (4 + 4 + 0 bytes): stage 1 saves nothing, because there is no optimizer state to shard; 74.51 GiB per GPU at stages 0 and 1. <sup class="src"><a href="#F8-15-src-R1">R1</a></sup> Sharding helps exactly where the optimizer state is large, which is why the example uses Adam.</li>
+</ul>
+<h3>Stage 3 is a different kind of program</h3>
+<p>Stages 1 and 2 change only the end of the step. Stage 3 changes the inside of the forward and backward passes: a layer cannot run until its parameters have been gathered. Implementations prefetch the next layer's parameters while the current layer computes, in the same spirit as F8-12's gradient buckets overlap the backward pass; when that prefetch is not hidden, the step slows down. The 1.5× communication of Listing 1 is the volume; whether it costs time is a question of overlap, answered by a timeline (F8-12's method), not by the table.</p>
+<h3>Sharding against the other strategies</h3>
+<p>Sharding reduces model-state memory without changing the mathematics, like data parallelism; it does not reduce activation memory, and it does not split a single layer's computation. Tensor parallelism (F8-13) splits each layer's weights and computation inside a group, with activation all-reduces in every layer; pipeline parallelism (F8-14) splits the layers and pays a bubble. In a combined plan, sharding is applied across the data-parallel dimension: each data-parallel group shards the states of its (tensor, pipeline) part of the model. <sup class="src"><a href="#F8-15-src-D1">D1</a></sup> <sup class="src"><a href="#F8-15-src-D5">D5</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not checked in this build: PyTorch provides sharded data parallelism as "Fully Sharded Data Parallel" (FSDP), with a sharding strategy option whose values include full sharding (comparable to stage 3) and a gradient-and-optimizer sharding mode (comparable to stage 2), and DeepSpeed exposes the ZeRO stages as a configuration value 0–3. Names, defaults and exact behaviour change between versions; read the documentation of the installed version before relying on any of them. This chapter's listings use only MPI calls whose declarations were opened (L1).</p></div>
+<h3>Checkpoints of sharded state</h3>
+<p>With plain data parallelism, any rank's copy of the optimizer state is the whole state; saving rank 0's copy is enough. With sharding, the state is the union of N different slices, and a checkpoint must hold all of them: one file per rank, or a collective write into one file, and a restart that gives each rank back its own slice (or redistributes the slices if N changes). Listing 2 with <code>ckpt=25</code> saves and reloads one file per rank at step 25 and still matches (R3). The forensic lab is the version that saves only rank 0's file. <sup class="src"><a href="#F8-15-src-R3">R3</a></sup> F8-16 builds the full checkpoint-and-restart machinery.</p>
+
+<h2 id="F8-15-hardware">How the hardware actually does it</h2>
+<p>The model states live in the GPU's own memory (HBM on data-centre GPUs); sharding decides how much of it each GPU must reserve before the first activation is stored. The reduce-scatter and all-gather run in the collective libraries on GPU streams, over the GPU-to-GPU links inside a machine and the network between machines; NCCL and RCCL provide both collectives directly. <sup class="src"><a href="#F8-15-src-D6">D6</a></sup> Some systems go further and move optimizer state to CPU memory or NVMe storage ("offload"), trading GPU memory for PCIe traffic; the ZeRO line of work includes such variants. This chapter does not quote any GPU memory size: read yours from the device query of CU201 or the vendor's data sheet, and put it in Listing 1 as the budget.</p>
+
+<h2 id="F8-15-worked">Worked example</h2>
+<p>Example A of Listing 1: Ψ = 10<sup>9</sup> parameters, N = 8 GPUs, 2 + 2 + 12 bytes per parameter. All by hand, then compared with R1.</p>
+<ol>
+<li>Stage 0: 16 × 10<sup>9</sup> bytes = 16 × 10<sup>9</sup> / 2<sup>30</sup> GiB = 14.90 GiB per GPU.</li>
+<li>Stage 1: (2 + 2) × 10<sup>9</sup> + 12 × 10<sup>9</sup>/8 = 4 × 10<sup>9</sup> + 1.5 × 10<sup>9</sup> = 5.5 × 10<sup>9</sup> bytes = 5.12 GiB.</li>
+<li>Stage 2: 2 × 10<sup>9</sup> + 14 × 10<sup>9</sup>/8 = 3.75 × 10<sup>9</sup> bytes = 3.49 GiB.</li>
+<li>Stage 3: 16 × 10<sup>9</sup>/8 = 2 × 10<sup>9</sup> bytes = 1.86 GiB.</li>
+<li>Communication, stages 0–2: 2 × 7/8 × 2 × 10<sup>9</sup> = 3.5 × 10<sup>9</sup> bytes = 3.26 GiB per GPU per step; stage 3: 3 × 7/8 × 2 × 10<sup>9</sup> = 5.25 × 10<sup>9</sup> bytes = 4.89 GiB.</li>
+<li>Largest model with a 64 GiB budget at stage 1: 64 × 2<sup>30</sup> / (4 + 12/8) = 1.25 × 10<sup>10</sup> parameters.</li>
+</ol>
+<p>All six numbers agree with R1's example A. <sup class="src"><a href="#F8-15-src-R1">R1</a></sup> The budget of 64 GiB is an invented teaching value, not the memory of any product.</p>
+
+<h2 id="F8-15-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>zero_mem.cpp</code>: memory and communication per GPU for the four stages.</p>
+<pre class="listing" data-src="F8-15/zero_mem.cpp"></pre>
+<p>Input <code>zero_mem.in</code> (label, parameters, ranks, bytes per parameter, per gradient, of optimizer state per parameter, budget in GiB; all invented teaching values):</p>
+<pre class="listing" data-src="F8-15/zero_mem.in"></pre>
+<p><b>Build command</b> (by <code>run_lab.sh</code>): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined zero_mem.cpp -o zero_mem</code>; run with <code>./zero_mem &lt; zero_mem.in</code>.</p>
+<pre class="output" data-run="F8-15/zero_mem"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">16</td><td><code>while (std::cin &gt;&gt; ...)</code></td><td>One case per input line.</td><td>Bytes per parameter are inputs, not hidden constants.</td></tr>
+<tr><td class="n">17–22</td><td><code>perStage</code></td><td>Model-state bytes per GPU for stages 0–3.</td><td>The table of Layer 3, line by line.</td></tr>
+<tr><td class="n">23</td><td><code>perParam</code></td><td>The same per parameter.</td><td>Used to find the largest model that fits the budget.</td></tr>
+<tr><td class="n">24–30</td><td><code>ring</code>, <code>commBytes</code></td><td>Bytes sent per GPU per step with ring collectives.</td><td>Stages 0–2 equal; stage 3 one extra all-gather.</td></tr>
+<tr><td class="n">37–40</td><td>print loop</td><td>One row per stage, in GiB (2<sup>30</sup> bytes).</td><td>Units stated in the header line.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>zero_os.cc</code>: plain data parallelism and a sharded optimizer state, side by side.</p>
+<pre class="listing" data-src="F8-15/zero_os.cc"></pre>
+<p><b>Build and run</b> (by <code>run.sh</code>): <code>mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -DOMPI_SKIP_MPICXX zero_os.cc -o zero_os</code>, then <code>mpirun --allow-run-as-root --oversubscribe -np 4 ./zero_os</code> (also 1 and 2 processes, and 4 with <code>ckpt=25</code>). The flags are explained in F8-12.</p>
+<pre class="output" data-run="F8-15/zero_np1"></pre>
+<pre class="output" data-run="F8-15/zero_np2"></pre>
+<pre class="output" data-run="F8-15/zero_np4"></pre>
+<pre class="output" data-run="F8-15/zero_ckpt"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">21–24</td><td>constants</td><td>1,024 parameters, batch 64, 50 steps, Adam's usual hyper-parameters.</td><td>Small enough to run anywhere; Adam because it has optimizer state.</td></tr>
+<tr><td class="n">38–51</td><td><code>gradient</code></td><td>Sum of the squared-error gradient over this rank's samples; data from a hash.</td><td>Deterministic: both trainers see the same data.</td></tr>
+<tr><td class="n">54–63</td><td><code>adam</code></td><td>Adam with bias correction on n parameters.</td><td>Element-wise: running it on slices is the same as on the whole.</td></tr>
+<tr><td class="n">65–84</td><td><code>save</code>, <code>load</code></td><td>Writes or reads the two moment vectors; aborts on any error.</td><td>Every I/O result is checked.</td></tr>
+<tr><td class="n">104–105</td><td>state</td><td>Plain: moments for all P. Sharded: moments for P/N.</td><td>The memory saving, in two declarations.</td></tr>
+<tr><td class="n">108–112</td><td>plain step</td><td>Gradient, <code>MPI_Allreduce</code>, average, Adam on all.</td><td>F8-12's data parallelism.</td></tr>
+<tr><td class="n">114–120</td><td>sharded step</td><td><code>MPI_Reduce_scatter_block</code>, average, Adam on the own slice, <code>MPI_Allgather</code>.</td><td>Stage 1 in four lines.</td></tr>
+<tr><td class="n">122–134</td><td>checkpoint test</td><td>Saves, clears and reloads the sharded moments; <code>bug=rank0ckpt</code> uses rank 0's file for everyone.</td><td>The forensic lab.</td></tr>
+<tr><td class="n">135–146</td><td>comparison</td><td>Largest weight difference; per slice around the checkpoint.</td><td>Shows which ranks' slices go wrong.</td></tr>
+<tr><td class="n">157–166</td><td>report</td><td>Distances to the true weights, optimizer bytes per rank, verdict.</td><td>The memory saving is printed, not claimed.</td></tr>
+<tr><td class="n">168</td><td><code>std::remove</code></td><td>Each rank deletes its own file.</td><td>No stale state for the next run.</td></tr>
+</tbody></table></div>
+
+<h2 id="F8-15-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Reading aloud is not free, but it is not extra either.</b> The halls seem to add a new chore; in fact the all-gather replaces the second half of the all-reduce the halls already did, so stages 1 and 2 add no bytes.</li>
+<li><b>Notebook pages are not independent of each other in general.</b> Adam's update is element-wise, so splitting is exact; an optimizer that needs whole-matrix information (for example one that normalises per layer) cannot be cut at arbitrary points, and the slice boundaries must follow its structure.</li>
+<li><b>A lost page in the kitchen is noticed.</b> A lost or wrong optimizer slice is not: training continues and the loss changes only slightly (forensic lab).</li>
+</ul>
+
+<h2 id="F8-15-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Counting only parameters.</b> "10<sup>10</sup> parameters in FP16 = 18.6 GiB, it fits" ignores gradients and optimizer state; Listing 1's example B says 149 GiB per GPU without sharding.</li>
+<li><b>Expecting stage 1 to scale without limit.</b> The replicated parameters and gradients remain; check the floor (Layer 3).</li>
+<li><b>Sharding an optimizer that has no state.</b> Plain SGD: nothing to save (R1, third case).</li>
+<li><b>Saving only one rank's state.</b> Works with plain data parallelism, silently wrong with sharding (forensic lab).</li>
+<li><b>Restarting on a different N without resharding.</b> The slices no longer line up with the ranks; a checkpoint format should record N and the slice boundaries, and the loader should refuse or redistribute.</li>
+</ul>
+
+<div class="co transition" id="F8-15-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F8-12 to F8-14 split the batch, the layer and the layer stack; every data-parallel replica still held complete model states. <b>What carries over:</b> the result must equal the unsharded computation within a tolerance; reduce-scatter and all-gather are the two halves of the ring all-reduce (F8-02); count bytes before measuring time. <sup class="src"><a href="#F8-15-src-R2">R2</a></sup> <b>What changes:</b> the state of a training job is now spread over all ranks, so saving and restoring it becomes a collective act: losing one rank loses part of the state. <sup class="src"><a href="#F8-15-src-R3">R3</a></sup> <b>What comes next:</b> F8-16 makes that loss survivable: detect a failed rank, stop the job, and restart from a consistent checkpoint.</p></div>
+
+<h2 id="F8-15-check">Check yourself</h2>
+<ol>
+<li>How many bytes per parameter does mixed-precision Adam need in this chapter's accounting, and what are the parts?</li>
+<li>Why does stage 1 not increase the communication volume compared with plain data parallelism?</li>
+<li>Compute stage 2 memory per GPU for Ψ = 2 × 10<sup>9</sup>, N = 16, 2 + 2 + 12 bytes.</li>
+<li>Which statement is true: (a) stage 2 memory halves when N doubles; (b) stage 3 sends 1.5 times the bytes of plain data parallelism in this chapter's model; (c) sharding reduces activation memory; (d) stage 1 helps plain SGD?</li>
+<li>Apply to a new case: a team has 8 GPUs with an (invented) 40 GiB budget for model states and a 3 × 10<sup>9</sup>-parameter model with Adam. Which is the lowest stage that fits? Use Listing 1 (add a line) and say what you added.</li>
+<li>Why are Listing 2's weights exactly equal on 2 ranks but differ by 7.45 × 10<sup>−8</sup> on 4?</li>
+<li>Predict, then run: change Listing 2 to use <code>kP = 1000</code>. What happens on 4 ranks, and on 8?</li>
+<li>Name two things a sharded checkpoint must record beyond the numbers themselves.</li>
+</ol>
+
+<h2 id="F8-15-lab">Lab</h2>
+<p><b>Goal.</b> Use the calculator to size a sharding plan, and confirm with MPI that sharding the optimizer state changes memory, not results.</p>
+<p><b>Hardware and software.</b> Any Linux computer with g++ and Open MPI (this build: g++ 13.3.0, Open MPI 4.1.6, 4 logical CPUs, no GPU). Extension on GPUs: a framework with sharded data parallelism on 2 or more GPUs; <span class="tag">untested in this build</span>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F8-15</code>. Check two rows of R1 by hand.</li>
+<li>Add a line for your own model to <code>zero_mem.in</code>, with a budget equal to your GPU's memory minus an activation estimate; label which numbers are measured and which invented.</li>
+<li>Read R2 and R3; then run Listing 2 on 1, 2, 4 processes yourself and confirm the optimizer bytes per rank fall as 1/N.</li>
+<li>Implement stage 2 in Listing 2: drop the full gradient after the reduce-scatter and keep only the slice. Measure the vector sizes and confirm the weights still match.</li>
+<li>Extension: on GPUs, train the same small model with your framework's sharded data parallelism at each available level and record peak GPU memory.</li>
+</ol>
+<p><b>Expected observations.</b> Step 1: hand results equal R1. Step 3: plain 8,192 bytes on every N; sharded 8,192, 4,096 and 2,048 bytes for N = 1, 2, 4; MATCH each time. Step 4: MATCH, with gradient storage 1/N.</p>
+<p><b>Verification.</b> Listing 2 prints MATCH with tolerance 10<sup>−5</sup>, and the printed optimizer bytes equal 8P/N.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"P and the batch must divide by the number of ranks" → choose N dividing 1,024 and 64.</li>
+<li>MATCH lost after your stage-2 change → a gradient slice used for the wrong parameters; print the slice start for each rank.</li>
+<li>Very slow with many processes → more processes than CPUs; use at most the number of logical CPUs for timing.</li>
+</ul>
+<p><b>Extension.</b> Add stage 3 to Listing 2: keep only your slice of the weights and all-gather them before computing the gradient; count the bytes sent and compare with Listing 1's 1.5×.</p>
+
+<h2 id="F8-15-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "It resumed, but it is not the same run." Yusuf's team switched their data-parallel training from plain Adam to a sharded optimizer state to save memory. Their checkpoint code had always saved rank 0's optimizer state, which was correct before the switch. After a restart from step 25 the job ran to the end without errors, but the final quality was worse than the uninterrupted reference run. The team re-ran the experiment with a per-slice comparison against the plain trainer.</p>
+<p><b>Evidence pack.</b> The comparison run's output <sup class="src"><a href="#F8-15-src-R4">R4</a></sup>, and, for contrast, the same run with one file per rank (R3, in the code walk-through):</p>
+<pre class="output" data-run="F8-15/zero_bug"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: at step 25 and at step 26, which slices differ from the plain trainer, and by how much?</li>
+<li>Why is slice 0 still correct at step 26, and why does it drift by step 50?</li>
+<li>Hypotheses: floating-point order; a wrong learning rate after restart; wrong optimizer state on some ranks. Which does the evidence support, and how do you rule the others out?</li>
+<li>Root cause: what did each rank load, and why was that harmless before the switch?</li>
+<li>Fix and verification: what must the checkpoint do, and what evidence (from R3) shows the fix works?</li>
+<li>Prevention: which automatic check would have caught this on the first restart?</li>
+</ol>
+<p><b>Method hints.</b> Compare R4 with R3 line by line; they differ only in the checkpoint.</p>
+
+<h2 id="F8-15-project">Mini-project</h2>
+<p><b>Memory section of a parallelism plan (contributes to the course exam P, design review).</b> For a model of your choice (state Ψ and the optimizer), and a cluster of your choice (state GPU memory as measured or as an invented value), produce one page: a table of Listing 1's results for the GPU counts you could get, the stage you choose, the activation memory you estimate on top (from F8-14's stash count or your own measurement), and the communication cost per step of your choice compared with plain data parallelism. Add a paragraph on checkpointing: files per rank, what is recorded, how a restart on a different number of GPUs would work.</p>
+<p><b>Rubric</b> (10 points): correct use of the formulas, with one row checked by hand (3); every input labelled measured or invented (2); activations accounted for, not ignored (2); checkpoint plan covers per-rank slices and a changed N (2); clear recommendation with its main risk (1).</p>
+
+<h2 id="F8-15-summary">Summary</h2>
+<ul>
+<li>Plain data parallelism replicates the model states on every GPU: 16 bytes per parameter in this chapter's mixed-precision Adam accounting.</li>
+<li>Sharding the optimizer state (stage 1) keeps each rank's slice only; reduce-scatter plus all-gather replaces the all-reduce at the same communication volume.</li>
+<li>Stage 2 also shards gradients (same volume); stage 3 also shards parameters (about 1.5 times the volume, memory 1/N).</li>
+<li>Listing 2 showed the sharded trainer matches the plain one (largest difference 7.45 × 10<sup>−8</sup> on 4 ranks) with a quarter of the optimizer memory.</li>
+<li>A sharded state must be checkpointed per rank; saving one rank's slice gives a silent, slowly growing error.</li>
+</ul>
+
+<h2 id="F8-15-sources">Sources</h2>
+<ol>
+<li id="F8-15-src-D1">D1 — Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, Yuxiong He, "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models", SC 2020 (tier 5; curriculum item 85): model states, the three partitioning stages, their memory and communication. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-15-src-D2">D2 — Diederik P. Kingma, Jimmy Ba, "Adam: A Method for Stochastic Optimization", ICLR 2015 (tier 5; not in the guide's registry, proposed in NOTES.md): the two moment estimates and bias correction used in Listing 2. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-15-src-D3">D3 — Paulius Micikevicius et al., "Mixed Precision Training", ICLR 2018 (tier 5; not in the guide's registry, proposed in NOTES.md): FP16 computation with an FP32 master copy of the weights. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-15-src-D4">D4 — MPI Forum, "MPI: A Message-Passing Interface Standard", chapter "Collective Communication" (reduce-scatter, all-gather) (tier 1; curriculum item 77). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-15-src-D5">D5 — Mohammad Shoeybi et al., "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism", 2019 (tier 5; curriculum item 85). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-15-src-D6">D6 — NVIDIA, NCCL documentation (collective operations: ReduceScatter, AllGather); AMD, RCCL documentation (tier 1; guide 4.6). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-15-src-L1">L1 — Open MPI 4.1.6 header in the build container (tier 4, opened): <code>/usr/lib/x86_64-linux-gnu/openmpi/include/mpi.h</code> lines 1759 (<code>MPI_Reduce_scatter_block</code>), 1331 (<code>MPI_Allgather</code>), 1345 (<code>MPI_Allreduce</code>).</li>
+<li id="F8-15-src-R1">R1 — lab run of Listing 1 on <code>zero_mem.in</code>: <code>F8-15/zero_mem.out</code>, <code>zero_mem.log</code> (g++ 13.3.0 with ASan and UBSan, exit code 0).</li>
+<li id="F8-15-src-R2">R2 — lab runs of Listing 2 on 1, 2 and 4 processes: <code>F8-15/zero_np1.out</code>, <code>zero_np2.out</code>, <code>zero_np4.out</code> with logs (Open MPI 4.1.6, exit code 0).</li>
+<li id="F8-15-src-R3">R3 — lab run of Listing 2 with <code>ckpt=25</code> on 4 processes: <code>F8-15/zero_ckpt.out</code>, <code>zero_ckpt.log</code> (exit code 0).</li>
+<li id="F8-15-src-R4">R4 — lab run of Listing 2 with <code>ckpt=25 bug=rank0ckpt</code> on 4 processes (forensic evidence): <code>F8-15/zero_bug.out</code>, <code>zero_bug.log</code> (exit code 0).</li>
+</ol>
+
+<h2 id="F8-15-glossary">Glossary links</h2>
+<p><a href="#gl-model-states">Model states</a> · <a href="#gl-optimizer-state">Optimizer state</a> · <a href="#gl-sharded-optimizer-state">Sharded optimizer state</a> · <a href="#gl-zero-stages">ZeRO stages</a> · <a href="#gl-reduce-scatter">Reduce-scatter</a> · <a href="#gl-data-parallelism">Data parallelism</a> · <a href="#gl-collective">Collective</a></p>
+
+<h2 id="F8-15-next">Next chapter</h2>
+<p>Next: <a href="#F8-16">F8-16 Fault tolerance: detect, abort, restart</a>. Previous: <a href="#F8-14">F8-14 Pipeline parallelism and the bubble</a>. Back to the course: <a href="#DG403">DG403</a>. Collectives refresher: <a href="#F8-02">F8-02</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackF">Track F</a>.</p>
+
+<h2 id="F8-15-answers">Answers to Check yourself</h2>
+<ol>
+<li>16: 2 (FP16 parameter) + 2 (FP16 gradient) + 12 (FP32 master parameter 4 + two FP32 Adam moments 8).</li>
+<li>An all-reduce is a reduce-scatter followed by an all-gather; stage 1 does the same two operations, with Adam on the slice in between.</li>
+<li>2 × 2 × 10<sup>9</sup> + 14 × 2 × 10<sup>9</sup>/16 = 4 × 10<sup>9</sup> + 1.75 × 10<sup>9</sup> = 5.75 × 10<sup>9</sup> bytes = 5.36 GiB.</li>
+<li>(b). (a) the replicated parameters do not shrink; (c) activations are untouched; (d) plain SGD has no optimizer state (R1, third case).</li>
+<li>Line <code>team 3e9 8 2 2 12 40</code>. Stage 0: 48 × 10<sup>9</sup> bytes = 44.7 GiB, too much; stage 1: 12 × 10<sup>9</sup> + 4.5 × 10<sup>9</sup> = 16.5 × 10<sup>9</sup> bytes = 15.4 GiB, fits. Stage 1 is the lowest that fits (before activations).</li>
+<li>With 2 ranks there are only two contributions; a + b = b + a, so any summation order gives the same result. With 4, the reduce-scatter and the all-reduce may group the four contributions differently, (a + b) + (c + d) against ((a + b) + c) + d, and rounding differs in the last bit.</li>
+<li>On 4 ranks it still works (1000/4 = 250). On 8 it stops with "P and the batch must divide by the number of ranks" (1000/8 is not whole), exit code 2 from <code>MPI_Abort</code>. Real implementations pad the last slice instead.</li>
+<li>The number of ranks N and each slice's parameter range (and the step number, and a checksum so a damaged file is refused: F8-16).</li>
+</ol>
+<h3 id="F8-15-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Step 25 (after reload): all slices about 3 × 10<sup>−8</sup>, normal. Step 26: slice 0 still 2.61 × 10<sup>−8</sup>, slices 1–3 about 0.0095–0.0102. By step 50: slices 1–3 about 0.075–0.079 and slice 0 0.0109; the final distance to the true weights is 13.5006 against 11.5682.</li>
+<li>Rank 0 loaded its own file, so its moments are right and its first update after the restart is right. From then on, the weights of slices 1–3 are wrong, and every gradient depends on all weights, so slice 0's gradient, and therefore its weights, drift too.</li>
+<li>Floating-point order: ruled out, differences of 10<sup>−2</sup> appear in one step, and R3 (same code, per-rank files) stays at 10<sup>−8</sup>. Learning rate: would affect all slices including slice 0 at step 26. Wrong optimizer state on ranks 1–3: fits exactly.</li>
+<li>Every rank loaded rank 0's file: ranks 1–3 got the moments of parameters 0–255 for their own slices. Before the switch every rank held identical full moments, so rank 0's file was the whole state.</li>
+<li>Save one file per rank (or a collective file with every slice), each rank loads its own; R3 shows MATCH with this fix. Also record N and the slice ranges.</li>
+<li>After every restart in testing, compare a few steps against an uninterrupted run (the per-slice check used here); and store a rank and slice header in each file, so a loader refuses a file that belongs to another rank.</li>
+</ol>
+<p>How the evidence was produced: Listing 2 run with <code>ckpt=25 bug=rank0ckpt</code> on 4 processes; the output is unedited. The team and its history are invented for the exercise.</p>

@@ -1,0 +1,339 @@
+<!--meta
+id: F8-12
+title: Data parallelism
+course: DG403
+level: L4
+prereqs: DG402; DS303; F8-03 The alpha-beta cost model and bus bandwidth; F8-05 Your own ring all-reduce; F8-06 NCCL and RCCL in a data-parallel training step; F8-11 Overlapping communication with computation
+time: 10–14 hours including the lab
+hardware: none for the listings: MPI processes on one Linux computer stand in for GPUs (this build: g++ 13.3.0, Open MPI 4.1.6, no GPU). The real-hardware extension needs two or more GPUs, or two GPU machines with a network (course requirement of DG402–DG403), or cloud instances
+maps: Curriculum Track F 14.1 (row "Parallelism strategies"; row "Overlap"); milestone F3 acceptance test (repeated with MPI); milestone F6 (bucketing and overlap, modelled); course card DG403 (guide 5.13)
+analogy: F8 — the great kitchen hall (registered: a chain of kitchen halls with a delivery service; passing bowls around a round table). Proposed in NOTES.md: "replica = a hall with its own full copy of the recipe book"
+-->
+
+<h2 id="F8-12-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>Four kitchen halls stand in a row, joined by a delivery service. Each hall has its own full copy of the same recipe book, and each is trying to improve the same soup. Every morning the head cooks share one big crate of tasting notes: Amara's hall reads the first quarter, Bao's the second, Chidi's the third and Dana's the last. Each hall writes down how it would change the recipe. Before lunch, the four lists travel around the halls on the delivery carts until every hall holds the sum of all four, and every hall makes exactly the same change to its book.</p>
+<p>For a week this works beautifully. Then the delivery service gets busy, and the cooks notice something odd: they spend more time waiting for the carts than tasting. Bao suggests sending each page of corrections as soon as it is written instead of waiting for the whole list. Amara warns that a cart for every single line would be worse still. Who is right?</p>
+</div>
+
+<h2 id="F8-12-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> data parallelism: replicas, shards of the global batch, gradient all-reduce, and why every replica must apply the same update.</li>
+<li><b>Prove</b> with a run that N-rank data-parallel training equals one-process training on the same global batch within a stated tolerance, and explain why it is not bit-for-bit equal.</li>
+<li><b>Implement</b> gradient buckets that are sent with non-blocking all-reduce while the backward pass continues.</li>
+<li><b>Predict</b> the step time of a data-parallel job with the alpha-beta model for different bucket sizes, and choose a bucket size.</li>
+<li><b>Diagnose</b> a step-time regression from a communication-stream trace.</li>
+<li><b>State</b> the limits of data parallelism (memory per replica, global batch size) that motivate the next three chapters.</li>
+</ul>
+
+<div class="co jargon" id="F8-12-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Data parallelism</dt><dd><b>Simple words:</b> every GPU trains a full copy of the model on a different part of the data, and the copies agree after every step. <b>Analogy:</b> every hall has the whole recipe book and reads a different part of the tasting notes. <b>Precise:</b> a training strategy in which N processes each hold a complete replica of the model, each computes the gradient of the loss on its shard of the global batch, the gradients are summed (all-reduce) and averaged, and every replica applies the identical optimizer update, so the replicas stay identical. <sup class="src"><a href="#F8-12-src-D1">D1</a></sup> <sup class="src"><a href="#F8-12-src-D2">D2</a></sup></dd>
+<dt>Model replica</dt><dd><b>Simple words:</b> one complete copy of the model's parameters, kept by one process. <b>Analogy:</b> one hall's copy of the recipe book. <b>Precise:</b> the full parameter set (and, in plain data parallelism, the full gradient and optimizer state) held by one rank; correctness requires all replicas to hold the same values after each step. <sup class="src"><a href="#F8-12-src-D1">D1</a></sup></dd>
+<dt>Global batch</dt><dd><b>Simple words:</b> all the training examples used for one update, counted over all GPUs together. <b>Analogy:</b> the whole crate of tasting notes for one morning. <b>Precise:</b> the set of B samples whose mean loss gradient defines one optimizer step; with N ranks each rank processes a shard of B/N samples (the local or per-rank batch). Changing N while keeping the per-rank batch fixed changes B, and with it the optimisation. <sup class="src"><a href="#F8-12-src-D1">D1</a></sup> <sup class="src"><a href="#F8-12-src-D6">D6</a></sup></dd>
+<dt>Gradient bucket</dt><dd><b>Simple words:</b> a group of gradients that are sent together in one all-reduce. <b>Analogy:</b> one cart loaded with several pages of corrections. <b>Precise:</b> a contiguous group of parameter gradients, filled in the order the backward pass produces them, whose all-reduce is launched as soon as every gradient in it is ready; the bucket size trades the per-message cost (alpha) against how early communication can start. <sup class="src"><a href="#F8-12-src-D1">D1</a></sup></dd>
+<dt>Communication-computation overlap</dt><dd><b>Simple words:</b> sending the first results while still computing the rest. <b>Analogy:</b> the carts leave with the first pages while the cooks write the next ones. <b>Precise:</b> running the gradient all-reduce of finished buckets concurrently with the backward computation of earlier layers (on a separate stream or with non-blocking collectives), so that only the communication that cannot be hidden ("exposed communication") adds to the step time. <sup class="src"><a href="#F8-12-src-D1">D1</a></sup> <sup class="src"><a href="#F8-12-src-D5">D5</a></sup></dd>
+<dt>Scaling efficiency</dt><dd><b>Simple words:</b> how close N GPUs come to being N times faster than one. <b>Analogy:</b> four halls finishing the work in a quarter of the time would be 100 %. <b>Precise:</b> for a fixed global batch, efficiency = T<sub>1</sub> / (N × T<sub>N</sub>), where T is the time per step; for a fixed per-rank batch (weak scaling), efficiency = T<sub>1</sub> / T<sub>N</sub>. Always state which one you report (milestone F3 asks for it). <sup class="src"><a href="#F8-12-src-M1">M1</a></sup></dd>
+</dl></div>
+
+<h2 id="F8-12-pictures">The idea in pictures</h2>
+<p>Figure 1 shows one data-parallel training step on four ranks. Each rank stands for one GPU in a real job; in this chapter's lab each rank is an MPI process on one computer.</p>
+<figure id="F8-12-fig1"><div class="svgbox">
+<svg viewBox="0 0 780 330" role="img" aria-labelledby="F8-12-f1t F8-12-f1d">
+<title id="F8-12-f1t">Figure 1: one data-parallel step on four ranks</title>
+<desc id="F8-12-f1d">At the top, a global batch of 32 samples is cut into four shards of 8 samples. Each shard goes down to one of four rank boxes, rank 0 to rank 3. Each rank box says: full model replica, forward and backward on my 8 samples, gradient sum of my shard. Below the four ranks a wide band says: all-reduce (sum) of the gradients, bucket by bucket; after it every rank holds the sum over all 32 samples. At the bottom: every rank applies the same update, p becomes p minus eta times g divided by 32, so the four replicas stay identical.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="330"/>
+<rect class="sv-b3" x="140" y="16" width="500" height="40" rx="6"/>
+<text class="sv-tb" x="155" y="41">global batch B = 32 samples</text>
+<line class="sv-line" x1="265" y1="16" x2="265" y2="56"/><line class="sv-line" x1="390" y1="16" x2="390" y2="56"/><line class="sv-line" x1="515" y1="16" x2="515" y2="56"/>
+<text class="sv-ts" x="430" y="41">4 shards of 8</text>
+<line class="sv-line" x1="110" y1="56" x2="110" y2="86"/><polygon class="sv-head" points="104,80 110,90 116,80"/>
+<line class="sv-line" x1="300" y1="56" x2="300" y2="86"/><polygon class="sv-head" points="294,80 300,90 306,80"/>
+<line class="sv-line" x1="490" y1="56" x2="490" y2="86"/><polygon class="sv-head" points="484,80 490,90 496,80"/>
+<line class="sv-line" x1="680" y1="56" x2="680" y2="86"/><polygon class="sv-head" points="674,80 680,90 686,80"/>
+<rect class="sv-b1" x="30" y="92" width="160" height="96" rx="6"/>
+<text class="sv-tb" x="42" y="114">rank 0</text><text class="sv-ts" x="42" y="134">full model replica</text><text class="sv-ts" x="42" y="152">forward + backward</text><text class="sv-ts" x="42" y="170">on samples 0–7</text>
+<rect class="sv-b1" x="220" y="92" width="160" height="96" rx="6"/>
+<text class="sv-tb" x="232" y="114">rank 1</text><text class="sv-ts" x="232" y="134">full model replica</text><text class="sv-ts" x="232" y="152">forward + backward</text><text class="sv-ts" x="232" y="170">on samples 8–15</text>
+<rect class="sv-b1" x="410" y="92" width="160" height="96" rx="6"/>
+<text class="sv-tb" x="422" y="114">rank 2</text><text class="sv-ts" x="422" y="134">full model replica</text><text class="sv-ts" x="422" y="152">forward + backward</text><text class="sv-ts" x="422" y="170">on samples 16–23</text>
+<rect class="sv-b1" x="600" y="92" width="160" height="96" rx="6"/>
+<text class="sv-tb" x="612" y="114">rank 3</text><text class="sv-ts" x="612" y="134">full model replica</text><text class="sv-ts" x="612" y="152">forward + backward</text><text class="sv-ts" x="612" y="170">on samples 24–31</text>
+<rect class="sv-b5" x="30" y="206" width="730" height="46" rx="6"/>
+<text class="sv-tb" x="44" y="226">all-reduce (sum) of the gradients, bucket by bucket</text>
+<text class="sv-ts" x="44" y="243">afterwards every rank holds the gradient sum over all 32 samples</text>
+<line class="sv-dash" x1="110" y1="188" x2="110" y2="206"/><line class="sv-dash" x1="300" y1="188" x2="300" y2="206"/>
+<line class="sv-dash" x1="490" y1="188" x2="490" y2="206"/><line class="sv-dash" x1="680" y1="188" x2="680" y2="206"/>
+<rect class="sv-b4" x="30" y="268" width="730" height="46" rx="6"/>
+<text class="sv-tb" x="44" y="288">same update on every rank: p ← p − η · g / 32</text>
+<text class="sv-ts" x="44" y="305">the four replicas stay identical (the "replica spread" column of the lab is 0)</text>
+</svg>
+</div><figcaption><b>Figure 1.</b> One step of data parallelism with N = 4 and B = 32, as Listing 1 does it. Data flows downwards; the dashed lines are gradients entering the all-reduce. <sup class="src"><a href="#F8-12-src-D1">D1</a></sup> <sup class="src"><a href="#F8-12-src-R1">R1</a></sup></figcaption></figure>
+<p>Figure 2 shows the question from the story: when can the all-reduce run? It is drawn to scale from the model of Listing 2 (invented teaching values, R2): one rank's computation on top, its communication stream underneath, for three bucket sizes.</p>
+<figure id="F8-12-fig2"><div class="svgbox">
+<svg viewBox="0 0 780 300" role="img" aria-labelledby="F8-12-f2t F8-12-f2d">
+<title id="F8-12-f2t">Figure 2: when the gradient all-reduce runs, for three bucket sizes</title>
+<desc id="F8-12-f2d">A time axis from 0 to 13,000 microseconds. Top row, computation: forward pass from 0 to 3,200, backward pass from 3,200 to 9,600. Row A, one bucket of 32 MiB: the all-reduce starts at 9,600, when the backward pass ends, and ends at 12,649. Row B, four buckets of 8 MiB: all-reduces from 4,800 to 6,087, 6,400 to 7,687, 8,000 to 9,287 and 9,600 to 10,887; only the last one sticks out past the backward pass. Row C, 64 buckets of 0.5 MiB: the communication stream is busy without a gap from 3,300 and is still busy at the right edge of the figure; it ends at 50,449.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="300"/>
+<line class="sv-line" x1="80" y1="262" x2="730" y2="262"/>
+<line class="sv-line" x1="80" y1="258" x2="80" y2="266"/><text class="sv-ts" x="76" y="282">0</text>
+<line class="sv-line" x1="240" y1="258" x2="240" y2="266"/><text class="sv-ts" x="222" y="282">3,200</text>
+<line class="sv-line" x1="560" y1="258" x2="560" y2="266"/><text class="sv-ts" x="542" y="282">9,600</text>
+<line class="sv-line" x1="712" y1="258" x2="712" y2="266"/><text class="sv-ts" x="690" y="282">12,649 µs</text>
+<text class="sv-ts" x="8" y="44">compute</text>
+<rect class="sv-b3" x="80" y="28" width="160" height="26" rx="3"/><text class="sv-ts" x="120" y="46">forward</text>
+<rect class="sv-b1" x="240" y="28" width="320" height="26" rx="3"/><text class="sv-ts" x="360" y="46">backward</text>
+<text class="sv-ts" x="8" y="98">A: 1 × 32</text>
+<rect class="sv-b5" x="560" y="82" width="152" height="26" rx="3"/><text class="sv-ts" x="570" y="100">all-reduce</text>
+<text class="sv-ts" x="8" y="152">B: 4 × 8</text>
+<rect class="sv-b5" x="320" y="136" width="64" height="26" rx="3"/>
+<rect class="sv-b5" x="400" y="136" width="64" height="26" rx="3"/>
+<rect class="sv-b5" x="480" y="136" width="64" height="26" rx="3"/>
+<rect class="sv-b5" x="560" y="136" width="64" height="26" rx="3"/>
+<text class="sv-ts" x="630" y="154">ends 10,887</text>
+<text class="sv-ts" x="8" y="206">C: 64 × 0.5</text>
+<rect class="sv-b6" x="245" y="190" width="485" height="26" rx="3"/>
+<text class="sv-ts" x="260" y="208">64 small all-reduces back to back (each 737 µs)</text>
+<line class="sv-line" x1="730" y1="203" x2="750" y2="203"/><polygon class="sv-head" points="746,197 756,203 746,209"/>
+<text class="sv-ts" x="600" y="236">continues to 50,449</text>
+<line class="sv-dash" x1="560" y1="20" x2="560" y2="250"/>
+</svg>
+</div><figcaption><b>Figure 2.</b> One step of the model in Listing 2 (64 layers, 0.5 MiB of gradients per layer, N = 8, alpha = 50 µs, beta = 25 GB/s; invented values, to scale on the time axis). The dashed line marks the end of the backward pass: everything to its right is exposed communication. <sup class="src"><a href="#F8-12-src-R2">R2</a></sup> <sup class="src"><a href="#F8-12-src-R3">R3</a></sup></figcaption></figure>
+
+<h2 id="F8-12-layer1">Layer 1 — the kid explanation</h2>
+<p>Training a model means showing it many examples and nudging its numbers a little after each group of examples. With four GPUs, the easiest way to go faster is to give each GPU its own complete copy of the model and a quarter of each group. Each GPU works out which nudge its quarter wants. Then the GPUs add their nudges together, so that each one knows the nudge the whole group wants, and every GPU makes the same nudge. Because they all start the same and always make the same nudge, the copies never drift apart.</p>
+<p>Adding the nudges together takes time, because the numbers must travel between GPUs. The trick is to start sending the first nudges while the GPU is still working out the rest.</p>
+
+<h2 id="F8-12-layer2">Layer 2 — the student explanation</h2>
+<h3>The step, precisely</h3>
+<p>The kitchen picture first: each hall reads a different part of the tasting notes, and the corrections are summed on the carts. Precisely: let the model have parameters <i>p</i>, let the loss of one sample <i>i</i> be <i>ℓ<sub>i</sub>(p)</i>, and let one step use a global batch of <i>B</i> samples. Plain gradient descent on one process computes <i>g = Σ<sub>i</sub> ∇ℓ<sub>i</sub>(p)</i> over the batch and updates <i>p ← p − η g / B</i>. Because a sum can be split into parts, rank <i>r</i> of <i>N</i> can compute the partial sum <i>g<sub>r</sub></i> over its own <i>B/N</i> samples; an all-reduce with the sum operation gives every rank <i>g = Σ<sub>r</sub> g<sub>r</sub></i>, and every rank applies the same update. That is the whole of data parallelism: the mathematics of the step is unchanged, only the work is split. <sup class="src"><a href="#F8-12-src-D1">D1</a></sup> <sup class="src"><a href="#F8-12-src-D2">D2</a></sup></p>
+<p>Three conditions keep the replicas identical, and each one is a classic bug when broken: all replicas start from the same parameters (one rank's initial values are broadcast to all); every rank divides by the global batch <i>B</i>, not by its shard size, or every rank averages the summed gradient over <i>N</i> after averaging its own shard; and every rank runs the same optimizer with the same hyperparameters and the same random choices. F8-06's forensic lab shows what happens when the first two are broken. <sup class="src"><a href="#F8-12-src-D1">D1</a></sup></p>
+<h3>The acceptance test, run with MPI</h3>
+<p>Milestone F3 states the test for this idea: with fixed seeds, N-GPU training produces the same loss curve as single-GPU training within a stated tolerance, taking the effective batch size into account. <sup class="src"><a href="#F8-12-src-M1">M1</a></sup> Listing 1 runs it with MPI processes in place of GPUs: a two-layer network (4 inputs, 8 hidden units with tanh, 1 output; 49 parameters), a global batch of 32, 60 steps of gradient descent. Rank 0 also trains a reference model on the whole batch alone and prints the largest difference between any parameter of the two after every step. R1 shows the result on 1, 2 and 4 ranks:</p>
+<ul>
+<li>On 1 rank the difference is exactly 0: the same additions in the same order.</li>
+<li>On 2 and 4 ranks the difference is not 0 but at most 5.96 × 10<sup>−8</sup>, inside the stated tolerance of 10<sup>−5</sup>; the losses agree to the seventh significant digit, with one-digit differences in the last place on some steps.</li>
+<li>The replica spread (the largest difference of one parameter between any two ranks) is 0 on every printed step.</li>
+</ul>
+<p>Why not exactly equal on 2 and 4 ranks? Because the reference adds 32 per-sample gradients in one order, while the data-parallel run adds 8 per rank and then adds the four partial sums in an order chosen by the MPI library. Floating-point addition rounds after every operation, so it is not associative: a different order gives a slightly different sum. That is why the milestone says "within a stated tolerance", and why the replica spread is 0: every rank receives the same all-reduce result, so the replicas agree with each other exactly even though they differ slightly from the reference. <sup class="src"><a href="#F8-12-src-D8">D8</a></sup> <sup class="src"><a href="#F8-12-src-R1">R1</a></sup></p>
+<h3>Buckets and overlap</h3>
+<p>In the halls, the carts can leave with the first pages while the cooks write the rest. The backward pass computes gradients from the last layer to the first, so the last layer's gradients are finished long before the first layer's. Instead of waiting for all gradients and launching one big all-reduce, an implementation groups gradients into buckets in the order they become ready and launches each bucket's all-reduce as soon as it is full, on a communication stream (NCCL, RCCL) or as a non-blocking collective (MPI), while the backward pass continues. The PyTorch DDP paper describes this design; milestone F6 asks you to build it. <sup class="src"><a href="#F8-12-src-D1">D1</a></sup> <sup class="src"><a href="#F8-12-src-M1">M1</a></sup></p>
+<p>Listing 1 does this on a small scale: the output layer's gradient (8 weights, 1 bias, plus the loss sum: 10 values) is bucket 0 and is sent with <code>MPI_Iallreduce</code> before the hidden layer's gradient (40 values) is computed; then bucket 1 is sent, and <code>MPI_Waitall</code> waits for both. Non-blocking collectives are part of the MPI Standard; the Open MPI 4.1.6 header in the build container declares <code>MPI_Iallreduce</code> and reports MPI version 3.1. <sup class="src"><a href="#F8-12-src-D5">D5</a></sup> <sup class="src"><a href="#F8-12-src-L1">L1</a></sup> On one computer with tiny buckets the overlap saves nothing measurable, and the run does not claim it does; what the run proves is that the bucketed order of operations gives the correct result. The timing question is answered with a model.</p>
+
+<h2 id="F8-12-layer3">Layer 3 — the engineer's depth</h2>
+<h3>A model of the step</h3>
+<p>The engineer's version of the cart question is a performance model. Let a model have <i>L</i> layers with equal backward time <i>t<sub>b</sub></i> and gradient size <i>s</i> bytes each, forward time <i>t<sub>f</sub></i> per layer, and buckets of <i>k</i> layers. With the ring all-reduce of F8-02 and the alpha-beta model of F8-03, one bucket of <i>S = k s</i> bytes on <i>N</i> ranks takes</p>
+<p class="n"><i>T<sub>AR</sub>(S) = 2 (N − 1) (α + S / (N β))</i></p>
+<p>where α is the fixed cost per message and β the bandwidth of one link. <sup class="src"><a href="#F8-12-src-D7">D7</a></sup> <sup class="src"><a href="#F8-12-src-R2">R2</a></sup> Bucket <i>j</i> is ready when the backward pass has finished its <i>k</i> layers; it starts when it is ready and the previous bucket has finished (one communication stream); the step ends when both the backward pass and the last all-reduce have finished. Listing 2 computes exactly this.</p>
+<p>Two forces pull in opposite directions:</p>
+<ul>
+<li><b>Small buckets</b> start early but pay α many times. With <i>L/k</i> buckets, the total α cost is <i>(L/k) × 2 (N − 1) α</i>; for 64 one-layer buckets in R2 that alone is 64 × 14 × 50 µs = 44,800 µs, more than four times the whole computation.</li>
+<li><b>Large buckets</b> pay α rarely but start late. With one bucket, nothing overlaps: the whole all-reduce comes after the backward pass.</li>
+</ul>
+<p>The best bucket lies between, and its position depends on α, β, N and the compute time per layer. R2's sweep, for invented values chosen to show the effect (64 layers, 0.5 MiB per layer, N = 8, α = 50 µs, β = 25 GB/s), finds the best at 16 layers (8 MiB): a step of 10,887 µs against 9,600 µs of pure computation, with 1,287 µs exposed; one 32 MiB bucket gives 12,649 µs; one-layer buckets give 50,449 µs. <sup class="src"><a href="#F8-12-src-R2">R2</a></sup> These numbers are a property of the invented values, not of any real GPU or network; the method is what carries over.</p>
+<div class="co note"><span class="lbl">Note</span><p>The model assumes the all-reduce does not slow the computation down. On a real GPU, collective-library kernels run on the same GPU as the training kernels and use some of its resources, and both share memory bandwidth, so overlapped communication can stretch the backward pass. Measure the stretch with a profiler (milestone F6 asks for a timeline); do not assume it is zero.</p></div>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not opened in this build: PyTorch DDP's default bucket size is a few tens of MiB and is a constructor argument; DDP builds buckets in reverse parameter order and may rebuild them after the first iteration from the order gradients actually arrived; NCCL kernels occupy a number of GPU multiprocessors that can be limited with environment variables. Check the PyTorch DDP paper (D1, sections on gradient bucketing) and the NCCL and RCCL documentation (D3, D4, environment variables) for the versions you use. None of these names or values is used by this chapter's code.</p></div>
+<h3>Strong and weak scaling, and the global batch</h3>
+<p>There are two ways to use more ranks. With a fixed global batch (strong scaling), each rank gets fewer samples, the computation per rank shrinks as 1/N, but the gradient all-reduce does not shrink: its size is the model's size, and its ring time grows towards 2 S / β as N grows. The communication share therefore rises with N, and overlap hides less and less. With a fixed per-rank batch (weak scaling), the computation per rank stays constant and the global batch grows as N; scaling efficiency looks better, but the optimisation is no longer the same: a larger global batch makes fewer, larger steps per epoch, and the learning rate and schedule must be retuned. The literature on large-batch training studies rules for that retuning; they are hyperparameter recipes, not guarantees, and this chapter does not rely on any of them. <sup class="src"><a href="#F8-12-src-D1">D1</a></sup> <sup class="src"><a href="#F8-12-src-D6">D6</a></sup></p>
+<p>When you report scaling (milestone F3 requires it), state which kind, the global batch, and the measured times. A data-parallel speed-up obtained by silently growing the batch is not the same result.</p>
+<h3>What data parallelism cannot fix</h3>
+<p>Every replica holds the whole model: parameters, gradients and optimizer state. Data parallelism therefore never lets you train a model that does not fit on one GPU; adding GPUs only adds copies. Three remedies follow in this course: split each layer across GPUs (tensor parallelism, F8-13), split the layers across GPUs (pipeline parallelism, F8-14), and stop replicating the optimizer state, gradients and parameters (sharding, F8-15). Large jobs combine them, for example tensor parallelism inside a node, pipeline stages across nodes and data parallelism over everything else; the Megatron-LM paper describes such a combination. <sup class="src"><a href="#F8-12-src-D9">D9</a></sup></p>
+
+<h2 id="F8-12-hardware">How the hardware actually does it</h2>
+<p>In the halls, the carts are the links between GPUs and the roads between buildings. On a real system each replica's parameters, gradients and optimizer state live in its GPU's memory. The gradient all-reduce is executed by a collective library (NCCL on NVIDIA GPUs, RCCL on AMD GPUs, or a GPU-aware MPI, DG402) as GPU kernels that move data over the links F8-04 measured: NVLink, xGMI or PCIe inside a node and the network between nodes. The library's operations are enqueued on a GPU stream, so they are asynchronous with respect to the host and can run concurrently with compute kernels on other streams; that is the mechanism behind bucketed overlap. <sup class="src"><a href="#F8-12-src-D3">D3</a></sup> <sup class="src"><a href="#F8-12-src-D4">D4</a></sup> <sup class="src"><a href="#F8-12-src-D1">D1</a></sup></p>
+<p>The α and β of the model are properties of the slowest link on the ring and of the library's algorithm; F8-03 and F8-04 showed how to measure them with bus-bandwidth curves. Use your measured values in Listing 2, not the invented ones. No GPU timing of any kind was measured in this build.</p>
+
+<h2 id="F8-12-worked">Worked example</h2>
+<p>The question: for the setup of R2 (64 layers, 0.5 MiB of gradient per layer, forward 50 µs and backward 100 µs per layer, N = 8, α = 50 µs, β = 25 GB/s), what is the step time with buckets of 16 layers? The arithmetic uses 1 MiB = 1,048,576 bytes and 25 GB/s = 25,000 bytes per µs.</p>
+<ol>
+<li>Bucket size: 16 × 0.5 MiB = 8 MiB = 8,388,608 bytes. Per ring message: <i>S/N</i> = 1,048,576 bytes, which takes 1,048,576 / 25,000 = 41.94 µs, plus α = 50 µs: 91.94 µs.</li>
+<li>One all-reduce: 2 (N − 1) = 14 messages on the critical path: 14 × 91.94 = 1,287.2 µs.</li>
+<li>Computation: forward 64 × 50 = 3,200 µs; backward 64 × 100 = 6,400 µs, ending at 9,600 µs.</li>
+<li>Bucket readiness: every 16 layers of backward = 1,600 µs, so at 4,800, 6,400, 8,000 and 9,600 µs.</li>
+<li>Communication stream: bucket 0 runs 4,800–6,087; bucket 1 is ready at 6,400 (the stream is free), runs 6,400–7,687; bucket 2 runs 8,000–9,287; bucket 3 runs 9,600–10,887.</li>
+<li>Step time: max(9,600, 10,887) = 10,887 µs; exposed communication 1,287 µs, exactly one bucket: the last bucket can never overlap, because nothing is computed after it.</li>
+</ol>
+<p>R2's row for 16 layers prints 10,887 µs and 1,287 µs exposed: the hand calculation and the program agree. <sup class="src"><a href="#F8-12-src-R2">R2</a></sup> The last step suggests a rule worth remembering: with perfect overlap, the exposed time is at least the all-reduce time of the last bucket, which argues for buckets that are not too large at the end of the backward pass.</p>
+
+<h2 id="F8-12-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>dp_train.cc</code>: data-parallel training with two gradient buckets and non-blocking all-reduce.</p>
+<pre class="listing" data-src="F8-12/dp_train.cc"></pre>
+<p><b>Build and run</b> (by <code>run.sh</code>): <code>mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -DOMPI_SKIP_MPICXX dp_train.cc -o dp_train</code>, then <code>mpirun --allow-run-as-root --oversubscribe -np 4 ./dp_train</code> (and with <code>-np 1</code> and <code>-np 2</code>). The container runs as root, which <code>mpirun</code> refuses without the first flag; the second lets it start more processes than it counts slots; <code>-DOMPI_SKIP_MPICXX</code> leaves out Open MPI's old C++ binding header, which does not compile under these warning flags. The MPI programs are built without sanitizers.</p>
+<p>On 1 rank:</p>
+<pre class="output" data-run="F8-12/dp_np1"></pre>
+<p>On 2 ranks:</p>
+<pre class="output" data-run="F8-12/dp_np2"></pre>
+<p>On 4 ranks:</p>
+<pre class="output" data-run="F8-12/dp_np4"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">16–23</td><td>constants</td><td>4 inputs, 8 hidden units, global batch 32, 60 steps; bucket 0 holds 10 values, bucket 1 holds 40.</td><td>The global batch is fixed: 1, 2 and 4 ranks train the same mathematical problem.</td></tr>
+<tr><td class="n">32–50</td><td><code>mix</code>, <code>uniform</code>, <code>sample</code></td><td>A hash turns (step, sample index) into inputs and a target.</td><td>Sample <i>i</i> of step <i>s</i> is the same on every rank and in the reference: no data loader, no randomness to synchronise.</td></tr>
+<tr><td class="n">52–61</td><td><code>initModel</code></td><td>Deterministic initial parameters.</td><td>Every rank could compute them, but lines 141–144 still broadcast rank 0's: the habit that protects real code with random initialisation.</td></tr>
+<tr><td class="n">63–84</td><td><code>Saved</code>, <code>forward</code></td><td>Runs the forward pass on a shard and keeps inputs, hidden activations and output errors.</td><td>The backward pass needs these; in a real model they are the activation memory (F8-14).</td></tr>
+<tr><td class="n">86–95</td><td><code>backwardOutput</code></td><td>Sums the output layer's gradient and the loss over the shard.</td><td>This is ready first: bucket 0.</td></tr>
+<tr><td class="n">97–109</td><td><code>backwardHidden</code></td><td>Sums the hidden layer's gradient over the shard.</td><td>Computed after bucket 0 has been launched: the overlap.</td></tr>
+<tr><td class="n">111–118</td><td><code>update</code></td><td>Applies <code>p -= kLr / kBatch * g</code>.</td><td>Divides the all-reduced sum by the global batch, once. Dividing by the shard size here is the F8-06 forensic bug.</td></tr>
+<tr><td class="n">135–138</td><td>divisibility check</td><td>Stops if 32 does not split into equal shards.</td><td>Unequal shards would change the mean silently.</td></tr>
+<tr><td class="n">141–144</td><td><code>MPI_Bcast</code></td><td>Copies rank 0's parameters to all ranks.</td><td>Condition 1 of Layer 2: one starting point.</td></tr>
+<tr><td class="n">153–155</td><td>forward, bucket 0</td><td>Forward on this rank's shard, then the output layer's gradient.</td><td>Each rank sees only samples <code>rank*shard</code> to <code>rank*shard+shard-1</code>.</td></tr>
+<tr><td class="n">156</td><td><code>MPI_Iallreduce(... &amp;req[0])</code></td><td>Starts summing bucket 0 over all ranks and returns at once.</td><td>The buffer must not be touched until the request completes.</td></tr>
+<tr><td class="n">157–158</td><td>bucket 1</td><td>Computes the hidden-layer gradient, then starts its all-reduce.</td><td>Every rank starts the collectives in the same order: required for correctness.</td></tr>
+<tr><td class="n">159–160</td><td><code>MPI_Waitall</code>, <code>update</code></td><td>Waits for both buckets, then updates.</td><td>The update needs every bucket's sum.</td></tr>
+<tr><td class="n">162–168</td><td>replica spread</td><td>Element-wise max and min of the parameters over all ranks.</td><td>A cheap check that the replicas are identical; worth logging in real jobs too.</td></tr>
+<tr><td class="n">170–182</td><td>reference</td><td>Rank 0 trains the same model on the whole batch alone and records the largest difference.</td><td>The milestone F3 comparison, inside the program.</td></tr>
+<tr><td class="n">184–187</td><td>verdict</td><td>Prints MATCH if the largest difference is at most 10<sup>−5</sup>.</td><td>A stated tolerance, as the milestone requires.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>dp_cost.cpp</code>: the step-time model with buckets and overlap.</p>
+<pre class="listing" data-src="F8-12/dp_cost.cpp"></pre>
+<p>Input <code>dp_cost.in</code> (invented teaching values; the label says so):</p>
+<pre class="listing" data-src="F8-12/dp_cost.in"></pre>
+<p><b>Build command</b> (by <code>run_lab.sh</code>): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined dp_cost.cpp -o dp_cost</code>; run with <code>./dp_cost &lt; dp_cost.in</code>.</p>
+<pre class="output" data-run="F8-12/dp_cost"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">16–22</td><td><code>struct Setup</code></td><td>Layers, gradient size per layer, forward and backward time per layer, ranks, α, β.</td><td>Everything the model knows; replace the values by your measurements.</td></tr>
+<tr><td class="n">24–28</td><td><code>ringUs</code></td><td>2 (N − 1) (α + bytes / N / β).</td><td>The ring formula of F8-03; 1 GB/s is 10<sup>3</sup> bytes per µs.</td></tr>
+<tr><td class="n">30–55</td><td><code>stepUs</code></td><td>Walks through the buckets: ready time, start = max(ready, stream free), end.</td><td>One communication stream: buckets queue behind each other (the "queued" column of the traces).</td></tr>
+<tr><td class="n">41</td><td><code>ready</code></td><td>With overlap, when the bucket's last layer is done; without, at the end of backward.</td><td>The only difference between the two step-time columns.</td></tr>
+<tr><td class="n">54</td><td><code>return std::max(...)</code></td><td>The step ends when both streams are done.</td><td>Exposed communication = step − computation.</td></tr>
+<tr><td class="n">69–79</td><td><code>trace</code> command</td><td>Prints the communication stream like a profiler timeline.</td><td>Used for the forensic lab.</td></tr>
+<tr><td class="n">80–93</td><td>sweep</td><td>Tries 1 to 64 layers per bucket and reports the best.</td><td>The bucket size is a tuning parameter: find it from a model, then confirm by measuring.</td></tr>
+</tbody></table></div>
+
+<h2 id="F8-12-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The halls do not really "agree".</b> In the story the cooks compare lists; in data parallelism nobody checks anything: the replicas stay equal only because they start equal and apply bit-identical updates. A replica that starts different stays different forever without any warning (F8-06's forensic lab shows a constant replica gap).</li>
+<li><b>Carts carry pages; all-reduce carries sums.</b> A ring all-reduce does not deliver every hall's list to every hall; it delivers the sum, in chunks, with every link busy at once (F8-02). The total traffic per rank is about twice the gradient size, whatever N is.</li>
+<li><b>One cart per line is not only "busy"; it is slower in a precise way.</b> The analogy suggests congestion; the real cost is the fixed α per message, paid 2 (N − 1) times per all-reduce, which a model can compute before you run anything.</li>
+<li><b>Real halls could taste in any order.</b> The floating-point sums depend on the order of additions, so "the same recipe change" is the same only up to rounding unless the order is fixed.</li>
+</ul>
+
+<h2 id="F8-12-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Replicas drift apart.</b> Symptom: the replica spread is not 0. Cause: no initial broadcast, or a rank-dependent random choice in the update (for example dropout masks are fine, but a rank-dependent optimizer seed is not). Find it: log a parameter checksum per rank at step 0 and every k steps. Fix: broadcast at start; derive every random choice that affects parameters from shared seeds. (F8-06's forensic lab.)</li>
+<li><b>Loss explodes only with N &gt; 1.</b> Symptom: the N-rank curve leaves the 1-rank curve at once. Cause: gradients summed but divided by the shard size, or not divided at all, so the step is N times too large. Find it: compare the first step's update with the reference. Fix: divide the sum by the global batch exactly once.</li>
+<li><b>Ranks stop in a collective forever.</b> Symptom: no progress, no error. Cause: ranks launched buckets in different orders or different sizes (for example, a parameter unused on one rank so its bucket never fills). Find it: log the bucket sequence per rank; F8-01's forensic lab and F8-16 show the hang. Fix: identical bucket order and sizes on every rank.</li>
+<li><b>Overlap made it slower.</b> Symptom: step time rose after enabling small buckets. Cause: α paid many times (R2: 1-layer buckets). Find it: count the all-reduces per step in a trace. Fix: larger buckets; check with the sweep.</li>
+<li><b>Bit-for-bit comparisons fail.</b> Symptom: N-rank parameters differ from 1-rank in the eighth digit. Cause: summation order (R1). Fix: compare with a tolerance stated in advance; check the replica spread separately, which must be exactly 0.</li>
+<li><b>"Scaling efficiency 98 %" that is not.</b> Cause: the per-rank batch was fixed, so the global batch grew. Fix: report strong and weak scaling separately, with the batch sizes.</li>
+</ul>
+
+<div class="co transition" id="F8-12-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> DG401 and DG402 built and measured the collectives: ring and tree algorithms (F8-02), the alpha-beta model (F8-03), your own ring all-reduce (F8-05), a data-parallel step with NCCL or RCCL (F8-06), multi-node all-reduce and overlap (F8-07 to F8-11). <b>What carries over:</b> every all-reduce is still a ring or tree with the same cost model; every rank must call every collective in the same order; measure before you believe. <sup class="src"><a href="#F8-12-src-D7">D7</a></sup> <b>What changes:</b> the question is no longer "how fast is one all-reduce" but "how is a whole training step organised": which tensors are communicated, when, in which groups, and whether the result is still the same training (the global batch, the tolerance). <sup class="src"><a href="#F8-12-src-D1">D1</a></sup> <b>What comes next:</b> F8-13 splits a single layer across GPUs, because data parallelism always needs the whole model on every GPU.</p></div>
+
+<h2 id="F8-12-check">Check yourself</h2>
+<ol>
+<li>Write the update of plain gradient descent on a batch of B samples, and show in two lines why N ranks with shards of B/N samples and a sum all-reduce compute the same update.</li>
+<li>Explain in your own words why R1's 4-rank run differs from the reference by 5.96 × 10<sup>−8</sup> while its replica spread is exactly 0.</li>
+<li>Which of these keeps the replicas identical if it is done on every rank: (a) each rank seeds its parameter initialisation with its rank number; (b) each rank divides the summed gradient by the global batch; (c) each rank launches its buckets in the order its gradients happen to finish, which may differ between ranks; (d) each rank shuffles its own shard with its own seed?</li>
+<li>Using the formula of Layer 3, compute the all-reduce time of one 4 MiB bucket in R2's setup, and check it against R2's row for 8 layers.</li>
+<li>Apply to a new case: in R2's setup, α drops to 5 µs (a faster library). Predict, without running, whether the best bucket gets larger or smaller, and why. Then change <code>dp_cost.in</code> and run it.</li>
+<li>Predict, then run: if Listing 1 is run with 3 ranks, what happens and why?</li>
+<li>A colleague reports "scaling efficiency 97 % from 8 to 64 GPUs" with a per-GPU batch of 16. What two questions do you ask before believing it means a 7.8× faster training?</li>
+<li>Why does even perfect overlap leave at least one bucket's all-reduce exposed?</li>
+<li>Name two things data parallelism cannot do that the next three chapters address.</li>
+</ol>
+
+<h2 id="F8-12-lab">Lab</h2>
+<p><b>Goal.</b> Show, with your own runs, that data-parallel training equals one-process training within a stated tolerance, and choose a bucket size for your machine from a model plus a measurement.</p>
+<p><b>Hardware and software.</b> Part A: any Linux computer with g++ and Open MPI (this build: g++ 13.3.0, Open MPI 4.1.6, 4 logical CPUs, no GPU; MPI processes stand in for GPUs). Part B: two or more NVIDIA GPUs with NCCL, or AMD GPUs with RCCL, or a cloud multi-GPU instance; two GPU machines for the multi-node variant (course requirement). Part B is <span class="tag">untested in this build</span>.</p>
+<p><b>Safety.</b> None beyond normal computer use. On shared GPU clusters, run jobs through the scheduler (F8-17, DS303), never on a login node.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F8-12</code> from the repository root. You should see the three runs of Listing 1 and the sweep of Listing 2, as above.</li>
+<li>State your tolerance before you look: write it in your lab notebook. Compare the 1-, 2- and 4-rank outputs line by line. Record the largest difference and the replica spread.</li>
+<li>Change <code>kSteps</code> to 600 and rerun. Does the largest difference grow? Explain what you see.</li>
+<li>Change Listing 1 so that bucket 1 is launched before bucket 0 on odd ranks only. Predict, then run with a 10 s time limit. (Undo the change afterwards.)</li>
+<li>Part B (GPUs): take your F8-06 NCCL or RCCL training step, add buckets launched on a communication stream as soon as their gradients are ready (milestone F6), and record a profiler timeline. Measure α and β on your GPUs (F8-03), put them into <code>dp_cost.in</code>, predict the best bucket size, then measure the step time for at least four bucket sizes.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: on 1 rank the difference is 0; on 2 and 4 ranks it is small and nonzero; the replica spread is 0 (R1). Step 4: the run stops with an MPI error or hangs, because ranks match collectives in different orders; a trial with Open MPI 4.1.6 while this chapter was written (not kept as a lab record) ended with an error about a truncated message; the precise behaviour depends on the MPI library and its algorithm choice, so record what yours does. Part B: a timeline with all-reduce kernels running concurrently with backward kernels; the measured best bucket size near the model's prediction, or an explanation of why not.</p>
+<p><b>Verification.</b> Milestone F3's acceptance tests, verbatim: "With fixed seeds, N-GPU training produces the same loss curve as single-GPU training within a stated tolerance (taking the effective batch size into account)." "Scaling efficiency from 1 to N GPUs is reported; the target is set in your plan." Milestone F6's: "The timeline shows all-reduce kernels running concurrently with backward kernels; step time decreases versus the non-overlapped F3 version on 2 nodes, and the saving is close to the hidden communication time." <sup class="src"><a href="#F8-12-src-M1">M1</a></sup></p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>mpirun</code> refuses to run as root → add <code>--allow-run-as-root</code> only inside a disposable container; on a normal system run as a normal user.</li>
+<li>"not enough slots" → <code>--oversubscribe</code>, or fewer processes.</li>
+<li>Compile errors inside Open MPI's C++ header under <code>-Werror</code> → <code>-DOMPI_SKIP_MPICXX</code> (the programs use only the C API).</li>
+<li>Hang after your step 4 change → this is the lesson; stop it with Ctrl-C or <code>timeout</code>.</li>
+</ul>
+<p><b>Extension.</b> Add a third bucket by splitting the hidden layer's weights from its biases, and log the order in which each rank completes its requests (<code>MPI_Testany</code>). Or implement weak scaling (fixed per-rank batch) and show that the loss curves now differ from the reference with B = 32 but match a reference with B = 8N.</p>
+
+<h2 id="F8-12-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "Step time quadrupled after the upgrade." Wiremu's team trains a 64-layer model on 8 GPUs. After a framework upgrade in week 42, the step time went from about 11 ms to about 50 ms; single-GPU speed is unchanged, and the GPUs report low utilisation. The team captured the communication stream of one step before and after. (The traces were produced by Listing 2's model of the team's setup, with the team's invented values; nothing else was changed between the two traces except one configuration value.)</p>
+<p><b>Evidence pack.</b> The input and the two traces <sup class="src"><a href="#F8-12-src-R3">R3</a></sup>:</p>
+<pre class="listing" data-src="F8-12/slow_step.in"></pre>
+<pre class="output" data-run="F8-12/slow_step"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: how many all-reduces does each trace contain, of what size, and how long does each take? When does the communication stream go idle in each?</li>
+<li>Hypotheses: list at least three (slower network; slower GPU computation; a changed bucket size; contention from another job) and the evidence for or against each.</li>
+<li>Root cause: what single configuration value differs, and how do you know from the numbers alone?</li>
+<li>Compute, from the alpha-beta formula, the share of the week-42 communication time that is the fixed per-message cost α.</li>
+<li>Fix: propose a value and predict the step time with it; check your prediction with Listing 2.</li>
+<li>Prevention: what would you log on every run so that this is noticed by a dashboard rather than by a user?</li>
+</ol>
+<p><b>Method hints.</b> Compare "ready" and "start": a growing queue means the communication stream, not the computation, is the bottleneck. Then divide one all-reduce's time into its α part and its β part.</p>
+
+<h2 id="F8-12-project">Mini-project</h2>
+<p><b>A bucket tuner.</b> Extend Listing 2 so that it reads a real per-layer profile (a list of layer names, gradient bytes and backward times, for example exported from your profiler in Part B, or invented and labelled so) instead of equal layers, and searches bucket boundaries (not only equal sizes) that minimise the step time. Compare its recommendation with equal buckets, and with your measurement if you have GPUs.</p>
+<p><b>Rubric</b> (10 points): reads a per-layer profile and reproduces R2 when given equal layers (3); a search that is correct on a hand-checked three-layer case (3); a short report comparing equal and tuned buckets, with every input value's origin stated (measured where, or invented) (2); tests for edge cases (one layer; a bucket larger than the model) (2).</p>
+
+<h2 id="F8-12-summary">Summary</h2>
+<ul>
+<li>Data parallelism: every rank holds a full replica, computes the gradient sum of its shard, all-reduces it, and applies the identical update.</li>
+<li>The replicas stay identical only if they start identical, divide by the global batch exactly once, and run identical updates.</li>
+<li>N-rank results equal 1-rank results within a tolerance, not bit for bit, because floating-point summation order changes (R1: largest difference 5.96 × 10<sup>−8</sup>, replica spread 0).</li>
+<li>Buckets launched while the backward pass continues hide communication; small buckets pay α many times, large buckets start late.</li>
+<li>A step-time model with the ring formula predicts the trade-off; in R2's invented setup the best bucket was 8 MiB and one-layer buckets were almost five times slower.</li>
+<li>Report scaling with the global batch stated; growing the batch changes the training.</li>
+<li>Data parallelism never reduces memory per GPU: the next chapters split layers, split the model into stages, and shard the replicated state.</li>
+</ul>
+
+<h2 id="F8-12-sources">Sources</h2>
+<ol>
+<li id="F8-12-src-D1">D1 — Shen Li et al., "PyTorch Distributed: Experiences on Accelerating Data Parallel Training", Proceedings of the VLDB Endowment, 2020 (tier 5; curriculum item 84). Sections on gradient bucketing, overlap and gradient averaging. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-12-src-D2">D2 — Alexander Sergeev, Mike Del Balso, "Horovod: fast and easy distributed deep learning in TensorFlow", 2018 (tier 5; curriculum item 85). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-12-src-D3">D3 — NVIDIA, NCCL documentation (NVIDIA Collective Communication Library user guide): collective operations, CUDA stream semantics, environment variables (tier 1; guide 4.6). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-12-src-D4">D4 — AMD, RCCL documentation ("ROCm Communication Collectives Library") (tier 1; guide 4.6). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-12-src-D5">D5 — MPI Forum, "MPI: A Message-Passing Interface Standard", chapter "Collective Communication", section on nonblocking collective operations (tier 1; curriculum item 77). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-12-src-D6">D6 — Priya Goyal et al., "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour", 2017 (tier 5; not in the guide's registry, proposed in NOTES.md), used only for the statement that large global batches require retuning the learning rate. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-12-src-D7">D7 — Pitch Patarasuk, Xin Yuan, "Bandwidth Optimal All-reduce Algorithms for Clusters of Workstations" (tier 5; curriculum item 79); the ring formula as used in F8-03. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-12-src-D8">D8 — IEEE, "IEEE Standard for Floating-Point Arithmetic" (IEEE 754), section on operations and rounding (tier 1); see also MA302. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-12-src-D9">D9 — Mohammad Shoeybi et al., "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism", 2019 (tier 5; curriculum item 85). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-12-src-M1">M1 — Systems Curriculum (repository file <code>SYSTEMS_CURRICULUM.html</code>), section 14.1 (rows "Overlap" and "Parallelism strategies") and milestones F3 and F6 (goal and acceptance tests quoted verbatim). A map, not a source for technical claims (AH-4).</li>
+<li id="F8-12-src-L1">L1 — Open MPI 4.1.6 header in the build container (tier 4, opened): <code>/usr/lib/x86_64-linux-gnu/openmpi/include/mpi.h</code> lines 196–198 (<code>OMPI_MAJOR_VERSION 4</code>, <code>OMPI_MINOR_VERSION 1</code>, <code>OMPI_RELEASE_VERSION 6</code>), 253–254 (<code>MPI_VERSION 3</code>, <code>MPI_SUBVERSION 1</code>), 527 (<code>MPI_IN_PLACE</code>), 1345 (<code>MPI_Allreduce</code>), 1347 (<code>MPI_Iallreduce</code>), 1369 (<code>MPI_Bcast</code>), 1923 (<code>MPI_Waitall</code>).</li>
+<li id="F8-12-src-R1">R1 — lab runs of Listing 1 on 1, 2 and 4 processes: <code>F8-12/dp_np1.out</code>, <code>dp_np2.out</code>, <code>dp_np4.out</code> with their logs (Open MPI 4.1.6, g++ 13.3.0, exit code 0).</li>
+<li id="F8-12-src-R2">R2 — lab run of Listing 2 on <code>dp_cost.in</code>: <code>F8-12/dp_cost.out</code>, <code>dp_cost.log</code> (g++ 13.3.0 with ASan and UBSan, exit code 0); invented input values.</li>
+<li id="F8-12-src-R3">R3 — lab run of Listing 2 on <code>slow_step.in</code> (forensic evidence): <code>F8-12/slow_step.out</code>, <code>slow_step.log</code> (exit code 0).</li>
+</ol>
+
+<h2 id="F8-12-glossary">Glossary links</h2>
+<p><a href="#gl-data-parallelism">Data parallelism</a> · <a href="#gl-model-replica">Model replica</a> · <a href="#gl-global-batch">Global batch</a> · <a href="#gl-gradient-bucket">Gradient bucket</a> · <a href="#gl-communication-computation-overlap">Communication–computation overlap</a> · <a href="#gl-scaling-efficiency">Scaling efficiency</a> · <a href="#gl-collective">Collective</a> · <a href="#gl-nccl-rccl">NCCL / RCCL</a> · <a href="#gl-alpha-beta-model">Alpha–beta model</a> · <a href="#gl-rank-mpi">Rank (MPI)</a></p>
+
+<h2 id="F8-12-next">Next chapter</h2>
+<p>Next: <a href="#F8-13">F8-13 Tensor parallelism</a>. Back to the course: <a href="#DG403">DG403</a>. Earlier chapters used here: <a href="#F8-03">F8-03</a>, <a href="#F8-05">F8-05</a>, <a href="#F8-06">F8-06</a>, <a href="#F8-11">F8-11</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackF">Track F</a>.</p>
+
+<h2 id="F8-12-answers">Answers to Check yourself</h2>
+<ol>
+<li><i>p ← p − (η / B) Σ<sub>i=1..B</sub> ∇ℓ<sub>i</sub>(p)</i>. Split the sum into N parts of B/N samples: Σ<sub>i</sub> = Σ<sub>r</sub> Σ<sub>i in shard r</sub>; rank r computes the inner sum g<sub>r</sub>; the all-reduce gives every rank Σ<sub>r</sub> g<sub>r</sub>, the same sum, so every rank computes the same update (up to rounding).</li>
+<li>The reference adds 32 gradients in one sequence; the 4-rank run adds 8 per rank and then the four partial sums in the library's order. Rounding after each addition makes the results differ in the last bits. All ranks receive the one result of the all-reduce, so they are identical to each other.</li>
+<li>(b) only. (a) gives different starting points (the replicas never meet again); (c) makes ranks match different buckets in the collectives (wrong sums or a hang); (d) is harmless for identity if every rank still processes its own disjoint shard, but it changes which samples form the global batch, so the run is not comparable with the reference; the parameters stay identical across ranks because the summed gradient is the same everywhere. The question asked what keeps replicas identical: (b) is required; (d) does not break identity but breaks comparability.</li>
+<li>S/N = 4 MiB / 8 = 524,288 bytes → 20.97 µs; + 50 = 70.97 µs; × 14 = 993.6 µs. R2: 8 buckets, 7,949 µs total, 7,949 / 8 = 993.6 µs.</li>
+<li>Smaller: with a small α, the cost of many messages falls, so earlier, smaller buckets become cheap and overlap more. (Your run with α = 5 should show the best bucket at fewer layers than 16; record your output and compare it with your prediction.)</li>
+<li>32 does not split into 3 equal shards: rank 0 prints the message and <code>MPI_Abort</code> ends the job with error code 2; <code>mpirun</code> reports the abort.</li>
+<li>Is the global batch the same in both runs (no: 128 versus 1,024), and does the 64-GPU run reach the same loss in the same number of samples or the same time (the learning rate and schedule had to be retuned)? Also: which time is compared, per step or to a target accuracy?</li>
+<li>The last bucket becomes ready only when the backward pass ends; there is no computation left to hide it behind, so its whole all-reduce time is exposed.</li>
+<li>Train a model whose parameters, gradients and optimizer state do not fit on one GPU (F8-13, F8-14, F8-15); reduce the memory per GPU; keep the global batch small while using many GPUs (tensor and pipeline parallelism use GPUs without growing the batch).</li>
+</ol>
+<h3 id="F8-12-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Week 41: 4 all-reduces of 8 MiB, 1,287 µs each, starting when ready (queued 0 µs); the stream is idle between them and only the last one passes the end of backward (9,600 µs); step 10,887 µs. Week 42: 64 all-reduces of 0.5 MiB, 737 µs each; from all-reduce 1 on, each waits in the queue (637 µs, 1,273 µs, … 40,112 µs); the stream never goes idle from 3,300 µs to 50,449 µs; step 50,449 µs.</li>
+<li>Slower network: no, the β part of each message is consistent with the same β (see 4), and the per-byte cost is unchanged. Slower computation: no, forward and backward end at the same times (3,200 and 9,600) in both. Contention: would slow both traces' all-reduces per byte; it does not. Changed bucket size: yes, 8 MiB versus 0.5 MiB.</li>
+<li>The bucket size (layers per bucket: 16 versus 1). Evidence: the all-reduce count went from 4 to 64 and the size from 8 MiB to 0.5 MiB while the total gradient (32 MiB) and the computation are unchanged.</li>
+<li>One 0.5 MiB all-reduce: 14 × (50 + 2.62) = 736.7 µs, of which 14 × 50 = 700 µs is α: 95 %. Over 64 buckets: 44,800 µs of 47,149 µs.</li>
+<li>Restore 16 layers per bucket (8 MiB): predicted 10,887 µs; R2's sweep and the week-41 trace confirm it. A learner who also tries 8 layers (4 MiB) finds 11,949 µs.</li>
+<li>Log per step: number of all-reduces, their sizes, the configured bucket size, step time and exposed communication time; alert when the all-reduce count per step changes after an upgrade. Keep a performance regression test (SP302) that runs a short job and compares step time.</li>
+</ol>
+<p>How the evidence was produced: <code>slow_step.in</code> runs Listing 2's trace command for the same setup with 16 and with 1 layers per bucket; the run's output is unedited.</p>

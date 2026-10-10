@@ -1,0 +1,316 @@
+<!--meta
+id: F8-17
+title: Scheduling GPU jobs on a cluster
+course: DG403
+level: L5
+prereqs: F8-16 Fault tolerance: detect, abort, restart; F5-26 GPU scheduling (DS303: GPUs as scheduler resources, device visibility); F5-22 Clusters and schedulers; MA-track probability (exponential distribution)
+time: 8–12 hours including the project material
+hardware: none for the listings (this build: g++ 13.3.0, Open MPI 4.1.6, nvcc 12.0 for one build, no GPU, no scheduler). Real use needs access to a GPU cluster with a batch scheduler (for example Slurm), or cloud instances
+maps: Track F 14.1 (distributed GPU work in practice: jobs on clusters); course card DG403 (guide 5.13): supports the course project (a fault-tolerant training run that resumes from checkpoint, here requeued by a scheduler) and exam P (design review: checkpoint interval and job shape); milestone F8 (restart in a scheduled setting)
+analogy: F8 — the great kitchen hall (registered: a chain of kitchen halls with a delivery service). Proposed in NOTES.md: "cluster scheduler = the booking office that gives a banquet a set of halls for a fixed evening"; "preemption warning = the office's knock on the door two minutes before the hall must be handed over"; "node-local storage = a cupboard that stays in its hall"
+-->
+
+<h2 id="F8-17-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>The halls do not belong to Wiremu's banquet team. They are booked through the booking office, which shares them among many teams: a banquet gets a set of halls, all at once, for a fixed evening, and when the evening ends, or when a more urgent booking arrives, the office knocks on the door. Two minutes later the halls must be empty.</p>
+<p>Wiremu's team learned to work with the knock: when it comes, they write the state of the dinner on a card, and ask the office to book them again. The next evening, the office gives them other halls across the courtyard. The card is still in the cupboard of the old hall. They start the dinner from the beginning.</p>
+</div>
+
+<h2 id="F8-17-able">What you will be able to do</h2>
+<ul>
+<li><b>Describe</b> what a distributed training job needs from a cluster scheduler: all its GPUs at once, on suitable nodes, for a bounded time, with a warning before it is stopped.</li>
+<li><b>Write</b> a batch script that turns the scheduler's warning into a checkpoint and a requeue.</li>
+<li><b>Map</b> ranks to GPUs from the node-local rank, and refuse an impossible job shape.</li>
+<li><b>Derive</b> the first-order optimum checkpoint interval, T* = √(2CM), and check it with a simulation.</li>
+<li><b>Diagnose</b> a requeued job that restarts from step 0.</li>
+</ul>
+
+<div class="co jargon" id="F8-17-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Requeue</dt><dd><b>Simple words:</b> putting a stopped job back in the queue so that it runs again later, possibly on other machines. <b>Analogy:</b> asking the booking office for another evening. <b>Precise:</b> a scheduler operation that returns a job that was running (or was stopped by preemption, failure or request) to the pending state under the same job identity; when it runs again it starts its batch script from the beginning, so the job itself must resume from its checkpoint. <sup class="src"><a href="#F8-17-src-D1">D1</a></sup></dd>
+<dt>Preemption warning signal</dt><dd><b>Simple words:</b> a signal the scheduler sends a short time before it stops a job, so that the job can save its work. <b>Analogy:</b> the knock on the door two minutes before the halls must be empty. <b>Precise:</b> a signal (commonly <code>SIGTERM</code> or a user-chosen one) delivered to the job's processes a configured time before the time limit or before preemption, followed by a forced kill if the job has not ended; the job's handler should checkpoint and exit. <sup class="src"><a href="#F8-17-src-D1">D1</a></sup> <sup class="src"><a href="#F8-17-src-R2">R2</a></sup></dd>
+<dt>Node-local rank</dt><dd><b>Simple words:</b> a process's number among the processes of the same job on the same machine. <b>Analogy:</b> a cook's seat number within one hall, not within the whole banquet. <b>Precise:</b> the rank of a process within the group of processes sharing a node; it is used to choose one GPU per process; in MPI it can be computed with <code>MPI_Comm_split_type(…, MPI_COMM_TYPE_SHARED, …)</code>, and launchers also set it in the environment (Open MPI: <code>OMPI_COMM_WORLD_LOCAL_RANK</code>). <sup class="src"><a href="#F8-17-src-L1">L1</a></sup> <sup class="src"><a href="#F8-17-src-R3">R3</a></sup></dd>
+<dt>Optimum checkpoint interval</dt><dd><b>Simple words:</b> how often to save so that the time spent saving and the work lost to failures add up to as little as possible. <b>Analogy:</b> writing the card often enough, but not so often that writing takes the evening. <b>Precise:</b> for checkpoint cost C and mean time between failures M (with C much smaller than M), the interval T that minimises the expected overhead is approximately T* = √(2CM) (Young's first-order approximation); higher-order estimates refine it when C is not small next to M. <sup class="src"><a href="#F8-17-src-D2">D2</a></sup> <sup class="src"><a href="#F8-17-src-D3">D3</a></sup> <sup class="src"><a href="#F8-17-src-R1">R1</a></sup></dd>
+</dl></div>
+
+<h2 id="F8-17-pictures">The idea in pictures</h2>
+<figure id="F8-17-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 270" role="img" aria-labelledby="F8-17-f1t F8-17-f1d">
+<title id="F8-17-f1t">Figure 1: the life of a preemptible training job</title>
+<desc id="F8-17-f1d">Left to right: submit; pending in the queue; the scheduler allocates all GPUs of the job at once on nodes A and B; the job runs and checkpoints to shared storage every T hours; the scheduler sends a warning signal a set time before the end; the job writes a checkpoint and exits with code 99; the batch script asks for a requeue; the job is pending again; it is allocated nodes C and D; it reads the checkpoint from shared storage and continues. A storage box below is connected to both runs. A note says a checkpoint in node-local storage on A would not be visible on C.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="270"/>
+<rect class="sv-box" x="16" y="40" width="80" height="44" rx="6"/><text class="sv-ts" x="28" y="66">submit</text>
+<rect class="sv-b8" x="112" y="40" width="80" height="44" rx="6"/><text class="sv-ts" x="122" y="66">pending</text>
+<rect class="sv-b3" x="208" y="40" width="190" height="44" rx="6"/><text class="sv-ts" x="218" y="58">run 1 on nodes A, B</text><text class="sv-ts" x="218" y="76">all GPUs at once</text>
+<rect class="sv-b5" x="414" y="40" width="110" height="44" rx="6"/><text class="sv-ts" x="422" y="58">warning signal</text><text class="sv-ts" x="422" y="76">→ ckpt, exit 99</text>
+<rect class="sv-b8" x="540" y="40" width="80" height="44" rx="6"/><text class="sv-ts" x="548" y="58">requeued,</text><text class="sv-ts" x="548" y="76">pending</text>
+<rect class="sv-b3" x="636" y="40" width="110" height="44" rx="6"/><text class="sv-ts" x="644" y="58">run 2 on C, D</text><text class="sv-ts" x="644" y="76">resume</text>
+<line class="sv-line" x1="96" y1="62" x2="104" y2="62"/><polygon class="sv-head" points="112,62 104,57 104,67"/>
+<line class="sv-line" x1="192" y1="62" x2="200" y2="62"/><polygon class="sv-head" points="208,62 200,57 200,67"/>
+<line class="sv-line" x1="398" y1="62" x2="406" y2="62"/><polygon class="sv-head" points="414,62 406,57 406,67"/>
+<line class="sv-line" x1="524" y1="62" x2="532" y2="62"/><polygon class="sv-head" points="540,62 532,57 532,67"/>
+<line class="sv-line" x1="620" y1="62" x2="628" y2="62"/><polygon class="sv-head" points="636,62 628,57 628,67"/>
+<rect class="sv-b1" x="208" y="160" width="538" height="40" rx="6"/><text class="sv-ts" x="220" y="184">shared storage: every node of every run can read the checkpoint</text>
+<line class="sv-line" x1="300" y1="84" x2="300" y2="152"/><polygon class="sv-head" points="300,160 295,152 305,152"/><text class="sv-ts" x="306" y="128">checkpoint every T</text>
+<line class="sv-line" x1="470" y1="84" x2="470" y2="152"/><polygon class="sv-head" points="470,160 465,152 475,152"/><text class="sv-ts" x="476" y="128">final ckpt</text>
+<line class="sv-line" x1="690" y1="160" x2="690" y2="92"/><polygon class="sv-head" points="690,84 685,92 695,92"/><text class="sv-ts" x="620" y="128">read ckpt</text>
+<rect class="sv-dash" x="16" y="160" width="176" height="80" rx="6"/><text class="sv-ts" x="26" y="182">node-local disk of A:</text><text class="sv-ts" x="26" y="200">not visible on C or D</text><text class="sv-ts" x="26" y="218">(forensic lab)</text>
+<text class="sv-ts" x="208" y="230">time limit, preemption or failure all end in the same place: a checkpoint and a fresh run</text>
+</svg>
+</div><figcaption><b>Figure 1.</b> The job, not the scheduler, carries its progress from one run to the next; the scheduler only starts it again. Sequence shown in R2 (dry run, one machine). <sup class="src"><a href="#F8-17-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F8-17-layer1">Layer 1 — the kid explanation</h2>
+<p>A big computer cluster is shared by many people, so a program for training a model does not start at once: it asks for a number of GPUs and waits until the cluster's booking system gives them all at once. It gets them for a limited time, and sometimes it is stopped early because someone more urgent needs them. So the program has to be polite and prepared: when it is warned that time is up, it saves its work, and asks to be put back in the line. Next time it may get different computers, so it must keep its saved work somewhere every computer can see.</p>
+
+<h2 id="F8-17-layer2">Layer 2 — the student explanation</h2>
+<h3>What a training job asks of the scheduler</h3>
+<p>The booking office gives a banquet all its halls at once. DS303's F5-26 introduced GPUs as scheduler resources and device visibility; a distributed training job adds four needs. <b>All at once</b>: a job of N ranks is useless with N − 1 GPUs, because the first collective blocks (F8-16); the scheduler must allocate all of them together (gang scheduling). <b>Placement</b>: tensor-parallel groups belong inside one machine (F8-13), so a job asks for whole nodes and a fixed number of GPUs per node. <b>Bounded time</b>: every job has a time limit, often shorter than the training run, so long runs are a chain of jobs. <b>A warning</b>: before a time limit or preemption, the scheduler can send a signal a set time ahead, and then kills the job. <sup class="src"><a href="#F8-17-src-D1">D1</a></sup></p>
+<h3>A batch script that survives</h3>
+<p>Listing 3, <code>train_job.sh</code>, is a batch script in Slurm's form: the <code>#SBATCH</code> lines ask for one node with 4 GPUs for 30 minutes, a <code>TERM</code> signal to the batch shell 120 s before the end, and permission to requeue. The script starts the worker in the background, so that the shell can receive the signal while waiting; on <code>TERM</code> its trap forwards the signal to the worker. Listing 4, the worker, sets a flag in its signal handler, finishes the current step, writes a checkpoint (temporary file, then <code>rename</code>, as in F8-16), and exits with code 99, which the script reads as "stopped on purpose": it asks the scheduler to requeue the job. <sup class="src"><a href="#F8-17-src-R2">R2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not checked against the Slurm documentation in this build (no scheduler was installed): the option names and meanings <code>--gpus-per-node</code>, <code>--time</code>, <code>--signal=B:TERM@120</code> ("B:" sends the signal to the batch shell only; 120 is seconds before the time limit), <code>--requeue</code>, <code>--open-mode=append</code>, the output pattern <code>%j</code> (job id), the variables <code>SLURM_JOB_ID</code> and <code>SLURM_RESTART_COUNT</code>, and the command <code>scontrol requeue &lt;job id&gt;</code>; also that at the time limit Slurm sends <code>SIGTERM</code> and then <code>SIGKILL</code> after a configured wait. Site configuration can disable requeueing or change the signals. Read <code>man sbatch</code> and <code>man scontrol</code> on your cluster before using Listing 3.</p></div>
+<p>R2 runs Listing 3 under plain bash, without a scheduler: a <code>SIGTERM</code> after 0.8 s plays the scheduler's warning. Run 1 printed "SIGTERM received; checkpoint written at step 16 (this run did steps 0 to 15); exiting with 99"; the second run, playing the requeued job, printed "resumed from … at step 16" and finished all 40 steps with x = 0.051355713222931. (The step at which the signal arrives depends on timing: 16 in the run shown.) <sup class="src"><a href="#F8-17-src-R2">R2</a></sup> The real scheduler path (<code>scontrol requeue</code>) is <span class="tag">untested in this build</span>.</p>
+<h3>One GPU per rank</h3>
+<p>A launcher starts several processes per node; each must use a different GPU. The usual rule: GPU = node-local rank. Listing 5 computes the node-local rank with <code>MPI_Comm_split_type</code> and <code>MPI_COMM_TYPE_SHARED</code> and compares it with Open MPI's <code>OMPI_COMM_WORLD_LOCAL_RANK</code>; both agree in R3. <sup class="src"><a href="#F8-17-src-L1">L1</a></sup> <sup class="src"><a href="#F8-17-src-R3">R3</a></sup> R3 also shows the failure the rule hides: 8 processes on a node with 4 GPUs map two ranks to each GPU and the program prints a warning. A training job should refuse such a shape instead of warning: Listing 6, the first lines of a GPU process, exits with an error when the local rank is not smaller than the number of visible GPUs. On this build machine it stops earlier, because there is no GPU at all: "cudaGetDeviceCount failed: cudaErrorNoDevice". <sup class="src"><a href="#F8-17-src-R4">R4</a></sup> <sup class="src"><a href="#F8-17-src-L2">L2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory: when a scheduler restricts a job to some GPUs through <code>CUDA_VISIBLE_DEVICES</code> (or <code>ROCR_VISIBLE_DEVICES</code>/<code>HIP_VISIBLE_DEVICES</code> on AMD), the process sees them renumbered from 0, so "GPU = node-local rank" still works inside the job; some sites instead give each task only its own GPU, in which case every process should use device 0. F5-26 discusses device visibility; check your site's configuration with a one-line test (print the variable and the device count in every rank) before the first real run. Listing 6 is <span class="tag">untested on hardware</span>.</p></div>
+
+<h2 id="F8-17-layer3">Layer 3 — the engineer's depth</h2>
+<h3>How often to checkpoint: Young's first-order interval</h3>
+<p>Let a checkpoint cost C hours, failures of the job arrive independently with mean time between failures M (exponential), and the interval between checkpoints be T hours of work, with C and T much smaller than M.</p>
+<ol>
+<li>Time spent checkpointing, per hour of work: C/T.</li>
+<li>Work lost per failure: on average half an interval, T/2 (failures fall uniformly within an interval when T is much smaller than M).</li>
+<li>Failures per hour: 1/M, so lost work per hour: T/(2M). (Restart time R adds R/M per hour, independent of T.)</li>
+<li>Overhead: f(T) = C/T + T/(2M). Its derivative −C/T² + 1/(2M) is zero at T² = 2CM.</li>
+<li>T* = √(2CM); at T*, both terms equal √(C/(2M)), and the overhead is √(2C/M) + R/M.</li>
+</ol>
+<p>This is Young's approximation; Daly's paper gives a higher-order estimate that matters when C is not small next to M. <sup class="src"><a href="#F8-17-src-D2">D2</a></sup> <sup class="src"><a href="#F8-17-src-D3">D3</a></sup> The derivation's assumptions are exactly the ones that break at scale: for a job on n nodes that each fail independently with mean M<sub>node</sub>, the job's M is M<sub>node</sub>/n. More nodes, shorter M, shorter T*.</p>
+<h3>The simulation agrees, and shows where the formula stops</h3>
+<p>Listing 1 simulates 2,000 runs of a 100-hour job for each interval, with invented values: C = 0.1 h, R = 0.2 h, node MTBF 2,000 h. R1 <sup class="src"><a href="#F8-17-src-R1">R1</a></sup>:</p>
+<figure id="F8-17-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 320" role="img" aria-labelledby="F8-17-f2t F8-17-f2d">
+<title id="F8-17-f2t">Figure 2: efficiency against checkpoint interval</title>
+<desc id="F8-17-f2d">Efficiency (work divided by wall time) on the vertical axis from 0.5 to 1.0; the checkpoint interval as a multiple of T* on the horizontal axis: one quarter, one half, 1, 2, 4. Three curves, each highest at T*: small job on 4 nodes, from 0.960 to 0.981 and back to 0.960; large job on 128 nodes, from 0.791 to 0.881 and down to 0.769; large job with a five times slower checkpoint, from 0.626 to 0.760 and down to 0.554.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="320"/>
+<line class="sv-line" x1="80" y1="60" x2="80" y2="260"/><line class="sv-line" x1="80" y1="260" x2="680" y2="260"/>
+<text class="sv-ts" x="46" y="64">1.0</text><text class="sv-ts" x="46" y="164">0.75</text><text class="sv-ts" x="46" y="264">0.5</text>
+<line class="sv-dash" x1="80" y1="160" x2="680" y2="160"/>
+<text class="sv-ts" x="110" y="280">T*/4</text><text class="sv-ts" x="240" y="280">T*/2</text><text class="sv-ts" x="374" y="280">T*</text><text class="sv-ts" x="500" y="280">2 T*</text><text class="sv-ts" x="630" y="280">4 T*</text>
+<text class="sv-ts" x="300" y="302">checkpoint interval (log scale)</text>
+<text class="sv-tb" x="80" y="36">efficiency = work / wall time (R1, 2,000 simulated runs per point)</text>
+<polyline class="sv-line" points="120,76 250,69.6 380,67.6 510,69.2 640,76"/>
+<circle class="sv-dot3" cx="120" cy="76" r="4"/><circle class="sv-dot3" cx="250" cy="69.6" r="4"/><circle class="sv-dot3" cx="380" cy="67.6" r="4"/><circle class="sv-dot3" cx="510" cy="69.2" r="4"/><circle class="sv-dot3" cx="640" cy="76" r="4"/>
+<text class="sv-ts" x="652" y="80">4 nodes</text>
+<polyline class="sv-line" points="120,143.6 250,116 380,107.6 510,118 640,152.4"/>
+<circle class="sv-dot1" cx="120" cy="143.6" r="4"/><circle class="sv-dot1" cx="250" cy="116" r="4"/><circle class="sv-dot1" cx="380" cy="107.6" r="4"/><circle class="sv-dot1" cx="510" cy="118" r="4"/><circle class="sv-dot1" cx="640" cy="152.4" r="4"/>
+<text class="sv-ts" x="652" y="148">128 nodes</text>
+<polyline class="sv-line" points="120,209.6 250,168 380,156 510,176.4 640,238.4"/>
+<circle class="sv-dot2" cx="120" cy="209.6" r="4"/><circle class="sv-dot2" cx="250" cy="168" r="4"/><circle class="sv-dot2" cx="380" cy="156" r="4"/><circle class="sv-dot2" cx="510" cy="176.4" r="4"/><circle class="sv-dot2" cx="640" cy="238.4" r="4"/>
+<text class="sv-ts" x="652" y="234">128 nodes,</text><text class="sv-ts" x="652" y="248">slow ckpt</text>
+<text class="sv-ts" x="386" y="62">0.981</text><text class="sv-ts" x="386" y="102">0.881</text><text class="sv-ts" x="386" y="150">0.760</text>
+</svg>
+</div><figcaption><b>Figure 2.</b> Every curve peaks at T* = √(2CM); the peak is flat, so a factor of two either side costs little; the peak itself falls as the job grows. Data: R1 (invented input values). <sup class="src"><a href="#F8-17-src-R1">R1</a></sup></figcaption></figure>
+<p>Compare with the formula. Small job: M = 500 h, T* = 10 h, predicted overhead √(2 × 0.1/500) + 0.2/500 = 0.0204, efficiency 1/1.0204 = 0.980; simulated 0.981. Large job: M = 15.6 h, T* = 1.77 h, predicted overhead 0.113 + 0.013 = 0.126, efficiency 0.888; simulated 0.881. Slow checkpoint (C = 0.5 h): predicted 0.253 + 0.013 = 0.266, efficiency 0.790; simulated 0.760. <sup class="src"><a href="#F8-17-src-R1">R1</a></sup> The first-order formula gets the best interval right and becomes optimistic about the efficiency as C/M grows: failures during checkpoints and restarts, ignored in the derivation, start to count. And "never checkpoint" on 128 nodes: efficiency 0.010, a mean wall time of 9,714 h for 100 h of work. <sup class="src"><a href="#F8-17-src-R1">R1</a></sup></p>
+<div class="co warning"><span class="lbl">Warning</span><p>Every input in Listing 1 is invented. Real node MTBF depends on the hardware, its age and the site; measure it from your cluster's failure records (DS304's MTBF and MTTR) before using the formula, and remember that failures of nodes in the same rack or on the same switch are not independent.</p></div>
+<h3>Job shape, queues and time limits</h3>
+<p>The scheduler starts a job only when all its resources are free together, so a larger job usually waits longer in the queue; schedulers fill gaps with smaller jobs that fit before the large one's start (backfill, F5-26 and DS303), which works well only when time limits are realistic. A long training run is therefore planned as a chain of jobs, each shorter than the site limit, each ending in a checkpoint (by the warning signal or by its own clock), each requeued or submitted as a dependency of the previous one. Placement matters too: request whole nodes for tensor-parallel groups, and ask the site how to request nodes close together in the network if the scheduler supports topology-aware placement (DG402). <sup class="src"><a href="#F8-17-src-D1">D1</a></sup></p>
+<h3>Node health and the restart path</h3>
+<p>A requeued job may land on the node that failed it. Two defences: a health check before training starts (every rank checks its GPU, prints its identity and runs a small all-reduce, so a broken node fails in seconds, not after an hour of waiting), and excluding a node that failed from the next run (schedulers provide an option to exclude named nodes; the job script can record the failing node from the logs). Both are cheap compared with a hung job of hundreds of GPUs (F8-16).</p>
+
+<h2 id="F8-17-hardware">How the hardware actually does it</h2>
+<p>The scheduler's controller runs on a management node and talks to an agent on every compute node; the agent starts the job's processes, confines them to the allocated CPUs, memory and GPUs (through operating-system control groups and device rules on Linux), delivers signals and reports exits. <sup class="src"><a href="#F8-17-src-D1">D1</a></sup> GPU memory is not shared between jobs in the usual configuration; a GPU is given to one job at a time, which is why the node-local mapping must be exactly right. Storage comes in two kinds: node-local disks (fast, private to one node, often cleared when the job ends) and a shared parallel file system (visible from every node, slower per node, shared by everyone). Checkpoints that a requeued job must read belong on the shared one, or must be copied there before the job ends. No speeds of either are quoted here: measure them on your cluster with the checkpoint you actually write, because C in the formula is that time.</p>
+
+<h2 id="F8-17-worked">Worked example</h2>
+<p>A job of 64 nodes, node MTBF 4,000 h (an invented value), checkpoint 6 minutes, restart 15 minutes. Choose T and estimate the efficiency.</p>
+<ol>
+<li>M = 4,000/64 = 62.5 h. C = 0.1 h, R = 0.25 h.</li>
+<li>T* = √(2 × 0.1 × 62.5) = √12.5 = 3.54 h of work between checkpoints.</li>
+<li>Overhead ≈ √(2 × 0.1/62.5) + 0.25/62.5 = √0.0032 + 0.004 = 0.0566 + 0.004 = 0.0606; efficiency about 1/1.0606 = 0.943.</li>
+<li>Check: C/M = 0.0016 is small, so the first-order formula should be close (compare R1's small-job case, C/M = 0.0002, error 0.001).</li>
+<li>The site's time limit is 24 h: about 6 checkpoints per job; set the warning signal so that a checkpoint (6 minutes) fits with a margin.</li>
+<li>Verify: add the line <code>example 100 0.1 0.25 4000 64</code> to <code>ckpt_interval.in</code> and run Listing 1.</li>
+</ol>
+
+<h2 id="F8-17-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>ckpt_interval.cpp</code>: a Monte Carlo model of checkpoint intervals.</p>
+<pre class="listing" data-src="F8-17/ckpt_interval.cpp"></pre>
+<pre class="listing" data-src="F8-17/ckpt_interval.in"></pre>
+<p><b>Build command</b> (by <code>run_lab.sh</code>): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined ckpt_interval.cpp -o ckpt_interval</code>; run with <code>./ckpt_interval &lt; ckpt_interval.in</code>.</p>
+<pre class="output" data-run="F8-17/ckpt_interval"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">16–20</td><td><code>exponential</code></td><td>Exponential sample by inverting the distribution function.</td><td>The memoryless failure model of the derivation.</td></tr>
+<tr><td class="n">23–38</td><td><code>run</code></td><td>Work in pieces of T; each piece plus its checkpoint either survives or loses itself and pays R.</td><td>Failures during checkpoints and restarts count too, unlike the first-order formula.</td></tr>
+<tr><td class="n">45–46</td><td><code>M</code>, <code>best</code></td><td>Job MTBF = node MTBF / nodes; T* = √(2CM).</td><td>Scale shortens M.</td></tr>
+<tr><td class="n">51–53</td><td>intervals, seed</td><td>T*/4 … 4T* and "never"; the same seed for every T.</td><td>Common random numbers: the comparison between intervals is not blurred by different luck.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>train_job.sh</code>: a batch script that checkpoints on the warning and asks to be requeued.</p>
+<pre class="listing" data-src="F8-17/train_job.sh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">2–10</td><td><code>#SBATCH</code></td><td>Resources, time limit, warning signal, requeue, appended output.</td><td>Unverified option names (box above); bash ignores them as comments.</td></tr>
+<tr><td class="n">17</td><td><code>CKPT_DIR</code></td><td>Defaults to the node's temporary folder.</td><td>The forensic lab's bug: a default that is fine on one node and wrong across nodes.</td></tr>
+<tr><td class="n">23–24</td><td>worker in background</td><td>Starts the worker and remembers its process id.</td><td>A shell waiting for a foreground program runs its trap only after the program ends.</td></tr>
+<tr><td class="n">26</td><td><code>trap … TERM</code></td><td>Forwards <code>SIGTERM</code> to the worker.</td><td>With "B:" the signal reaches only the script.</td></tr>
+<tr><td class="n">27–32</td><td><code>wait</code> twice</td><td>The first <code>wait</code> returns early (status above 128) when the trap runs; the second gets the worker's real exit code.</td><td>Otherwise the script would read 143 instead of 99.</td></tr>
+<tr><td class="n">33–42</td><td><code>case</code></td><td>0: done; 99: requeue (or the dry-run message); other: failure.</td><td>The exit code is the contract between worker and script.</td></tr>
+</tbody></table></div>
+<p><b>Listing 4</b> — <code>worker.cpp</code>: a stand-in trainer that stops politely on <code>SIGTERM</code>.</p>
+<pre class="listing" data-src="F8-17/worker.cpp"></pre>
+<pre class="output" data-run="F8-17/worker"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">17–22</td><td><code>onTerm</code></td><td>Sets a <code>sig_atomic_t</code> flag only.</td><td>Very little is safe inside a signal handler; the main loop does the work.</td></tr>
+<tr><td class="n">24–36</td><td><code>save</code></td><td>Writes <code>.tmp</code>, then renames over the old checkpoint.</td><td>F8-16's atomic replace, in C++17 <code>std::filesystem</code>.</td></tr>
+<tr><td class="n">53–63</td><td>resume</td><td>Reads the checkpoint, or says clearly that it starts at step 0.</td><td>That line is the forensic lab's key evidence.</td></tr>
+<tr><td class="n">66–81</td><td>loop</td><td>Step; checkpoint every <code>every</code> steps, on the flag, or at the end; exit 99 on the flag.</td><td>The current step is finished before stopping: no half step is saved.</td></tr>
+</tbody></table></div>
+<p>R2 runs Listings 3 and 4 together (built with <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g</code>; <code>SIGTERM</code> after 0.8 s; second run in the same "node" folder):</p>
+<pre class="output" data-run="F8-17/job_preempt"></pre>
+
+<p><b>Listing 5</b> — <code>local_rank.cc</code>: node-local rank and GPU choice.</p>
+<pre class="listing" data-src="F8-17/local_rank.cc"></pre>
+<p><b>Build and run</b> (by <code>run.sh</code>): <code>mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -DOMPI_SKIP_MPICXX local_rank.cc -o local_rank</code>; <code>mpirun --allow-run-as-root --oversubscribe -np 8 ./local_rank gpus=4</code>; lines sorted by rank.</p>
+<pre class="output" data-run="F8-17/local_rank"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">22</td><td><code>MPI_Comm_split_type</code></td><td>One communicator per shared-memory node.</td><td>Portable across launchers; no environment variable needed.</td></tr>
+<tr><td class="n">24–26</td><td>local rank, variable</td><td>Rank within the node; Open MPI's own variable for comparison.</td><td>The two agree in R3.</td></tr>
+<tr><td class="n">27–29</td><td>print</td><td>GPU = local rank mod GPUs, with a warning if processes exceed GPUs.</td><td>The modulo hides an error; Listing 6 refuses instead.</td></tr>
+</tbody></table></div>
+<p><b>Listing 6</b> — <code>pick_gpu.cu</code>: choose and check the GPU. <span class="tag">untested on hardware</span></p>
+<pre class="listing" data-src="F8-17/pick_gpu.cu"></pre>
+<p><b>Build command</b>: <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings pick_gpu.cu -o pick_gpu</code> (CUDA 12.0). The run on the GPU-less build machine:</p>
+<pre class="output" data-run="F8-17/pick_gpu"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">7–14</td><td><code>check</code></td><td>Prints the error's name and text.</td><td>R4 shows <code>cudaErrorNoDevice</code>, value 100 (L2).</td></tr>
+<tr><td class="n">18–19</td><td><code>local</code></td><td>Node-local rank from Open MPI's variable (0 if absent).</td><td>Under another launcher, read its variable or use Listing 5's method.</td></tr>
+<tr><td class="n">21–25</td><td>count, shape check</td><td>Refuses a local rank without its own GPU.</td><td>A wrong job shape fails at once, with a message.</td></tr>
+<tr><td class="n">26</td><td><code>cudaSetDevice</code></td><td>Binds this process to its GPU before any other CUDA call.</td><td>Otherwise every process starts on device 0.</td></tr>
+</tbody></table></div>
+
+<h2 id="F8-17-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The booking office knows what a banquet is.</b> A scheduler knows resources and time, nothing about steps or checkpoints; whether a requeued job resumes is entirely the job's business.</li>
+<li><b>A knock always comes.</b> A warning signal comes before time limits and (where configured) preemption; a node failure gives no warning at all, so periodic checkpoints are still needed.</li>
+<li><b>Halls are interchangeable.</b> Nodes are not: different GPU models, network positions, and local storage contents.</li>
+</ul>
+
+<h2 id="F8-17-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Worker in the foreground.</b> The script's trap runs only after the worker ends, i.e. after the kill. Fix: background plus <code>wait</code> (Listing 3).</li>
+<li><b>Reading 143 instead of 99.</b> The first <code>wait</code> returned because of the trap. Fix: wait again.</li>
+<li><b>Warning shorter than the checkpoint.</b> The job is killed mid-write. Fix: measure C; set the warning to several C.</li>
+<li><b>Checkpoint on node-local storage.</b> A requeued job on another node starts from zero (forensic lab).</li>
+<li><b>Two ranks on one GPU.</b> Wrong job shape or launcher settings; every rank should print its node, local rank and GPU at start (Listing 5), and the program should refuse (Listing 6).</li>
+<li><b>Checkpoint interval by habit.</b> "Every hour" on 4 nodes and on 512 nodes are very different choices (R1).</li>
+</ul>
+
+<div class="co transition" id="F8-17-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F8-16 made one job survive a failure with a watchdog, checkpoints and a restart script. <b>What carries over:</b> atomic checkpoints, exit codes as a contract, deterministic resumption, evidence by comparison with an uninterrupted run. <sup class="src"><a href="#F8-17-src-R2">R2</a></sup> <b>What changes:</b> the restart is done by a scheduler that also stops jobs on purpose, moves them to other nodes and limits their time; the checkpoint interval becomes a calculation from C and M. <sup class="src"><a href="#F8-17-src-D2">D2</a></sup> <sup class="src"><a href="#F8-17-src-R1">R1</a></sup> <b>What comes next:</b> DG403 ends here; the course project and exam P bring the parallelism plan (F8-12 to F8-15) and the fault-tolerant run (F8-16, F8-17) together. Track G, or the HP courses, follow.</p></div>
+
+<h2 id="F8-17-check">Check yourself</h2>
+<ol>
+<li>Why does a distributed training job need all its GPUs allocated at the same time?</li>
+<li>Derive T* = √(2CM) in five lines and state two assumptions.</li>
+<li>A node MTBF of 8,000 h and 256 nodes; C = 0.2 h. Compute M and T*.</li>
+<li>Why does the job script run the worker in the background?</li>
+<li>Which is true: (a) a requeued job continues its processes where they stopped; (b) the scheduler's warning signal makes periodic checkpoints unnecessary; (c) node-local rank is the usual basis for choosing a GPU; (d) T* grows with the number of nodes?</li>
+<li>Apply to a new case: in R1, the slow checkpoint (0.5 h) cut the best efficiency from 0.881 to 0.760 on 128 nodes. Name two engineering changes that reduce C, and one that raises M.</li>
+<li>Predict, then run: add <code>tiny-ckpt 100 0.01 0.2 2000 128</code> to <code>ckpt_interval.in</code>. What T* and efficiency do you expect?</li>
+</ol>
+
+<h2 id="F8-17-lab">Lab</h2>
+<p><b>Goal.</b> Make a training job a good citizen of a cluster scheduler: correct GPU mapping, checkpoint on warning, requeue, and an interval chosen by calculation.</p>
+<p><b>Hardware and software.</b> Part A: any Linux computer with g++, Open MPI and bash (this build). Part B: an account on a GPU cluster with a batch scheduler; <span class="tag">untested in this build</span>.</p>
+<p><b>Safety.</b> On a shared cluster, test with short time limits and small jobs; do not requeue in a loop without a limit, and follow the site's rules for preemptible queues.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F8-17</code> and read R1–R5.</li>
+<li>Add your own line to <code>ckpt_interval.in</code> with values for your intended job (state which are measured); record T* and the efficiency.</li>
+<li>Part B: run Listing 5 and Listing 6 (or their framework equivalents) in a 2-node job and record the mapping of ranks to GPUs.</li>
+<li>Part B: submit Listing 3 with a short time limit (for example 5 minutes, warning 60 s) and a long run; confirm that it checkpoints, is requeued, resumes, and finishes with the same result as an uninterrupted run.</li>
+<li>Measure C for a real checkpoint of your training job on shared storage, and recompute T*.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: efficiency falls as nodes grow, peak at T*. Step 4: the job's output file shows two or more runs, each starting where the previous one stopped.</p>
+<p><b>Verification.</b> The final result of the requeued chain equals an uninterrupted run (checksum or exact value, as in R2's x = 0.051355713222931).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>No signal arrives → check the warning option and whether it targets the batch shell or the job steps.</li>
+<li>The requeued job starts at step 0 → see the forensic lab.</li>
+<li>All ranks on GPU 0 → <code>cudaSetDevice</code> missing or the local rank read from the wrong variable.</li>
+</ul>
+<p><b>Extension.</b> Replace the requeue with a chain of dependent jobs (each submitted to start after the previous one ends) and compare the queue waiting time of both approaches on your cluster.</p>
+
+<h2 id="F8-17-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "Requeued, and back to zero." Olu's job was preempted after a while; the job script did its work, the scheduler requeued it, and the job ran again on another node. It finished, but used twice the GPU time the team budgeted. The output of both runs is below (dry run, reproduced on one machine: <code>NODE</code> and <code>TMPDIR</code> are set by <code>run.sh</code> to play two nodes). <sup class="src"><a href="#F8-17-src-R5">R5</a></sup></p>
+<pre class="output" data-run="F8-17/restart_zero"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Did the job checkpoint correctly when warned? Quote the evidence.</li>
+<li>Where did run 1 put its checkpoint, and where did run 2 look?</li>
+<li>Why did run 2 not fail, and why is its final x equal to R2's?</li>
+<li>Root cause in Listing 3: which line, and why did it work in R2?</li>
+<li>Fix: two options, and the evidence that would show the fix works.</li>
+<li>Prevention: what should a job print at the start of every run, and what check could make it refuse to start from zero silently?</li>
+</ol>
+
+<h2 id="F8-17-project">Mini-project</h2>
+<p><b>Course project, scheduled part.</b> Extend the F8-16 project (fault-tolerant training that resumes from checkpoint) to run under a scheduler: a batch script with resource requests, a warning signal and requeue; checkpoints on shared storage with an interval computed from measured C and an MTBF you state (measured from your cluster's records or invented and labelled); GPU mapping checked at start; a run that is preempted or time-limited at least twice and finishes with the uninterrupted result. Report: the job chain's timeline (from the scheduler's accounting), the overhead you measured against the formula's prediction, and the risks you did not cover.</p>
+<p><b>Exam P practice.</b> In a design review, present the job shape (nodes, GPUs per node, ranks per GPU), the parallelism plan of F8-12 to F8-15, and the checkpoint and restart plan of F8-16 and F8-17, with every number labelled measured or invented.</p>
+<p><b>Rubric</b> (20 points): requeue chain demonstrated with logs (6); result equal to the uninterrupted run, or the difference explained (4); interval derived from measured C, with the formula and Listing 1 (4); GPU mapping verified on every rank (2); report with labelled numbers and risks (4).</p>
+
+<h2 id="F8-17-summary">Summary</h2>
+<ul>
+<li>A distributed training job needs all its GPUs at once, on suitable nodes, for a bounded time; long runs are chains of jobs.</li>
+<li>The job turns the scheduler's warning into a checkpoint and exit code 99, and the script asks for a requeue; R2 showed the resume at step 16 and the same result.</li>
+<li>Each rank picks the GPU of its node-local rank and refuses an impossible job shape.</li>
+<li>Young's T* = √(2CM) gives the checkpoint interval; R1's simulation agrees on the interval and shows the formula is optimistic about efficiency when C/M grows.</li>
+<li>Checkpoints of requeued jobs belong on storage every node can read.</li>
+</ul>
+
+<h2 id="F8-17-sources">Sources</h2>
+<ol>
+<li id="F8-17-src-D1">D1 — SchedMD, Slurm documentation: <code>sbatch</code>, <code>scontrol</code>, the "Quick Start User Guide" and the GRES and preemption pages (tier 2; guide 4.5). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-17-src-D2">D2 — John W. Young, "A first order approximation to the optimum checkpoint interval", Communications of the ACM, 1974 (tier 5; not in the guide's registry, proposed in NOTES.md). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-17-src-D3">D3 — J. T. Daly, "A higher order estimate of the optimum checkpoint interval for restart dumps", Future Generation Computer Systems, 2006 (tier 5; not in the guide's registry, proposed in NOTES.md). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-17-src-L1">L1 — Open MPI 4.1.6 header in the build container (tier 4, opened): <code>/usr/lib/x86_64-linux-gnu/openmpi/include/mpi.h</code> lines 798 (<code>MPI_COMM_TYPE_SHARED</code>), 1461 (<code>MPI_Comm_split_type</code>).</li>
+<li id="F8-17-src-L2">L2 — CUDA 12.0 headers in the build container (tier 4, opened): <code>cuda_runtime_api.h</code> lines 1409 (<code>cudaGetDeviceCount</code>) and 2163 (<code>cudaSetDevice</code>); <code>driver_types.h</code> line 545 (<code>cudaErrorNoDevice = 100</code>).</li>
+<li id="F8-17-src-R1">R1 — lab run of Listing 1 on <code>ckpt_interval.in</code>: <code>F8-17/ckpt_interval.out</code>, <code>ckpt_interval.log</code> (g++ 13.3.0 with ASan and UBSan, exit code 0; seed 12345).</li>
+<li id="F8-17-src-R2">R2 — lab runs of Listing 4 alone (<code>F8-17/worker.out</code>) and of Listings 3 and 4 with a <code>SIGTERM</code> and a second run (<code>F8-17/job_preempt.out</code>, <code>job_preempt.log</code>; bash, no scheduler, exit code 0).</li>
+<li id="F8-17-src-R3">R3 — lab run of Listing 5 on 8 processes: <code>F8-17/local_rank.out</code>, <code>local_rank.log</code> (Open MPI 4.1.6, exit code 0).</li>
+<li id="F8-17-src-R4">R4 — build and run of Listing 6 on the GPU-less build machine: <code>F8-17/pick_gpu.out</code>, <code>pick_gpu.log</code> (nvcc 12.0; exit code 1; untested on hardware).</li>
+<li id="F8-17-src-R5">R5 — lab run <code>restart_zero</code> (forensic evidence): <code>F8-17/restart_zero.out</code>, <code>restart_zero.log</code> (exit code 0).</li>
+</ol>
+
+<h2 id="F8-17-glossary">Glossary links</h2>
+<p><a href="#gl-requeue">Requeue</a> · <a href="#gl-preemption-warning-signal">Preemption warning signal</a> · <a href="#gl-node-local-rank">Node-local rank</a> · <a href="#gl-optimum-checkpoint-interval">Optimum checkpoint interval</a> · <a href="#gl-gang-scheduling">Gang scheduling</a> · <a href="#gl-preemption-scheduling">Preemption (scheduling)</a> · <a href="#gl-device-visibility-gpu">Device visibility (GPU)</a> · <a href="#gl-backfill-scheduling">Backfill scheduling</a> · <a href="#gl-mtbf-and-mttr">MTBF and MTTR</a> · <a href="#gl-checkpoint-job">Checkpoint (job)</a></p>
+
+<h2 id="F8-17-next">Next chapter</h2>
+<p>This is the last chapter of <a href="#DG403">DG403</a>. Previous: <a href="#F8-16">F8-16 Fault tolerance: detect, abort, restart</a>. Related: <a href="#F5-26">F5-26</a> (GPU scheduling, DS303). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackF">Track F</a>.</p>
+
+<h2 id="F8-17-answers">Answers to Check yourself</h2>
+<ol>
+<li>Every step ends in a collective over all ranks; with one GPU missing, the others would block in the first collective (F8-16), holding GPUs that do nothing.</li>
+<li>Overhead per hour of work C/T (checkpoints) + T/(2M) (half an interval lost per failure, 1/M failures per hour); derivative −C/T² + 1/(2M) = 0; T* = √(2CM). Assumptions: failures independent and memoryless (exponential); C and T much smaller than M.</li>
+<li>M = 8,000/256 = 31.25 h; T* = √(2 × 0.2 × 31.25) = √12.5 = 3.54 h.</li>
+<li>So that the shell can run its <code>TERM</code> trap while the worker is running; a shell runs traps only between commands, and <code>wait</code> is interruptible.</li>
+<li>(c). (a) a requeued job starts again from its batch script; (b) failures give no warning; (d) T* shrinks as M = M<sub>node</sub>/n shrinks.</li>
+<li>Smaller C: write only the state that is needed, in parallel from all ranks (each its own slice, F8-15), or asynchronously (copy to host memory, write in the background); a faster storage tier first, copied to shared storage later. Larger M: health checks and exclusion of failing nodes, fewer nodes for the same work where possible.</li>
+<li>T* = √(2 × 0.01 × 15.625) = 0.56 h; overhead ≈ √(2 × 0.01/15.625) + 0.2/15.625 = 0.0358 + 0.0128 = 0.049, efficiency about 0.95; the simulation should be close, since C/M is small. Run it to compare.</li>
+</ol>
+<h3 id="F8-17-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Yes: "SIGTERM received; checkpoint written at step 16 (this run did steps 0 to 15); exiting with 99", then "asking to be requeued".</li>
+<li>Run 1: <code>./node-a-local-tmp/f8-ckpt</code>, the temporary folder of node A. Run 2: <code>./node-b-local-tmp/f8-ckpt</code>, node B's own folder, which is empty.</li>
+<li>Missing checkpoints are not an error for the worker: it printed "no checkpoint at …, starting at step 0" and did all 40 steps (0 to 39). The computation is deterministic, so it reaches the same x; only the 16 steps of run 1 were wasted. On a real cluster node A's temporary folder may also have been cleared when the job ended.</li>
+<li>Line 17: <code>CKPT_DIR</code> defaults to <code>${TMPDIR:-/tmp}/f8-ckpt</code>, a node-local path. In R2 both runs played the same node, so the path was the same.</li>
+<li>(a) Set <code>CKPT_DIR</code> to shared storage visible from every node; (b) keep the fast local write but copy the checkpoint to shared storage before exiting with 99, and copy it back at start. Evidence: a second run on another node printing "resumed from … at step 16", and the same final result.</li>
+<li>Print node, job id, restart count, checkpoint path and the step it starts from; refuse to start at step 0 when the restart count is above 0 (or when a marker file on shared storage says checkpoints exist) unless explicitly told to.</li>
+</ol>
+<p>How the evidence was produced: Listing 3 under bash with <code>NODE=node-a TMPDIR=./node-a-local-tmp</code>, <code>SIGTERM</code> after 0.8 s, then <code>NODE=node-b TMPDIR=./node-b-local-tmp</code>; process ids replaced by a placeholder, otherwise unedited; the step of the checkpoint (16 here) depends on timing and can differ by one in another run. The restart count shows 0 in both runs because no scheduler set it.</p>
