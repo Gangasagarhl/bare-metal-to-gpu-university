@@ -157,3 +157,50 @@ The course lab "deviceQuery / rocminfo on the lab GPU (GPU required; recorded ou
   - PCI-SIG "PCI Express Base Specification".
   - IEEE 754. bfloat16 needs a separate source.
 - **Alternative named-product document.** "NVIDIA A100 Tensor Core GPU Architecture" whitepaper.
+
+## Owner rulings applied
+
+Verification pass of 2026-10-10 (verifier: Fact-Checker agent). Each "Decision for the owner" above, with the ruling applied:
+
+1. **Named product (F1-63).** Ruling **D1** (reference kit) — decided by verifier: the named products are the kit's GPUs, the AMD Radeon RX 9070 XT (RDNA 4, gfx1201) and the NVIDIA GeForce RTX 5060 Ti 16 GB (Blackwell, cc 12.0), with the numbers of `build/KIT.md` (new source K1 in F1-63). The AMD CDNA 2 whitepaper (opened) stays as the worked whitepaper because the course's compiler evidence is for gfx90a; the chapter says so and notes the two RDNA 4 differences (no MFMA; wave32 default). The A100 whitepaper (W2) is no longer proposed. The "Decision for the owner" box became a "Verifier's decision (owner ruling D1)" box; the summary bullet was updated.
+2. **TG-1 invented teaching GPU.** Ruling **A2** (teaching stand-in, labelled) and **A4** (exercise values): kept, already labelled "invented" wherever used. Registering TG-1 in the guide is for the build lead; nothing changed in the chapters.
+3. **"Banquet hall" analogy.** Ruling **A3**: approved as proposed (F1's name for the F6 hall mapping). No change in the chapters.
+4. **X1–X5 placeholders (F1-63 forensic).** Ruling **A4** — decided by verifier: the placeholders stay. Replacing them with W1's numbers would change the forensic input file and its recorded run for no teaching gain; the checker's rules are unaffected.
+5. **No-device outputs kept as evidence.** Ruling **C3**: kept; every "untested on hardware" box now also says what is needed to test it (a kit GPU and toolkit, `run_lab.sh` on that machine, the new `.log` pasted into the QA record).
+6. **WMMA listing target (`-arch=sm_80`).** Decided by verifier: unchanged; the chapter's instruction to add `-arch=sm_80` (or newer; the kit's RTX 5060 Ti is sm_120) stays. A per-lab architecture flag in `run_lab.sh` is a build-tool change outside this unit.
+7. **Measured CPU numbers.** Ruling **A5**: the re-run of 2026-10-10 changed only `F1-55/chains.out`, `F1-59/host_bw.out` and the date lines of the `.log` files; the recorded files were restored with `git checkout`.
+8. **Course forensic "Why is my GPU idle?"** No ruling needed; unchanged.
+9. **Glossary seed terms.** Ruling **A7**: the seed ids are kept; the merged terms (Latency, Throughput, ILP, Register file, Little's law) are canonical where first defined. The glossary's "pending verification (dossier gate G1 open)" wording on 55 source lines was replaced by a pointer to the chapter's Sources entry.
+- **A1**: nothing was trimmed. **A8, A10, D2–D4**: no keys, licence placeholders, simulators or robot images in this unit (checked with grep: no `LicenseRef-Uni-Lab`). **B6/B7**: not in this unit's scope (exams are written by another pass). **C1/C2/C4**: applied as described below.
+
+## Verification pass
+
+Date 2026-10-10. Shared web-fetch budget: exhausted for most of the pass ("400 per hour, shared by every agent"); fetches were retried in small batches, and what could not be opened is recorded honestly in every dossier and Sources list.
+
+**Opened (dossiers list the address):**
+- CUDA Programming Guide release 13.4.2 (contents; 2.3 "Writing SIMT Kernels"; 2.5 "Asynchronous Execution"; the execution-model appendix; 3.2 "Advanced Kernel Programming", opened late in the pass: 3.2.2.1 SIMT execution model, 3.2.2.1.1 independent thread scheduling, 3.2.2.2 hardware multithreading, 3.2.6 L1/shared balance).
+- PTX ISA 9.4 (to section 5.2; WARP_SZ in 4.5.1; later sections by table of contents).
+- "AMD Instinct MI200" ISA Reference Guide, 4 February 2022 (title page, contents, preface, chapters 1–3; chapters 4–13 by title).
+- AMD CDNA 2 whitepaper "INTRODUCING AMD CDNA 2 ARCHITECTURE" (complete).
+- LLVM "User Guide for AMDGPU Backend" (to the processors table).
+- Hennessy & Patterson 6th edition (publisher's catalogue page with chapter list); Little 1961 (abstract page); ROCm GPU-architecture link page.
+- Local headers H1 (CUDA 12.0) and H2 (HIP 5.7) re-read.
+
+**Not opened (cited by catalogue entry or title, ruling C2; claims stay in boxes):** PMPP 4th edition (catalogue listing only), CUDA PG sections 3.4 / 5.1 and the warp vote / warp matrix functions page, CUDA Binary Utilities, nvcc driver docs, CUDA Runtime API cudaDeviceProp page, HIP hipDeviceProp_t page, LLVM metadata/kernel-descriptor sections, ROCm mi250.html / rdna.html, JEDEC JESD235 and JESD250, IEEE 754-2019, PCI-SIG (site blocked), NVIDIA NVLink page, A100 whitepaper.
+
+**Corrected or moved out of unverified boxes:**
+- F1-56: four 16-wide SIMD units per CDNA CU, 64-work-item wavefronts (W1, D6 1.1).
+- F1-57: SIMT per-thread state, consecutive thread ids, warp size 32 (PG 2.3.1/2.3.2/2.3.4.2.1/3.2.2.1), per-thread program counter and call stack from cc 7.0 (PG 3.2.2.1.1), WARP_SZ (PTX 4.5.1), EXEC/VCC (ISA 3.3/3.9).
+- F1-58: gfx90a LDS 64 kB per CU, 32 banks × 512 entries × 4 bytes (ISA 2.2.1).
+- F1-59: real worked example added (MI250X 8,192-bit, 3.2 TB/s; MI210 4,096-bit, 1.6 TB/s; W1); J1/J2 now JESD235/JESD250.
+- F1-55/F1-60: zero-cost warp switching quoted from PG 3.2.2.2. F1-60: VMCNT/LGKMCNT definitions (ISA 3.1 Table 2); scheduler ordering (PG 2.3.7).
+- F1-61: unified VGPR/AGPR pool, AV0–AV255, 512 VGPRs (ISA preface, 3.1, 3.6.4); four Matrix Core units per CU and FP64 shapes (W1).
+- F1-62: Infinity Fabric link figures (S3/W1); pinned-memory requirement for overlap (PG 2.5.2.3).
+- F1-63: named product (ruling D1); whitepaper structure replaced by W1's real sections, per-package CU counts and the 1,700 MHz boost footnote.
+- All chapters: "Title only — not opened" removed; editions/versions/sections recorded; no URLs in chapters.
+
+**Left unverified (with the reason in each box):** NVIDIA SM partitioning and scheduler counts; RDNA WGP pairing; "Volta" as the name of cc 7.0, the `*_sync` mask rule and convergence-barrier SASS; NVIDIA shared-memory bank count and from which generation L1/shared is unified; the 24-registers-with-cap-16 anomaly; transfers per reported memory clock; HBM/GDDR6 internal organisation; NVIDIA dependency tracking; `s_nop` semantics and MFMA NOP counts; `accum_offset` meaning; HMMA.884 operation and SASS shape reading; per-generation formats; WMMA fragment rules; NVSwitch equidistance; xGMI topologies; PCIe P2P platform rules; sparsity in peak figures.
+
+**Labs:** all nine re-run with `run_lab.sh`, exit 0. Differences were timing noise only (`F1-55/chains.out`, `F1-59/host_bw.out`, `.log` date lines); recorded files restored (A5). The 18 no-device runs (exit code 1 inside the logs) remain "untested on hardware" (C3). Status for the catalogue: "internally checked · hardware steps untested" (C4).
+
+**Diagrams, edit, accessibility:** all 18 inline SVGs have `title`/`desc`, `role="img"` and text labels; tables have header cells; headings in order; no colour-only meaning. No trimming.
