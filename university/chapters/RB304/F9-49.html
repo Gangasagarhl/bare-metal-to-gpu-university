@@ -1,0 +1,283 @@
+<!--meta
+id: F9-49
+title: Real-time in ROS 2: memory, executors, priorities
+course: RB304
+level: L3–L4
+prereqs: F9-48 (measurement, page faults, locked memory); F9-45; RB303 (ROS 2 nodes, topics, the executor idea); F2-42 or OS305 (lock-free single-producer single-consumer queue)
+time: 10–14 hours including the lab
+hardware: none (a Linux computer with g++); ROS 2 is NOT installed in the build container, so the chapter's code is a miniature executor of its own that shows the ideas; applying them to a real ROS 2 node is untested in this build
+maps: Course RB304 goal "design ROS 2 nodes whose control path meets its deadlines"; ROS 2 documentation (executors, callback groups, real-time guidance); prepares F9-50 (ros2_control) and RB403 (F9-67)
+analogy: F9 — a drummer who must hit every beat (registered); the "band with one player for every instrument versus one player per part" mapping for executors and callback groups is this chapter's proposal, listed in NOTES.md
+-->
+
+<h2 id="F9-49-hook">Story hook</h2>
+<p>A small band has only one musician. She plays the drums, and every ten bars she also has to turn the page of the sheet music for the whole band, which takes her a few seconds because the pages stick. Every time she turns a page, the beat stops. Nobody would build a band that way. Yet a ROS 2 node can be built exactly that way without anybody noticing: the 1 kHz control callback and a "harmless" 10 Hz logging callback share one thread, and every time the logger runs, the control loop waits.</p>
+<p>This chapter takes a node like that, measures it, finds the cause in a trace, and rebuilds it so that the control path has its own thread with a real-time priority, no memory allocation, and a lock-free hand-over to everything else. Then the same rules are mapped onto ROS 2's own concepts, which the build container could not run, so they come with honest boxes.</p>
+
+<h2 id="F9-49-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> how an executor turns callbacks into work on threads, and what a callback group guarantees.</li>
+<li><b>Diagnose</b> a late control callback from a callback trace: which callback ran instead, and why it could.</li>
+<li><b>Design</b> the thread and group structure of a node with a hard control path and soft side tasks.</li>
+<li><b>Remove</b> allocation, locks and blocking calls from a control path and prove it with counters.</li>
+<li><b>Hand data</b> from the real-time thread to non-real-time threads through a preallocated lock-free ring, and account for drops.</li>
+</ul>
+
+<div class="co jargon" id="F9-49-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Executor</dt><dd><b>Simple words:</b> the part of a robot program that decides which waiting piece of work runs next, and on which thread. <b>Analogy:</b> the musician who plays the parts given to her, one at a time. <b>Precise:</b> a loop that waits for events (timer expiry, arriving messages, service requests), then calls the callbacks registered for them on the thread or threads it owns; ROS 2 provides executors of this kind (<a href="#RB303">RB303</a>). Listing 1 is a miniature with one thread that serves timers only. <sup class="src"><a href="#F9-49-src-D1">D1</a></sup></dd>
+<dt>Callback group</dt><dd><b>Simple words:</b> a set of callbacks with one rule about whether they may run at the same time. <b>Analogy:</b> the parts written for one player. <b>Precise:</b> in ROS 2, a grouping of callbacks that the executor serves under the group's rule (callbacks of a "mutually exclusive" group never run concurrently); a group is added to one executor, so groups are how a node's callbacks are split between threads. Listing 1's groups are mutually exclusive by construction. <sup class="src"><a href="#F9-49-src-D1">D1</a></sup></dd>
+<dt>Real-time path (control path)</dt><dd><b>Simple words:</b> the chain of code that must finish before the deadline every cycle. <b>Analogy:</b> the drumbeat. <b>Precise:</b> the callbacks and functions between reading the sensor and writing the command in each control cycle, including everything they call; every operation on it must have a bounded, known duration. <sup class="src"><a href="#F9-49-src-D2">D2</a></sup></dd>
+<dt>Lock-free ring buffer</dt><dd><b>Simple words:</b> a fixed circle of slots where one thread writes and another reads, without waiting for each other. <b>Analogy:</b> a rack of sheet-music pages: the drummer drops each page in; the page-turner takes them out. <b>Precise:</b> a single-producer single-consumer queue of fixed capacity, with head and tail indices updated with atomic release and acquire operations, so neither side ever blocks; when it is full, the producer drops the item and counts it (<a href="#F2-42">F2-42</a>). <sup class="src"><a href="#F9-49-src-D3">D3</a></sup></dd>
+<dt>Allocation-free loop</dt><dd><b>Simple words:</b> a loop that never asks for new memory while it runs. <b>Analogy:</b> every stick laid out before the concert. <b>Precise:</b> a code path that performs no heap allocation or deallocation after initialisation (no <code>new</code>, no growing containers, no string building); verified by counting allocations per thread, as Listing 2 does by replacing the global <code>operator new</code>. <sup class="src"><a href="#F9-49-src-D2">D2</a></sup></dd>
+</dl></div>
+<p>Terms from earlier chapters: <a href="#gl-jitter">jitter</a> (<a href="#F9-45">F9-45</a>); <a href="#gl-blocking-term-b">blocking term (B)</a> (<a href="#F9-46">F9-46</a>); <a href="#gl-page-fault">page fault</a>, <a href="#gl-locked-memory-mlockall">locked memory</a>, <a href="#gl-tail-latency">tail latency</a> (<a href="#F9-48">F9-48</a>); <a href="#gl-priority-inversion">priority inversion</a> (<a href="#OS305">OS305</a>).</p>
+
+<h2 id="F9-49-pictures">The idea in pictures</h2>
+<figure id="F9-49-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 230" role="img" aria-labelledby="F9-49-f1t F9-49-f1d">
+<title id="F9-49-f1t">Figure 1: the measured worst control cycle of the bad configuration</title>
+<desc id="F9-49-f1d">A time line in microseconds relative to the release of the worst control cycle, from minus 1000 to plus 5000. Short control blocks at minus 885. A logging block starts at minus 881 and ends at plus 4604, filling the line. The control release at 0 is marked; its callback starts at plus 4653, after the logging block. The next control release at plus 1000 also starts late, at plus 4703. Label: one thread, one group: control waits for logging.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="230"/>
+<text class="sv-tb" x="20" y="28">one executor thread, one callback group (node_bad.out, measured)</text>
+<line class="sv-line" x1="40" y1="130" x2="720" y2="130"/>
+<text class="sv-ts" x="40" y="150">−1000</text><text class="sv-ts" x="140" y="150">0</text><text class="sv-ts" x="230" y="150">+1000</text><text class="sv-ts" x="610" y="150">+5000</text>
+<rect class="sv-b1" x="52" y="100" width="4" height="26"/>
+<rect class="sv-b5" x="56" y="100" width="550" height="26" rx="2"/><text class="sv-t" x="230" y="118">logging: format + write (5.5 ms)</text>
+<rect class="sv-b1" x="606" y="100" width="6" height="26"/><rect class="sv-b1" x="613" y="100" width="6" height="26"/>
+<polygon class="sv-head" points="140,96 134,84 146,84"/><text class="sv-ts" x="110" y="78">control due</text>
+<polygon class="sv-head" points="240,96 234,84 246,84"/><text class="sv-ts" x="214" y="78">next due</text>
+<line class="sv-line2" x1="140" y1="175" x2="606" y2="175"/><text class="sv-ts" x="300" y="193">start lateness 4,653 µs</text>
+<rect class="sv-b1" x="40" y="205" width="14" height="12"/><text class="sv-ts" x="60" y="215">control callback</text>
+<rect class="sv-b5" x="190" y="205" width="14" height="12"/><text class="sv-ts" x="210" y="215">logging callback</text>
+<text class="sv-ts" x="400" y="215">scale: 1 px ≈ 10 µs</text>
+</svg></div><figcaption><b>Figure 1.</b> Drawn from the trace printed by Listing 2 in the bad configuration: the logger started at −881.5 µs and returned at +4,604.4 µs; the control callback due at 0 started at +4,653.0 µs. One thread can run one callback at a time. <sup class="src"><a href="#F9-49-src-R2">R2</a></sup></figcaption></figure>
+
+<figure id="F9-49-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 270" role="img" aria-labelledby="F9-49-f2t F9-49-f2d">
+<title id="F9-49-f2t">Figure 2: the fixed structure</title>
+<desc id="F9-49-f2d">Two executors side by side. Left: executor 1, a thread at SCHED_FIFO 80 with locked memory, serving the control callback group with the 1 kHz control timer; inside the callback: read, compute, write, push record. Right: executor 2, a SCHED_OTHER thread serving the logging group with the 10 Hz timer: pop all records, format, write. Between them a ring of 512 slots, with an arrow from control to the ring labelled push, never waits, and from the ring to logging labelled pop. Below: allocations in control: 0; drops counted.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="270"/>
+<rect class="sv-b1" x="20" y="30" width="270" height="180" rx="8"/>
+<text class="sv-tb" x="34" y="54">executor 1 (thread)</text>
+<text class="sv-ts" x="34" y="72">SCHED_FIFO 80, memory locked</text>
+<rect class="sv-b3" x="34" y="86" width="242" height="108" rx="6"/>
+<text class="sv-t" x="46" y="106">group: control</text>
+<text class="sv-ts" x="46" y="126">timer 1 kHz → control callback</text>
+<text class="sv-ts" x="46" y="144">PI step, motor model</text>
+<text class="sv-ts" x="46" y="162">push record (no allocation)</text>
+<text class="sv-ts" x="46" y="180">no lock, no I/O</text>
+<rect class="sv-b6" x="320" y="95" width="120" height="70" rx="35"/>
+<text class="sv-t" x="342" y="126">ring</text><text class="sv-ts" x="338" y="144">512 slots</text>
+<line class="sv-line" x1="276" y1="130" x2="312" y2="130"/><polygon class="sv-head" points="320,130 310,125 310,135"/>
+<text class="sv-ts" x="262" y="226">push: never waits</text>
+<rect class="sv-b8" x="470" y="30" width="270" height="180" rx="8"/>
+<text class="sv-tb" x="484" y="54">executor 2 (thread)</text>
+<text class="sv-ts" x="484" y="72">SCHED_OTHER</text>
+<rect class="sv-b4" x="484" y="86" width="242" height="108" rx="6"/>
+<text class="sv-t" x="496" y="106">group: logging</text>
+<text class="sv-ts" x="496" y="126">timer 10 Hz → logging callback</text>
+<text class="sv-ts" x="496" y="144">pop all records</text>
+<text class="sv-ts" x="496" y="162">format, write (may allocate,</text>
+<text class="sv-ts" x="496" y="180">may block: allowed here)</text>
+<line class="sv-line" x1="440" y1="130" x2="476" y2="130"/><polygon class="sv-head" points="484,130 474,125 474,135"/>
+<text class="sv-ts" x="440" y="226">pop</text>
+<text class="sv-ts" x="20" y="255">counted in the run: allocations in control 0, records dropped 0 (node_fixed.out)</text>
+</svg></div><figcaption><b>Figure 2.</b> The fixed configuration of Listing 2: separate groups on separate executor threads, real-time priority and locked memory for the control thread only, and a lock-free ring as the only connection. <sup class="src"><a href="#F9-49-src-R3">R3</a></sup></figcaption></figure>
+
+<h2 id="F9-49-layer1">Layer 1 — the kid explanation</h2>
+<p>A robot program has many little jobs: steer the motors, read the camera, write a diary of what happened. Something has to decide which job runs when; that something is called the executor. If one worker does all jobs one after another, a slow job (writing the diary) makes the fast, important job (steering) wait.</p>
+<p>So you give the steering job its own worker, who is allowed to go first and never stops to do anything slow. The steering worker drops short notes into a box; the diary worker picks them up later and writes them down at his own pace.</p>
+
+<h2 id="F9-49-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F9-49-l2-exec">Executors and groups, in miniature</h3>
+<p>ROS 2 programs hand their callbacks to an executor, which waits for events and runs the callbacks on its threads (<a href="#RB303">RB303</a>). <sup class="src"><a href="#F9-49-src-D1">D1</a></sup> ROS 2 is not installed in the build container, so Listing 1 implements the idea in about 120 lines: a <code>CallbackGroup</code> holds periodic timers; an <code>Executor</code> owns one thread, sleeps until the earliest timer is due, then runs every due callback of its groups in order, and records each run (release, start, end) in a trace allocated before spinning. It is not ROS 2's executor; it has the two properties that matter here: <b>one thread runs one callback at a time</b>, and <b>a callback cannot be interrupted by another callback of the same executor</b>.</p>
+<p>Listing 2 is a node with a 1 kHz control callback (a PI controller driving a simulated motor) and a 10 Hz logging callback that formats the recent samples and writes them (to <code>/dev/null</code>, a real system call). It runs in two configurations.</p>
+
+<h3 id="F9-49-l2-bad">The bad configuration</h3>
+<p>Both callbacks in one group on one SCHED_OTHER executor thread; the control callback appends to a growing vector and builds a log message string every cycle. Result on the build container (measured, AH-23): <sup class="src"><a href="#F9-49-src-R2">R2</a></sup></p>
+<pre class="output" data-run="F9-49/node_bad"></pre>
+<ul>
+<li>74 of 2,999 control cycles missed their 1 ms deadline (end of callback later than release + 1 ms); maximum start lateness 4,653.0 µs.</li>
+<li>The logger runs 29 times, with a median duration of 3,020.9 µs: three whole control periods every time.</li>
+<li>6,024 allocations in 2,999 control runs: about two per cycle (the message string, and the vector growing).</li>
+<li>The trace names the cause: the worst control start came right after a logging callback that ran from −881.5 to +4,604.4 µs. The next control release (+1,000) is served at +4,702.7 µs: two releases were served late back to back.</li>
+</ul>
+<p>In the vocabulary of <a href="#F9-46">F9-46</a>, the logging callback is a non-preemptible section of 5.5 ms in front of a task with a 1 ms deadline: a blocking term B larger than the period. No analysis could make that schedulable.</p>
+
+<h3 id="F9-49-l2-fixed">The fixed configuration</h3>
+<p>Four changes, each one rule from F9-47 and F9-48: (1) control in its own group on its own executor thread, (2) that thread at SCHED_FIFO 80, (3) memory locked and the control callback free of allocation, (4) records handed to the logger through a 512-slot lock-free ring (Figure 2). <sup class="src"><a href="#F9-49-src-D2">D2</a></sup> Result: <sup class="src"><a href="#F9-49-src-R3">R3</a></sup></p>
+<pre class="output" data-run="F9-49/node_fixed"></pre>
+<ul>
+<li>Misses 74 → 3; p99 start lateness 2,185.3 → 224.4 µs; maximum 4,653.0 → 1,919.4 µs.</li>
+<li>0 allocations in the control path, 0 records dropped; the logger did the same work (2,944,320 bytes in both runs) on its own thread, and its own lateness (up to 2,040.5 µs) no longer matters to the controller.</li>
+<li>The trace around the worst control start contains only control callbacks: nothing in this program delayed it. The remaining tail comes from outside the program, as in F9-48 (non-RT kernel, virtual machine).</li>
+<li>The final speed is the same in both runs (0.558): the controller's arithmetic depends on the cycle count, not on the timing, because this simulated motor advances by exactly 1 ms per call. On a real motor, late cycles change the physics (Layer 3).</li>
+</ul>
+
+<h2 id="F9-49-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F9-49-l3-ros">Mapping to ROS 2</h3>
+<p>The structure of the fixed configuration is the one recommended for ROS 2 real-time nodes in its documentation and talks: real-time callbacks in their own callback group, that group in an executor whose thread has a real-time policy and priority, everything else in other groups and executors, memory prepared and locked before the loop, and no allocation, blocking or unbounded work on the real-time path. <sup class="src"><a href="#F9-49-src-D1">D1</a></sup> <sup class="src"><a href="#F9-49-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>ROS 2 names from the author's memory, none compiled in this build (ROS 2 is not installed in the build container): the rclcpp executors <code>SingleThreadedExecutor</code>, <code>MultiThreadedExecutor</code>, <code>StaticSingleThreadedExecutor</code> and the newer <code>EventsExecutor</code> (availability depends on the ROS 2 distribution); callback group types <code>MutuallyExclusive</code> and <code>Reentrant</code> created with <code>create_callback_group</code>, and passed to timers and subscriptions in their options; adding a group to a specific executor with <code>add_callback_group</code> instead of adding the whole node; that a multi-threaded executor runs callbacks of different groups in parallel but gives no priorities; that the executor thread's priority is set by the program, for example with <code>pthread_setschedparam</code> before spinning, because ROS 2 does not set it. Check the ROS 2 documentation for your distribution ("Executors", "About callback groups", real-time guidance) and test a node with a trace before relying on any of this.</p></div>
+<h3 id="F9-49-l3-memory">Memory on the real-time path</h3>
+<p>Everything F9-48 measured applies inside ROS 2, with additions: messages are objects whose fields (strings, unbounded sequences) may allocate when filled or copied; publishing and receiving go through middleware layers that may allocate or lock internally. <sup class="src"><a href="#F9-49-src-D2">D2</a></sup> The practical approach: prove the path allocation-free with a counter like Listing 2's (lines 27–35); keep messages on the real-time path of fixed size; and do not publish from the real-time thread directly, but hand data through a ring to a non-real-time thread that publishes.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not tested in this build: the <code>realtime_tools</code> package's real-time-safe publisher and buffer classes (which hand messages to a non-real-time thread internally); the "ros2_tracing" tools, which record executor and callback events with the kernel's tracer and can produce traces like Listing 2's for a real node; allocator options for messages and publishers; that the default DDS middleware may allocate during publish. Check each package's documentation for your distribution.</p></div>
+
+<h3 id="F9-49-l3-ring">The ring and its failure mode</h3>
+<p>The ring (lines 40–63) is the same algorithm as F2-42's and F9-51's: the producer writes the slot, then publishes the new head with a release store; the consumer reads the head with an acquire load before reading the slot. <sup class="src"><a href="#F9-49-src-D3">D3</a></sup> When the ring is full, <code>push</code> returns false and the control callback counts a drop instead of waiting. Size it from the rates: control produces 100 records per logging period, so 512 slots allow the logger to be up to about five periods late before drops start. Waiting would move the logger's lateness into the control loop, which is what the fix removed. A drop counter must be reported (line 220) so that losing data is visible, not silent; <a href="#F9-51">F9-51</a>'s forensic lab is what happens when it is not watched.</p>
+
+<h3 id="F9-49-l3-time">When late cycles change the physics</h3>
+<p>Listing 2's motor advances exactly 1 ms per control call, so its final speed is the same in both runs. A real motor keeps moving while the callback waits; a PI controller that assumes dt = 1 ms when 5 ms passed computes the wrong integral and acts on old data. Measure dt each cycle and use it, or better, keep the cycles on time; and treat repeated misses as a fault (F9-50 turns misses into a requirement with a test).</p>
+
+<h2 id="F9-49-hardware">How the hardware actually does it</h2>
+<p>Two executor threads become two kernel threads, which the scheduler places on processors; the build container has 4. While the logger formats text on one processor, the control thread can run on another; with one shared thread, the second processor sits unused and the control callback waits. The ring's indices live in memory shared between processors; the release and acquire operations make sure that the processor running the logger sees the slot's contents before it sees the new head index (how much a processor reorders memory accesses on its own differs between architectures; the C++ atomics give the same guarantee on all of them, by limiting both the compiler and, where needed, the processor). <sup class="src"><a href="#F9-49-src-D3">D3</a></sup> Locked memory keeps the control thread's pages resident, so it takes no page faults (F9-48).</p>
+
+<h2 id="F9-49-worked">Worked example</h2>
+<p><b>Task.</b> Using the bad configuration's numbers, compute a lower bound on the blocking term B for the control callback, and the number of control releases that a single logging run can delay; check against the trace.</p>
+<ol>
+<li>B is at least the longest logging duration: 5,485.9 µs (maximum measured, a lower bound of the true worst). <sup class="src"><a href="#F9-49-src-R2">R2</a></sup></li>
+<li>Releases inside a logging run of length L: up to ⌈L / 1,000 µs⌉ = 6 for L = 5,485.9 µs; each is served after the logger returns, back to back.</li>
+<li>Trace: the logger ran from −881.5 to +4,604.4 µs, which contains the releases at 0, +1,000 … +4,000. The printed lines show the first two of them served at +4,653.0 and +4,702.7 µs. Consistent.</li>
+<li>Deadline misses caused by one such logging run: every release whose callback ends later than release + 1 ms; here all releases from 0 to +3,000 (their ends are after +4,653), and the one at +4,000 ends close to +4,700, inside its deadline. About 4 per logging run; 74 misses in 29 logging runs is about 2.6 per run, as shorter logging runs delay fewer releases.</li>
+</ol>
+
+<h2 id="F9-49-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>uexec.h</code>, the miniature executor.</p>
+<pre class="listing" data-src="F9-49/uexec.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>29–34</td><td><code>TraceEvent</code></td><td>Release, start and end of one callback run.</td><td>The evidence that names a cause.</td></tr>
+<tr><td>44–50</td><td><code>CallbackGroup</code></td><td>A list of timers served by one executor.</td><td>Groups are the unit you place on threads.</td></tr>
+<tr><td>60–75</td><td><code>start</code></td><td>Assigns ids and first releases, reserves trace capacity, starts the thread.</td><td>Nothing grows while spinning.</td></tr>
+<tr><td>85–90</td><td>policy</td><td>SCHED_FIFO on the executor's own thread if a priority is given; records refusal.</td><td>Priority belongs to threads, so to executors.</td></tr>
+<tr><td>91–100</td><td>wait</td><td>Absolute sleep until the earliest due timer.</td><td>Same rule as F9-45 and F9-48.</td></tr>
+<tr><td>101–111</td><td>dispatch</td><td>Runs every due callback, in order, to completion; then advances its release.</td><td>A long callback delays every other callback of this executor.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>rt_node.cc</code>, the node in both configurations.</p>
+<pre class="listing" data-src="F9-49/rt_node.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>27–35</td><td><code>operator new</code></td><td>Counts allocations per thread.</td><td>Proves "allocation-free" instead of hoping.</td></tr>
+<tr><td>40–63</td><td><code>SpscRing</code></td><td>Fixed ring, release/acquire indices, drop when full.</td><td>The only link between the threads.</td></tr>
+<tr><td>68–80</td><td><code>Motor</code>, <code>Pid</code></td><td>First-order motor, clamped PI.</td><td>Something real for the loop to control.</td></tr>
+<tr><td>87–98</td><td><code>formatReport</code></td><td>Formats 40 copies of the recent samples, writes to <code>/dev/null</code>.</td><td>A realistic slow, allocating, system-calling callback.</td></tr>
+<tr><td>170–186</td><td><code>control</code></td><td>PI step; bad: grows a vector and builds a string; fixed: pushes into the ring.</td><td>The difference between 6,024 and 0 allocations.</td></tr>
+<tr><td>187–197</td><td><code>logging</code></td><td>Collects recent samples (from the ring or the history) and formats them.</td><td>Same work in both configurations.</td></tr>
+<tr><td>199–208</td><td>groups and executors</td><td>Bad: one group, one executor; fixed: two of each, control at SCHED_FIFO 80.</td><td>The structural fix in nine lines.</td></tr>
+<tr><td>125–144</td><td><code>showWorst</code></td><td>Prints the trace around the latest control start.</td><td>Turns a histogram into a cause.</td></tr>
+</tbody></table></div>
+<p>The lab script and the sanitizer check run: <sup class="src"><a href="#F9-49-src-R1">R1</a></sup></p>
+<pre class="listing" data-src="F9-49/run.sh"></pre>
+<pre class="output" data-run="F9-49/node_smoke"></pre>
+
+<h2 id="F9-49-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A musician can tell when she is falling behind; an executor runs its callbacks blindly.</b> Nothing in the executor knows about deadlines; only your measurement does.</li>
+<li><b>Two musicians share one beat by listening; two threads share data only through memory.</b> The ring's memory ordering rules are what listening is for threads.</li>
+<li><b>Adding players to a band costs salaries; adding threads costs context switches and memory, and more threads at real-time priority make the system harder to analyse.</b> One real-time thread per rate or per independent path, not one per callback.</li>
+</ul>
+
+<h2 id="F9-49-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> control misses deadlines periodically, at the rate of another callback. <b>Cause:</b> both in one group or one single-threaded executor. <b>Find:</b> a callback trace (Listing 2's, or the ROS 2 tracing tools). <b>Fix:</b> separate groups on separate executors.</li>
+<li><b>Symptom:</b> separate groups, still late. <b>Cause:</b> the executor thread is SCHED_OTHER (nobody set its priority) or competes with other real-time threads. <b>Check:</b> <code>chrt -p</code> on the thread; print the policy as Listing 1 does.</li>
+<li><b>Symptom:</b> rare long cycles that correlate with nothing. <b>Cause:</b> allocation (a log message, a growing container, a message with an unbounded field) or a lock shared with a slow thread. <b>Find:</b> allocation counter and page-fault counter on the control thread. <b>Fix:</b> preallocate; ring instead of lock.</li>
+<li><b>Symptom:</b> after the fix, log records are missing. <b>Cause:</b> the ring was too small for the logger's worst lateness. <b>Fix:</b> size from rates, report drops, and decide whether drops are acceptable for that data.</li>
+<li><b>Symptom:</b> "printf debugging" makes the loop late. <b>Cause:</b> console output is a system call that may block. <b>Fix:</b> log through the ring.</li>
+</ul>
+
+<div class="co transition" id="F9-49-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#RB303">RB303</a> wrote ROS 2 nodes with callbacks and an executor; <a href="#F9-48">F9-48</a> measured latency and found page faults; <a href="#F9-47">F9-47</a> set thread priorities against the kernel's own threads. <b>What carries over:</b> absolute release times, real-time priority for the control thread only, locked and preallocated memory, histograms and traces as evidence. <b>What changes:</b> the unit of scheduling you design with is no longer a thread you wrote but a callback that a framework calls; the structure of executors and groups decides what can delay what, and the hand-over between threads becomes a data structure you must size. <b>What comes next:</b> <a href="#F9-50">F9-50</a> looks at ros2_control, where the framework itself fixes the real-time loop (read, update, write) and your code becomes a controller and a hardware interface inside it.</p></div>
+
+<h2 id="F9-49-check">Check yourself</h2>
+<ol>
+<li>What two properties of Listing 1's executor explain the bad configuration's tail?</li>
+<li>Why does putting the control and logging callbacks into separate groups on the same single-threaded executor not help?</li>
+<li>Where exactly did the 6,024 allocations come from? Which line would you check first in a code review?</li>
+<li>Size the ring for a logger that runs at 5 Hz and may be up to 300 ms late, with control at 1 kHz.</li>
+<li>Apply to a new case: a node has a 500 Hz control callback, a 30 Hz camera callback taking 12 ms, and a 1 Hz diagnostics callback taking 40 ms. Propose groups, executors and priorities.</li>
+<li>The fixed configuration still had 3 misses and a maximum start lateness of 1,919.4 µs. What does the trace say about the cause, and what does it not say?</li>
+<li>Why should the real-time thread not publish ROS 2 messages directly, even if publishing is fast most of the time?</li>
+<li>Predict, then run: reduce the ring to 64 slots (line 160). How many drops do you predict, and why?</li>
+</ol>
+
+<h2 id="F9-49-lab">Lab</h2>
+<p><b>Goal.</b> Reproduce the bad and fixed configurations, read the trace, and apply the same structure to a real ROS 2 node if you have ROS 2.</p>
+<p><b>Hardware and software needed.</b> A Linux computer with g++ 13.3.0 (as in the logs); permission for real-time priorities (F9-48's lab). Run <code>university/labs/run_lab.sh university/labs/F9-49</code>. The ROS 2 part (step 5) needs a ROS 2 installation; it is <b>untested in this build</b>.</p>
+<div class="co safety"><span class="lbl">Safety</span><p>The motor here is simulated. When you apply this to a real robot, a control thread at real-time priority that hangs takes a processor with it: keep throttling on, test in simulation first, and keep a hardware stop independent of the computer. See the course <a href="#safety">safety rules</a>.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab; read <code>node_bad.out</code> and <code>node_fixed.out</code>; draw Figure 1 from your own trace.</li>
+<li>Change one thing at a time from bad toward fixed (separate executors only; then priority; then no allocation; then the ring) and record misses and p99 for each step.</li>
+<li>Make the logging callback 10 times slower (line 90: 400 repetitions). Predict the effect on each configuration, then run.</li>
+<li>Reduce the ring and measure drops (Check yourself 8).</li>
+<li>(ROS 2, untested in this build) Build a node with a 1 kHz timer and a 10 Hz logging timer in one mutually exclusive group on a single-threaded executor; measure start lateness with your own timestamps; then apply the fixed structure (unverified box in Layer 3) and measure again.</li>
+</ol>
+<p><b>Expected observations.</b> From the build container (measured, AH-23): bad, 74 misses and maximum 4,653.0 µs, trace showing logging before the worst start; fixed, 3 misses, maximum 1,919.4 µs, 0 allocations, 0 drops. <sup class="src"><a href="#F9-49-src-R2">R2</a></sup> <sup class="src"><a href="#F9-49-src-R3">R3</a></sup> On your machine the numbers differ; the pattern should not.</p>
+<p><b>Verification.</b> <code>run.sh</code> fails if the fixed configuration's allocation count is not 0. All steps exit 0.</p>
+<p><b>Troubleshooting.</b> "SCHED_OTHER (refused)" in the fixed line → real-time permission (F9-48 lab). Drops in the fixed run → logger starved; check the machine's load.</p>
+<p><b>Extension.</b> Add a subscription-like event source to Listing 1 (a second thread posts "messages" into a ring that the executor polls) and show how a burst of messages delays a timer in the same group.</p>
+
+<h2 id="F9-49-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A team's mobile robot wobbles for a moment roughly ten times a second. The wheel controller is a ROS 2 node; nobody changed the controller in months. Last week, someone added a callback to the same node that logs the recent wheel commands at 10 Hz "for the new dashboard", and a small change in the control callback that records each command into a history vector and a text message.</p>
+<p><b>Evidence pack.</b> The node reproduced on the miniature executor (Listing 2, configuration "bad"), with its callback trace: <sup class="src"><a href="#F9-49-src-R2">R2</a></sup></p>
+<pre class="output" data-run="F9-49/node_bad"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what does the trace show running between the control callback before the worst one and the worst one?</li>
+<li>Hypotheses: (a) the controller got slower; (b) the kernel or machine delays the thread; (c) another callback on the same thread; (d) allocation in the control callback. Which numbers in the output speak for or against each?</li>
+<li>Root cause: explain the 10 Hz rhythm of the wobble.</li>
+<li>Fix: give the structural change and the code changes, and the evidence you would require.</li>
+<li>Prevention: which automatic checks would have caught both problems in review or test?</li>
+</ol>
+<p><b>Method hints.</b> Compare the control callback's duration with its start lateness. Look at the logging run's start and end in the trace.</p>
+
+<h2 id="F9-49-project">Mini-project</h2>
+<p><b>A callback-latency watchdog.</b> Extend Listing 1 so that each timer has a deadline; the executor counts misses per callback and, on a miss, copies the last 16 trace events into a "black box" buffer that the logging thread later prints. Use it on Listing 2 with a deliberately inserted slow path (a 3 ms busy loop every 777th control cycle) and show that the black box names it.</p>
+<p><b>Rubric.</b> No allocation on the executor thread after start, proven by the counter (3). Black box shows the correct preceding events (3). Miss counting correct against a hand-checked trace (2). Written explanation of what the watchdog cannot see (time spent outside the program) (2).</p>
+
+<h2 id="F9-49-summary">Summary</h2>
+<ul>
+<li>An executor runs one callback at a time per thread; a long callback delays every other callback on that thread.</li>
+<li>Put the control path in its own group on its own executor thread with a real-time priority; everything else elsewhere.</li>
+<li>No allocation, locks or blocking calls on the control path; count allocations to prove it.</li>
+<li>Hand data out of the real-time thread through a preallocated lock-free ring; size it from rates and report drops.</li>
+<li>Measured on the build container: bad, 74 misses, maximum 4.65 ms, 6,024 allocations; fixed, 3 misses, maximum 1.92 ms, 0 allocations, 0 drops (AH-23).</li>
+<li>ROS 2's executor and callback-group APIs are listed in unverified boxes; the structure is what transfers.</li>
+</ul>
+
+<h2 id="F9-49-sources">Sources</h2>
+<ol>
+<li id="F9-49-src-D1">ROS 2 documentation: "Executors" and "About callback groups" (tier 2). <i>Titles only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F9-49-src-D2">ROS 2 documentation, real-time programming guidance and the ROS 2 real-time working group's material (tier 2). <i>Titles only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F9-49-src-D3">ISO/IEC 14882:2020 (C++20), atomic operations and memory order (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F9-49-src-R1">R1 — <code>node_smoke.log</code>: sanitizer build (address and undefined behaviour), 0.3 s run, exit code 0; timing not used.</li>
+<li id="F9-49-src-R2">R2 — <code>node_bad.log</code>, exit code 0; measured on the build container (AH-23).</li>
+<li id="F9-49-src-R3">R3 — <code>node_fixed.log</code>, exit code 0; measured on the build container (AH-23); <code>run.sh</code> checks the allocation count is 0.</li>
+</ol>
+
+<h2 id="F9-49-glossary">Glossary links</h2>
+<p><a href="#gl-executor-ros-2">Executor (ROS 2)</a> · <a href="#gl-callback-group">Callback group</a> · <a href="#gl-real-time-path-control-path">Real-time path</a> · <a href="#gl-lock-free-ring-buffer">Lock-free ring buffer</a> · <a href="#gl-allocation-free-loop">Allocation-free loop</a> · <a href="#gl-blocking-term-b">Blocking term (B)</a> · <a href="#gl-page-fault">Page fault</a></p>
+
+<h2 id="F9-49-next">Next chapter</h2>
+<p>Next: <a href="#F9-50">F9-50 ros2_control</a>. Previous: <a href="#F9-48">F9-48 Measuring latency</a>. Back to the course: <a href="#RB304">RB304</a>. ROS 2 basics: <a href="#RB303">RB303</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackH">Track H</a>.</p>
+
+<h2 id="F9-49-answers">Answers to Check yourself</h2>
+<ol>
+<li>One thread runs one callback at a time, and a running callback is not interrupted by another callback of the same executor; so a 3–5.5 ms logging run delays every control release that falls inside it.</li>
+<li>A single thread still runs one callback at a time; groups only decide which callbacks may run in parallel when there are threads to run them.</li>
+<li>Line 180 (<code>history.push_back</code>, reallocating as the vector grows) and lines 181–182 (building a <code>std::string</code> message and storing it); about 2 per cycle. Line 181 first: string building in a control loop is the commonest form.</li>
+<li>Records per logging period 200 (1 kHz / 5 Hz), plus 300 ms late = 300 more: at least 500 slots, plus margin, e.g. 1,024 (and report drops).</li>
+<li>Control alone in a group on an executor thread at the highest real-time priority of the node; camera in its own group on a second thread at a lower real-time priority or SCHED_OTHER, depending on whether its result has a deadline; diagnostics in a third group on a SCHED_OTHER thread. Data out of control through rings; nothing on the control thread may wait for the camera.</li>
+<li>That no other callback of this program ran before it; so the cause lies outside the program (kernel, other processes, the virtual machine). It does not say which; F9-48's methods (and a kernel trace) would.</li>
+<li>Publishing goes through middleware that may allocate, lock or make system calls; "fast most of the time" is a median, and the control path needs a bounded worst case.</li>
+<li>About 100 records arrive per logging period; with 63 usable slots, at least 37 drops per logging run when the logger is on time: about 29 × 37 ≈ 1,070 in 3 s, more if it is late. Measure to check.</li>
+</ol>
+<h3 id="F9-49-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Between the control callback ending at −881.6 µs and the worst control start at +4,653.0 µs, the logging callback ran from −881.5 to +4,604.4 µs. Logging runs take 3,020.9 µs at the median. <sup class="src"><a href="#F9-49-src-R2">R2</a></sup></p>
+<p><b>Hypotheses.</b> (a) The control callback's median duration is 3.0 µs: it is not slow. (b) The kernel or machine may add some delay, but the worst case follows a logging run exactly. (c) Confirmed by the trace. (d) 6,024 allocations in 2,999 runs: present, a source of rare long cycles (maximum duration 174.1 µs) and a risk, but not the cause of the 4.6 ms gaps.</p>
+<p><b>Root cause.</b> The logging callback shares the control callback's single executor thread; each 10 Hz logging run blocks the control loop for 3–5.5 ms, which produces several missed cycles in a row ten times a second: the wobble's rhythm. The allocations are a second, smaller defect.</p>
+<p><b>Fix.</b> Control in its own group on its own executor thread at a real-time priority, logging elsewhere; history and messages replaced by a push into a preallocated ring; memory locked. Evidence to require: the fixed run's trace contains no other callback before the worst start, the allocation counter is 0, drops are 0 (as in <code>node_fixed.out</code>). <sup class="src"><a href="#F9-49-src-R3">R3</a></sup></p>
+<p><b>Prevention.</b> A test that runs the node for a few seconds and asserts zero allocations on the control thread and no deadline misses caused by own callbacks (a trace check); a review rule that new callbacks go into an explicitly named group, never the default one.</p>
+<p><b>How the evidence was made.</b> <code>rt_node bad</code>. It differs from <code>rt_node fixed</code> in the placement of the logging timer (lines 201–205), the executors and priority (206–208, 212), locked memory (166) and the control callback's record keeping (177–183). The motor, controller, logger work and duration are the same.</p>
