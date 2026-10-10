@@ -144,3 +144,46 @@ Forensic authors: Kofi (F1-19), Lena (F1-20), Priya (F1-21), Omar (F1-22), plus 
    - Please confirm this split matches the HW202 integration plan, and that its 8-bit addresses and 8-bit words match HW202's CPU. HW202's U16 uses 16-bit registers, so the widths may need to change: `program_counter.v` has a WIDTH parameter, but the RAM is fixed at 8-bit words.
 5. **Verilator output filtering.** Web-link lines are removed with `grep -v` and the removal is stated in the output. Confirm this is acceptable under the no-URL rule.
 6. **Exam P ("design an FSM from a word description").** F1-19's method section and mini-project (vending machine) are written as practice for it. The exam itself was not written.
+
+## Owner rulings applied
+
+1. **FPGA board for F1-22 Part B** — rulings D1, C3 and B2. `build/KIT.md` did not exist when this unit was verified, so no board is named (decided by verifier: name none until KIT.md names one). Part B stays "untested on hardware"; its box now says exactly what is needed to test it (board with ≥ 4 LEDs and 1 button, vendor toolchain, constraints file, DIV from the board clock, a recorded run). `board_top.v` keeps `DIV = 4` for simulation.
+2. **Verilog standard edition** — ruling C2. Cited as IEEE Std 1364-2005 (catalogue page opened: superseded by IEEE 1800-2009; active successor IEEE 1800-2023, catalogue page opened). Its text was not opened, so no claim rests on it alone; the labs keep `-g2005`.
+3. **Curriculum milestone** — decided by verifier: none. The course card (guide 5.6) itself says "Maps to: Prepares HW202"; kept as is.
+4. **Course project split and widths** — ruling B3 (the proposed split is approved): PC in F1-17/F1-21, memory unit in F1-20, resource budget in F1-22. Decided by verifier: keep 8-bit addresses and words in HW201; widening to HW202's 16-bit CPU is HW202's integration step (`program_counter.v` has a WIDTH parameter; the RAM's word width is the one change HW202 must make).
+5. **Verilator output filtering** — decided by verifier: acceptable. Removing the tool's web-link lines keeps chapters free of URLs (AH-30), and every filtered output says so; the warnings themselves are unchanged.
+6. **Exam P ("design an FSM from a word description")** — ruling B4: exams are written in this pass under the separate exam brief, not in this verification task. F1-19's method section and mini-project remain the practice material.
+7. **Analogy proposals** (latch = serving hatch, flip-flop = ticket clip at the bell, ...) — ruling A3: approved; each chapter's "Where the analogy breaks" was re-checked.
+8. **Glossary duplicates** — ruling A7: earlier courses' definitions win; qualified names kept ("Counter (hardware)", "Register (hardware)", "Feedback (in a circuit)", "Module/Port/Parameter (Verilog)"). The `source` field of every entry now names the opened source and chapter (or the chapter's Sources list) instead of "pending verification".
+9. **Exercise values** — ruling A4: the delays, periods, traffic timings, 95 % leak per tick, 0.5 threshold and 8 rows remain labelled "exercise value" in the chapters.
+10. **Recorded runs** — ruling A5: all seven labs re-run; outputs identical, only log dates differed, so the recorded files were restored.
+11. **Licence** — ruling A10: no `LicenseRef-Uni-Lab` placeholder exists in `labs/F1-16` to `labs/F1-22`; nothing to change (the lab code falls under MIT by the ruling). **Teaching keys** (A8): none in this unit.
+12. **Hardware status** — rulings C3, C4: only F1-22 Part B is untested on hardware; F1-16 to F1-21 have no hardware steps.
+
+## Verification pass
+
+Done on 2026-10-10 by the Fact-Checker agent (verification brief `build/verify/VERIFY_BRIEF.md`).
+
+**Opened** (URLs in the dossiers `_dossiers/F1-16.dossier.html` … `F1-22.dossier.html`):
+- Harris & Harris, *Digital Design and Computer Architecture, RISC-V Edition* (Elsevier catalogue page: 1st edition, 2021) and the authors' own lecture slides for chapters 1, 3, 4 and 5 ("© 2021 Sarah Harris and David Harris"). The book text itself was not opened; claims cite the slide headings.
+- Nisan & Schocken, *The Elements of Computing Systems*, chapter 3 "Sequential Logic" (authors' site; no edition printed).
+- IEEE 1364-2005 and IEEE 1800-2023 catalogue pages (text not opened).
+- Vendor documents: TI SN74HC161 (SCLS297D), Nexperia 74HC393 (Rev. 9) and 74HC164 (Rev. 11) data sheets; Intel/Altera Quartus Design Recommendations (683082, 683323) and Timing Analyzer (683243); AMD UG470 v1.17, UG474 rev 1.9, UG953 2021.1 (RAMB18E1); Lattice MachXO2 family page.
+- David Harris, "Lecture 15: SRAM" (CMOS VLSI Design 4th Ed. slides); Kim et al., "Flipping Bits in Memory Without Accessing Them" (DRAM background and disturbance errors).
+- Built-in help of the installed Yosys 0.33, Icarus Verilog 12.0 and Verilator 5.020 (plus the online Yosys cell-library page).
+- **Not opened** (the shared web-access budget of the session ran out): Patterson & Hennessy, *Computer Organization and Design*; Petzold, *Code*. No claim rests on them any more.
+
+**Checked:** 222 tagged claims (F1-16 37, F1-17 27, F1-18 32, F1-19 26, F1-20 40, F1-21 35, F1-22 25) plus all unverified boxes. Every "Title only — not opened" note is gone; tags now name the slide heading or section.
+
+**Main corrections:**
+- F1-18: clock gating is done with a register on the inactive edge feeding the gate (not "special cells, not an AND gate"); the synchronizer gives the first flip-flop the period minus setup time, not a full cycle; "clock network is one of the largest power consumers" softened.
+- F1-20: DRAM read/restore, banks and commands now follow Kim et al. §2; SRAM-vs-DRAM speed and cost claims moved into the unverified box; "memories in processors are synchronous" limited to FPGA block RAM; the firmware sentence removed; `cell` as a reserved word confirmed by a check run with `-g2005`.
+- F1-21: the `$_SDFFE_PP0P_` reading is confirmed by Yosys's own help (box turned into a note); simulator race claims moved into a new unverified box.
+- F1-22: FPGA-vs-ASIC trade-off and uses moved into the unverified box; volatile configuration and reload, synchronous block RAM, 6-input LUTs of one family now cited to vendor documents; `integer` = 32 bits shown by the R4 run.
+- F1-16/F1-17/F1-19: SR latch jargon no longer says "(or NAND)" with active-high S/R; ripple-counter timing-analysis difficulty sourced to vendor guidance; Gray encoding for clock-domain crossing moved into an unverified box.
+
+**Left unverified (boxes):** part-specific timing numbers (F1-16, F1-17, F1-18); metastability of a released NOR latch (F1-16); clock generation on real boards (F1-18); Gray encoding and real traffic rules (F1-19); SRAM/DRAM speed, cost and JEDEC numbers (F1-20); simulator races and sim/synth mismatches (F1-21); FPGA vs ASIC and real toolchain details (F1-22).
+
+**Labs:** all seven re-run with `run_lab.sh`, exit 0; outputs identical to the recorded ones (expected-fail forensic steps still fail as intended). F1-22 Part B remains untested on hardware.
+
+**QA records:** `university/qa/F1-16.json` … `F1-22.json`, factcheck "done".
