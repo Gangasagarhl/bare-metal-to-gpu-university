@@ -340,12 +340,17 @@ def render_chapter(meta, course_title, known, problems, nxt, prev):
     nav = []
     if prev:
         nav.append('<a href="#%s">← %s</a>' % (prev, prev))
-    nav.append('<a href="#%s">course %s</a>' % (meta["course"], meta["course"]))
+    group = {"BR": "bridges", "MP": "mega"}.get(meta["course"])
+    if group:
+        nav.append('<a href="#%s">%s</a>' % (group, esc(course_title.lower())))
+    else:
+        nav.append('<a href="#%s">course %s</a>' % (meta["course"], meta["course"]))
     nav.append('<a href="#catalogue">catalogue</a>')
     if nxt:
         nav.append('<a href="#%s">%s →</a>' % (nxt, nxt))
     front = [
-        ("Course", '<a href="#%s">%s %s</a>' % (meta["course"], meta["course"], esc(course_title))),
+        ("Course", '<a href="#%s">%s</a>' % (group, esc(course_title)) if group else
+                   '<a href="#%s">%s %s</a>' % (meta["course"], meta["course"], esc(course_title))),
         ("Chapter id", "%s %s" % (cid, esc(meta["title"]))),
         ("Level", lvl),
         ("Prerequisites", linkify_ids(esc(meta.get("prereqs", "none")), known)),
@@ -464,7 +469,7 @@ def build():
     written_known = set(chapters) | set(cards)
 
     for cid in chapters:
-        if cid not in {c[0] for c in all_chapters}:
+        if cid not in {c[0] for c in all_chapters} and cid not in bridges and cid not in mps:
             problems.append("chapter %s is not in any course card" % cid)
 
     # statistics
@@ -528,9 +533,15 @@ def build():
                     '<td class="n">%s</td><td>%s</td></tr>' % (chid, link, title, course, course, esc(lvlc), status_tag(st), ver, qa))
     for b in bridges + mps:
         t, lvl = card_title_level(cards[b]["html"])
-        rows.append('<tr><td class="n"><a href="#%s">%s</a></td><td>%s</td><td>%s</td><td class="n">%s</td><td>%s</td>'
-                    '<td class="n">—</td><td>—</td></tr>' % (b, b, esc(t), "bridge" if b.startswith("BR") else "mega project",
-                                                             esc(lvl), status_tag("planned")))
+        st = chapter_status(b, chapters)
+        if b in chapters:
+            t = chapters[b]["title"]
+            lvl = chapters[b].get("level", lvl)
+        rows.append('<tr id="cat-%s"><td class="n"><a href="#%s">%s</a></td><td>%s</td><td>%s</td><td class="n">%s</td><td>%s</td>'
+                    '<td class="n">%s</td><td>%s</td></tr>'
+                    % (b, b, b, esc(t), '<a href="#bridges">bridge</a>' if b.startswith("BR") else '<a href="#mega">mega project</a>',
+                       esc(lvl), status_tag(st), "v0.1" if b in chapters else "—",
+                       '<a href="#qa-%s">QA</a>' % b if b in chapters else "—"))
     P.append('<h2 id="catalogue">Catalogue</h2><p>Every chapter, bridge chapter and mega project with its status (guide 12.5). '
              'Status words: <i>planned</i> (not yet written), <i>draft</i> (written, code not yet run), <i>draft · code run</i> '
              '(written and every listing compiled and run in this build), <i>internally checked</i> (an independent checker agent '
@@ -572,12 +583,20 @@ def build():
                                         seq[i + 1] if i + 1 < len(seq) else None, seq[i - 1] if i > 0 else None))
 
     # --- bridges and mega projects
-    P.append('<h2 class="fac" id="bridges">Bridge chapters</h2>' + section(guide, blocks, "s6"))
-    P.append('<h2 class="fac" id="mega">Mega projects</h2>' + section(guide, blocks, "s11-6"))
+    for hid, sec, group, gtitle in (("bridges", "s6", bridges, "Bridge chapters"), ("mega", "s11-6", mps, "Mega projects")):
+        html_ = section(guide, blocks, sec)
+        for b in group:
+            if b in chapters:  # the written chapter owns the anchor; the card stays as the summary
+                html_ = html_.replace(' id="%s"' % b, '', 1)
+        P.append('<h2 class="fac" id="%s">%s</h2>' % (hid, gtitle) + html_)
+        seq = [b for b in group if b in chapters]
+        for i, b in enumerate(seq):
+            P.append(render_chapter(chapters[b], gtitle, written_known, problems,
+                                    seq[i + 1] if i + 1 < len(seq) else None, seq[i - 1] if i > 0 else None))
 
     # --- QA records
     P.append('<h2 class="fac" id="qa">QA records</h2><p>One record per written chapter (guide 3.7). Gates follow guide 12.3.</p>')
-    for chid, _, _, _ in all_chapters:
+    for chid in [c[0] for c in all_chapters] + bridges + mps:
         if chid in chapters:
             P.append(render_qa(chid, chapters[chid], chapter_status(chid, chapters)))
 

@@ -24,8 +24,10 @@ complete courses. `PROGRESS.md` (regenerated on every course commit) shows what 
    (it discards nothing; it adds the course's chapter and lab folders, refreshes
    PROGRESS.md, commits and pushes). If an agent rebuilt `university/UNIVERSITY.html`,
    restore it first with `git checkout -- university/UNIVERSITY.html`.
-5. After all 87 courses: bridge chapters BR-01..10 and mega projects MP1..8 (the builder
-   needs a placement for them), the glossary-link fixes, `python3 university/build/build.py --check`,
+5. Bridge chapters BR-01..10 and mega projects MP1..8 are in the same queue and use the same
+   steps (one folder each, e.g. `university/chapters/BR-03/`, prompts in `prompts/BR-03.txt`;
+   the builder renders them under "Bridge chapters" and "Mega projects").
+6. After every queue entry is done: the glossary-link fixes, `python3 university/build/build.py --check`,
    commit `university/UNIVERSITY.html`, and mark the pull request ready.
 
 Owner decisions are collected in each course's `university/chapters/<COURSE>/NOTES.md`.
