@@ -162,3 +162,84 @@ Lena/Amara F1-52, Rafael F1-53, Ana/Tomás/Ines F1-54); none is a real person.
 
 `python3 university/build/build.py` exited 0; none of its PROBLEM lines (320 "broken link" lines at the last run, all
 `#gl-…` targets of other courses) mentions F1-49 … F1-54 or an HW205 glossary link.
+
+## Owner rulings applied
+
+Verification pass of 2026-10-10 (rulings in `university/OWNER_RULINGS.md`).
+
+1. **Doorbell analogy conflict** (NVMe/RDMA doorbell registers ring host→device, the faculty's "doorbell" means an
+   interrupt) → ruling **A3**: all mappings proposed above are approved and each course keeps its own cast; no
+   separate image is registered. **Decided by verifier:** keep the per-chapter wording (F1-50's bell "wired to the
+   warehouse counter", F1-52's "red marker" for the tail write and "kitchen bell" for the interrupt); the jargon entry
+   of F1-50 and the "Where the analogy breaks" lists of F1-50 and F1-52 already state the clash. The sentence
+   "(Owner decision recorded in NOTES.md)" in F1-52 was replaced by "(ruling A3: the two images stay distinct)".
+2. **Wireshark lab** (loopback + QEMU capture + a student step on the learner's own machine) → ruling **C3**: accepted.
+   The student step stays marked "untested in this build" and says what is needed (a computer whose network the
+   learner may capture, Wireshark or tshark, administrator rights).
+3. **F1-53 depth** (preview with a toy model, real verbs runs left to DS401) → rulings **C3** and **D1**: accepted;
+   the chapter now names the reference kit for the real runs (KIT.md: two NVIDIA ConnectX-6 Lx NICs cabled back to
+   back, or Soft-RoCE on ordinary Ethernet) in its "Untested on hardware" box.
+4. **F1-54 scope** (one-line heat model; sensors and EDAC as a student step) → no ruling covers it; **decided by
+   verifier:** keep the one-line model; HW101 (F1-03) carries the physics of power and heat. The sensor/EDAC step
+   stays "untested on hardware" (ruling C3) and says what is needed (a physical Linux computer with hwmon/thermal
+   sysfs entries and, for EDAC, ECC memory with an EDAC driver).
+5. **Toy models as forensic evidence** (RGMII, rx stall, stale key, ECC log; invented NVMe and PHY register maps)
+   → ruling **A2**: approved. Every forensic pack now says in one sentence that it is the course's own model and names
+   the real thing it stands for (the FTL firmware of an SSD; QEMU's NVMe device and the NVM Express Base
+   Specification's queue rules; a MAC driver's counters and the PHY's IEEE 802.3 clause 22 registers read over MDIO;
+   the e1000e descriptor ring traced in the lab; libibverbs (rdma-core); the Linux EDAC/rasdaemon memory-error
+   reports).
+6. **Word counts** above the L2/L3 targets → ruling **A1**: accepted as written; nothing trimmed for length.
+7. **`.cc` listing** (`nvme_trace.cc`, compiled by `run.sh`, not by `run_lab.sh`) → no ruling covers it; **decided by
+   verifier:** keep. `build.py` inserts any `data-src` path (checked in the build of 2026-10-10: the listing renders),
+   and the lab-files appendix lists every file of the folder regardless of extension.
+- Ruling **A5** applied to the lab re-runs (see below). Rulings **A8** (committed keys), **A10** (licence placeholder)
+  and **D4** (e-stop) do not apply: HW205's lab folders contain no keys, no `LicenseRef-Uni-Lab` marker and no robot
+  image. Ruling **B4** (exams): written by the Exam Writer pass, not here. Ruling **A7** (glossary duplicates): the
+  verifier's cross-course check found collisions that the build notes had missed. "Descriptor" (F1-52) collided with
+  HW204's USB "Descriptor" (a different meaning) and was renamed "Descriptor (NIC ring)" in `glossary.json` and in the
+  chapter's jargon list and glossary links. "Descriptor ring" duplicates HW204 F1-44 with the same meaning: HW204 is the
+  earlier course, so its wording is canonical and the HW205 entry's source now says so. HW205's NVMe/virtio terms also
+  appear in DR301 (11 terms) and "Block device" in OS304; HW205 comes first in the build order, so HW205's wording is
+  canonical for those and nothing was changed here. "DMA (direct memory access)" and "Interrupt (from a NIC)" keep
+  their qualified names because HW204 defines the general terms. Ruling **C4**:
+  status of all six chapters is "internally checked · hardware steps untested".
+
+## Verification pass
+
+Fact-Checker / Source Researcher agent, 2026-10-10. Dossiers: `university/_dossiers/F1-49…F1-54.dossier.html`;
+QA records: `university/qa/F1-49…F1-54.json` (all "factcheck": "done"; status "internally checked · hardware steps
+untested", ruling C4).
+
+**Opened (web, 2026-10-10):** OSTEP v1.10 chapters 36 "I/O Devices", 37 "Hard Disk Drives" and 44 "Flash-based SSDs"
+(F1-49); QEMU documentation "NVMe Emulation" and QEMU v8.2.2 `include/block/nvme.h` on the GitHub mirror (F1-50);
+Linux kernel documentation "PHY Abstraction Layer" (F1-51); QEMU v8.2.2 `hw/net/e1000_regs.h` (the ten ring register names, F1-52);
+Intel 8254x Software Developer's Manual Rev 4.0 — title page and introduction only, the fetched text was truncated
+before the register chapter (F1-52).
+**Not opened:** the NVM Express Base, PCIe Transport and NVM Command Set specifications; IEEE 802.3 and the RGMII
+specification; the Intel 82574 datasheet and QEMU's `e1000x_regs.h` (interrupt, address and descriptor bits); the VIRTIO specification; LDD3; the kernel
+DMA-API, memory-barriers, NAPI, EDAC, machine-check and hwpoison documents; the InfiniBand Architecture
+Specification (registration-walled) and the rdma-core manual pages; the NVIDIA GPUDirect and RDMA programming
+manuals; the IANA port registry; the ACPI 6.5 thermal chapter; the Intel SDM and AMD APM; JEDEC JESD79-4/-5
+(registration-walled); the Patterson/Hennessy and Harris textbooks (not freely readable). Reason: the web-fetch
+budget (400 per hour, shared by every agent) was exhausted for most of this pass; each attempt after the first few
+was refused. Every claim that only those documents can settle sits in an unverified box that names the document and
+section to check; the sources lists say "not opened" honestly (AH-4).
+
+**Corrections made:** F1-49 retagged to OSTEP sections, cell wording and SLC/MLC/TLC endurance corrected, read-modify-
+write marked as reasoning, bad-block/ECC sentences softened, hardware paragraph rewritten around OSTEP ch. 36. F1-50
+register names, CC fields, entry sizes, opcodes and CNS values confirmed from QEMU's header (tier 4, "what this
+implementation does"); sources D1–D5 say what was and was not opened; D6 added. F1-51 RGMII delay (1.5–2 ns, added by
+PHY, MAC or traces) and the four `PHY_INTERFACE_MODE_RGMII*` modes confirmed from the kernel document; D6 added.
+F1-52 ring register names RDBAL…RDT/TDBAL…TDT confirmed from QEMU's header (D7 added); "Descriptor" renamed
+(ruling A7); Figure 1 ownership now also in text. F1-53 Figure 1 legend no longer names
+colours. All six forensic packs name the toy model as the course's own and say what it stands for (ruling A2); all
+"untested on hardware" boxes say what would be needed (rulings C3, D1; `build/KIT.md`).
+
+**Labs:** all six folders re-run with `run_lab.sh` and each `run.sh` (expected exit codes 33 for `nvme_trace`, 124 for
+`qemu_capture` and `ring_trace`); every listing passed; differences were only dates, timestamps, ephemeral ports and
+one virtual disk's size; recorded files restored with `git checkout -- university/labs/F1-49 … F1-54` (ruling A5).
+Untested on hardware: `rdma_check`, `sensors`, and the physical-NIC and real-SSD student steps.
+
+**Build:** fragments validated (balanced, ids prefixed, no URLs, no scripts); `build.py` run and
+`university/UNIVERSITY.html` restored afterwards.
