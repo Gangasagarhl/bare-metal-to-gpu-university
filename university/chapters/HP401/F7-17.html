@@ -1,0 +1,292 @@
+<!--meta
+id: F7-17
+title: Matrix cores: MFMA and rocWMMA
+course: HP401
+level: L4
+prereqs: F7-16; HP302 (F7-10 registers, F7-13 reading AMD ISA); CU302 (F6-25 mixed precision and tolerances, F6-26 tensor cores with the WMMA API); MA302
+time: 12–20 hours including the lab
+hardware: Lab steps 1–5: any Linux computer with g++, hipcc and nvcc (this build: no GPU). Steps 6–8: an AMD Instinct (CDNA) GPU with matrix cores listed in the ROCm compatibility matrix, with ROCm, rocWMMA and hipBLASLt or rocBLAS; RDNA3 users follow the WMMA variant. A cloud instance is acceptable
+maps: Curriculum E7 on AMD (part of E9); Track E 13.2 topic 7 (mixed precision); item 73 (rocWMMA); course forensic "Matrix cores unused"
+analogy: F7 — the great kitchen hall
+-->
+
+<h2 id="F7-17-hook">Story hook</h2>
+<p>In a corner of the great kitchen hall stands a machine that the helpers rarely use. You lay a small tray of numbers on its left side and another on its top, and in one push it multiplies the whole tray and adds the result into a third tray. A row of helpers working by hand needs many steps for the same tray.</p>
+<p>The machine is picky. It takes only trays of certain sizes. It takes only certain kinds of numbers: short ones in, longer ones out. And every helper of the row must hand in their part of the tray in exactly the place the machine expects: if Aiko puts her numbers where Tomás's should go, the machine still runs, quickly and silently, and the answer is wrong.</p>
+<p>Last week a team in the hall swore they were using the machine. Their dishes came out right, but slowly. When someone finally looked at the list of steps the helpers really followed, the machine was not in it at all. This chapter is about that machine on AMD GPUs: the <b>matrix cores</b>, their <b>MFMA</b> instructions, the <b>rocWMMA</b> library, and how to prove from the disassembly that you really use them.</p>
+
+<h2 id="F7-17-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what one MFMA instruction computes, which wave holds which operands, and which AMD targets have it.</li>
+<li><b>Write</b> a small FP16-input, FP32-accumulate GEMM with a compiler builtin for MFMA, and state exactly which part of it is unverified.</li>
+<li><b>Prove</b> from the ISA that the matrix instructions are in the inner loop, and read their accumulator registers (AGPRs or VGPRs).</li>
+<li><b>Justify</b> an E7 tolerance from FP16 and BF16 input rounding and FP32 accumulation.</li>
+<li><b>Compare</b> the MFMA route with rocWMMA and with CUDA WMMA, and choose between them.</li>
+<li><b>Diagnose</b> "matrix cores unused" from build logs, macros and disassembly.</li>
+</ul>
+
+<div class="co jargon" id="F7-17-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Matrix core</dt><dd><b>Simple words:</b> a part of an AMD GPU that multiplies small blocks of numbers in one instruction. <b>Analogy:</b> the tray machine in the corner of the hall. <b>Precise:</b> AMD's name for the matrix-multiply units of its CDNA (Instinct) GPUs, used through MFMA instructions; RDNA3 GPUs have WMMA instructions instead. NVIDIA's comparable units are tensor cores. <sup class="src"><a href="#F7-17-src-D2">D2</a></sup> <sup class="src"><a href="#F7-17-src-C1">C1</a></sup></dd>
+<dt>MFMA</dt><dd><b>Simple words:</b> the instruction that tells the matrix core to multiply-add a tray. <b>Analogy:</b> one push of the machine. <b>Precise:</b> "matrix fused multiply-add": a wave-wide instruction D = A × B + C on fixed block shapes and types, named like <code>v_mfma_f32_32x32x8f16</code> (FP32 result, a 32 × 32 × 8 block, FP16 inputs); in HIP reachable through clang builtins such as <code>__builtin_amdgcn_mfma_f32_32x32x8f16</code>. <sup class="src"><a href="#F7-17-src-D2">D2</a></sup> <sup class="src"><a href="#F7-17-src-R2">R2</a></sup></dd>
+<dt>Fragment (operand layout)</dt><dd><b>Simple words:</b> each thread's share of the small matrices, in the order the machine wants. <b>Analogy:</b> which helper puts which numbers where on the tray. <b>Precise:</b> the mapping from (lane, register element) to (row, column) of A, B and C for one matrix instruction; documented per instruction in the ISA guide and the AMD Matrix Instruction Calculator, and hidden by rocWMMA's fragment types. <sup class="src"><a href="#F7-17-src-D2">D2</a></sup> <sup class="src"><a href="#F7-17-src-D4">D4</a></sup></dd>
+<dt>AGPR (accumulation register)</dt><dd><b>Simple words:</b> a special register where the matrix machine keeps its running sums. <b>Analogy:</b> a separate tray rack next to the machine. <b>Precise:</b> accumulation VGPRs of CDNA GPUs, written <code>a[...]</code> in the ISA; the compiler placed the MFMA accumulator in AGPRs for gfx908 and, inside a loop, for gfx90a (R2, R3). <sup class="src"><a href="#F7-17-src-R2">R2</a></sup> <sup class="src"><a href="#F7-17-src-R3">R3</a></sup> <sup class="src"><a href="#F7-17-src-C1">C1</a></sup></dd>
+<dt>rocWMMA</dt><dd><b>Simple words:</b> a library that lets you use the matrix machine without knowing where each number goes. <b>Analogy:</b> a tray holder that puts every helper's numbers in the right place for you. <b>Precise:</b> AMD's C++ header library of wave-level matrix multiply-accumulate with fragment types, modelled on CUDA's WMMA API (<a href="#F6-26">F6-26</a>); names to be checked in its documentation (unverified box). <sup class="src"><a href="#F7-17-src-D3">D3</a></sup></dd>
+<dt>Mixed precision</dt><dd><b>Simple words:</b> short numbers in, longer numbers for the sums. <b>Analogy:</b> small trays in, a big tray for the results. <b>Precise:</b> FP16 or BF16 inputs with FP32 accumulation; the error comes mainly from rounding the inputs (unit roundoff 2<sup>−11</sup> for FP16, 2<sup>−8</sup> for BF16) and from the FP32 sums (2<sup>−24</sup> per addition). <sup class="src"><a href="#F7-17-src-D6">D6</a></sup> <sup class="src"><a href="#F7-17-src-R5">R5</a></sup></dd>
+</dl></div>
+
+<h2 id="F7-17-pictures">The idea in pictures</h2>
+<p>Figure 1 shows one <code>v_mfma_f32_32x32x8f16</code>: a whole wave of 64 lanes hands in a 32 × 8 block of A and an 8 × 32 block of B, and receives a 32 × 32 block of D = A × B + C. The counts per lane follow from the builtin's types, which the compiler checked: 4 FP16 values of A, 4 of B and 16 FP32 values of C per lane (64 × 4 = 256 = 32 × 8; 64 × 16 = 1,024 = 32 × 32).</p>
+<figure id="F7-17-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F7-17-f1t F7-17-f1d">
+<title id="F7-17-f1t">Figure 1: one MFMA instruction, 32 by 32 by 8, executed by a whole wave</title>
+<desc id="F7-17-f1d">On the left, a tall narrow block labelled A, 32 rows by 8 columns, FP16, held as 4 values in each of 64 lanes (two VGPRs per lane). At the top, a wide flat block labelled B, 8 rows by 32 columns, FP16, 4 values per lane. In the middle, a square block labelled C and D, 32 by 32, FP32, 16 values per lane, in AGPRs or VGPRs. A box below reads: one instruction for the whole wave of 64 lanes: v_mfma_f32_32x32x8f16, 32 times 32 times 8 multiply-adds equals 8,192. Another box says: which lane holds which element is the operand layout, documented in the ISA guide and the Matrix Instruction Calculator; this chapter does not verify it.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<rect class="sv-b1" x="40" y="80" width="60" height="200"/><text class="sv-tb" x="44" y="72">A</text><text class="sv-ts" x="108" y="170">32 × 8 FP16</text><text class="sv-ts" x="108" y="186">4 per lane</text>
+<rect class="sv-b2" x="200" y="20" width="200" height="50"/><text class="sv-tb" x="410" y="40">B</text><text class="sv-ts" x="410" y="58">8 × 32 FP16, 4 per lane</text>
+<rect class="sv-b5" x="200" y="80" width="200" height="200"/><text class="sv-tb" x="240" y="170">C → D</text><text class="sv-ts" x="240" y="190">32 × 32 FP32</text><text class="sv-ts" x="240" y="206">16 per lane</text>
+<rect class="sv-b6" x="440" y="100" width="300" height="70"/><text class="sv-tm" x="450" y="124">v_mfma_f32_32x32x8f16</text><text class="sv-ts" x="450" y="144">one instruction, the whole wave (64 lanes)</text><text class="sv-ts" x="450" y="160">32 × 32 × 8 = 8,192 multiply-adds</text>
+<rect class="sv-box" x="440" y="190" width="300" height="70"/><text class="sv-ts" x="450" y="212">which lane holds which element:</text><text class="sv-ts" x="450" y="228">the operand layout (ISA guide, Matrix</text><text class="sv-ts" x="450" y="244">Instruction Calculator) — unverified here</text>
+<line class="sv-line" x1="100" y1="180" x2="192" y2="180"/><polygon class="sv-head" points="200,180 191,175 191,185"/>
+<line class="sv-line" x1="300" y1="70" x2="300" y2="74"/>
+<text class="sv-ts" x="40" y="310">Not to scale. Types and counts from the builtin's signature as compiled (R2); mnemonic from the gfx90a ISA output (R3).</text>
+</svg></div><figcaption><b>Figure 1.</b> One MFMA instruction. Data flows from A and B into the accumulator block. The instruction name and the accumulator registers come from the compiler's output for gfx908, gfx90a and gfx942 (R2, R3); the meaning of the name is from the CDNA ISA guide (D2, title only). <sup class="src"><a href="#F7-17-src-D2">D2</a></sup> <sup class="src"><a href="#F7-17-src-R2">R2</a></sup> <sup class="src"><a href="#F7-17-src-R3">R3</a></sup></figcaption></figure>
+
+<p>Figure 2 shows the decision every matrix-core kernel goes through at compile time, and where it can silently go wrong: the forensic lab of this chapter.</p>
+<figure id="F7-17-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 210" role="img" aria-labelledby="F7-17-f2t F7-17-f2d">
+<title id="F7-17-f2t">Figure 2: from source to matrix instructions, per target</title>
+<desc id="F7-17-f2d">A flow from left to right. Box 1: the build command chooses targets with offload-arch. Box 2: the device pass for each target defines macros such as __gfx90a__ and the target features. Box 3: the source chooses a path, either the MFMA builtin or a fallback with ordinary FMAs. Box 4: the ISA, which either contains v_mfma in the inner loop or only v_fma instructions. Under box 3 a note says: a guard that lists the wrong target names silently selects the fallback. Under box 4: the only proof is the disassembly.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="210"/>
+<rect class="sv-b1" x="20" y="40" width="160" height="70"/><text class="sv-tb" x="30" y="62">1 build command</text><text class="sv-tm" x="30" y="84">--offload-arch=</text><text class="sv-ts" x="30" y="100">one pass per target</text>
+<rect class="sv-b2" x="210" y="40" width="160" height="70"/><text class="sv-tb" x="220" y="62">2 device pass</text><text class="sv-ts" x="220" y="84">macros __gfx90a__ …</text><text class="sv-ts" x="220" y="100">target features</text>
+<rect class="sv-b6" x="400" y="40" width="160" height="70"/><text class="sv-tb" x="410" y="62">3 source path</text><text class="sv-ts" x="410" y="84">MFMA builtin</text><text class="sv-ts" x="410" y="100">or FMA fallback</text>
+<rect class="sv-b5" x="590" y="40" width="150" height="70"/><text class="sv-tb" x="600" y="62">4 ISA</text><text class="sv-ts" x="600" y="84">v_mfma in loop?</text><text class="sv-ts" x="600" y="100">or only v_fma</text>
+<line class="sv-line" x1="180" y1="75" x2="202" y2="75"/><polygon class="sv-head" points="210,75 201,70 201,80"/>
+<line class="sv-line" x1="370" y1="75" x2="392" y2="75"/><polygon class="sv-head" points="400,75 391,70 391,80"/>
+<line class="sv-line" x1="560" y1="75" x2="582" y2="75"/><polygon class="sv-head" points="590,75 581,70 581,80"/>
+<text class="sv-ts" x="380" y="140">a guard naming the wrong targets silently picks the fallback</text>
+<text class="sv-ts" x="560" y="160">the only proof is the disassembly</text>
+<text class="sv-ts" x="20" y="190">Without a fallback, a target lacking matrix instructions fails to compile ("needs target feature mai-insts", R2).</text>
+</svg></div><figcaption><b>Figure 2.</b> The compile-time path to matrix instructions. Arrows show the order of the build. Macro names and the error message are from this build's compiler runs (R2, R7). <sup class="src"><a href="#F7-17-src-R2">R2</a></sup> <sup class="src"><a href="#F7-17-src-R7">R7</a></sup></figcaption></figure>
+
+<h2 id="F7-17-layer1">Layer 1 — the kid explanation</h2>
+<p>A matrix multiply is many small multiplications added together. A row of helpers can do it by hand, one multiply-add at a time. The matrix core is a machine that does a whole block of them in one go, if you give it numbers in exactly the shape and order it wants.</p>
+<p>Two things make it tricky. First, it wants short numbers (half precision) in and gives longer numbers out, so you must check that the small rounding errors are acceptable. Second, it will not tell you if you forgot to use it. The program is still correct, only slower. So you check the list of instructions the compiler produced.</p>
+
+<h2 id="F7-17-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F7-17-l2-what">What one MFMA does</h3>
+<p>An MFMA instruction is executed by a whole wave. For <code>v_mfma_f32_32x32x8f16</code> the wave multiplies a 32 × 8 FP16 block by an 8 × 32 FP16 block and adds the product into a 32 × 32 FP32 block. <sup class="src"><a href="#F7-17-src-D2">D2</a></sup> In HIP 5.7 (clang 17) the builtin <code>__builtin_amdgcn_mfma_f32_32x32x8f16(a, b, c, cbsz, abid, blgp)</code> takes a vector of 4 <code>_Float16</code> for A, the same for B, and a vector of 16 <code>float</code> for C, and returns the new 16 floats; Listing 1 passes 0 for the last three arguments, which select broadcast variants described in the ISA guide. <sup class="src"><a href="#F7-17-src-R2">R2</a></sup> <sup class="src"><a href="#F7-17-src-D2">D2</a></sup></p>
+
+<h3 id="F7-17-l2-targets">Which targets have it</h3>
+<p>The <code>targets</code> run compiles one call of this builtin for five targets (R2): gfx908 and gfx90a accept it as <code>v_mfma_f32_32x32x8f16</code>; gfx942 accepts it and prints the mnemonic <code>v_mfma_f32_32x32x8_f16</code>; gfx1030 and gfx1100 reject it with "needs target feature mai-insts". RDNA3 (gfx1100) has its own matrix instruction, which the <code>wmma_rdna3</code> run shows as <code>v_wmma_f32_16x16x16_f16</code> on a wave of 32 (R4). <sup class="src"><a href="#F7-17-src-R2">R2</a></sup> <sup class="src"><a href="#F7-17-src-R4">R4</a></sup> So a "matrix-core kernel" is per architecture family: CDNA uses MFMA, RDNA3 uses WMMA, older RDNA has neither, and NVIDIA uses its own MMA instructions (<a href="#F6-26">F6-26</a>).</p>
+
+<h3 id="F7-17-l2-layout">The operand layout, and what is unverified</h3>
+<p>Every lane must place its 4 + 4 inputs and read its 16 outputs according to the instruction's layout. Listing 1 keeps that mapping in six small functions (lines 18–23) and states that it is assumed, not verified, in this build.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Listing 1 assumes this layout for <code>v_mfma_f32_32x32x8f16</code>: lane <i>l</i>, element <i>e</i> of A holds A[<i>l</i> mod 32][4·⌊<i>l</i>/32⌋ + <i>e</i>]; of B holds B[4·⌊<i>l</i>/32⌋ + <i>e</i>][<i>l</i> mod 32]; element <i>e</i> = 0…15 of C holds C[8·⌊<i>e</i>/4⌋ + 4·⌊<i>l</i>/32⌋ + <i>e</i> mod 4][<i>l</i> mod 32]. This comes from the author's memory, which is not a source (AH-3). Check it against the "AMD Instinct MI200 (CDNA2) Instruction Set Architecture" guide, MFMA chapter, or the AMD Matrix Instruction Calculator, for this exact instruction. The program's own test will also catch a wrong layout on hardware: it compares every element of C with a CPU reference and prints the first five mismatches.</p></div>
+
+<h3 id="F7-17-l2-registers">Where the accumulators live</h3>
+<p>The compiler's choice of registers is visible in the ISA. For a single call, gfx908 put C in AGPRs (<code>a[0:15]</code>, <code>.agpr_count: 16</code>), while gfx90a and gfx942 used ordinary VGPRs (<code>v[0:15]</code>, <code>.agpr_count: 0</code>) (R2). Inside Listing 1's K loop on gfx90a, the compiler placed the accumulator in AGPRs (<code>a[0:15]</code>, <code>.agpr_count: 16</code>, <code>.amdhsa_accum_offset 28</code>) and initialised them with <code>v_accvgpr_write_b32</code> (R3). <sup class="src"><a href="#F7-17-src-R2">R2</a></sup> <sup class="src"><a href="#F7-17-src-R3">R3</a></sup> The curriculum's vocabulary table describes "accumulation registers on CDNA"; how the AGPR and VGPR files share the register budget on gfx90a is in the ISA guide and the LLVM AMDGPU user guide, and matters for occupancy (<a href="#F7-10">F7-10</a>). <sup class="src"><a href="#F7-17-src-C1">C1</a></sup> <sup class="src"><a href="#F7-17-src-D5">D5</a></sup></p>
+
+<h3 id="F7-17-l2-rocwmma">rocWMMA and CUDA WMMA</h3>
+<p>Writing layouts by hand is error-prone and not portable across instruction shapes. CUDA's answer is the WMMA API in <code>mma.h</code>: fragment types, <code>load_matrix_sync</code>, <code>mma_sync</code>, <code>store_matrix_sync</code>. The <code>cuda_wmma</code> run builds such a kernel for sm_80 in this build and finds 10 <code>HMMA.16816.F32</code> instructions in its SASS (R6). <sup class="src"><a href="#F7-17-src-H1">H1</a></sup> <sup class="src"><a href="#F7-17-src-R6">R6</a></sup> rocWMMA is AMD's library in the same style. <sup class="src"><a href="#F7-17-src-D3">D3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>rocWMMA is not installed in this build. The chapter assumes, from the curriculum's description and the author's memory, that it offers a namespace <code>rocwmma</code> with <code>fragment</code>, <code>fill_fragment</code>, <code>load_matrix_sync</code>, <code>mma_sync</code> and <code>store_matrix_sync</code> mirroring CUDA's names, with block sizes and types restricted per architecture. Check every identifier, the supported block sizes and types for your GPU, and the header to include in the rocWMMA documentation for your ROCm version before porting <code>cuda_wmma.cu.inc</code>.</p></div>
+
+<h2 id="F7-17-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F7-17-l3-error">An E7 tolerance from first principles</h3>
+<p>E7 asks for "Error versus an FP64 reference within a tolerance justified from FP16/BF16 input rounding." <sup class="src"><a href="#F7-17-src-C1">C1</a></sup> Rounding a real number to FP16 introduces a relative error of at most <i>u</i><sub>16</sub> = 2<sup>−11</sup> (round to nearest, 11-bit significand), to BF16 at most 2<sup>−8</sup>. <sup class="src"><a href="#F7-17-src-D6">D6</a></sup> A product of two rounded inputs has relative error at most 2<i>u</i> + <i>u</i><sup>2</sup>. The product of two FP16 numbers is exact in FP32 (11 + 11 = 22 significand bits ≤ 24), so the only further error is the FP32 summation, at most about <i>K</i>·2<sup>−24</sup> relative to S = Σ|<i>a<sub>k</sub>b<sub>k</sub></i>|. <sup class="src"><a href="#F7-17-src-D7">D7</a></sup> Bound: |error| ≤ (2<i>u</i> + <i>u</i><sup>2</sup> + <i>K</i>·2<sup>−24</sup>)·S.</p>
+<p>Listing 2 measures the worst observed error over 200 random dot products for K = 64, 512 and 4,096, in three variants (R5): FP16 inputs summed in FP64, FP16 inputs summed in FP32, and BF16 inputs summed in FP32. All observed errors lie below the bounds it prints; the first two columns agree to three digits, which says that for these sizes input rounding dominates and FP32 accumulation adds little; BF16 errors are roughly eight times larger, matching the ratio of the unit roundoffs (2<sup>−8</sup> / 2<sup>−11</sup> = 8). <sup class="src"><a href="#F7-17-src-R5">R5</a></sup> Use the bound, not the observation, as the test tolerance; quote S, not |result|, as the scale.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Listing 2 assumes the matrix instruction computes the exact products and adds them in FP32 one by one. Real MFMA hardware may add groups of products in a different order or with different intermediate precision, and may treat denormals and rounding modes in its own way. The ISA guide's MFMA chapter (D2) describes this; it was not opened in this build. The bound above holds for the model; recheck it against the documented behaviour of your instruction.</p></div>
+
+<h3 id="F7-17-l3-perf">From one instruction to a fast kernel</h3>
+<p>Listing 1 is correctness-first: one wave per 32 × 32 tile, operands loaded from global memory as single 16-bit values (<code>global_load_ushort</code>, 6 per iteration in R3) and no LDS. In its inner loop, address arithmetic outnumbers the single <code>v_mfma</code>. A fast kernel combines everything of <a href="#F7-16">F7-16</a> with the matrix instruction: block tiles staged in LDS with wide loads, several MFMA tiles per wave (so one wave reuses its A fragment across several B fragments), double buffering, and an LDS layout that delivers fragments without bank conflicts. Composable Kernel and hipBLASLt do this (<a href="#F7-18">F7-18</a>, <a href="#F7-19">F7-19</a>); E7's second acceptance test compares your kernel with hipBLASLt half-precision GEMM. <sup class="src"><a href="#F7-17-src-C1">C1</a></sup></p>
+<p>The instruction's throughput per clock, its latency in cycles and the number of independent MFMAs needed to keep the unit busy are hardware facts of each GPU; they belong in your dossier from the ISA guide or the vendor's tuning guide, not in this chapter.</p>
+
+<h3 id="F7-17-l3-choose">MFMA builtins, rocWMMA, or a library?</h3>
+<div class="tw"><table>
+<thead><tr><th>Route</th><th>You control</th><th>You must get right</th><th>Portability</th></tr></thead>
+<tbody>
+<tr><td>hipBLASLt / rocBLAS</td><td>Shapes, types, layouts</td><td>Workspace, the API's conventions</td><td>Library chooses per GPU</td></tr>
+<tr><td>Composable Kernel</td><td>Tile parameters, fusion</td><td>Choosing a supported instance</td><td>Per architecture instances</td></tr>
+<tr><td>rocWMMA</td><td>Tiling, LDS, the loop</td><td>Fragment types and sizes</td><td>Across CDNA/RDNA3 where supported (check)</td></tr>
+<tr><td>MFMA builtins</td><td>Everything</td><td>Operand layout, registers, scheduling</td><td>One instruction family per target</td></tr>
+</tbody></table></div>
+
+<h2 id="F7-17-hardware">How the hardware actually does it</h2>
+<p>The MFMA instruction is issued once for the wave, like any vector instruction, but executed by the matrix unit; its sources are VGPRs (A and B) and AGPRs or VGPRs (C), and its result goes to AGPRs or VGPRs (R2, R3). <sup class="src"><a href="#F7-17-src-D2">D2</a></sup> On gfx908 the accumulator must be in AGPRs in the code this compiler produced; on gfx90a both appear, depending on the code. Moving values between the two files costs instructions (<code>v_accvgpr_write_b32</code> to initialise, reads at the end). The <code>s_nop</code> just before the MFMA in R3 is one of the waits the compiler inserts between dependent instructions; the required wait states for MFMA are listed in the ISA guide and handled by the compiler, which is a good reason not to write MFMA kernels in inline assembly.</p>
+
+<h2 id="F7-17-worked">Worked example</h2>
+<p><b>How many MFMAs for a 4096 × 4096 × 4096 FP16 GEMM?</b> Each <code>32x32x8</code> instruction does 32·32·8 = 8,192 multiply-adds = 16,384 FLOP. The GEMM does 2·4096<sup>3</sup> = 137,438,953,472 FLOP. Instructions: 137,438,953,472 / 16,384 = 8,388,608 MFMAs, i.e. (4096/32)·(4096/32)·(4096/8) = 128 · 128 · 512 = 8,388,608. Each 32 × 32 output tile needs 512 of them in sequence, which is exactly Listing 1's K loop with K = 4,096.</p>
+<p><b>A tolerance for K = 520 (Listing 1's test).</b> Listing 1's inputs are multiples of 1/64 between −0.78 and 0.78, so they are exact in FP16 and only the FP32 sum rounds: tolerance K·2<sup>−24</sup>·S = 520 · 5.96 × 10<sup>−8</sup> · S ≈ 3.1 × 10<sup>−5</sup>·S per element. With random inputs that must be rounded to FP16, add 2·2<sup>−11</sup> + 2<sup>−22</sup> ≈ 9.8 × 10<sup>−4</sup>, which dominates.</p>
+<p><b>Reading the layout (as assumed).</b> Lane 37, element 2 of A: row 37 mod 32 = 5, k = 4·⌊37/32⌋ + 2 = 6, so A[5][6]. Element 13 of C in lane 37: row 8·3 + 4·1 + 1 = 29, column 5. If the layout were wrong, the program's test would report mismatches such as row 29, column 5 first.</p>
+
+<h2 id="F7-17-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>mfma_gemm.hip</code>: FP16 GEMM with one MFMA builtin per K step (complete program; untested on hardware; operand layout unverified).</p>
+<pre class="listing" data-src="F7-17/mfma_gemm.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a mfma_gemm.hip -o mfma_gemm</code>, then <code>./mfma_gemm</code>.</p>
+<pre class="output" data-run="F7-17/mfma_gemm"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Built for gfx90a; the run stopped at the first allocation (no AMD GPU). On an MI200-class GPU it should print 0 elements outside tolerance if the assumed layout is right. What would be needed: a gfx90a GPU (or change the target and builtin for another CDNA GPU after checking the ISA guide), ROCm, and a rerun.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–13</td><td><code>half4</code>, <code>float16v</code></td><td>Clang vector types of 4 FP16 and 16 FP32.</td><td>The builtin's operand types (R2).</td></tr>
+<tr><td>18–23</td><td>layout functions</td><td>Assumed lane/element ↔ row/column mapping.</td><td>All layout knowledge in one place; unverified.</td></tr>
+<tr><td>33</td><td><code>__launch_bounds__(64)</code></td><td>One wave per workgroup.</td><td>The builtin works on the whole wave.</td></tr>
+<tr><td>39</td><td><code>float16v acc = {}</code></td><td>Zeroed accumulator.</td><td>Became <code>v_accvgpr_write_b32</code> into AGPRs (R3).</td></tr>
+<tr><td>40–49</td><td>K loop</td><td>Gathers 4 + 4 FP16 values per lane, one MFMA per 8 k.</td><td>The <code>v_mfma</code> in the inner loop: what E7 requires.</td></tr>
+<tr><td>50–52</td><td>store</td><td>16 outputs per lane.</td><td>16 <code>global_store_dword</code>.</td></tr>
+<tr><td>57–61</td><td>shape check</td><td>M, N multiples of 32, K of 8.</td><td>No edge handling in this kernel: it refuses.</td></tr>
+<tr><td>82–100</td><td>test</td><td>Every element against an FP64 reference with K·2<sup>−24</sup>·S.</td><td>Catches a wrong layout on hardware.</td></tr>
+</tbody></table></div>
+
+<p><b>Compiler evidence</b> for Listing 1 (gfx90a): the inner loop, the MFMA line and the register metadata.</p>
+<pre class="output" data-run="F7-17/isa_gemm"></pre>
+<p>The same builtin for five targets, and the RDNA3 matrix instruction:</p>
+<pre class="listing" data-src="F7-17/one_mfma.hip.inc"></pre>
+<pre class="output" data-run="F7-17/targets"></pre>
+<pre class="listing" data-src="F7-17/wmma_rdna3.hip.inc"></pre>
+<pre class="output" data-run="F7-17/wmma_rdna3"></pre>
+
+<p><b>Listing 2</b> — <code>fp16_error.cpp</code>: where the error of a mixed-precision dot product comes from.</p>
+<pre class="listing" data-src="F7-17/fp16_error.cpp"></pre>
+<pre class="output" data-run="F7-17/fp16_error"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–24</td><td><code>toBf16</code></td><td>Rounds an FP32 to BF16 (round to nearest even on the top 16 bits).</td><td>No BF16 type needed on the host.</td></tr>
+<tr><td>47–52</td><td>three sums</td><td>FP16→FP64, FP16→FP32, BF16→FP32.</td><td>Separates input rounding from accumulation.</td></tr>
+<tr><td>60–61</td><td>bounds</td><td>2<i>u</i> + <i>u</i><sup>2</sup> + K·2<sup>−24</sup>.</td><td>The E7 tolerance, relative to S.</td></tr>
+</tbody></table></div>
+<p><code>_Float16</code> is used on the host with g++ 13 at <code>-Wpedantic</code> without warnings in this build (R5).</p>
+
+<p><b>Listing 3</b> — <code>cuda_wmma.cu.inc</code>: the CUDA WMMA API for comparison (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-17/cuda_wmma.cu.inc"></pre>
+<pre class="output" data-run="F7-17/cuda_wmma"></pre>
+
+<h2 id="F7-17-breaks">Where the analogy breaks</h2>
+<ul>
+<li>The tray machine sits in a corner, separate from the helpers. Matrix cores are part of each compute unit and are driven by an instruction in the same wave's instruction stream, with operands in the wave's own registers.</li>
+<li>"One push" suggests one cycle. An MFMA has a latency of many cycles and the compiler must keep enough independent work around it; the number is in the ISA guide, not in the story.</li>
+<li>In the story, wrong placement is a helper's mistake that someone might notice. With a wrong operand layout nothing fails: the instruction runs and produces a wrong matrix; only a full comparison with a reference shows it.</li>
+<li>The story's machine takes "short numbers". Several formats exist (FP16, BF16, FP32, integer types and others per generation), each with its own instruction names and shapes; the story hides that you choose the format.</li>
+</ul>
+
+<h2 id="F7-17-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> "needs target feature mai-insts". <b>Cause:</b> compiling an MFMA builtin for a target without matrix-core instructions (gfx1030, gfx1100 in R2). <b>Fix:</b> a per-target path (WMMA on RDNA3, FMA fallback elsewhere) guarded correctly.</li>
+<li><b>Symptom:</b> fast enough? correct, but no faster than FMA code. <b>Cause:</b> the matrix path is not compiled in (the forensic lab). <b>How to find it:</b> <code>grep -c v_mfma</code> on the disassembly for every target you ship. <b>Fix:</b> correct the guard; add the grep to CI.</li>
+<li><b>Symptom:</b> wrong results in a regular pattern of rows. <b>Cause:</b> wrong operand layout. <b>How to find it:</b> fill A with the identity and B with distinct values; print C. <b>Fix:</b> take the layout from the ISA guide or the Matrix Instruction Calculator.</li>
+<li><b>Symptom:</b> E7 tolerance test fails by a small margin. <b>Cause:</b> tolerance relative to |result| instead of S, or inputs not FP16-exact in the CPU reference. <b>Fix:</b> derive the tolerance as in Layer 3.</li>
+<li><b>Symptom:</b> occupancy dropped after adding MFMA tiles. <b>Cause:</b> AGPR plus VGPR use. <b>How to find it:</b> <code>.agpr_count</code>, <code>.vgpr_count</code>, <code>accum_offset</code> in the metadata. <b>Fix:</b> fewer accumulator tiles per wave, or accept it after measuring.</li>
+</ul>
+
+<div class="co transition" id="F7-17-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-26">F6-26</a> used tensor cores through CUDA's WMMA API; <a href="#F7-16">F7-16</a> tiled FP32 GEMM with FMAs on AMD. <b>What carries over:</b> tiling, LDS staging, mixed-precision tolerances (<a href="#F6-25">F6-25</a>), the habit of reading the machine code. <sup class="src"><a href="#F7-17-src-H1">H1</a></sup> <b>What changes:</b> AMD's matrix instructions are per architecture family (MFMA on CDNA, WMMA on RDNA3, none on older RDNA, R2, R4); one instruction covers a whole 64-lane wave and larger blocks; accumulators may live in AGPRs; the layout is AMD's own; rocWMMA and builtins replace <code>mma.h</code>. <sup class="src"><a href="#F7-17-src-R2">R2</a></sup> <b>What comes next:</b> <a href="#F7-18">F7-18</a> reads Composable Kernel, AMD's library that assembles these instructions into tuned kernels.</p></div>
+
+<h2 id="F7-17-check">Check yourself</h2>
+<ol>
+<li>What does the name <code>v_mfma_f32_32x32x8f16</code> tell you, and how many values of A, B and C does each lane hold?</li>
+<li>For which of gfx908, gfx90a, gfx942, gfx1030 and gfx1100 did the builtin compile in this build, and what happened for the others?</li>
+<li>Which statement is true? (a) The compiler turns any FP16 loop into MFMA instructions when it can. (b) A wrong operand layout causes a hardware exception. (c) The disassembly is the proof that a kernel uses matrix cores. (d) AGPRs are only used on RDNA.</li>
+<li>Explain in your own words why the product of two FP16 values is exact in FP32 and what that means for the E7 tolerance.</li>
+<li>Apply: a BF16 GEMM with K = 1,024. Compute the bound relative to S.</li>
+<li>Predict, then run: compile <code>one_mfma.hip.inc</code> for gfx940. Will it compile, and which mnemonic do you expect?</li>
+<li>Using the assumed layout, which lane and element of B hold B[7][20]?</li>
+<li>When would you choose rocWMMA over MFMA builtins, and when hipBLASLt over both?</li>
+</ol>
+
+<h2 id="F7-17-lab">Lab</h2>
+<p><b>Goal.</b> Build a matrix-core GEMM, prove the matrix instructions are in its inner loop, justify its tolerance, and (on an AMD GPU) run E7 against hipBLASLt.</p>
+<p><b>Hardware and software needed.</b> Steps 1–5: no GPU; g++ 13.3, hipcc (HIP 5.7, clang 17), nvcc (CUDA 12.0). Steps 6–8: a CDNA GPU with matrix cores in the ROCm compatibility matrix (or RDNA3 for the WMMA variant), ROCm, rocWMMA, hipBLASLt; record versions. Folder <code>university/labs/F7-17</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F7-17</code>; read <code>targets.out</code>, <code>isa_gemm.out</code>, <code>fp16_error.out</code>.</li>
+<li>Find the MFMA in the full gfx90a assembly of Listing 1 and identify which VGPR pairs hold A and B.</li>
+<li>Add a gfx942 build of Listing 1 to <code>run.sh</code> and compare the mnemonic and the accumulator registers.</li>
+<li>Extend Listing 2 with K = 16,384 and explain when the K·2<sup>−24</sup> term starts to matter for FP16.</li>
+<li>Look up the layout of <code>v_mfma_f32_32x32x8f16</code> in the ISA guide or the Matrix Instruction Calculator and correct lines 18–23 if needed; record the document and section.</li>
+<li>On a CDNA GPU: run Listing 1 (0 mismatches).</li>
+<li>On a CDNA GPU: write the rocWMMA version of Listing 3 and compare both with hipBLASLt half-precision GEMM using the <a href="#F7-19">F7-19</a> harness.</li>
+<li>On a CDNA GPU: confirm with the disassembly of every build that the matrix instructions are in the inner loop.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: the outputs above. On a GPU: your own numbers (AH-23).</p>
+<p><b>Verification</b> (E7 acceptance tests, verbatim, on AMD): "Error versus an FP64 reference within a tolerance justified from FP16/BF16 input rounding." "Reaches X % of cuBLAS/hipBLASLt half-precision GEMM; the disassembly shows the matrix instructions in the inner loop." <sup class="src"><a href="#F7-17-src-C1">C1</a></sup></p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The builtin is unknown → the compiler is older or the target lacks the feature; check the clang version line and the target.</li>
+<li><code>isa_gemm</code> shows no "Inner Loop Header" → the loop was unrolled or restructured after your edits; search for <code>v_mfma</code> and the nearest <code>s_cbranch</code>.</li>
+<li>Listing 3 fails to build without <code>-arch=sm_80</code> → WMMA needs a recent architecture; the lab builds it in <code>run.sh</code> with that flag.</li>
+</ul>
+<p><b>Extension.</b> Give each wave a 64 × 32 output tile (two MFMAs per K step sharing the A fragment) and stage A and B in LDS; count VGPRs and AGPRs.</p>
+
+<h2 id="F7-17-forensic">Forensic lab</h2>
+<p><b>Scenario: "Matrix cores unused"</b> (the course's forensic lab). Lin's team moved from an MI200-class GPU to an MI300-class GPU. Their FP16 GEMM still passes all tests, but it is no faster than their old FP32 kernel. Lin is sure the kernel uses MFMA: "it is in the source".</p>
+<p><b>Evidence pack.</b> (1) The kernel as committed (its Makefile line is in the comment):</p>
+<pre class="listing" data-src="F7-17/slow_gemm.hip.inc"></pre>
+<p>(2) Matrix and FMA instructions in <code>linGemm</code> when built for gfx942 and, as a control, for gfx90a, and the gfx macros the compiler defines for gfx942:</p>
+<pre class="output" data-run="F7-17/lin_isa"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what does the gfx942 disassembly contain instead of <code>v_mfma</code>?</li>
+<li>Hypotheses: list at least two (the compiler cannot use MFMA on gfx942; the source never reaches the builtin for gfx942; the Makefile builds the wrong target). Which evidence rules each in or out?</li>
+<li>Root cause: which line, and why did no test fail?</li>
+<li>Fix, and a check that would have caught it automatically.</li>
+<li>Prevention: how should per-target code paths be written so that a new target fails loudly instead of quietly falling back?</li>
+</ol>
+<p><b>Method hints.</b> Compare the macros defined for gfx942 with the ones the guard tests. Use the gfx90a build as the control experiment: same source, other target.</p>
+
+<h2 id="F7-17-project">Mini-project</h2>
+<p><b>A matrix-path checker for MP4.</b> Write a script (shell or Python) that builds a given HIP source for a list of targets, counts matrix instructions (<code>v_mfma</code>, <code>v_wmma</code>) per kernel in each build, and fails if a kernel marked "matrix" in a small manifest has none on a target listed as having matrix cores. Run it on Listing 1 and on Lin's kernel.</p>
+<p><b>Rubric.</b> Works for at least gfx90a, gfx942 and gfx1100 (3). Catches Lin's bug with a clear message (3). Manifest format documented (2). Output and versions recorded (2).</p>
+
+<h2 id="F7-17-summary">Summary</h2>
+<ul>
+<li>An MFMA instruction is a wave-wide D = A × B + C on a fixed block shape and type; <code>v_mfma_f32_32x32x8f16</code> holds 4 + 4 FP16 inputs and 16 FP32 accumulators per lane.</li>
+<li>MFMA exists on CDNA targets (gfx908, gfx90a, gfx942 in this build); RDNA3 has WMMA; gfx1030 has neither.</li>
+<li>The operand layout decides correctness; it is unverified here and must come from the ISA guide or the Matrix Instruction Calculator.</li>
+<li>Accumulators can live in AGPRs; the metadata shows <code>.agpr_count</code> and <code>accum_offset</code>.</li>
+<li>E7 tolerance: (2<i>u</i> + <i>u</i><sup>2</sup> + <i>K</i>·2<sup>−24</sup>)·Σ|<i>ab</i>|, with <i>u</i> = 2<sup>−11</sup> (FP16) or 2<sup>−8</sup> (BF16).</li>
+<li>The disassembly is the only proof that matrix cores are used; check it for every target you ship.</li>
+</ul>
+
+<h2 id="F7-17-sources">Sources</h2>
+<ol>
+<li id="F7-17-src-D2">D2 — AMD, "AMD Instinct MI200 (CDNA2) Instruction Set Architecture" and "AMD Instinct MI300 (CDNA3) Instruction Set Architecture" reference guides (tier 1): MFMA instructions, operand layouts, AGPRs, wait states. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F7-17-src-D3">D3 — AMD, rocWMMA documentation (tier 2). <i>Title only — not opened during this build; library not installed (dossier gate G1 open).</i></li>
+<li id="F7-17-src-D4">D4 — AMD, AMD Matrix Instruction Calculator (tier 2; a tool describing MFMA/WMMA operand layouts, as named in the curriculum). <i>Not available during this build (dossier gate G1 open).</i></li>
+<li id="F7-17-src-D5">D5 — LLVM project, "User Guide for AMDGPU Backend" (tier 2): AGPRs, <code>accum_offset</code>, kernel descriptors. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-17-src-D6">D6 — IEEE, "IEEE Standard for Floating-Point Arithmetic" (IEEE 754) (tier 1): binary16 precision (11 significand bits). BF16 is not an IEEE 754 interchange format; its 8-bit significand is checked here only by Listing 2's arithmetic. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-17-src-D7">D7 — Nicholas J. Higham, "Accuracy and Stability of Numerical Algorithms" (tier 3): error bounds for inner products. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-17-src-H1">H1 — CUDA 12.0 headers as installed (nvidia-cuda-dev 12.0.146), used in this build: <code>mma.h</code> (namespace <code>nvcuda::wmma</code>: <code>fragment</code>, <code>fill_fragment</code>, <code>load_matrix_sync</code>, <code>mma_sync</code>, <code>store_matrix_sync</code>), confirmed by compiling Listing 3. Tier 1.</li>
+<li id="F7-17-src-C1">C1 — Systems Curriculum, milestone E7 and the 13.1 vocabulary table (map only, AH-4): acceptance tests quoted verbatim; "accumulation registers on CDNA"; MFMA on CDNA and WMMA on RDNA3.</li>
+<li id="F7-17-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F7-17/mfma_gemm.log</code>), HIP 5.7, gfx90a; untested on hardware, exit code 1.</li>
+<li id="F7-17-src-R2">R2 — the MFMA builtin compiled for five targets (<code>targets.log</code>), clang 17 via hipcc, compiled only.</li>
+<li id="F7-17-src-R3">R3 — inner loop and metadata of Listing 1 for gfx90a (<code>isa_gemm.log</code>), compiled only.</li>
+<li id="F7-17-src-R4">R4 — WMMA builtin for gfx1100 (<code>wmma_rdna3.log</code>), compiled only.</li>
+<li id="F7-17-src-R5">R5 — run of Listing 2 (<code>fp16_error.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F7-17-src-R6">R6 — build, run and SASS of Listing 3 (<code>cuda_wmma.log</code>), CUDA 12.0; untested on hardware.</li>
+<li id="F7-17-src-R7">R7 — forensic evidence: Lin's kernel for gfx942 and gfx90a, and the gfx942 macros (<code>lin_isa.log</code>), compiled only.</li>
+</ol>
+
+<h2 id="F7-17-glossary">Glossary links</h2>
+<p><a href="#gl-matrix-core">Matrix core</a> · <a href="#gl-mfma">MFMA</a> · <a href="#gl-fragment-operand-layout">Fragment (operand layout)</a> · <a href="#gl-agpr-accumulation-register">AGPR (accumulation register)</a> · <a href="#gl-rocwmma">rocWMMA</a> · <a href="#gl-mixed-precision">Mixed precision</a></p>
+
+<h2 id="F7-17-next">Next chapter</h2>
+<p>Next: <a href="#F7-18">F7-18 Composable Kernel</a>. Previous: <a href="#F7-16">F7-16</a>. Back to the course: <a href="#HP401">HP401</a>.</p>
+
+<h2 id="F7-17-answers">Answers to Check yourself</h2>
+<ol>
+<li>FP32 result (<code>f32</code>), block M × N × K = 32 × 32 × 8, FP16 inputs (<code>f16</code>). Per lane: 4 values of A, 4 of B, 16 of C (from the builtin's types; 64 × 4 = 32 × 8 and 64 × 16 = 32 × 32).</li>
+<li>gfx908, gfx90a and gfx942 (the latter with mnemonic <code>v_mfma_f32_32x32x8_f16</code>); gfx1030 and gfx1100 failed with "needs target feature mai-insts" (R2).</li>
+<li>(c). (a) is wrong: Lin's fallback loop on gfx942 became <code>v_fma_mix_f32</code>, not MFMA (R7). (b) is wrong: a wrong layout runs silently. (d) is wrong: AGPRs appeared on CDNA targets (gfx908, gfx90a), not RDNA.</li>
+<li>An FP16 value has an 11-bit significand; the product of two has at most 22 significant bits, which fit in FP32's 24. So multiplying adds no error; the tolerance only has to cover input rounding (if inputs were not already FP16) and the FP32 additions.</li>
+<li>2·2<sup>−8</sup> + 2<sup>−16</sup> + 1,024·2<sup>−24</sup> ≈ 0.0078125 + 0.0000153 + 0.000061 ≈ 7.89 × 10<sup>−3</sup> of S.</li>
+<li>It should compile (gfx940 is a CDNA3 target like gfx942 in this compiler); expect the gfx942-style mnemonic <code>v_mfma_f32_32x32x8_f16</code>. The Lab Engineer's check run (scratch copy, not in the recorded output) printed exactly that, with the accumulator in VGPRs.</li>
+<li>B[k][col] is held by lane <i>l</i> with <i>l</i> mod 32 = 20 and 4·⌊<i>l</i>/32⌋ + <i>e</i> = 7, so ⌊<i>l</i>/32⌋ = 1, <i>e</i> = 3: lane 52, element 3 (under the unverified layout).</li>
+<li>rocWMMA when you write your own tiled kernel (fusion, custom epilogue) but do not want to manage layouts per instruction; builtins only when you need control rocWMMA does not give; hipBLASLt when a plain GEMM (with its supported epilogues) is what you need: it is the reference and usually the right answer.</li>
+</ol>
+<h3 id="F7-17-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Built for gfx942, <code>linGemm</code> contains 2 <code>v_fma_mix_f32</code> (mixed-precision FMAs, the fallback loop) and 0 <code>v_mfma</code>. Built for gfx90a from the same source, it contains <code>v_mfma_f32_32x32x8f16</code>. For gfx942 the compiler defines <code>__gfx942__</code> (R7).</p>
+<p><b>Root cause.</b> Line 14: the guard tests <code>__gfx908__</code>, <code>__gfx90a__</code> and <code>__gfx940__</code>, but the Makefile builds for gfx942, where only <code>__gfx942__</code> is defined. The preprocessor silently takes the <code>#else</code> branch. The fallback is correct, so every test passes: only performance and the disassembly reveal it.</p>
+<p><b>Wrong answers and why.</b> "gfx942 has no MFMA": the <code>targets</code> run compiles the builtin for gfx942 (R2). "Wrong target in the Makefile": the target is right; the source does not recognise it.</p>
+<p><b>Fix.</b> Add <code>__gfx942__</code> (and check the full list of CDNA targets in the HIP documentation), or better, test a feature rather than a list of names where the toolchain offers one. <b>Prevention:</b> make the fallback an explicit, named choice, and add <code>#error</code> for unknown AMD targets in performance-critical files; add a CI step that greps the disassembly for <code>v_mfma</code> per target (the mini-project). <b>How the evidence was produced:</b> <code>slow_gemm.hip.inc</code> built with <code>--cuda-device-only -S</code> for both targets; macros from <code>-dM -E</code>.</p>

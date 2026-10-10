@@ -1,0 +1,317 @@
+<!--meta
+id: F7-15
+title: Reductions and scans with rocPRIM and hipCUB
+course: HP401
+level: L4
+prereqs: HP302 (F7-08 wavefronts, F7-11 LDS, F7-12 cross-lane operations, F7-13 reading AMD ISA); CU302; CU301 (F6-14 reductions, F6-15 warp-level primitives); BR-02
+time: 10–16 hours including the lab
+hardware: Lab steps 1–5: any Linux computer with g++, hipcc and nvcc (this build: no GPU). Steps 6–8: an AMD GPU listed in the ROCm compatibility matrix with ROCm, rocPRIM and hipCUB installed (versions recorded as the logs do), or a cloud instance; optionally an NVIDIA GPU for the HIP NVIDIA path
+maps: Curriculum E3 and E4 run on AMD (part of E9); Track E 13.2 topic 5 (parallel primitives); item 73 (rocPRIM, hipCUB)
+analogy: F7 — the great kitchen hall
+-->
+
+<h2 id="F7-15-hook">Story hook</h2>
+<p>At closing time the great kitchen hall counts what it used today. Every helper has a little tally of onions peeled. Yusuf, a new helper, suggests that everyone walk to one shared counter and click it once per onion. The queue at the counter reaches the door.</p>
+<p>Old Marisol shows the hall's way. Each row of helpers first adds up its own tallies by passing numbers sideways, neighbour to neighbour, until the last helper of the row holds the row's total. Then each table adds its rows. Only one number per table goes to the counter. The next morning the same trick, with one twist, tells every helper <em>where</em> to put their onions on a long shelf: everyone needs the sum of all tallies before theirs, a running total.</p>
+<p>Marisol does not invent the trick anew each day. She takes the hall's recipe book down from the shelf, written by the people who built the hall, and follows the page called "sum" or "running total". This chapter is about that trick (reduction and scan), about the recipe books on AMD GPUs (<b>rocPRIM</b> and <b>hipCUB</b>), and about the subtle way that the same recipe gives a slightly different answer in a different hall.</p>
+
+<h2 id="F7-15-able">What you will be able to do</h2>
+<ul>
+<li><b>Write</b> a wave-width-agnostic block reduction and block scan in HIP that is correct on wave64 (CDNA), wave32 (RDNA) and warp32 (NVIDIA), and read in the AMD ISA what the compiler made of it.</li>
+<li><b>Explain</b> the two-phase temporary-storage calling pattern of device-wide primitives (CUB, hipCUB, rocPRIM) and use it correctly.</li>
+<li><b>Explain</b> single-pass scan with decoupled look-back and trace it by hand for a few tiles.</li>
+<li><b>Justify</b> a tolerance for floating-point reductions from the order of operations, and explain why two correct GPUs can disagree.</li>
+<li><b>Measure</b> (on an AMD GPU) your reduction and scan against hipCUB/rocPRIM, as the E3 and E4 acceptance tests require.</li>
+<li><b>Diagnose</b> a "wrong on AMD" report that is really a wrong test.</li>
+</ul>
+
+<div class="co jargon" id="F7-15-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Reduction</dt><dd><b>Simple words:</b> combining many values into one, such as a sum or a maximum. <b>Analogy:</b> every row adds its tallies, then every table, until one number is left. <b>Precise:</b> applying an associative binary operator (sum, max, min, logical or) over a sequence to produce one value; on a GPU done as a tree inside waves, then across waves, then across blocks. <sup class="src"><a href="#F7-15-src-D5">D5</a></sup> <sup class="src"><a href="#F7-15-src-H2">H2</a></sup></dd>
+<dt>Scan (prefix sum)</dt><dd><b>Simple words:</b> a running total: each output is the sum of the inputs before it. <b>Analogy:</b> each helper learns how many onions all the helpers before them peeled, so they know where their onions go on the shelf. <b>Precise:</b> an inclusive scan's <i>i</i>-th output includes the <i>i</i>-th input; an exclusive scan's does not (CUB's header comment defines both this way). <sup class="src"><a href="#F7-15-src-H2">H2</a></sup></dd>
+<dt>rocPRIM</dt><dd><b>Simple words:</b> AMD's library of ready-made parallel building blocks for HIP. <b>Analogy:</b> the AMD hall's own recipe book. <b>Precise:</b> a ROCm library of device-wide, block-level and wave-level primitives (reduce, scan, sort, histogram and others) written for AMD GPUs. <sup class="src"><a href="#F7-15-src-D3">D3</a></sup></dd>
+<dt>hipCUB</dt><dd><b>Simple words:</b> a library with CUB's names, so code written for CUB ports easily. <b>Analogy:</b> a translated copy of the NVIDIA hall's recipe book whose pages point at the AMD book. <b>Precise:</b> a thin HIP wrapper that exposes a CUB-style interface; on AMD it calls rocPRIM, on NVIDIA it calls CUB (see the unverified box in Layer 2 for the details this build could not check). <sup class="src"><a href="#F7-15-src-D3">D3</a></sup></dd>
+<dt>Temporary storage (two-phase call)</dt><dd><b>Simple words:</b> scratch memory that a library routine needs, which you must give it. <b>Analogy:</b> before cooking, you ask the recipe how many bowls it needs, fetch them, then cook. <b>Precise:</b> device-wide primitives take a pointer and a size; called with a null pointer they only write the required size; called again with an allocation of that size they do the work. <sup class="src"><a href="#F7-15-src-H2">H2</a></sup></dd>
+<dt>Decoupled look-back</dt><dd><b>Simple words:</b> a way for each block of a scan to find the total of all earlier blocks without a second pass over the data. <b>Analogy:</b> each table posts a note "my own total is ready" or "my running total is ready"; a table looks at the notes of the tables before it and stops at the first running total. <b>Precise:</b> the single-pass prefix-scan algorithm of Merrill and Garland in which every tile publishes its aggregate and later its inclusive prefix, and successors accumulate predecessors' values until they meet an inclusive prefix; CUB's device scan header says its device-wide scan implements it. <sup class="src"><a href="#F7-15-src-D4">D4</a></sup> <sup class="src"><a href="#F7-15-src-H2">H2</a></sup></dd>
+<dt>Run-to-run determinism</dt><dd><b>Simple words:</b> getting exactly the same bits every time you run the same thing on the same machine. <b>Analogy:</b> the same hall, same rows, same order of adding: the same total to the last digit. <b>Precise:</b> CUB's header promises it for floating-point sums on the same GPU, and warns that devices with a different compute capability may give different results because tile sizes differ. <sup class="src"><a href="#F7-15-src-H2">H2</a></sup></dd>
+</dl></div>
+
+<h2 id="F7-15-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the three levels of a block-wide scan on an AMD CDNA GPU: a shuffle scan inside each 64-lane wave, one value per wave in LDS, a scan of those values by wave 0, and the final correction. Listing 1 implements exactly this, and its instruction counts appear in the <code>isa_scan</code> run.</p>
+<figure id="F7-15-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 340" role="img" aria-labelledby="F7-15-f1t F7-15-f1d">
+<title id="F7-15-f1t">Figure 1: a block scan in three levels: inside each wave, across waves through LDS, then the correction</title>
+<desc id="F7-15-f1d">Four boxes in a row at the top, labelled wave 0 to wave 3, each 64 lanes. Inside each, a note says: inclusive scan with shuffle-up, distances 1, 2, 4, 8, 16, 32 (six steps on wave64; five on wave32). From the last lane of each wave an arrow goes down to one cell of a small row labelled LDS: waveTotals, four cells. A dashed line labelled barrier crosses the figure. Below, wave 0 scans the four cells (two steps). A second dashed barrier line follows. At the bottom, each wave adds the scanned total of the waves before it to its own lane results and subtracts its own input to get the exclusive result. The last thread writes the block's total for the second phase, which adds the totals of earlier blocks.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="340"/>
+<rect class="sv-b1" x="20" y="20" width="165" height="70"/><text class="sv-tb" x="30" y="42">wave 0 (lanes 0–63)</text><text class="sv-ts" x="30" y="62">shuffle-up scan</text><text class="sv-ts" x="30" y="78">d = 1, 2, 4, 8, 16, 32</text>
+<rect class="sv-b1" x="205" y="20" width="165" height="70"/><text class="sv-tb" x="215" y="42">wave 1</text><text class="sv-ts" x="215" y="62">same six steps</text>
+<rect class="sv-b1" x="390" y="20" width="165" height="70"/><text class="sv-tb" x="400" y="42">wave 2</text><text class="sv-ts" x="400" y="62">same six steps</text>
+<rect class="sv-b1" x="575" y="20" width="165" height="70"/><text class="sv-tb" x="585" y="42">wave 3</text><text class="sv-ts" x="585" y="62">same six steps</text>
+<line class="sv-line" x1="170" y1="90" x2="300" y2="134"/><polygon class="sv-head" points="306,137 296,138 299,130"/>
+<line class="sv-line" x1="355" y1="90" x2="350" y2="132"/><polygon class="sv-head" points="350,138 345,129 355,129"/>
+<line class="sv-line" x1="540" y1="90" x2="400" y2="134"/><polygon class="sv-head" points="394,137 401,130 404,138"/>
+<line class="sv-line" x1="725" y1="90" x2="450" y2="134"/><polygon class="sv-head" points="444,137 451,131 453,139"/>
+<text class="sv-ts" x="470" y="116">last lane writes the wave total</text>
+<rect class="sv-b2" x="290" y="138" width="200" height="30"/><text class="sv-t" x="300" y="158">LDS: waveTotals[4]</text>
+<line class="sv-dash" x1="20" y1="184" x2="740" y2="184"/><text class="sv-ts" x="24" y="179">__syncthreads() (s_barrier)</text>
+<rect class="sv-b5" x="230" y="194" width="320" height="34"/><text class="sv-t" x="240" y="216">wave 0 scans the 4 wave totals (2 steps)</text>
+<line class="sv-dash" x1="20" y1="244" x2="740" y2="244"/><text class="sv-ts" x="24" y="239">__syncthreads() (s_barrier)</text>
+<rect class="sv-b6" x="20" y="256" width="720" height="40"/><text class="sv-t" x="30" y="281">every lane: out = (scanned total of earlier waves) + inclusive − own input  →  exclusive scan of the block</text>
+<text class="sv-ts" x="20" y="322">Not to scale. On wave32 (RDNA, NVIDIA) the same code makes 8 waves of 32 lanes, five shuffle steps, and wave 0 scans 8 totals.</text>
+</svg></div><figcaption><b>Figure 1.</b> Block-wide exclusive scan with 256 threads on wave64. Arrows show data flow. The number of shuffle steps is log<sub>2</sub> of the wave width, which the compiler knows per target; the counts are confirmed by the <code>isa_scan</code> run (R3). Device-wide scans add a second level across blocks (Figure 2). <sup class="src"><a href="#F7-15-src-H1">H1</a></sup> <sup class="src"><a href="#F7-15-src-R3">R3</a></sup></figcaption></figure>
+
+<p>Figure 2 shows the second level of a device-wide scan in the single-pass style: each tile (one block's share of the data) publishes a flag and a value, and later tiles look back.</p>
+<figure id="F7-15-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F7-15-f2t F7-15-f2d">
+<title id="F7-15-f2t">Figure 2: decoupled look-back across four tiles</title>
+<desc id="F7-15-f2d">Four tiles in a row, tile 0 to tile 3, with own totals 10, 7, 5 and 8. Under each tile is its status cell: tile 0 shows P 10 (inclusive prefix 10), tile 1 shows P 17, tile 2 shows A 5 (only its aggregate is ready), tile 3 is working. An arrow from tile 3 goes back to tile 2 and reads A 5, adds it and continues; a second arrow goes to tile 1 and reads P 17, adds it and stops. Tile 3's exclusive prefix is 22 and it publishes P 30.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<rect class="sv-b1" x="30" y="30" width="150" height="50"/><text class="sv-tb" x="40" y="52">tile 0</text><text class="sv-ts" x="40" y="70">own total 10</text>
+<rect class="sv-b1" x="210" y="30" width="150" height="50"/><text class="sv-tb" x="220" y="52">tile 1</text><text class="sv-ts" x="220" y="70">own total 7</text>
+<rect class="sv-b1" x="390" y="30" width="150" height="50"/><text class="sv-tb" x="400" y="52">tile 2</text><text class="sv-ts" x="400" y="70">own total 5</text>
+<rect class="sv-b6" x="570" y="30" width="150" height="50"/><text class="sv-tb" x="580" y="52">tile 3 (working)</text><text class="sv-ts" x="580" y="70">own total 8</text>
+<rect class="sv-b5" x="30" y="100" width="150" height="34"/><text class="sv-tm" x="40" y="122">P 10</text>
+<rect class="sv-b5" x="210" y="100" width="150" height="34"/><text class="sv-tm" x="220" y="122">P 17</text>
+<rect class="sv-b2" x="390" y="100" width="150" height="34"/><text class="sv-tm" x="400" y="122">A 5</text>
+<rect class="sv-box" x="570" y="100" width="150" height="34"/><text class="sv-tm" x="580" y="122">A 8 → P 30</text>
+<path class="sv-line" d="M 645 134 C 620 175, 500 175, 470 140"/><polygon class="sv-head" points="467,135 476,140 467,146"/>
+<text class="sv-ts" x="500" y="186">1: reads A 5, adds, continues</text>
+<path class="sv-line" d="M 645 134 C 610 225, 320 225, 290 140"/><polygon class="sv-head" points="287,135 296,140 287,146"/>
+<text class="sv-ts" x="300" y="236">2: reads P 17, adds, stops: exclusive prefix 22</text>
+<text class="sv-ts" x="30" y="166">P = inclusive prefix ready; A = only the tile's own aggregate ready</text>
+</svg></div><figcaption><b>Figure 2.</b> Decoupled look-back, the worked example of this chapter. Arrows show which status cells tile 3 reads, in order. A tile whose predecessor has published nothing yet must wait and retry. The algorithm is from Merrill and Garland (D4); CUB's scan header names it (H2); Listing 4 models it on the CPU (R5). <sup class="src"><a href="#F7-15-src-D4">D4</a></sup> <sup class="src"><a href="#F7-15-src-H2">H2</a></sup> <sup class="src"><a href="#F7-15-src-R5">R5</a></sup></figcaption></figure>
+
+<h2 id="F7-15-layer1">Layer 1 — the kid explanation</h2>
+<p>A reduction is adding up a long list. A scan is writing down the running total after each item. Both look like jobs for one person with a pencil. On a GPU they are jobs for a whole hall: the helpers of a row pass numbers sideways, so after a few passes the last helper of the row has the row's total. Then the tables add their rows. Then one number per table goes on.</p>
+<p>Because this pattern is needed everywhere (counting, sorting, packing results without gaps), the people who build the GPU write it once, very carefully, and put it in a library. On AMD GPUs that library is rocPRIM, and hipCUB gives it the same names as NVIDIA's CUB. You still learn to write the pattern yourself, because you need to understand what the library does, check it, and sometimes fuse it into your own kernel.</p>
+
+<h2 id="F7-15-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F7-15-l2-wave">Inside a wave: shuffles</h3>
+<p>Within a wave, lanes exchange registers with cross-lane operations (<a href="#F7-12">F7-12</a>). In HIP 5.7, <code>__shfl_up(var, delta, width)</code> returns the value of the lane <code>delta</code> below, with <code>width</code> defaulting to <code>warpSize</code>, and in device code <code>warpSize</code> is defined as the constant <code>__AMDGCN_WAVEFRONT_SIZE</code>, which the compiler sets per target (64 for gfx90a, 32 for gfx1100, as the <code>isa_scan</code> run shows). <sup class="src"><a href="#F7-15-src-H1">H1</a></sup> <sup class="src"><a href="#F7-15-src-R3">R3</a></sup> An inclusive scan in a wave takes log<sub>2</sub>(<code>warpSize</code>) steps: at step <i>d</i> = 1, 2, 4, … every lane with index ≥ <i>d</i> adds the value <i>d</i> lanes below (the Hillis–Steele pattern taught in <a href="#F6-15">F6-15</a>). <sup class="src"><a href="#F7-15-src-D5">D5</a></sup> A reduction is the same with <code>__shfl_down</code>, ending with the total in lane 0.</p>
+<p>The loop bound must be <code>warpSize</code>, never 32. Code written for 32 lanes and run on wave64 silently scans each half separately; that is the forensic lab of <a href="#HP301">HP301</a>. Listing 1 uses <code>warpSize</code> everywhere and sizes its LDS array for the narrowest wave (32 lanes), so the same source works for 64-lane and 32-lane waves.</p>
+
+<h3 id="F7-15-l2-block">Inside a block: one value per wave in LDS</h3>
+<p>After the wave scan, the last lane of every wave holds the wave's total. It writes it to an LDS array, the block synchronises, wave 0 scans that small array, the block synchronises again, and every lane adds the scanned total of the waves before it. With 256 threads that is four totals on wave64 and eight on wave32: in the generated code, the gfx90a build has 6 + 2 = 8 <code>ds_bpermute_b32</code> instructions and the gfx1100 build 5 + 3 = 8 (R3). <sup class="src"><a href="#F7-15-src-R3">R3</a></sup></p>
+
+<h3 id="F7-15-l2-device">Across blocks: the device-wide primitives</h3>
+<p>A block cannot see another block's LDS, and blocks have no cheap barrier across the grid (<a href="#F6-12">F6-12</a>). Device-wide reduction therefore uses either a second kernel over the block totals, atomics, or a single pass in which blocks communicate through global memory. Writing this well, for every size, type and GPU, is the work a library does. CUB, installed in this build as version 2.0.1, documents the calling convention in its headers: every device-wide algorithm takes <code>d_temp_storage</code> and <code>temp_storage_bytes</code>; when <code>d_temp_storage</code> is null, the call only writes the required size and does no work. <sup class="src"><a href="#F7-15-src-H2">H2</a></sup> Listing 2 uses exactly this with <code>cub::DeviceReduce::Sum</code> and <code>cub::DeviceScan::ExclusiveSum</code>; it was built for real and printed <code>CUB_VERSION 200001</code> before stopping at the first allocation (R2). <sup class="src"><a href="#F7-15-src-R2">R2</a></sup></p>
+
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>rocPRIM and hipCUB are not installed in this build, so nothing about their exact interface was checked. What the chapter assumes, and you must confirm in the rocPRIM and hipCUB documentation (and headers) for the ROCm version you install: (1) hipCUB offers the CUB names in a namespace <code>hipcub</code> (for example <code>hipcub::DeviceReduce::Sum</code> and <code>hipcub::DeviceScan::ExclusiveSum</code>) with the same two-phase temporary-storage convention and a <code>hipStream_t</code> instead of <code>cudaStream_t</code>; (2) on AMD it forwards to rocPRIM and on NVIDIA to CUB; (3) rocPRIM's own device functions (names such as <code>rocprim::reduce</code> and <code>rocprim::exclusive_scan</code>) use the same null-pointer size query. Port Listing 2 to hipCUB by changing the include, namespace and runtime calls, build it, and record the header version you used.</p></div>
+
+<h3 id="F7-15-l2-float">Floating point: the order is part of the answer</h3>
+<p>Integer addition is associative, so every order gives the same sum. Floating-point addition rounds after every operation, so the order changes the result (MA302; IEEE 754 defines each operation's rounding, not the order a program chooses). <sup class="src"><a href="#F7-15-src-D6">D6</a></sup> A GPU reduction adds in an order set by the grid size, the block size and the wave width. Listing 3 replays four such orders on the CPU for the same 16,777,216 floats: wave width 32 and 64 with 1,024 blocks give different last digits, and so do different block counts; the integer sums forwards and backwards agree exactly (R4). <sup class="src"><a href="#F7-15-src-R4">R4</a></sup> CUB's header states the consequence for libraries: results are reproducible run to run on the same GPU, but may differ on a GPU of another compute capability because tile sizes differ. <sup class="src"><a href="#F7-15-src-H2">H2</a></sup> The test of a float reduction is therefore a tolerance, never equality with a "golden" number from another GPU.</p>
+
+<h2 id="F7-15-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F7-15-l3-lookback">Single-pass scan with decoupled look-back</h3>
+<p>The classic device scan is three passes: reduce each tile, scan the tile totals, then scan each tile again with its offset. That reads the input twice. CUB's header describes its device scan as single-pass: about 2<i>n</i> data movement (<i>n</i> reads, <i>n</i> writes), achieved by decoupled look-back. <sup class="src"><a href="#F7-15-src-H2">H2</a></sup> Each tile keeps a status word: X (nothing yet), A (aggregate of this tile only) or P (inclusive prefix up to and including this tile). A tile reduces its data, publishes A, then reads its predecessors from the nearest backwards: it adds every A it sees, keeps going, and stops at the first P. It then publishes P = (sum found) + (own aggregate) and writes its outputs. <sup class="src"><a href="#F7-15-src-D4">D4</a></sup> Because many tiles publish A early, a tile rarely waits for the full chain; that is the "decoupling".</p>
+<p>Listing 4 models this on the CPU with a scheduler that gives one step at a time to a random live tile, so tiles really interleave. It passes the E4 size list (1, 2<sup>k</sup>−1, 2<sup>k</sup>, 2<sup>k</sup>+1 and a large size) for random, sorted, reverse-sorted and all-equal inputs, and reports how many status words each tile read and how often a tile had to wait on an X (R5). <sup class="src"><a href="#F7-15-src-R5">R5</a></sup> The model's scheduler is deliberately pessimistic: every tile may start at any time. On a GPU, tiles that wait on a predecessor which has not been scheduled yet could wait forever; the paper's answer is to hand out tile numbers in the order blocks actually start (a global counter), rather than to use <code>blockIdx.x</code>. <sup class="src"><a href="#F7-15-src-D4">D4</a></sup></p>
+<div class="co warning"><span class="lbl">Watch out</span><p>A look-back scan relies on the status word and its value becoming visible together, in order, to other blocks. That needs the memory-model guarantees of the platform (fences or atomics with the right ordering). The CPU model in Listing 4 does not test this at all, because it runs on one thread. Do not write your own look-back scan for production without reading the HIP documentation on memory fences and the paper; use the library.</p></div>
+
+<h3 id="F7-15-l3-tolerance">A tolerance you can defend</h3>
+<p>For a sum computed as a tree whose longest chain of additions has depth <i>d</i>, the first-order error bound is |error| ≤ <i>d</i> · <i>u</i> · Σ|<i>x<sub>i</sub></i>|, with <i>u</i> = 2<sup>−24</sup> for FP32 round-to-nearest. <sup class="src"><a href="#F7-15-src-D7">D7</a></sup> Listing 3 prints this bound for each order: 16,777,216 for the sequential float loop (a useless bound, and indeed its error is the largest of the GPU-like orders), and depths around 600–1,100 for the GPU orders. The observed errors are far below the bounds because random signs cancel; the bound is what you can prove, not what you will see. E3's acceptance test asks for "your stated tolerance" against a Kahan-summed reference: state it from this bound, relative to Σ|<i>x</i>|, not relative to the result (whose size can be close to zero). <sup class="src"><a href="#F7-15-src-C1">C1</a></sup></p>
+
+<h3 id="F7-15-l3-when">Library or own kernel?</h3>
+<p>Use the library for stand-alone reductions, scans, sorts and histograms: it is tuned per architecture and tested on sizes you would forget. Write your own when the primitive is a small step inside a larger kernel (a block scan inside a stream-compaction kernel, a wave reduction inside a softmax): then you want a block-level or wave-level primitive, which rocPRIM and CUB also offer, or your own Listing 1. In both cases the E3/E4 rule holds: measure against the library on the same GPU with the same harness (<a href="#F7-19">F7-19</a>). <sup class="src"><a href="#F7-15-src-C1">C1</a></sup></p>
+
+<h2 id="F7-15-hardware">How the hardware actually does it</h2>
+<p>The <code>isa_scan</code> run shows what the compiler made of <code>__shfl_up</code> for both AMD targets: <code>ds_bpermute_b32</code>, a cross-lane permute that goes through the LDS hardware without allocating LDS, preceded by index arithmetic and followed by a wait on <code>lgkmcnt</code> (<a href="#F7-13">F7-13</a>). <sup class="src"><a href="#F7-15-src-R3">R3</a></sup> <sup class="src"><a href="#F7-15-src-D2">D2</a></sup> Because <code>warpSize</code> is a compile-time constant on AMD, the loop is fully unrolled: six permute steps on gfx90a, five on gfx1100. The two <code>__syncthreads()</code> became two <code>s_barrier</code>. The kernel uses 32 bytes of LDS (eight <code>int</code> slots) on both targets. The vendor ISA guide (D2) also describes DPP (data-parallel primitives) modifiers that let some cross-lane moves happen inside a VALU instruction; whether rocPRIM uses them for its wave scans on your GPU is something to read in its source, not to assume.</p>
+
+<h2 id="F7-15-worked">Worked example</h2>
+<p><b>A wave scan by hand</b> (8 lanes for readability; a real wave has 32 or 64). Inputs: 3, 1, 4, 1, 5, 9, 2, 6.</p>
+<div class="tw"><table>
+<thead><tr><th>Step</th><th>Rule</th><th>Lanes 0–7 after the step</th></tr></thead>
+<tbody>
+<tr><td>start</td><td>own value</td><td>3, 1, 4, 1, 5, 9, 2, 6</td></tr>
+<tr><td><i>d</i> = 1</td><td>lane ≥ 1 adds the old value of lane − 1</td><td>3, 4, 5, 5, 6, 14, 11, 8</td></tr>
+<tr><td><i>d</i> = 2</td><td>lane ≥ 2 adds the old value of lane − 2</td><td>3, 4, 8, 9, 11, 19, 17, 22</td></tr>
+<tr><td><i>d</i> = 4</td><td>lane ≥ 4 adds the old value of lane − 4</td><td>3, 4, 8, 9, 14, 23, 25, 31</td></tr>
+<tr><td>exclusive</td><td>inclusive − own input</td><td>0, 3, 4, 8, 9, 14, 23, 25</td></tr>
+</tbody></table></div>
+<p>Three steps for 8 lanes; log<sub>2</sub> 64 = 6 steps for wave64. "Old value" matters: all lanes read before any writes, which the shuffle guarantees because every lane's <code>__shfl_up</code> happens in the same instruction.</p>
+<p><b>A look-back by hand</b> (Figure 2). Tile aggregates 10, 7, 5, 8. Tile 0 publishes P 10. Tile 1 reads P 10, publishes P 17. Tile 2 has published only A 5 when tile 3 looks back: tile 3 adds 5, moves to tile 1, reads P 17, adds it and stops. Its exclusive prefix is 5 + 17 = 22 (check: 10 + 7 + 5 = 22) and it publishes P 22 + 8 = 30.</p>
+<p><b>Temporary storage.</b> Listing 2 queries both algorithms and allocates the larger size once, so one buffer serves both calls. This is safe only because the calls run one after the other on the same stream.</p>
+
+<h2 id="F7-15-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>block_scan.hip</code>: a wave-width-agnostic block scan (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-15/block_scan.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a block_scan.hip -o block_scan</code>, then <code>./block_scan</code>.</p>
+<pre class="output" data-run="F7-15/block_scan"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 1 was built for real for gfx90a and stopped at the first allocation because the build container has no AMD GPU. On a GPU it should print <code>errors = 0</code>; that has not been verified. What would be needed: an AMD GPU in the ROCm compatibility matrix and a rerun of <code>run_lab.sh</code> (change <code>--offload-arch</code> to your GPU's gfx target, printed by <code>rocminfo</code>).</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–9</td><td><code>kBlock</code>, <code>kMaxWaves</code></td><td>256 threads; LDS slots for the narrowest wave width.</td><td>256 is a whole number of waves for 32 and 64; 8 slots cover both.</td></tr>
+<tr><td>11–17</td><td><code>check</code></td><td>Prints the error name and text and exits.</td><td>Every HIP call is checked (AH-27).</td></tr>
+<tr><td>20–30</td><td><code>waveInclusiveScan</code></td><td>log<sub>2</sub>(<code>warpSize</code>) shuffle-up steps.</td><td>No literal 32 anywhere; unrolled per target (R3).</td></tr>
+<tr><td>35–39</td><td>indices</td><td>Global index, lane and wave of this thread.</td><td><code>%</code> and <code>/</code> by <code>warpSize</code>, a constant on AMD.</td></tr>
+<tr><td>41</td><td><code>x = (g &lt; n) ? in[g] : 0</code></td><td>Out-of-range threads contribute 0.</td><td>They still take part in shuffles and barriers.</td></tr>
+<tr><td>42–45</td><td>wave totals</td><td>The last lane stores the wave's total in LDS.</td><td>One LDS write per wave.</td></tr>
+<tr><td>46, 54</td><td><code>__syncthreads()</code></td><td>Barriers around the wave-0 phase.</td><td>Become <code>s_barrier</code> (R3).</td></tr>
+<tr><td>47–53</td><td>wave 0</td><td>Scans the wave totals.</td><td>Lanes ≥ <code>numWaves</code> use 0 and do not write.</td></tr>
+<tr><td>55–58</td><td>correction</td><td>Adds earlier waves' total; subtracts own input.</td><td>Turns an inclusive scan into an exclusive one.</td></tr>
+<tr><td>59–61</td><td>block total</td><td>The last thread writes the block's sum.</td><td>Input to the second level (here on the host).</td></tr>
+<tr><td>64–104</td><td><code>main</code></td><td>1,000,003 elements (not a block multiple), check against a running total.</td><td>The host adds the block offsets: a device scan would do this on the GPU.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>cub_device.cu</code>: the library way, with CUB 2.0.1 as installed (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-15/cub_device.cu"></pre>
+<p><b>Build command</b>: <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings cub_device.cu -o cub_device</code>, then <code>./cub_device</code>.</p>
+<pre class="output" data-run="F7-15/cub_device"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18</td><td><code>CUB_VERSION</code></td><td>Prints the library version macro.</td><td>Record the version of every library you benchmark against.</td></tr>
+<tr><td>33–39</td><td>phase 1</td><td>Null <code>dTemp</code>: each call only writes its byte count.</td><td>The documented size query (H2).</td></tr>
+<tr><td>40</td><td><code>cudaMalloc(&amp;dTemp, tempBytes)</code></td><td>One buffer, the larger of the two sizes.</td><td>Reuse is safe on one stream, in order.</td></tr>
+<tr><td>42–45</td><td>phase 2</td><td>The same calls do the work, asynchronously.</td><td>Synchronise (or use a stream event) before reading.</td></tr>
+<tr><td>47–60</td><td>check</td><td>Sum and scan against the host.</td><td>Integers: exact equality is the right test.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>tree_order.cpp</code>: the same float sum in different orders (runs on the CPU).</p>
+<pre class="listing" data-src="F7-15/tree_order.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined tree_order.cpp -o tree_order</code>.</p>
+<pre class="output" data-run="F7-15/tree_order"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–44</td><td><code>gpuOrderSum</code></td><td>Grid-stride sums, then a shuffle-down tree of width <code>width</code>, then wave totals, then block totals.</td><td>The order a typical GPU reduction uses; all in FP32.</td></tr>
+<tr><td>55–66</td><td>reference</td><td>Kahan summation in double.</td><td>The E3 reference.</td></tr>
+<tr><td>77–93</td><td>table</td><td>Result, error, depth and bound per order.</td><td>Different orders, different last digits; all inside the bound.</td></tr>
+<tr><td>95–102</td><td>integers</td><td>Forward and backward integer sums.</td><td>Identical: integer tests may use equality.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>lookback.cpp</code>: a CPU model of decoupled look-back with interleaved tiles.</p>
+<pre class="listing" data-src="F7-15/lookback.cpp"></pre>
+<pre class="output" data-run="F7-15/lookback"></pre>
+<p>The model publishes P directly for tile 0, counts every status word read (<code>looks/tile</code>) and every read that found X (<code>waits</code>). The large looks-per-tile values come from the random scheduler, which lets tiles far ahead start before their neighbours; read them as a property of the model, not of a GPU.</p>
+
+<p><b>Compiler evidence</b> without a GPU: instruction counts of <code>blockScan</code> for both AMD wave widths, and the same source built through HIP's NVIDIA path.</p>
+<pre class="output" data-run="F7-15/isa_scan"></pre>
+<pre class="output" data-run="F7-15/hip_nvidia"></pre>
+<p>On the NVIDIA path, HIP 5.7's <code>hipGetErrorName</code> returned the CUDA name <code>cudaErrorNoDevice</code>: a small reminder that the NVIDIA back end is a thin layer over the CUDA runtime (R6). <sup class="src"><a href="#F7-15-src-R6">R6</a></sup></p>
+
+<h2 id="F7-15-breaks">Where the analogy breaks</h2>
+<ul>
+<li>Helpers passing numbers "sideways" suggests a walk along the row taking time per step. A shuffle moves all 64 values at once in one instruction; what costs time is the number of steps (log<sub>2</sub> of the width), not the distance.</li>
+<li>The recipe book suggests the library always gives the same answer. For floating point it gives a reproducible answer on the same GPU, and possibly a different one on another (H2): the book's page depends on the hall.</li>
+<li>In the story, tables wait politely for earlier tables. On a GPU, a block that waits for a block which has not started can wait forever; real look-back scans number their tiles in start order to avoid that (D4).</li>
+<li>"Recipe book written by the builders" hides that rocPRIM and CUB are open-source projects with versions and bugs; you record the version you used like any other dependency.</li>
+</ul>
+
+<h2 id="F7-15-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> the sum is right on NVIDIA and about half (or garbage) on CDNA. <b>Cause:</b> a shuffle loop that starts at 16 or uses <code>% 32</code>. <b>How to find it:</b> grep for literal 32 and 16 near shuffles (<a href="#F7-20">F7-20</a> has a scanner). <b>Fix:</b> <code>warpSize</code>, and LDS arrays sized for the narrowest wave.</li>
+<li><b>Symptom:</b> a library call returns success but the output is unchanged. <b>Cause:</b> only the size query was made (null temporary storage). <b>How to find it:</b> count the calls: each algorithm is called twice. <b>Fix:</b> allocate and call again.</li>
+<li><b>Symptom:</b> random wrong results when two library calls overlap. <b>Cause:</b> one temporary buffer shared by calls on different streams. <b>Fix:</b> one buffer per stream, or order the streams with events.</li>
+<li><b>Symptom:</b> a float test fails "only on the new GPU". <b>Cause:</b> an equality test against a number recorded on another GPU. <b>How to find it:</b> compare the difference with the bound of Layer 3. <b>Fix:</b> a tolerance relative to Σ|<i>x</i>| (the forensic lab).</li>
+<li><b>Symptom:</b> integer sum overflows for large inputs. <b>Cause:</b> 32-bit accumulator. <b>Fix:</b> accumulate in 64 bits; CUB lets the output type differ from the input type (check hipCUB's equivalent).</li>
+</ul>
+
+<div class="co transition" id="F7-15-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-14">F6-14</a> and <a href="#F6-15">F6-15</a> built reductions and warp shuffles in CUDA; <a href="#F7-12">F7-12</a> showed AMD's cross-lane operations and 64-bit masks. <b>What carries over:</b> the tree pattern, the barrier discipline, the CUB calling convention (hipCUB copies its names, unverified box). <sup class="src"><a href="#F7-15-src-H2">H2</a></sup> <b>What changes:</b> the wave width is 64 on CDNA and 32 on RDNA, so the number of shuffle steps and of wave totals changes per target; the compiler unrolls for each target (R3); the reference library is rocPRIM/hipCUB, and its float results need not match CUB's bit for bit. <sup class="src"><a href="#F7-15-src-R3">R3</a></sup> <b>What comes next:</b> <a href="#F7-16">F7-16</a> uses LDS for a bigger job: tiling a matrix multiply.</p></div>
+
+<h2 id="F7-15-check">Check yourself</h2>
+<ol>
+<li>How many <code>__shfl_up</code> steps does an inclusive wave scan take on gfx90a, and on gfx1100? Where in the run output can you confirm it?</li>
+<li>Why does Listing 1 size <code>waveTotals</code> as <code>kBlock / 32</code> and not <code>kBlock / warpSize</code>?</li>
+<li>Which statement is true? (a) A device-wide library call with a null temporary pointer sums the data but cannot return it. (b) A null temporary pointer makes the call write only the required size. (c) Temporary storage can always be shared between streams. (d) The temporary size is the same on every GPU.</li>
+<li>Explain in your own words why a float reduction on two correct GPUs may differ in the last digits, and what the test should check instead.</li>
+<li>Apply: tiles with aggregates 4, 6, 2, 9, 1. Tile 4 looks back while tiles 3 and 2 show A and tile 1 shows P. What does tile 4 read, what is its exclusive prefix, and what does it publish?</li>
+<li>Predict, then run: change <code>kBlock</code> to 128 in Listing 1 and rerun the <code>isa_scan</code> step. How many <code>ds_bpermute_b32</code> do you expect for gfx90a and for gfx1100?</li>
+<li>For 2<sup>28</sup> floats reduced by 1,024 blocks of 256 threads with wave64, what depth <i>d</i> do you get with the formula of Listing 3, and what bound relative to Σ|<i>x</i>|?</li>
+<li>When would you write your own block scan instead of calling the device-wide library function?</li>
+</ol>
+
+<h2 id="F7-15-lab">Lab</h2>
+<p><b>Goal.</b> Build and read a portable block scan, use the library calling convention, model look-back, and (on an AMD GPU) run E3/E4 against hipCUB/rocPRIM.</p>
+<p><b>Hardware and software needed.</b> Steps 1–5: no GPU; g++ 13.3, hipcc (HIP 5.7, clang 17) and nvcc (CUDA 12.0) as in the logs. Steps 6–8: an AMD GPU in the ROCm compatibility matrix, ROCm with rocPRIM and hipCUB, or a cloud instance; record every version line. Folder <code>university/labs/F7-15</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>From the repository root run <code>university/labs/run_lab.sh university/labs/F7-15</code>. Open <code>isa_scan.out</code>, <code>tree_order.out</code> and <code>lookback.out</code>.</li>
+<li>In the gfx90a assembly (rebuild with <code>--cuda-device-only -S</code>), find the six permute steps and the shift amounts that become the lane offsets.</li>
+<li>Change the reduction in Listing 3 to wave width 16 and to 128 blocks; explain the new rows with the depth formula.</li>
+<li>Add a tile size of 64 to Listing 4 and compare looks per tile.</li>
+<li>Port Listing 2 to hipCUB on paper: list every identifier you change and look each one up in the hipCUB documentation (the unverified box).</li>
+<li>On an AMD GPU: run Listing 1 (0 errors), your hipCUB port of Listing 2, and Listing 1 built for your gfx target.</li>
+<li>On an AMD GPU: E3 — your best reduction versus hipCUB <code>DeviceReduce</code>; E4 — your scan versus rocPRIM/hipCUB <code>DeviceScan</code>, with the harness of <a href="#F7-19">F7-19</a> (warm-up, median of at least 20 runs).</li>
+<li>Optional: the same source through HIP's NVIDIA path on an NVIDIA GPU.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: the outputs above. On a GPU: write your own times; no expected numbers are given because none were measured (AH-23).</p>
+<p><b>Verification</b> (E3 and E4 acceptance tests, verbatim from the curriculum, run on AMD): "Sum of 2^28 floats matches a Kahan-summed CPU reference within your stated tolerance; integer sums are exact." "Best version reaches X % of CUB DeviceReduce / hipCUB DeviceReduce throughput." "The same source runs correctly with wave64 on AMD (no hidden 32-lane assumption)." "Results identical to a CPU reference for random, sorted, reverse-sorted and all-equal inputs, including sizes 1, 2^k−1, 2^k+1." "Scan and sort reach X % of CUB/rocPRIM DeviceScan and DeviceRadixSort." <sup class="src"><a href="#F7-15-src-C1">C1</a></sup> Write X before you measure.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>isa_scan</code> finds no <code>blockScan</code> → the mangled name changed with your edits; list labels with <code>grep -E '^_Z' .tmp.s</code>.</li>
+<li>The NVIDIA-path build complains about deprecated warp functions → see <a href="#F7-20">F7-20</a>: HIP 5.7's NVIDIA mapping of <code>__ballot</code> was rejected for sm_80 in this build; shuffles built cleanly here.</li>
+<li><code>tree_order</code> is slow → it is built with sanitizers and no optimisation; the lab sets a 60 s limit.</li>
+</ul>
+<p><b>Extension.</b> Add a stream-compaction kernel (keep the positive elements) built on Listing 1: flags, block scan, scatter.</p>
+
+<h2 id="F7-15-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Leilani's team runs nightly tests on an NVIDIA GPU and a new AMD GPU. The test <code>sum_16M_floats</code> passes on NVIDIA and fails on AMD with "expected 31.248283, got 31.248207". A colleague files a bug: "hipCUB reduction wrong on AMD". The test compares the GPU result with a number recorded once on the NVIDIA machine.</p>
+<p><b>Evidence pack.</b> The Lab Engineer replayed the reduction orders on the CPU with the same data (Listing 3, output above, R4): the row "W=32, 1024 blocks × 256" stands for the NVIDIA order, "W=64, 1024 blocks × 256" for the AMD order with the same grid. The CUB header note on determinism (quoted in Layer 2, H2) is also part of the evidence.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: how large is the difference between the two results, and how does it compare with each result's error against the Kahan reference?</li>
+<li>Hypotheses: list at least two (a bug in the AMD reduction; a different order of additions; the test's reference value). Which evidence rules each in or out?</li>
+<li>Root cause: what is actually wrong?</li>
+<li>Fix: write the corrected test condition, with the tolerance justified.</li>
+<li>Prevention: what rule should the team adopt for every float test that runs on more than one GPU?</li>
+</ol>
+<p><b>Method hints.</b> Compare both errors with the bound printed by Listing 3. Ask what an equality test against a number from another GPU is really testing.</p>
+
+<h2 id="F7-15-project">Mini-project</h2>
+<p><b>A portable primitives header for MP4.</b> Collect Listing 1's wave scan, a wave reduction (shuffle-down), a block reduction and a block scan into one header that compiles for gfx90a, gfx1100 and (through the NVIDIA path) sm_80. Add a test program that checks every function for block sizes 64, 128, 256 and 1,024 and input sizes 1, 2<sup>k</sup>−1, 2<sup>k</sup>+1, and a float test with a tolerance derived from Layer 3.</p>
+<p><b>Rubric.</b> Compiles for all three targets with no literal 32 (2). Integer tests exact, float tests with a justified tolerance (3). Instruction counts from the ISA recorded per target (2). README listing what was and was not run on hardware, with version lines (3).</p>
+
+<h2 id="F7-15-summary">Summary</h2>
+<ul>
+<li>Reduction and scan are trees: inside a wave with shuffles, across waves through LDS, across blocks through global memory.</li>
+<li>Use <code>warpSize</code>: on AMD it is a per-target compile-time constant (64 for gfx90a, 32 for gfx1100), and the compiler unrolls accordingly.</li>
+<li>Device-wide library calls follow the two-phase convention: size query with a null pointer, then the real call.</li>
+<li>Single-pass scan with decoupled look-back reads the input once; tiles publish A, then P, and look back to the first P.</li>
+<li>Float reductions depend on the order; test them with a tolerance relative to Σ|<i>x</i>|, never equality across GPUs.</li>
+<li>rocPRIM and hipCUB were not available in this build: their identifiers are in an unverified box to check against their documentation.</li>
+</ul>
+
+<h2 id="F7-15-sources">Sources</h2>
+<ol>
+<li id="F7-15-src-D1">D1 — AMD, HIP documentation (HIP Programming Guide, HIP API reference; warp cross-lane functions) (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F7-15-src-D2">D2 — AMD, "AMD Instinct MI200 (CDNA2) Instruction Set Architecture" reference guide (tier 1): data share operations (<code>ds_bpermute_b32</code>), DPP. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-15-src-D3">D3 — AMD, rocPRIM and hipCUB documentation (tier 2). <i>Title only — not opened during this build; the libraries are not installed (dossier gate G1 open).</i></li>
+<li id="F7-15-src-D4">D4 — Duane Merrill and Michael Garland, "Single-pass Parallel Prefix Scan with Decoupled Look-back", NVIDIA Technical Report NVR-2016-002, 2016 (tier 5; title and report number as cited in the CUB 2.0.1 header comment, H2). <i>Paper not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-15-src-D5">D5 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): chapters on reduction and prefix sum. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-15-src-D6">D6 — IEEE, "IEEE Standard for Floating-Point Arithmetic" (IEEE 754) (tier 1): rounding of each operation. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-15-src-D7">D7 — Nicholas J. Higham, "Accuracy and Stability of Numerical Algorithms" (tier 3): error bounds for summation. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-15-src-H1">H1 — HIP 5.7 headers as installed (Ubuntu package libamdhip64-dev 5.7.1-3), read in this build: <code>hip/amd_detail/amd_warp_functions.h</code> (<code>static constexpr int warpSize = __AMDGCN_WAVEFRONT_SIZE;</code>, <code>__shfl_up</code> and <code>__shfl_down</code> with <code>width = warpSize</code>). Tier 1.</li>
+<li id="F7-15-src-H2">H2 — CUB 2.0.1 headers as installed (Ubuntu package libcub-dev 2.0.1-2), read in this build: <code>cub/version.cuh</code> (<code>CUB_VERSION 200001</code>); <code>cub/device/device_reduce.cuh</code> (temporary-storage parameters; the "run-to-run determinism" note); <code>cub/device/device_scan.cuh</code> (definitions of inclusive and exclusive scan; single-pass decoupled look-back, about 2<i>n</i> data movement). Tier 4 (reference implementation, version recorded).</li>
+<li id="F7-15-src-C1">C1 — Systems Curriculum, Track E milestones E3, E4, E9 and section 13.4 (map only, AH-4): goals and acceptance tests quoted verbatim.</li>
+<li id="F7-15-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F7-15/block_scan.log</code>), HIP 5.7, gfx90a; untested on hardware, exit code 1.</li>
+<li id="F7-15-src-R2">R2 — build and run of Listing 2 (<code>cub_device.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F7-15-src-R3">R3 — instruction counts and metadata of <code>blockScan</code> for gfx90a and gfx1100 (<code>isa_scan.log</code>), clang 17 via hipcc, compiled only.</li>
+<li id="F7-15-src-R4">R4 — run of Listing 3 (<code>tree_order.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F7-15-src-R5">R5 — run of Listing 4 (<code>lookback.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F7-15-src-R6">R6 — Listing 1 through HIP's NVIDIA path (<code>hip_nvidia.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+</ol>
+
+<h2 id="F7-15-glossary">Glossary links</h2>
+<p><a href="#gl-reduction-gpu">Reduction (GPU)</a> · <a href="#gl-scan-prefix-sum">Scan (prefix sum)</a> · <a href="#gl-rocprim">rocPRIM</a> · <a href="#gl-hipcub">hipCUB</a> · <a href="#gl-temporary-storage-two-phase-call">Temporary storage (two-phase call)</a> · <a href="#gl-decoupled-look-back">Decoupled look-back</a> · <a href="#gl-run-to-run-determinism">Run-to-run determinism</a></p>
+
+<h2 id="F7-15-next">Next chapter</h2>
+<p>Next: <a href="#F7-16">F7-16 GEMM on AMD: tiling for LDS</a>. Previous course: <a href="#HP302">HP302</a> (last chapter <a href="#F7-14">F7-14</a>). Back to the course: <a href="#HP401">HP401</a>.</p>
+
+<h2 id="F7-15-answers">Answers to Check yourself</h2>
+<ol>
+<li>Six on gfx90a (log<sub>2</sub> 64) and five on gfx1100 (log<sub>2</sub> 32). In <code>isa_scan.out</code>: 8 <code>ds_bpermute_b32</code> for each target, which is 6 + 2 (four wave totals) and 5 + 3 (eight wave totals).</li>
+<li>Because the array must be large enough for the narrowest wave (most waves per block) and its size must be a compile-time constant in host-visible code; 256 / 32 = 8 slots cover wave32 and wave64.</li>
+<li>(b). (a) is wrong: the size query does no work. (c) is wrong: concurrent calls on different streams would overwrite each other's scratch data. (d) is wrong: the size depends on the algorithm, the type, the size of the input and the library's tuning for the GPU.</li>
+<li>Each float addition rounds, so the result depends on the order; the order depends on grid, block and wave sizes, which differ between GPUs (and CUB warns about exactly this, H2). The test should check |result − reference| ≤ tolerance, with the tolerance from a bound such as <i>d</i>·<i>u</i>·Σ|<i>x</i>|.</li>
+<li>It reads tile 3 (A 9), tile 2 (A 2), tile 1 (P 4 + 6 = 10) and stops. Exclusive prefix 9 + 2 + 10 = 21 (check: 4 + 6 + 2 + 9 = 21); it publishes P 21 + 1 = 22.</li>
+<li>With 128 threads: gfx90a has 2 waves, so 6 + 1 = 7; gfx1100 has 4 waves, so 5 + 2 = 7. The Lab Engineer's check run (scratch copy, not in the recorded output) counted 7 for both targets.</li>
+<li>2<sup>28</sup> / 2<sup>18</sup> = 1,024 elements per thread, + 6 + 4 + 1,024 = 2,058; bound 2,058 × 2<sup>−24</sup> ≈ 1.23 × 10<sup>−4</sup> of Σ|<i>x</i>|.</li>
+<li>When the scan is one step inside a bigger kernel (fused into compaction, sorting, softmax) and a device-wide call would need an extra kernel launch and a round trip through global memory; then use a block- or wave-level primitive (library or your own), still tested against the device-wide library.</li>
+</ol>
+<h3 id="F7-15-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> The two results differ by 31.248283 − 31.248207 = 0.000076. Their errors against the Kahan reference (31.249278) are −0.000994 and −0.001070: both are of the same size, the AMD-order result is not noticeably worse, and both are about 10<sup>−10</sup> of Σ|<i>x</i>| (8,387,434.698), far inside the bound of about 549.</p>
+<p><b>Root cause.</b> The test is wrong, not the GPU: it requires bit-equality with a value produced by a different order of additions on another GPU. The wave width (32 versus 64) changes the shuffle tree, so the last digits change. CUB documents that float results may differ across devices with different tile sizes (H2).</p>
+<p><b>Wrong answers and why.</b> "hipCUB is buggy": both orders are equally close to the reference; a bug would show an error far larger than the bound or a dependence on the input pattern. "Use double on AMD": changes the numbers but not the principle; the test would still compare across orders.</p>
+<p><b>Fix.</b> <code>|got − ref| ≤ d · 2<sup>−24</sup> · Σ|x|</code> with a Kahan or double reference computed on the host, and <i>d</i> from the launch configuration (or a documented, slightly larger constant). <b>Prevention:</b> float tests never compare against numbers recorded on a GPU; every tolerance is written down with its derivation. <b>How the evidence was produced:</b> Listing 3, seed 2026, uniform values in [−1, 1).</p>
