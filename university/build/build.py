@@ -786,9 +786,6 @@ def build():
                          '<p class="back"><a href="#keys-%s">answer key</a> · <a href="#%s">course %s</a></p></section>'
                          % (course, course, course, exams, course, course, course))
                 exam_courses.append(course)
-                plab = os.path.join(UNI, "labs", course + "-P")
-                if os.path.isdir(plab):
-                    P.append(render_lab_files(course + "-P"))
 
     # --- bridges and mega projects
     for hid, sec, group, gtitle in (("bridges", "s6", bridges, "Bridge chapters"), ("mega", "s11-6", mps, "Mega projects")):
@@ -809,8 +806,9 @@ def build():
              'and practical (guide 11.4). Chapter quiz answers are at the end of each chapter ("Answers to Check yourself"). '
              'Learners: try the exam first.</p>')
     for c, k in keys:
-        P.append('<div class="keys" id="keys-%s"><h3>%s answer key</h3>%s<p class="back"><a href="#%s-exams">back to the %s exams</a></p></div>'
-                 % (c, c, k, c, c))
+        # practical folders hold reference solutions and hidden evidence (ruling B7): markers' material, so it sits with the key
+        P.append('<div class="keys" id="keys-%s"><h3>%s answer key</h3>%s%s<p class="back"><a href="#%s-exams">back to the %s exams</a></p></div>'
+                 % (c, c, k, render_lab_files(c + "-P"), c, c))
     if not keys:
         P.append("<p>No answer keys yet.</p>")
     P.append('<h2 class="fac" id="dossiers">Source dossiers</h2><p>One dossier per chapter (guide 3.2): every document the '
