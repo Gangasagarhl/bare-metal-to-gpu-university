@@ -46,6 +46,9 @@ L0–L1 courses: midterm and final are written but are ungraded practice papers;
 quizzes 20 %, practical 50 %, project 30 % (ruling B6). Other courses use the 11.4 defaults.
 The `-P` README says candidates get only the starting file(s) (ruling B7).
 
+## UNIVERSITY.html
+If you run build.py, restore university/UNIVERSITY.html with `git checkout` afterwards. The practical folder `labs/<C>-P/` is rendered inside the answer-keys appendix, not after the exams.
+
 ## Report
 Short summary: files written, number of questions per exam, practical run result, anything the
 owner should know.
