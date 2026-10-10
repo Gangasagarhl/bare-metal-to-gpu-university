@@ -20,15 +20,17 @@ It is built by following the three HTML prompt files at the repository root:
 university/
 ├─ UNIVERSITY.html          ← the generated one-file university (open this)
 ├─ README.md                ← this file
+├─ OWNER_DECISIONS.md       ← every author's open questions for the owner, in one place
 ├─ build/
 │  ├─ build.py              ← Integrator: assembles UNIVERSITY.html and checks links/ids/HTML
 │  ├─ AUTHOR_BRIEF*.md      ← the exact briefs the chapter-author agents received
 │  ├─ prompts/<COURSE>.txt  ← the full task given to each course's author agent
-│  ├─ QUEUE.txt, PROGRESS.md← build order of all 87 courses and what is done so far
+│  ├─ QUEUE.txt, PROGRESS.md← build order (87 courses, 10 bridges, 8 mega projects) and what is done
+│  ├─ decisions.py          ← regenerates OWNER_DECISIONS.md from every NOTES.md
 │  └─ RESUME.md, resume.sh, commit_course.sh ← how to continue after an interruption
 ├─ chapters/
 │  ├─ FRAGMENT_FORMAT.md    ← the chapter file format (21 template sections)
-│  └─ <COURSE>/             ← one folder per course, e.g. KID101/
+│  └─ <UNIT>/               ← one folder per course (e.g. KID101/), bridge (BR-01/) or mega project (MP1/)
 │     ├─ <CHAPTER-ID>.html  ← one chapter fragment, e.g. F0-01.html
 │     ├─ glossary.json      ← glossary entries proposed by the course (four-part format)
 │     └─ NOTES.md           ← unverified claims, open decisions, listings run
@@ -49,9 +51,11 @@ python3 university/build/build.py --check            # regenerate UNIVERSITY.htm
 
 ## Build progress
 
-The build is in progress. [`build/PROGRESS.md`](build/PROGRESS.md) lists every course as done or
-pending and is updated with each course commit; [`build/RESUME.md`](build/RESUME.md) says how to
-continue after an interruption.
+Complete: all 87 courses (603 chapters), all 10 bridge chapters and all 8 mega-project handbooks
+are written, and every chapter's lab passed `run_lab.sh` when it was written. `build.py --check`
+reports no problems (no broken links, no duplicate ids). [`build/PROGRESS.md`](build/PROGRESS.md)
+lists every unit; [`OWNER_DECISIONS.md`](OWNER_DECISIONS.md) collects what each author left for
+the owner to decide.
 
 ## Status and honesty
 
