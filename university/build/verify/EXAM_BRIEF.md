@@ -41,6 +41,11 @@ learning goals, Check yourself, labs, forensic labs, mini-projects and NOTES.md)
    here and mark the hardware version untested on hardware.
 Validate both fragments (html.parser balance, prefixed ids, no URLs, no script).
 
+## Owner rulings B6 and B7
+L0–L1 courses: midterm and final are written but are ungraded practice papers; weights are
+quizzes 20 %, practical 50 %, project 30 % (ruling B6). Other courses use the 11.4 defaults.
+The `-P` README says candidates get only the starting file(s) (ruling B7).
+
 ## Report
 Short summary: files written, number of questions per exam, practical run result, anything the
 owner should know.

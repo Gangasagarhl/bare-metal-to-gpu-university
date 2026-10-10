@@ -60,6 +60,13 @@ the unit's verifier in the spirit of these rulings and recorded the same way.
   policy: no one-to-one unsupervised sessions with a minor; sessions happen in a shared or
   recorded space with a responsible adult informed; no private contact details exchanged; any
   concern goes to the responsible adult the same day.
+- **B6 L0–L1 grading.** Courses at level L0–L1 use the L0 option of guide 11.4: quizzes,
+  practical and course project are graded (quizzes 20 %, practical 50 %, project 30 %, an
+  exercise value under A4) with encouraging written feedback. Their midterm and final are still
+  written (B4) but are ungraded practice papers. All other courses use the 11.4 default weights.
+- **B7 Practical evidence.** A practical's reference solution and hidden evidence live in
+  `labs/<C>-P/`; candidates are given only the starting file(s) the paper names. Each `-P`
+  README says so.
 
 ## C. Verification
 
