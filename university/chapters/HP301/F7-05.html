@@ -1,0 +1,291 @@
+<!--meta
+id: F7-05
+title: Vector add in HIP, line by line
+course: HP301
+level: L3
+prereqs: F7-03, F7-04; CU201 (F6-02 thread hierarchy, F6-04 vector add); HW301 (F1-57) recommended
+time: 3–4 hours including the lab
+hardware: None for the steps shown here (build, read the AMD assembly, run to the runtime's "no device" error). Running needs an AMD GPU listed in the ROCm compatibility matrix (or an NVIDIA GPU for the NVIDIA back end). This build had no GPU.
+maps: Curriculum E1 (vector add, correctness) and E9 (first part); E10 preview (reading AMD ISA); 13.2 topics 1 and 11; HIP documentation "Porting CUDA code to HIP"
+analogy: F7 — the great kitchen hall (one recipe card followed by every helper, rows of 64)
+-->
+
+<h2 id="F7-05-hook">Story hook</h2>
+<p>The first dish Amara cooks in the second building is the simplest on the menu: two bowls of numbers, add them pairwise, put the results in a third bowl. A million and three pairs. She hands out the recipe card to tables of 256 helpers, rows of 64 at each table, and every helper works out "my pair is table number times 256 plus my seat number".</p>
+<p>The kitchen manager, Kwame, watches the last table. Only 67 of its 256 helpers have a pair to add; the other 189 seats have numbers beyond the end of the bowls. The card says "if your number is past the last pair, do nothing". Kwame wants to see how the second building's stoves handle that line: does each helper think about it, or does the row decide together? He asks for the card as the stove actually reads it, the machine's own instructions. This chapter reads them.</p>
+
+<h2 id="F7-05-able">What you will be able to do</h2>
+<ul>
+<li><b>Write</b> a complete HIP vector add with checked calls, a bounds check and a CPU comparison, and explain every line.</li>
+<li><b>Compute</b> the grid for any <code>n</code> and block size, and say exactly which threads, wavefronts and lanes of the last block do work.</li>
+<li><b>Produce and read</b> the AMD GPU assembly of a kernel: scalar versus vector registers, the execution mask, memory instructions and the kernel's resource metadata.</li>
+<li><b>Show</b> from the assembly alone whether a kernel has a bounds check, without running it.</li>
+<li><b>Compare</b> the same kernel's AMD assembly with NVIDIA PTX and SASS from HIP's NVIDIA back end.</li>
+</ul>
+
+<div class="co jargon" id="F7-05-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>AMD GPU assembly (ISA)</dt><dd><b>Simple words:</b> the GPU's own instructions, written as text, that the compiler produced from your kernel. <b>Analogy:</b> the recipe card as the stove reads it. <b>Precise:</b> the AMDGPU instruction set (here for gfx90a, a CDNA2 target) as emitted by clang's AMDGPU back end; obtained in this build with <code>hipcc --save-temps</code>, which keeps the <code>.s</code> file. <sup class="src"><a href="#F7-05-src-D2">D2</a></sup> <sup class="src"><a href="#F7-05-src-D5">D5</a></sup> <sup class="src"><a href="#F7-05-src-R2">R2</a></sup></dd>
+<dt>Scalar register (SGPR)</dt><dd><b>Simple words:</b> a register that holds one value for the whole wavefront. <b>Analogy:</b> the number written on the table, the same for every helper at it. <b>Precise:</b> a 32-bit register named <code>s0</code>, <code>s1</code>, …; used for values uniform across the wavefront (kernel arguments, block index, pointers); the metadata field <code>.sgpr_count</code> counts them. <sup class="src"><a href="#F7-05-src-D2">D2</a></sup> <sup class="src"><a href="#F7-05-src-R2">R2</a></sup></dd>
+<dt>Vector register (VGPR)</dt><dd><b>Simple words:</b> a register that holds a separate value for each lane. <b>Analogy:</b> each helper's own hands. <b>Precise:</b> a register named <code>v0</code>, <code>v1</code>, …, with one 32-bit element per lane of the wavefront; per-thread values such as <code>threadIdx.x</code> and <code>i</code> live here; <code>.vgpr_count</code> counts them. <sup class="src"><a href="#F7-05-src-D2">D2</a></sup> <sup class="src"><a href="#F7-05-src-R2">R2</a></sup></dd>
+<dt>Execution mask (EXEC)</dt><dd><b>Simple words:</b> a row of on/off switches, one per lane, saying which lanes take part in the next vector instruction. <b>Analogy:</b> the helpers in a row who raise their hand for this step. <b>Precise:</b> a 64-bit register on wave64 targets; an <code>if</code> on a per-lane condition becomes a compare that writes a lane mask (<code>vcc</code>) and <code>s_and_saveexec_b64</code>, which restricts EXEC; <code>s_cbranch_execz</code> skips code when no lane is left. <sup class="src"><a href="#F7-05-src-D2">D2</a></sup> <sup class="src"><a href="#F7-05-src-R2">R2</a></sup></dd>
+<dt>Kernel arguments segment (kernarg)</dt><dd><b>Simple words:</b> the small block of memory where the kernel's arguments are placed for it to read. <b>Analogy:</b> the slip clipped to the recipe card with today's quantities. <b>Precise:</b> a memory region whose address the kernel receives in an SGPR pair; arguments sit at fixed offsets (here <code>a</code> at 0, <code>b</code> at 8, <code>c</code> at 16, <code>n</code> at 24 = 0x18) and the metadata field <code>.kernarg_segment_size</code> is 28 bytes. <sup class="src"><a href="#F7-05-src-D5">D5</a></sup> <sup class="src"><a href="#F7-05-src-R2">R2</a></sup></dd>
+</dl></div>
+
+<h2 id="F7-05-pictures">The idea in pictures</h2>
+<p>Figure 1 is the thread hierarchy of this chapter's launch, with the index formula, as in <a href="#F6-02">F6-02</a>, now with the AMD level between block and thread: the wavefront. The vector has 1,000,003 elements; blocks have 256 threads; on gfx90a each block is four wavefronts of 64 lanes.</p>
+<figure id="F7-05-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F7-05-f1t F7-05-f1d">
+<title id="F7-05-f1t">Figure 1: grid, blocks, wavefronts and lanes for n = 1,000,003 and 256 threads per block</title>
+<desc id="F7-05-f1d">At the top, a row of blocks labelled block 0, block 1, an ellipsis, block 3905 and block 3906, with the text grid = (1,000,003 + 255) / 256 = 3907 blocks. Block 3906, the last, is enlarged below into four wavefronts of 64 lanes each: wavefront 0 lanes with threadIdx.x 0 to 63, wavefront 1 with 64 to 127, wavefront 2 with 128 to 191, wavefront 3 with 192 to 255. Under the enlarged block, the index formula i = blockIdx.x times blockDim.x plus threadIdx.x, and the example: block 3906, thread 66 gives i = 3906 times 256 plus 66 = 1,000,002, the last element. A note says threads 67 to 255 of the last block have i greater than or equal to n and must do nothing.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="12" y="22">grid = (1,000,003 + 255) / 256 = 3907 blocks of 256 threads</text>
+<rect class="sv-b1" x="12" y="36" width="90" height="36" rx="4"/><text class="sv-t" x="22" y="59">block 0</text>
+<rect class="sv-b1" x="112" y="36" width="90" height="36" rx="4"/><text class="sv-t" x="122" y="59">block 1</text>
+<text class="sv-tb" x="222" y="59">…</text>
+<rect class="sv-b1" x="262" y="36" width="110" height="36" rx="4"/><text class="sv-t" x="272" y="59">block 3905</text>
+<rect class="sv-b2" x="382" y="36" width="110" height="36" rx="4"/><text class="sv-tb" x="392" y="59">block 3906</text>
+<line class="sv-dash" x1="382" y1="72" x2="12" y2="100"/><line class="sv-dash" x1="492" y1="72" x2="748" y2="100"/>
+<rect class="sv-b3" x="12" y="100" width="178" height="62" rx="4"/><text class="sv-tb" x="22" y="122">wavefront 0</text><text class="sv-ts" x="22" y="142">threadIdx.x 0–63</text><text class="sv-ts" x="22" y="156">64 lanes</text>
+<rect class="sv-b3" x="196" y="100" width="178" height="62" rx="4"/><text class="sv-tb" x="206" y="122">wavefront 1</text><text class="sv-ts" x="206" y="142">threadIdx.x 64–127</text><text class="sv-ts" x="206" y="156">64 lanes</text>
+<rect class="sv-b3" x="380" y="100" width="178" height="62" rx="4"/><text class="sv-tb" x="390" y="122">wavefront 2</text><text class="sv-ts" x="390" y="142">threadIdx.x 128–191</text><text class="sv-ts" x="390" y="156">64 lanes</text>
+<rect class="sv-b3" x="564" y="100" width="184" height="62" rx="4"/><text class="sv-tb" x="574" y="122">wavefront 3</text><text class="sv-ts" x="574" y="142">threadIdx.x 192–255</text><text class="sv-ts" x="574" y="156">64 lanes</text>
+<rect class="sv-box" x="12" y="180" width="736" height="44" rx="4"/><text class="sv-tm" x="24" y="200">i = blockIdx.x * blockDim.x + threadIdx.x</text><text class="sv-tm" x="24" y="216">block 3906, thread 66: i = 3906 * 256 + 66 = 1,000,002 (the last element)</text>
+<text class="sv-t" x="12" y="250">Threads 67–255 of block 3906 have i ≥ n = 1,000,003: the bounds check must stop them.</text>
+<text class="sv-ts" x="12" y="272">Wavefront size 64 is the compiler's value for gfx90a in this build (R2); on NVIDIA the same block is 8 warps of 32.</text>
+</svg></div><figcaption><b>Figure 1.</b> The launch of Listing 1 as a hierarchy: grid, block, wavefront, lane. Counts are computed in the Worked example; the wavefront size is from the compiler's metadata for gfx90a (R2); the grouping of a block's threads into consecutive wavefronts follows D1 and D2 (pending verification). Not to scale.</figcaption></figure>
+<p>Figure 2 shows what the bounds check becomes on AMD hardware for the last block: not a branch per thread, but a mask per wavefront. Wavefronts whose mask is all zeros skip the body entirely.</p>
+<figure id="F7-05-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F7-05-f2t F7-05-f2d">
+<title id="F7-05-f2t">Figure 2: the execution mask of each wavefront of the last block after the bounds check</title>
+<desc id="F7-05-f2d">Four horizontal bars, one per wavefront of block 3906, each divided into 64 lane cells drawn as a single bar with a filled part and an empty part. Wavefront 0: all 64 lanes on; the mask has 64 ones; the body runs. Wavefront 1: lanes 64, 65 and 66 on, 61 lanes off; the body runs with 3 active lanes. Wavefront 2: all lanes off; s_cbranch_execz jumps over the body. Wavefront 3: all lanes off; the body is skipped. A legend says filled means EXEC bit 1 (lane active), hatched outline means EXEC bit 0. The instructions shown at the side are v_cmp_gt_i32 vcc, s1, v0, then s_and_saveexec_b64, then s_cbranch_execz.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<text class="sv-tb" x="12" y="22">block 3906 after:  v_cmp_gt_i32 vcc, s1, v0 ; s_and_saveexec_b64 ; s_cbranch_execz</text>
+<text class="sv-t" x="12" y="62">wavefront 0</text><rect class="sv-b5" x="120" y="44" width="384" height="26" rx="2"/><text class="sv-ts" x="520" y="62">64 lanes on: body runs</text>
+<text class="sv-t" x="12" y="104">wavefront 1</text><rect class="sv-b5" x="120" y="86" width="18" height="26" rx="2"/><rect class="sv-dash" x="138" y="86" width="366" height="26" rx="2"/><text class="sv-ts" x="520" y="104">3 lanes on (64–66): body runs</text>
+<text class="sv-t" x="12" y="146">wavefront 2</text><rect class="sv-dash" x="120" y="128" width="384" height="26" rx="2"/><text class="sv-ts" x="520" y="146">0 lanes on: execz, skipped</text>
+<text class="sv-t" x="12" y="188">wavefront 3</text><rect class="sv-dash" x="120" y="170" width="384" height="26" rx="2"/><text class="sv-ts" x="520" y="188">0 lanes on: execz, skipped</text>
+<rect class="sv-b5" x="120" y="214" width="20" height="14" rx="2"/><text class="sv-ts" x="146" y="226">EXEC bit 1 (lane active)</text>
+<rect class="sv-dash" x="320" y="214" width="20" height="14" rx="2"/><text class="sv-ts" x="346" y="226">EXEC bit 0 (lane inactive), dashed outline</text>
+</svg></div><figcaption><b>Figure 2.</b> Execution masks of the last block, computed in the Worked example from the instructions in R2. Bar lengths are proportional to lane counts (64 lanes = full bar). The instruction semantics are from D2 (pending verification); the masks were not observed on hardware.</figcaption></figure>
+
+<h2 id="F7-05-layer1">Layer 1 — the kid explanation</h2>
+<p>Vector add is the "hello" of GPU programming: add two long lists of numbers pairwise. Every GPU thread adds one pair. Each thread works out which pair is its own from two numbers it is given: which block it belongs to, and its seat in the block. The program on the CPU side gets memory on the GPU, copies the two lists in, starts the kernel, copies the answer back and checks it against an answer computed on the CPU.</p>
+<p>The HIP version is the CUDA version with the names changed, as you saw in <a href="#F7-03">F7-03</a>. What is new in this chapter is that you also look at the instructions the compiler made for the AMD GPU. They show two kinds of registers: some hold one number for the whole row of 64 helpers, some hold a number for each helper. They also show how "if my number is past the end, do nothing" works: the row switches off the helpers who have nothing to do, and if nobody in the row has anything to do, the row skips the work completely.</p>
+
+<h2 id="F7-05-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F7-05-l2-program">The program</h3>
+<p>Listing 1 is the program. Its structure is the CU201 vector add of <a href="#F6-04">F6-04</a> with HIP names: allocate three device buffers, copy <code>A</code> and <code>B</code> in, launch <code>vecAdd</code> with <code>grid = (n + block − 1) / block</code>, check the launch with <code>hipGetLastError</code>, wait with <code>hipDeviceSynchronize</code> (so that a fault inside the kernel is reported at a named place), copy <code>C</code> back, compare every element with the CPU's sum, free. <sup class="src"><a href="#F7-05-src-D1">D1</a></sup> The inputs are integers converted to <code>float</code> (<code>i</code> and <code>2i</code>, with sums below 2^24 = 16,777,216), so the GPU's and CPU's sums are exact and must be equal bit for bit. <sup class="src"><a href="#F7-05-src-D6">D6</a></sup></p>
+<p><code>n = 1,000,003</code> is deliberately not a multiple of 256, so the last block has threads past the end: the bounds check <code>if (i &lt; n)</code> is exercised. This build compiled Listing 1 for gfx90a and for the NVIDIA back end; both runs stopped at the first <code>hipMalloc</code> because there is no GPU (R1, R5). <sup class="src"><a href="#F7-05-src-R1">R1</a></sup> <sup class="src"><a href="#F7-05-src-R5">R5</a></sup></p>
+
+<h3 id="F7-05-l2-isa">Getting the AMD assembly</h3>
+<p>The compiler can keep its intermediate files: <code>hipcc --save-temps</code> leaves, among others, a file <code>&lt;name&gt;-hip-amdgcn-amd-amdhsa-gfx90a.s</code> with the device assembly for that target. <sup class="src"><a href="#F7-05-src-R2">R2</a></sup> Listing 2 (<code>isa_of.sh</code>) builds a file with <code>--save-temps</code>, keeps only the instructions of each kernel (no comments or directives) and prints selected metadata fields. Reading it needs no GPU: it is the exact code the GPU would run.</p>
+
+<h3 id="F7-05-l2-read">Reading the kernel</h3>
+<p>The table maps each source statement of <code>vecAdd</code> to the gfx90a instructions in R2. The instruction meanings are from the CDNA2 ISA reference (D2) and the AMDGPU back-end guide (D5), both pending verification; the instructions themselves are this build's real output. <sup class="src"><a href="#F7-05-src-R2">R2</a></sup> <sup class="src"><a href="#F7-05-src-D2">D2</a></sup> <sup class="src"><a href="#F7-05-src-D5">D5</a></sup></p>
+<div class="tw"><table>
+<thead><tr><th>Source</th><th>gfx90a instructions (R2)</th><th>Reading</th></tr></thead>
+<tbody>
+<tr><td><code>blockDim.x</code></td><td><code>s_load_dword s0, s[4:5], 0x4</code>; <code>s_and_b32 s0, s0, 0xffff</code></td><td>Scalar load from the dispatch packet; keep the low 16 bits (the block's x size)</td></tr>
+<tr><td><code>n</code></td><td><code>s_load_dword s1, s[6:7], 0x18</code></td><td>Scalar load of the 4th argument from the kernarg segment, offset 24</td></tr>
+<tr><td>wait</td><td><code>s_waitcnt lgkmcnt(0)</code></td><td>Wait until the scalar loads have arrived</td></tr>
+<tr><td><code>blockIdx.x * blockDim.x</code></td><td><code>s_mul_i32 s8, s8, s0</code></td><td>Block index (in <code>s8</code> at entry) times block size: one scalar multiply for the whole wavefront</td></tr>
+<tr><td><code>+ threadIdx.x</code></td><td><code>v_add_u32_e32 v0, s8, v0</code></td><td><code>threadIdx.x</code> arrives in <code>v0</code>, one per lane; now <code>v0</code> = <code>i</code></td></tr>
+<tr><td><code>if (i &lt; n)</code></td><td><code>v_cmp_gt_i32_e32 vcc, s1, v0</code>; <code>s_and_saveexec_b64 s[0:1], vcc</code>; <code>s_cbranch_execz .LBB0_2</code></td><td>Per-lane compare into the 64-bit mask <code>vcc</code>; restrict EXEC to those lanes; jump to the end if none remain (Figure 2)</td></tr>
+<tr><td>pointers <code>a</code>, <code>b</code>, <code>c</code></td><td><code>s_load_dwordx4 s[0:3], s[6:7], 0x0</code>; <code>s_load_dwordx2 s[4:5], s[6:7], 0x10</code></td><td>Load <code>a</code> and <code>b</code> (16 bytes) and <code>c</code> (8 bytes) from the kernarg segment, only on the path that needs them</td></tr>
+<tr><td>byte offset <code>4 * i</code></td><td><code>v_ashrrev_i32_e32 v1, 31, v0</code>; <code>v_lshlrev_b64 v[0:1], 2, v[0:1]</code></td><td>Sign-extend <code>i</code> to 64 bits, multiply by 4 (shift left 2)</td></tr>
+<tr><td><code>&amp;a[i]</code>, <code>&amp;b[i]</code></td><td><code>v_add_co_u32</code> / <code>v_addc_co_u32</code> pairs</td><td>64-bit address = scalar base + per-lane offset, low and high halves with carry</td></tr>
+<tr><td><code>a[i]</code>, <code>b[i]</code></td><td><code>global_load_dword v6, v[4:5], off</code>; <code>global_load_dword v7, v[2:3], off</code></td><td>Two per-lane loads from global memory</td></tr>
+<tr><td><code>a[i] + b[i]</code></td><td><code>s_waitcnt vmcnt(0)</code>; <code>v_add_f32_e32 v2, v6, v7</code></td><td>Wait for the vector loads; one vector float add for all active lanes</td></tr>
+<tr><td><code>c[i] = …</code></td><td><code>global_store_dword v[0:1], v2, off</code></td><td>Per-lane store</td></tr>
+<tr><td>end</td><td><code>.LBB0_2:</code> <code>s_endpgm</code></td><td>End of the kernel; the target of the <code>execz</code> jump</td></tr>
+</tbody></table></div>
+<p>The metadata at the end of R2 says: 28 bytes of kernel arguments (3 pointers × 8 + one <code>int</code> × 4), 13 SGPRs, 8 VGPRs, no private (scratch) memory, wavefront size 64.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Three readings above come from memory of the AMDGPU calling convention, not from an opened document: that <code>s[4:5]</code> holds the dispatch-packet pointer and offset 4 holds the work-group size, that <code>s[6:7]</code> holds the kernarg-segment pointer, and that the work-group id arrives in <code>s8</code> and the work-item id in <code>v0</code>. They are consistent with the code (the 0x18 offset matches <code>n</code>'s position, the <code>0xffff</code> mask matches a 16-bit field), but check them in the LLVM AMDGPU user guide's sections on the kernel descriptor, initial kernel execution state and the HSA dispatch packet (D5) before teaching them as fact.</p></div>
+
+<h2 id="F7-05-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F7-05-l3-uniform">Uniform and divergent values</h3>
+<p>The compiler decides for every value whether it is the same in all lanes of a wavefront (uniform) or may differ (divergent). Uniform values go to SGPRs and scalar instructions, executed once per wavefront; divergent ones to VGPRs and vector instructions. <sup class="src"><a href="#F7-05-src-D5">D5</a></sup> <sup class="src"><a href="#F7-05-src-D2">D2</a></sup> In R2 you can follow the split exactly: <code>blockIdx.x * blockDim.x</code> and every kernel argument are scalar (<code>s_mul_i32</code>, <code>s_load_*</code>); from the moment <code>threadIdx.x</code> enters (<code>v_add_u32</code>), everything is vector. This is the hardware reason behind a CUDA habit: compute what is the same for the whole block outside the per-thread part, and the compiler can keep it in scalar registers. NVIDIA's SASS for the same kernel has a related idea, uniform registers (<code>UR4</code> in F7-07's R7), but the split is less visible. <sup class="src"><a href="#F7-05-src-R6">R6</a></sup></p>
+
+<h3 id="F7-05-l3-mask">Masks instead of branches</h3>
+<p>On a SIMT machine, a per-lane <code>if</code> cannot send different lanes of one wavefront to different instructions at the same time. AMD's ISA makes this explicit: the compare writes a 64-bit lane mask, <code>s_and_saveexec_b64</code> turns off the lanes that fail, and the body runs for the rest; a real branch (<code>s_cbranch_execz</code>) is taken only when the whole wavefront agrees (all lanes off). <sup class="src"><a href="#F7-05-src-D2">D2</a></sup> That is why the mask is 64 bits wide on this target, and why code that stores lane masks in 32-bit integers loses half of them (<a href="#F7-07">F7-07</a>, HP302). NVIDIA's PTX for the same <code>if</code> uses a predicate and a branch (<code>setp.ge.s32 %p1</code>, <code>@%p1 bra</code>), and its SASS a predicated exit (<code>@P0 EXIT</code>) (R6); the hardware masking is hidden from the instruction text. <sup class="src"><a href="#F7-05-src-D3">D3</a></sup></p>
+
+<h3 id="F7-05-l3-resources">Resource metadata and why it matters later</h3>
+<p>The metadata fields are the compiler's statement of what one wavefront of this kernel needs: SGPRs, VGPRs, scratch, kernel-argument bytes, wavefront size. The number of VGPRs per lane, together with LDS use and the block size, limits how many wavefronts can be resident on a compute unit at once (occupancy), which is HP302's topic. <sup class="src"><a href="#F7-05-src-D2">D2</a></sup> For <code>vecAdd</code> the counts are small (8 VGPRs, 13 SGPRs) and no scratch is used (<code>.private_segment_fixed_size: 0</code>); a non-zero scratch size would mean registers spilled to memory, which is the first thing to check when a kernel is unexpectedly slow. The forensic lab below uses the same fields to compare two builds.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>How SGPR and VGPR counts translate into occupancy on gfx90a (register-file size per SIMD, allocation granularity) is not stated here because it is a hardware number not printed by any program in this build; HP302 takes it from the CDNA2 ISA reference (D2) and measures it.</p></div>
+
+<h2 id="F7-05-hardware">How the hardware actually does it</h2>
+<p>An AMD compute unit runs wavefronts on SIMD units; each vector instruction operates on all lanes whose EXEC bit is set, reading per-lane operands from VGPRs, while scalar instructions run once on a separate scalar unit and read SGPRs. <sup class="src"><a href="#F7-05-src-D2">D2</a></sup> <sup class="src"><a href="#F7-05-src-D4">D4</a></sup> Memory instructions are issued per wavefront: the 64 addresses of a <code>global_load_dword</code> are combined by the memory system, so neighbouring lanes reading neighbouring words (as here, <code>a[i]</code> with consecutive <code>i</code>) is the coalesced pattern of <a href="#F6-08">F6-08</a>. The two counters in R2, <code>lgkmcnt</code> (scalar and LDS loads) and <code>vmcnt</code> (vector memory), are how the program waits for loads that are still in flight: the GPU does not stall at the load, it stalls at the <code>s_waitcnt</code> that needs the result, and meanwhile other wavefronts can run (latency hiding, <a href="#F1-57">F1-57</a>). HP302 studies all of this with measurements.</p>
+
+<h2 id="F7-05-worked">Worked example</h2>
+<p><b>Question.</b> For <code>n = 1,000,003</code> and <code>block = 256</code> on gfx90a: how many blocks are launched, how many threads are idle, and for each wavefront of the last block, how many lanes are active after the bounds check and does it execute the body?</p>
+<ol>
+<li><b>Blocks.</b> <code>grid = (1,000,003 + 255) / 256 = 1,000,258 / 256</code> = 3907.26…, which integer division rounds down to 3907. Check: 3906 × 256 = 999,936 is less than 1,000,003, and 3907 × 256 = 1,000,192 is not, so 3907 blocks are exactly enough.</li>
+<li><b>Threads launched.</b> 3907 × 256 = 1,000,192; idle threads = 1,000,192 − 1,000,003 = 189.</li>
+<li><b>Last block.</b> It is block 3906, covering <code>i</code> from 3906 × 256 = 999,936 to 1,000,191. Valid <code>i</code> are 999,936 … 1,000,002: 67 threads (<code>threadIdx.x</code> 0–66). 67 + 189 = 256. ✓</li>
+<li><b>Wavefronts.</b> Wavefront 0 (<code>threadIdx.x</code> 0–63): 64 active, body runs. Wavefront 1 (64–127): 64, 65, 66 active = 3 lanes, body runs with 61 lanes masked. Wavefronts 2 and 3: 0 active, <code>s_cbranch_execz</code> jumps to <code>.LBB0_2</code>. That is Figure 2.</li>
+<li><b>Same on NVIDIA.</b> Warps of 32: warps 0 and 1 full, warp 2 (64–95) has 3 active lanes, warps 3–7 have none and take the <code>@P0 EXIT</code> in every thread.</li>
+</ol>
+<p><b>Check.</b> The arithmetic was verified as integer arithmetic in the text; the instructions that implement step 4 are in R2. On a GPU, Listing 1 prints <code>grid=3907 block=256</code>, which you can compare (untested here).</p>
+
+<h2 id="F7-05-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>vec_add.hip</code>.</p>
+<pre class="listing" data-src="F7-05/vec_add.hip"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line(s)</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>2</td><td><code>#include &lt;hip/hip_runtime.h&gt;</code></td><td>HIP runtime and kernel language</td><td>The only HIP-specific include</td></tr>
+<tr><td>7–14</td><td><code>check</code></td><td>Prints error name and text, exits</td><td>Every runtime call goes through it (CU201 rule)</td></tr>
+<tr><td>16</td><td><code>__global__ void vecAdd(const float* a, const float* b, float* c, int n)</code></td><td>Kernel signature: two inputs, one output, the length</td><td>Becomes 28 bytes of kernel arguments (R2)</td></tr>
+<tr><td>18</td><td><code>const int i = blockIdx.x * blockDim.x + threadIdx.x;</code></td><td>Global index</td><td>Scalar multiply plus vector add in the ISA</td></tr>
+<tr><td>19–21</td><td><code>if (i &lt; n) { c[i] = a[i] + b[i]; }</code></td><td>Bounds check and the work</td><td>Becomes the EXEC-mask sequence (Figure 2)</td></tr>
+<tr><td>26–34</td><td><code>n = 1000003</code>, vectors <code>hA</code>, <code>hB</code>, <code>hC</code></td><td>Host data; <code>hC</code> starts at −1</td><td>An element the GPU never wrote stays −1 and fails the check</td></tr>
+<tr><td>36–43</td><td><code>hipMalloc</code> ×3, <code>hipMemcpy</code> ×2</td><td>Device buffers, inputs copied in</td><td>Each call checked</td></tr>
+<tr><td>45–47</td><td><code>block = 256</code>, <code>grid = (n + block - 1) / block</code>, launch</td><td>3907 blocks of 256</td><td>Ceiling division covers every element</td></tr>
+<tr><td>48–49</td><td><code>hipGetLastError</code>, <code>hipDeviceSynchronize</code></td><td>Launch errors, then errors during the kernel</td><td>A fault is reported with the name "kernel vecAdd"</td></tr>
+<tr><td>50</td><td><code>hipMemcpy(… DeviceToHost)</code></td><td>Result back</td><td>Blocking copy</td></tr>
+<tr><td>52–58</td><td>comparison loop, <code>printf</code></td><td>Counts elements different from the CPU sum</td><td>Exact comparison is valid for these integer inputs</td></tr>
+<tr><td>59–62</td><td><code>hipFree</code> ×3, exit status</td><td>Release, report success or failure</td><td>Exit code is usable by scripts</td></tr>
+</tbody></table></div>
+<p><b>Build command</b> (lab runner): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a vec_add.hip -o vec_add</code>. Output (R1), then the NVIDIA back end (R5):</p>
+<pre class="output" data-run="F7-05/vec_add"></pre>
+<pre class="output" data-run="F7-05/vec_add_nvidia"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Both builds are real; the runs stopped at the first <code>hipMalloc</code>. Expected on a GPU: <code>vecAdd n=1000003 grid=3907 block=256: 0 errors</code>; not observed in this build.</p></div>
+
+<p><b>Listing 2</b> — <code>isa_of.sh</code>: print a kernel's AMD assembly and metadata.</p>
+<pre class="listing" data-src="F7-05/isa_of.sh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line(s)</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>6–8</td><td><code>mktemp -d</code>, <code>trap</code>, <code>cp</code></td><td>Works in a temporary folder that is always removed</td><td><code>--save-temps</code> writes many files</td></tr>
+<tr><td>9</td><td><code>hipcc … --offload-arch="$arch" --save-temps -c k.hip</code></td><td>Compiles once for the chosen target, keeping the intermediate files</td><td>Only the device assembly for that target is needed</td></tr>
+<tr><td>10–11</td><td><code>asm=…-hip-amdgcn-amd-amdhsa-$arch.s</code></td><td>The device assembly file; prints its target line</td><td>Proves which target the code is for</td></tr>
+<tr><td>13–16</td><td><code>awk</code></td><td>From each kernel label to <code>s_endpgm</code>: instructions and labels only, comments removed</td><td>Short enough to read line by line</td></tr>
+<tr><td>18–19</td><td><code>grep … sgpr_count|vgpr_count|wavefront_size …</code></td><td>Selected metadata fields</td><td>Resources per wavefront; used again in HP302</td></tr>
+</tbody></table></div>
+<p><b>Output for <code>vec_add.hip</code></b> (step <code>isa</code>, R2):</p>
+<pre class="output" data-run="F7-05/isa"></pre>
+<p><b>For comparison</b>, the same kernel through HIP's NVIDIA back end, as PTX and as SASS for <code>sm_80</code> (from <a href="#F7-07">F7-07</a>'s lab, step <code>vec_add_ptx</code>, R6):</p>
+<pre class="output" data-run="F7-07/vec_add_ptx"></pre>
+<p>Line up the two: the index (<code>mad.lo.s32</code> / <code>IMAD</code> versus <code>s_mul_i32</code> + <code>v_add_u32</code>), the bounds check (predicate and exit versus EXEC mask and <code>execz</code>), two loads, one float add, one store. Same recipe; different stove.</p>
+
+<h2 id="F7-05-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Helpers who "do nothing" still sit in the row.</b> In the kitchen an idle helper could leave; on the GPU, masked lanes of an active wavefront occupy their lane for every instruction the wavefront issues. Only a whole wavefront with no active lanes skips the work.</li>
+<li><b>The number on the table is not written once by a person.</b> The scalar registers are filled by hardware and by scalar loads the compiler places; "uniform" is a property the compiler proves, not a choice of the helpers.</li>
+<li><b>Tables of 256 do not exist as furniture.</b> A block is a scheduling group; on gfx90a it is four wavefronts that may run on different SIMD units of one compute unit (D2), not a physical table of 256 seats.</li>
+</ul>
+
+<h2 id="F7-05-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Correct for n = 2^20, wrong or crashing for n = 1,000,003</td><td>Missing bounds check</td><td>No <code>v_cmp</code>/<code>s_and_saveexec</code> in the ISA (forensic lab, R3)</td><td>Add <code>if (i &lt; n)</code></td></tr>
+<tr><td>Last elements of <code>C</code> are −1</td><td>Grid computed with <code>n / block</code> (rounds down)</td><td>Print <code>grid</code>; compare with the ceiling formula</td><td><code>(n + block - 1) / block</code></td></tr>
+<tr><td><code>--save-temps</code> files not found</td><td>Wrong name pattern or target</td><td><code>ls</code> the folder; names include the target</td><td>Use the pattern of Listing 2, line 10</td></tr>
+<tr><td>Comparison fails by tiny amounts on other inputs</td><td>Non-integer inputs; exact comparison not valid</td><td>Print the differences</td><td>Use a tolerance justified by the inputs (E3)</td></tr>
+<tr><td><code>hipErrorInvalidDevice</code> at the first <code>hipMalloc</code></td><td>No usable GPU (here: none)</td><td>F7-02's checklist</td><td>Fix the installation</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F7-05-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-04">F6-04</a> wrote vector add in CUDA and <a href="#F6-02">F6-02</a> drew the thread hierarchy; <a href="#F7-03">F7-03</a> and <a href="#F7-04">F7-04</a> renamed CUDA to HIP. <b>What carries over:</b> the whole program shape, the index formula, the ceiling-division grid, the bounds check and exact checking on the CPU. <sup class="src"><a href="#F7-05-src-D1">D1</a></sup> <b>What changes:</b> on gfx90a the block splits into wavefronts of 64, not warps of 32; the bounds check becomes a 64-bit execution mask; uniform values live in scalar registers that are visible in the ISA; and you read AMD assembly from <code>--save-temps</code> instead of SASS from cuobjdump. <sup class="src"><a href="#F7-05-src-R2">R2</a></sup> <b>What comes next:</b> <a href="#F7-06">F7-06</a> builds real projects with hipcc and CMake, where the list of GPU targets must be set on purpose.</p></div>
+
+<h2 id="F7-05-check">Check yourself</h2>
+<ol>
+<li>Which values of <code>vecAdd</code> live in SGPRs and which in VGPRs, according to R2? Why?</li>
+<li>Which is true? (a) Masked lanes skip the instruction and free the SIMD for another wavefront at once. (b) <code>s_cbranch_execz</code> jumps only when no lane of the wavefront is active. (c) The kernel needs 28 bytes of arguments because a <code>float*</code> is 4 bytes. (d) <code>.wavefront_size: 64</code> means every block has 64 threads.</li>
+<li>Explain in your own words why the bounds check is a mask and not a branch on this target.</li>
+<li>Apply to a new case: <code>n = 300</code>, <code>block = 128</code> on gfx90a. How many blocks, and which wavefronts of the last block run the body with how many active lanes?</li>
+<li>Predict, then run: build <code>vec_add.hip</code> with Listing 2 for <code>gfx1030</code> (<code>./isa_of.sh vec_add.hip gfx1030</code>). Which metadata field changes, and which mask instruction do you expect instead of <code>s_and_saveexec_b64</code>?</li>
+<li>Why is it safe to compare <code>hC[i] != hA[i] + hB[i]</code> exactly in this program, and when would it not be?</li>
+<li>Where in R2 would you look first if <code>vecAdd</code> were unexpectedly slow after a code change, and why?</li>
+</ol>
+
+<h2 id="F7-05-lab">Lab</h2>
+<p><b>Goal.</b> Build and verify HIP vector add (curriculum E1) and annotate its AMD assembly for one target line by line.</p>
+<p><b>Hardware and software needed.</b> Steps 1–4: hipcc (this build: <code>HIP version: 5.7.31921-0</code>, clang 17.0.6), no GPU. Step 5: an AMD GPU listed in the ROCm compatibility matrix (or an NVIDIA GPU for the NVIDIA back end). Folder <code>university/labs/F7-05</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F7-05</code>. Compare <code>vec_add.out</code>, <code>vec_add_nvidia.out</code>, <code>isa.out</code> and <code>isa_b.out</code> with the listings.</li>
+<li>Copy <code>isa.out</code> into your notes and write the source line next to each instruction (use the table in Layer 2 as a model; do it without looking first).</li>
+<li>Run <code>./isa_of.sh vec_add.hip gfx1030</code> and compare: register counts, wavefront size, mask instructions. Write down every difference.</li>
+<li>Change the kernel to use <code>size_t</code> for <code>i</code> and <code>n</code>; regenerate the ISA. Which instructions disappear or appear, and how do the register counts change?</li>
+<li>On a GPU: run with <code>n</code> = 1, 255, 256, 257, 1,000,003 and 100,000,000 (edit line 26) on each back end you have.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: R1–R5 as shown. Steps 3 and 4 are yours to record (the authors ran step 3 while preparing <a href="#F7-07">F7-07</a>, where gfx1030's <code>.wavefront_size</code> is 32). Step 5 was not run (no GPU).</p>
+<p><b>Verification.</b> Curriculum E1's acceptance test, verbatim, applied to vector add: "SAXPY is bit-exact against a CPU reference for 1 to 100 million elements, including non-multiple-of-block sizes." (the same test for <code>vecAdd</code>: 0 errors for every <code>n</code> of step 5), and "Compute Sanitizer (or the ROCm address sanitizer support) reports no errors."</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>isa_of.sh</code> prints only the target line → the kernel name pattern did not match (the awk looks for mangled names starting <code>_Z</code>) → check the <code>.s</code> file for the label; an <code>extern "C"</code> kernel is not mangled.</li>
+<li>Many more instructions than R2 → built without <code>-O2</code> → keep the options of line 9.</li>
+<li>The run prints <code>hipErrorInvalidDevice</code> at <code>hipMalloc</code> → no usable GPU (as in this build) → <a href="#F7-02">F7-02</a>.</li>
+</ul>
+<p><b>Extension.</b> Write a grid-stride version (<code>for (int k = i; k &lt; n; k += gridDim.x * blockDim.x)</code>), launch a fixed grid, and find the loop in the ISA: which instructions form the loop and where is the exit test?</p>
+
+<h2 id="F7-05-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Two branches of the course repository contain <code>vecAdd</code>. Main (build A) is Listing 1. A colleague's branch (build B, <code>vec_add_b.hip</code>) "simplifies" the kernel and reports: "same output on my tests, fewer registers, so it is better." Her tests used <code>n = 2^20</code>. Nobody in the team has an AMD GPU today. You are asked whether build B may be merged.</p>
+<p><b>Evidence pack.</b> The assembly and metadata of both builds for gfx90a: R2 (<code>isa.out</code>, build A) and R3 (<code>isa_b.out</code>, build B), and the two run records R1 and R4 (both stopped at <code>hipMalloc</code>: no GPU). <sup class="src"><a href="#F7-05-src-R3">R3</a></sup> <sup class="src"><a href="#F7-05-src-R4">R4</a></sup> The source of build B is not in the pack; work from the assembly.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: list every difference between R2 and R3: instructions present in one and not the other, labels, metadata values.</li>
+<li>Hypotheses: give at least two explanations for "fewer VGPRs" (different scheduling of the same work; less work done). Which instructions decide between them?</li>
+<li>Root cause: what source change produces R3? Write the kernel body you believe B has.</li>
+<li>Consequence: for <code>n = 1,000,003</code>, which <code>i</code> values does build B write, and what does that mean for memory? Why did the colleague's test not see it?</li>
+<li>Fix and prevention: what should the review checklist and the test sizes be?</li>
+</ol>
+<p><b>Method hints.</b> Find the instructions that implement <code>if (i &lt; n)</code> in R2 (Layer 2 table) and look for them in R3. Check whether R3 ever loads <code>n</code> (kernarg offset 0x18). Then reason about the last block as in the Worked example.</p>
+
+<h2 id="F7-05-project">Mini-project</h2>
+<p><b>An annotated ISA card.</b> For SAXPY (from <a href="#F7-04">F7-04</a>) produce a one-page card: source on the left, gfx90a instructions in the middle, your reading on the right, plus the metadata and the same kernel's PTX from the NVIDIA back end (use the commands of F7-07's <code>run.sh</code>). Mark where <code>a</code> (a scalar argument) lives and how <code>a * x[i] + y[i]</code> is computed (look for a fused multiply-add).</p>
+<p><b>Rubric.</b> Every instruction annotated (4). Scalar/vector split explained (2). Bounds check identified on both vendors (2). Honest marking of readings not confirmed in D2/D5 (2).</p>
+
+<h2 id="F7-05-summary">Summary</h2>
+<ul>
+<li>HIP vector add is CUDA vector add with HIP names: checked calls, ceiling-division grid, bounds check, exact CPU comparison.</li>
+<li><code>hipcc --save-temps</code> keeps the AMD assembly; reading it needs no GPU.</li>
+<li>Uniform values (arguments, <code>blockIdx.x * blockDim.x</code>) are in SGPRs; per-thread values in VGPRs.</li>
+<li>On gfx90a a per-lane <code>if</code> becomes a 64-bit execution mask; a wavefront with no active lane jumps over the body.</li>
+<li>The metadata gives the resources per wavefront: here 28 bytes of arguments, 13 SGPRs, 8 VGPRs, no scratch, wave64.</li>
+<li>A missing bounds check is visible in the assembly alone (forensic lab).</li>
+<li>No GPU ran this code in this build: the ISA and builds are real, runtime results are untested on hardware.</li>
+</ul>
+
+<h2 id="F7-05-sources">Sources</h2>
+<ol>
+<li id="F7-05-src-D1">D1 — AMD, HIP documentation: HIP Programming Guide (programming model, kernel language) and "Porting CUDA code to HIP" (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F7-05-src-D2">D2 — AMD, "AMD Instinct MI200" (CDNA2) Instruction Set Architecture reference guide: SGPRs, VGPRs, EXEC and VCC, <code>s_and_saveexec_b64</code>, <code>s_cbranch_execz</code>, <code>s_waitcnt</code>, global memory instructions (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-05-src-D3">D3 — NVIDIA, "Parallel Thread Execution ISA" (predicates, <code>setp</code>, <code>bra</code>) and "CUDA Binary Utilities" (SASS) (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-05-src-D4">D4 — AMD, CDNA2 architecture whitepaper (compute units, SIMD units, scalar unit) (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-05-src-D5">D5 — LLVM project, "User Guide for AMDGPU Backend": code object metadata, kernel descriptor, initial kernel execution state, kernarg segment, uniform values (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-05-src-D6">D6 — IEEE 754-2019, binary32 format (integers up to 2^24 exactly representable) (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-05-src-R1">R1 — Build for gfx90a and run of <code>vec_add.hip</code> (<code>university/labs/F7-05/vec_add.log</code>), HIP 5.7.31921; untested on hardware, exit code 1.</li>
+<li id="F7-05-src-R2">R2 — AMD assembly and metadata of <code>vecAdd</code> for gfx90a (<code>isa.log</code>), HIP 5.7.31921, clang 17.0.6.</li>
+<li id="F7-05-src-R3">R3 — Same for build B, <code>vec_add_b.hip</code> (<code>isa_b.log</code>).</li>
+<li id="F7-05-src-R4">R4 — Build for gfx90a and run of <code>vec_add_b.hip</code> (<code>vec_add_b.log</code>); untested on hardware, exit code 1.</li>
+<li id="F7-05-src-R5">R5 — NVIDIA-back-end build and run of <code>vec_add.hip</code> (<code>vec_add_nvidia.log</code>), nvcc 12.0; untested on hardware, exit code 1.</li>
+<li id="F7-05-src-R6">R6 — PTX and SASS (<code>sm_80</code>) of <code>vecAdd</code> through the NVIDIA back end (<code>university/labs/F7-07/vec_add_ptx.log</code>), recorded in <a href="#F7-07">F7-07</a>.</li>
+</ol>
+
+<h2 id="F7-05-glossary">Glossary links</h2>
+<p><a href="#gl-amd-gpu-assembly-isa">AMD GPU assembly (ISA)</a> · <a href="#gl-scalar-register-sgpr">Scalar register (SGPR)</a> · <a href="#gl-vector-register-vgpr">Vector register (VGPR)</a> · <a href="#gl-execution-mask-exec">Execution mask (EXEC)</a> · <a href="#gl-kernel-arguments-segment-kernarg">Kernel arguments segment (kernarg)</a> · <a href="#gl-wavefront">Wavefront</a> · <a href="#gl-kernel-gpu">Kernel (GPU)</a></p>
+
+<h2 id="F7-05-next">Next chapter</h2>
+<p>Next: <a href="#F7-06">F7-06 Building with hipcc and CMake</a>. Previous: <a href="#F7-04">F7-04</a>. Back to the course: <a href="#HP301">HP301</a>.</p>
+
+<h2 id="F7-05-answers">Answers to Check yourself</h2>
+<ol>
+<li>SGPRs: the kernel arguments (<code>n</code> in <code>s1</code>, the pointers in <code>s[0:3]</code> and <code>s[4:5]</code>), <code>blockDim.x</code> and <code>blockIdx.x * blockDim.x</code> (<code>s8</code>). VGPRs: <code>threadIdx.x</code> and everything derived from it (<code>i</code>, addresses, loaded values, the sum). The compiler puts values that are the same for every lane of the wavefront in scalar registers.</li>
+<li>(b). (a) is false: masked lanes still take their slot in each instruction the wavefront issues. (c) is false: pointers are 8 bytes (3 × 8 + 4 = 28). (d) is false: it is the number of lanes per wavefront; a block of 256 is four wavefronts.</li>
+<li>All lanes of a wavefront execute the same instruction stream; a per-lane condition can only switch lanes off for a stretch of instructions (EXEC), and a real jump is possible only when all lanes agree, which <code>s_cbranch_execz</code> checks.</li>
+<li><code>(300 + 127) / 128 = 3</code> blocks (427 / 128 = 3.3, rounded down to 3). The last block (2) covers <code>i</code> = 256…383; valid 256…299 = 44 threads. Its wavefront 0 (<code>threadIdx.x</code> 0–63) has 44 active lanes and runs the body; wavefront 1 (64–127) has none and skips.</li>
+<li>Run by the authors in this build (recorded in NOTES.md): <code>.wavefront_size: 32</code>, <code>.sgpr_count: 11</code>, <code>.vgpr_count: 6</code>. The mask sequence is different from the prediction many people make (<code>s_and_saveexec_b32</code>): the compiler saved <code>exec_lo</code> with <code>s_mov_b32 s0, exec_lo</code> and used <code>v_cmpx_gt_i32_e64 s1, v0</code>, a compare that writes EXEC directly, followed by the same <code>s_cbranch_execz</code>. The index was computed with one vector multiply-add, <code>v_mad_u64_u32</code>. Lesson: predict the <i>kind</i> of change (32-bit mask, wave32), then let the compiler output tell you the exact instructions.</li>
+<li>The inputs are integers below 2^24 and their sums are below 2^24 (at most 3 × 1,000,002), so every value and every sum is exactly representable in <code>float</code> and both processors produce the same bits. With general real inputs, or a different order of operations, results can differ in the last bits; then a justified tolerance is needed.</li>
+<li><code>.private_segment_fixed_size</code> (non-zero means scratch, often register spills), then <code>.vgpr_count</code> and <code>.sgpr_count</code> (occupancy), then the loop or memory instructions that changed.</li>
+</ol>
+<h3 id="F7-05-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> R3 has no <code>s_load_dword s1, s[6:7], 0x18</code> (it never loads <code>n</code>), no <code>v_cmp_gt_i32</code>, no <code>s_and_saveexec_b64</code>, no <code>s_cbranch_execz</code> and no <code>.LBB0_2</code> label. Its metadata: <code>.sgpr_count: 16</code> (A: 13), <code>.vgpr_count: 5</code> (A: 8); kernarg size 28 and wavefront size 64 are the same. Both run records stopped at <code>hipMalloc</code>.</p>
+<p><b>Hypotheses.</b> (1) Same work, scheduled differently: would still contain the compare and mask. (2) Less work: the compare is gone, and <code>n</code> is never read. The missing instructions decide for (2).</p>
+<p><b>Root cause.</b> Build B's kernel has no bounds check: <code>c[i] = a[i] + b[i];</code> without <code>if (i &lt; n)</code>. (The source confirms it: <code>vec_add_b.hip</code> differs from Listing 1 only in lines 19–21 and the comment line.)</p>
+<p><b>Consequence.</b> For <code>n = 1,000,003</code>, threads with <code>i</code> = 1,000,003 … 1,000,191 (189 threads) read past the end of <code>a</code> and <code>b</code> and write past the end of <code>c</code>: out-of-bounds global memory accesses, which may corrupt other allocations, fault, or appear to work. The colleague used <code>n = 2^20</code>, a multiple of 256, so no thread was out of range.</p>
+<p><b>Fix and prevention.</b> Restore <code>if (i &lt; n)</code>. Review rule: a kernel launched with a ceiling-division grid must contain a bounds check, visible as a compare and an EXEC restriction in the ISA. Test sizes always include non-multiples of the block size (E1's own rule) and run under the address sanitizer on hardware. "Fewer registers" is not evidence of better code when the work differs. <b>How the evidence was produced:</b> real compiler output for both files in this build; the bounds check was removed deliberately in <code>vec_add_b.hip</code>.</p>
+<p><b>Wrong answers.</b> "B is better because it uses fewer VGPRs": it does less work. "Both runs failed the same way, so they are equivalent": both runs failed for lack of a GPU, which says nothing about the kernels.</p>

@@ -1,0 +1,321 @@
+<!--meta
+id: F7-07
+title: Running HIP on NVIDIA through the CUDA back end
+course: HP301
+level: L3
+prereqs: F7-03 to F7-06; CU301 recommended (warp shuffles, reductions); HW301 (F1-57)
+time: 4–5 hours including the lab and the forensic lab
+hardware: None for the steps shown here (builds for both back ends, PTX, SASS and AMD ISA, and the university's CPU lane model). Running needs an NVIDIA GPU for the NVIDIA back end and an AMD GPU listed in the ROCm compatibility matrix for the AMD side. This build had no GPU; results on either vendor's hardware are untested.
+maps: Curriculum E9 (first part: "run on both vendors"; "fix warp-size assumptions and lane masks"); E3 acceptance ("no hidden 32-lane assumption"); 13.2 topic 12 ("warp-size-dependent code, 64-bit lane masks on wave64"); HIP documentation "Porting CUDA code to HIP" and warp cross-lane functions
+analogy: F7 — the great kitchen hall (testing the second building's cards in the first building)
+-->
+
+<h2 id="F7-07-hook">Story hook</h2>
+<p>Amara has rewritten every card in the shared cookbook language. The second building will not be ready for another month, but her own building can read the shared language too: its prep chef translates each card back into the old building's words and cooks it on the old stoves. So she tests every card at home. Everything tastes right. She signs the cards off and sends them across the road.</p>
+<p>The note comes back the next day, from Ines, the second building's head cook: "Card 17, the sauce: the card says pass the spoon along the row, sixteen places, then eight, four, two, one, and the first helper in every row puts the total in the pot. In your building a row is 32, so that reached everyone. Ours are 64. The spoon never crossed the middle of the row, and only the first helper of each row poured. Half the sauce never got into the pot. The card was correct for your building. It was never correct for ours." This chapter is about what testing at home can and cannot prove.</p>
+
+<h2 id="F7-07-able">What you will be able to do</h2>
+<ul>
+<li><b>Build and run</b> HIP code through HIP's NVIDIA back end, and show from the executable and the generated code that it is a CUDA program underneath.</li>
+<li><b>State</b> exactly what a passing run on NVIDIA proves about a HIP port, and what it cannot prove.</li>
+<li><b>Explain</b> how <code>warpSize</code> and the shuffle functions are defined on each back end in your HIP version, and read the consequences in PTX and AMD ISA.</li>
+<li><b>Diagnose</b> a reduction that is correct on NVIDIA and wrong on AMD from per-lane outputs, and fix it without hard-coding a lane count.</li>
+<li><b>Apply</b> curriculum E9's acceptance test to your E1–E5 ports on the back ends you have, marking the rest untested on hardware.</li>
+</ul>
+
+<div class="co jargon" id="F7-07-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>NVIDIA back end (of HIP)</dt><dd><b>Simple words:</b> the way of building HIP code so that it runs on NVIDIA GPUs, by turning it into CUDA. <b>Analogy:</b> the first building's prep chef cooking a shared-language card on the old stoves. <b>Precise:</b> HIP's NVIDIA platform: hipcc runs nvcc (R1); HIP's headers map every HIP name onto CUDA (F7-03); the result is an ordinary CUDA fat binary linked to the CUDA runtime (R8). <sup class="src"><a href="#F7-07-src-D1">D1</a></sup> <sup class="src"><a href="#F7-07-src-R1">R1</a></sup> <sup class="src"><a href="#F7-07-src-R8">R8</a></sup></dd>
+<dt>warpSize (HIP)</dt><dd><b>Simple words:</b> the number of lanes in the warp or wavefront the kernel runs on, readable inside a kernel. <b>Analogy:</b> how long a row of helpers is in the building where the card is cooked. <b>Precise:</b> a built-in available in device code; in HIP 5.7 on AMD it is <code>static constexpr int warpSize = __AMDGCN_WAVEFRONT_SIZE;</code> (a compile-time constant per target: 64 for gfx90a, 32 for gfx1030 in R2), and on NVIDIA it is CUDA's <code>warpSize</code>, which PTX reads from the special register <code>WARP_SZ</code> (R4). <sup class="src"><a href="#F7-07-src-H1">H1</a></sup> <sup class="src"><a href="#F7-07-src-R2">R2</a></sup> <sup class="src"><a href="#F7-07-src-R4">R4</a></sup></dd>
+<dt>Shuffle (cross-lane exchange)</dt><dd><b>Simple words:</b> every lane reads a value from another lane of the same warp or wavefront in one step. <b>Analogy:</b> passing the spoon along the row. <b>Precise:</b> HIP's <code>__shfl_xor(var, lane_mask, width = warpSize)</code> returns <code>var</code> from lane <code>self ^ lane_mask</code>; on AMD it is built on <code>ds_bpermute</code>, on NVIDIA HIP defines it as <code>__shfl_xor_sync(0xffffffff, …)</code> (R5). <sup class="src"><a href="#F7-07-src-H1">H1</a></sup> <sup class="src"><a href="#F7-07-src-R5">R5</a></sup></dd>
+<dt>Butterfly reduction</dt><dd><b>Simple words:</b> adding up the values of a group by exchanging with partners at distance 16, 8, 4, 2, 1 (or 32 first, for 64 lanes), so that every lane ends with the total. <b>Analogy:</b> pairs of helpers swapping and adding, then pairs of pairs, until the whole row knows the sum. <b>Precise:</b> a reduction over 2^k lanes with k steps of <code>v += shfl_xor(v, 2^j)</code>; it covers exactly the lanes reachable by the offsets used, so its first offset must be half the group size. <sup class="src"><a href="#F7-07-src-D3">D3</a></sup> <sup class="src"><a href="#F7-07-src-R6">R6</a></sup></dd>
+<dt>Untested on AMD hardware</dt><dd><b>Simple words:</b> an honest label for a result that was only checked on NVIDIA or only compiled for AMD. <b>Analogy:</b> "tasted at home only" written on the card. <b>Precise:</b> the university's AH-26 marking, which the F7 faculty requires when the NVIDIA back end replaces an AMD GPU for a lab (guide 5.12, hardware requirement).</dd>
+</dl></div>
+
+<h2 id="F7-07-pictures">The idea in pictures</h2>
+<p>Figure 1 is the course's forensic case in one picture: a butterfly reduction whose first offset is 16, on a 32-lane warp and on a 64-lane wavefront. With 32 lanes the offsets 16, 8, 4, 2, 1 connect every lane to every other. With 64 lanes they never connect the two halves: lanes 0–31 end with the sum of their half, lanes 32–63 with the sum of theirs, and a single leader per wavefront adds only one half to the total.</p>
+<figure id="F7-07-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F7-07-f1t F7-07-f1d">
+<title id="F7-07-f1t">Figure 1: a butterfly reduction starting at offset 16 on 32 and on 64 lanes</title>
+<desc id="F7-07-f1d">Upper half, labelled NVIDIA warp, 32 lanes: one box spanning lanes 0 to 31, with curved exchange arcs labelled 16, 8, 4, 2, 1 inside it, and the result: every lane holds 528, the sum of inputs 1 to 32; leader lane 0 adds 528; per block of 64 threads two warps give 528 plus 1552 equals 2080, correct. Lower half, labelled AMD wavefront, 64 lanes on gfx90a: two boxes, lanes 0 to 31 and lanes 32 to 63, each with the same arcs 16, 8, 4, 2, 1 inside it; a dashed arc of offset 32 between the boxes is crossed out, labelled missing in the ported code. Results: lanes 0 to 31 hold 528, lanes 32 to 63 hold 1552; only lane 0 is leader since threadIdx.x modulo warpSize equals 0 only there, so the total is 528 instead of 2080. Note: values from the university's lane model, R6.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="12" y="22">NVIDIA warp: 32 lanes, offsets 16, 8, 4, 2, 1</text>
+<rect class="sv-b1" x="12" y="34" width="300" height="56" rx="6"/><text class="sv-t" x="22" y="56">lanes 0–31</text><text class="sv-ts" x="22" y="76">exchanges reach every lane</text>
+<path class="sv-line" d="M150 34 Q200 6 250 34"/><text class="sv-ts" x="186" y="14">16, 8, 4, 2, 1</text>
+<text class="sv-t" x="330" y="56">every lane: 528 (= 1 + … + 32)</text>
+<text class="sv-t" x="330" y="76">2 warps per block: 528 + 1552 = 2080 ✓</text>
+<text class="sv-tb" x="12" y="128">AMD wavefront on gfx90a: 64 lanes, same code</text>
+<rect class="sv-b2" x="12" y="140" width="300" height="56" rx="6"/><text class="sv-t" x="22" y="162">lanes 0–31</text><text class="sv-ts" x="22" y="182">offsets 16 … 1 stay inside</text>
+<rect class="sv-b2" x="330" y="140" width="300" height="56" rx="6"/><text class="sv-t" x="340" y="162">lanes 32–63</text><text class="sv-ts" x="340" y="182">offsets 16 … 1 stay inside</text>
+<path class="sv-dash" d="M162 196 Q321 250 480 196"/><text class="sv-ts" x="250" y="246">offset 32: missing in the ported loop</text>
+<line class="sv-line2" x1="306" y1="214" x2="336" y2="232"/><line class="sv-line2" x1="306" y1="232" x2="336" y2="214"/>
+<text class="sv-t" x="12" y="276">lanes 0–31 hold 528; lanes 32–63 hold 1552</text>
+<text class="sv-t" x="12" y="296">one leader per wavefront (threadIdx.x % warpSize == 0): lane 0 only</text>
+<text class="sv-tb" x="12" y="318">total = 528, expected 2080 ✗   (values: the university's lane model, R6)</text>
+</svg></div><figcaption><b>Figure 1.</b> The ported reduction of Listing 1 on the two lane counts. The lane values are from the university's CPU lane model, which implements HIP 5.7's <code>__shfl_xor</code> rule from the AMD header (R5, R6); they were not observed on a GPU. The lane counts per target are the compiler's (R2). Not to scale.</figcaption></figure>
+<p>Figure 2 is the testing matrix that follows from this chapter: which question each kind of evidence can answer. Only the right-hand column answers the question that matters for an AMD port, and it needs an AMD GPU.</p>
+<figure id="F7-07-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 270" role="img" aria-labelledby="F7-07-f2t F7-07-f2d">
+<title id="F7-07-f2t">Figure 2: what each kind of evidence proves about a HIP port</title>
+<desc id="F7-07-f2d">A grid with four rows and three columns. Columns: AMD compile, no GPU needed; NVIDIA back-end run; AMD GPU run. Rows and entries: 1, the source is pure HIP with no leftover CUDA names: yes, no, yes. 2, the API calls and the algorithm are right with 32 lanes: no, yes, partly (only on wave32 targets). 3, the algorithm is right with 64 lanes: no, no, yes on wave64 targets. 4, AMD performance and resource use: partly (register counts and ISA from the compiler), no, yes with a profiler. A note under the grid says: this build could produce only the first column and the build half of the second.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="270"/>
+<rect class="sv-box" x="250" y="10" width="160" height="40" rx="4"/><text class="sv-tb" x="260" y="30">AMD compile</text><text class="sv-ts" x="260" y="44">no GPU needed</text>
+<rect class="sv-box" x="420" y="10" width="160" height="40" rx="4"/><text class="sv-tb" x="430" y="30">NVIDIA back end</text><text class="sv-ts" x="430" y="44">run on NVIDIA GPU</text>
+<rect class="sv-box" x="590" y="10" width="160" height="40" rx="4"/><text class="sv-tb" x="600" y="30">AMD GPU run</text><text class="sv-ts" x="600" y="44">listed GPU</text>
+<text class="sv-t" x="12" y="80">pure HIP, no CUDA left</text>
+<rect class="sv-b5" x="250" y="62" width="160" height="30" rx="4"/><text class="sv-t" x="260" y="82">yes (F7-03)</text>
+<rect class="sv-b8" x="420" y="62" width="160" height="30" rx="4"/><text class="sv-t" x="430" y="82">no: CUDA accepted</text>
+<rect class="sv-b5" x="590" y="62" width="160" height="30" rx="4"/><text class="sv-t" x="600" y="82">yes</text>
+<text class="sv-t" x="12" y="124">right with 32 lanes</text>
+<rect class="sv-b8" x="250" y="106" width="160" height="30" rx="4"/><text class="sv-t" x="260" y="126">no</text>
+<rect class="sv-b5" x="420" y="106" width="160" height="30" rx="4"/><text class="sv-t" x="430" y="126">yes</text>
+<rect class="sv-b6" x="590" y="106" width="160" height="30" rx="4"/><text class="sv-t" x="600" y="126">on wave32 targets</text>
+<text class="sv-t" x="12" y="168">right with 64 lanes</text>
+<rect class="sv-b8" x="250" y="150" width="160" height="30" rx="4"/><text class="sv-t" x="260" y="170">no</text>
+<rect class="sv-b8" x="420" y="150" width="160" height="30" rx="4"/><text class="sv-t" x="430" y="170">no</text>
+<rect class="sv-b5" x="590" y="150" width="160" height="30" rx="4"/><text class="sv-t" x="600" y="170">yes, on wave64</text>
+<text class="sv-t" x="12" y="212">AMD performance</text>
+<rect class="sv-b6" x="250" y="194" width="160" height="30" rx="4"/><text class="sv-t" x="260" y="214">partly: ISA, regs</text>
+<rect class="sv-b8" x="420" y="194" width="160" height="30" rx="4"/><text class="sv-t" x="430" y="214">no</text>
+<rect class="sv-b5" x="590" y="194" width="160" height="30" rx="4"/><text class="sv-t" x="600" y="214">yes, with profiler</text>
+<text class="sv-ts" x="12" y="252">Every cell carries its answer in words; colour only repeats it. This build produced the first column and NVIDIA builds (no GPU runs).</text>
+</svg></div><figcaption><b>Figure 2.</b> The testing matrix for a HIP port. Row 1 is shown by F7-03's R4 and R5; rows 2 and 3 by this chapter's Figure 1 and R6; row 4 is the subject of HP302. The matrix is the university's synthesis of these runs, not a vendor statement.</figcaption></figure>
+
+<h2 id="F7-07-layer1">Layer 1 — the kid explanation</h2>
+<p>HIP code can be built for NVIDIA GPUs too. Then HIP becomes CUDA again: every HIP word is turned into its CUDA word, and the program runs exactly like a CUDA program. That is useful. If you only have an NVIDIA GPU, you can still check that your HIP port works.</p>
+<p>But it checks the port in the old building. In the old building a row of helpers is always 32 long. If your program quietly assumes "rows of 32", the old building will never notice, because there the assumption is true. In the new building many rows are 64 long, and the same program gives the wrong answer without any error message.</p>
+<p>So you use the NVIDIA back end for what it is good at: checking that the HIP calls are right and that the program works with 32 lanes. And you use two other checks for the rest: compiling for AMD, which needs no GPU and catches leftover CUDA words; and running on an AMD GPU, which is the only way to prove the program is right with 64 lanes. When you have no AMD GPU, you write "untested on AMD hardware" next to the result.</p>
+
+<h2 id="F7-07-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F7-07-l2-build">Building for NVIDIA</h3>
+<p>Two ways were used in this course. With hipcc: <code>HIP_PLATFORM=nvidia hipcc -std=c++17 -x cu file.hip</code> (this container also needed <code>CUDA_PATH=/usr</code>, <a href="#F7-01">F7-01</a>). With <code>HIP_PLATFORM=nvidia</code>, hipcc runs <code>/usr/bin/nvcc -Wno-deprecated-gpu-targets -lcuda -lcudart -L/usr/lib64 -std=c++17 -x cu</code> plus your file (R1). <sup class="src"><a href="#F7-07-src-R1">R1</a></sup> With CMake: compile the <code>.hip</code> file as CUDA (<a href="#F7-06">F7-06</a>, Listing 3). In both cases nvcc compiles the file, HIP's headers detect nvcc and select their NVIDIA implementation, and every HIP call becomes an inline call to CUDA (<a href="#F7-03">F7-03</a>). <sup class="src"><a href="#F7-07-src-D1">D1</a></sup> <sup class="src"><a href="#F7-07-src-H2">H2</a></sup> nvcc options pass through: <code>-arch=sm_80</code>, <code>-gencode …</code>, <code>-ptx</code>, <code>-cubin</code> all worked in this build (R4, R7, R8).</p>
+
+<h3 id="F7-07-l2-what">What you get: a CUDA program</h3>
+<p>The executable is indistinguishable in structure from one built by nvcc from CUDA source. R8 lists the GPU code inside two executables built with the same <code>-gencode</code> options, one from <code>vec_add.hip</code> through the NVIDIA back end, one from <code>saxpy.cu</code> with plain nvcc: the same entries, <code>sm_80</code> and <code>sm_86</code> machine code plus <code>sm_86</code> PTX. <sup class="src"><a href="#F7-07-src-R8">R8</a></sup> One difference is visible: the HIP build lists the shared library <code>libcudart.so.12</code>, because hipcc passes <code>-lcudart</code>; the plain nvcc build lists none, so it carries the CUDA runtime inside the executable. Either way, the runtime underneath is NVIDIA's: error names are CUDA's (<code>cudaErrorNoDevice</code> in R9 and R10), and NVIDIA's tools (cuobjdump, Compute Sanitizer, the Nsight profilers) work on it as on any CUDA program. <sup class="src"><a href="#F7-07-src-D2">D2</a></sup></p>
+<p>The generated code is CUDA's too. F7-05's <code>vecAdd</code>, built this way, becomes the PTX and SASS of R7: the index with <code>mad.lo.s32</code>, the bounds check as a predicate <code>%p1</code> and a branch, and in SASS a predicated <code>@P0 EXIT</code>. <sup class="src"><a href="#F7-07-src-R7">R7</a></sup> Compare with the AMD ISA of the same source in <a href="#F7-05">F7-05</a>: the work is the same, the machines are not.</p>
+
+<h3 id="F7-07-l2-proves">What a passing NVIDIA run proves</h3>
+<p>If the HIP port builds and passes its correctness tests on an NVIDIA GPU through the NVIDIA back end, you know: the HIP calls are used correctly (they become the CUDA calls you trust), memory is allocated, copied and freed correctly, launches are configured correctly, and the algorithm is correct <i>for 32-lane warps</i>. You do not know: whether the source compiles for AMD (leftover CUDA names compile on NVIDIA: F7-03, R5 there), whether the algorithm is correct for 64-lane wavefronts, whether AMD-specific intrinsics are used correctly, or anything about AMD performance. Figure 2 is this paragraph as a table.</p>
+
+<h3 id="F7-07-l2-warpsize">warpSize on each back end</h3>
+<p>The fix for hidden lane counts is the built-in <code>warpSize</code>, but its nature differs by back end, and it is worth seeing the difference in generated code. On AMD, HIP 5.7 declares <code>static constexpr int warpSize = __AMDGCN_WAVEFRONT_SIZE;</code> (R5, line 86): the compiler knows the value for each target and writes it as a constant. Listing 4's kernel <code>out[0] = warpSize;</code> became <code>v_mov_b32_e32 v1, 64</code> for gfx90a and <code>v_mov_b32_e32 v1, 32</code> for gfx1030, with matching <code>.wavefront_size</code> metadata (R2). <sup class="src"><a href="#F7-07-src-R2">R2</a></sup> On NVIDIA the same kernel's PTX reads <code>mov.u32 %r1, WARP_SZ;</code> (R4): a value PTX leaves to the hardware, not a literal. <sup class="src"><a href="#F7-07-src-R4">R4</a></sup> <sup class="src"><a href="#F7-07-src-D4">D4</a></sup> Consequence for code: a loop <code>for (offset = warpSize / 2; …)</code> is fully unrolled into a known number of shuffles on AMD and stays a loop in NVIDIA's PTX. R3 counts exactly that: the fixed kernel has 6 shuffles for gfx90a (offsets 32 to 1), 5 for gfx1030 (16 to 1), and a single shuffle inside a loop in the <code>sm_80</code> PTX. <sup class="src"><a href="#F7-07-src-R3">R3</a></sup></p>
+
+<h2 id="F7-07-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F7-07-l3-shfl">The shuffle in two headers</h3>
+<p>R5 prints both definitions of <code>__shfl_xor</code> in this HIP version. AMD (<code>amd_warp_functions.h</code> lines 403–408): the source lane is <code>self ^ lane_mask</code>, replaced by <code>self</code> if it falls outside the caller's <code>width</code>-sized segment (<code>index &gt;= ((self + width) &amp; ~(width - 1))</code>), and the value moves with <code>__builtin_amdgcn_ds_bpermute(index &lt;&lt; 2, var)</code>. NVIDIA (<code>nvidia_hip_runtime_api.h</code> line 558): <code>#define __shfl_xor(...) __shfl_xor_sync(0xffffffff, __VA_ARGS__)</code>. <sup class="src"><a href="#F7-07-src-R5">R5</a></sup> <sup class="src"><a href="#F7-07-src-H1">H1</a></sup> Three consequences:</p>
+<ol>
+<li>The HIP form has no mask argument, and on NVIDIA it supplies the full 32-lane mask <code>0xffffffff</code>; all 32 lanes must therefore reach the shuffle together, as CUDA's <code>_sync</code> rules require. <sup class="src"><a href="#F7-07-src-D4">D4</a></sup></li>
+<li>The default <code>width</code> is <code>warpSize</code>, so on gfx90a a shuffle can reach any of 64 lanes; whether it does depends only on the offsets your loop uses.</li>
+<li>Lane masks that come back from votes (<code>__ballot</code>) are 64-bit on AMD: <code>unsigned long long int __ballot(int predicate)</code> (R5, line 715). Storing one in an <code>unsigned int</code>, as CUDA code often does with <code>__ballot_sync</code>'s 32-bit result, drops lanes 32–63. <a href="#F1-57">F1-57</a> introduced this; HP302 (<a href="#F7-08">F7-08</a> onward) measures it.</li>
+</ol>
+
+<h3 id="F7-07-l3-portable">Writing lane-count-independent code</h3>
+<p>The rules that make a kernel correct on 32 and 64 lanes, each tied to this chapter's evidence:</p>
+<ul>
+<li><b>Start butterflies and tree loops at <code>warpSize / 2</code></b>, never at 16 (Listing 2 versus Listing 1; R6 shows both totals).</li>
+<li><b>Choose leaders and lane ids with <code>warpSize</code></b>: <code>threadIdx.x % warpSize == 0</code>, <code>lane = threadIdx.x % warpSize</code>, <code>warp = threadIdx.x / warpSize</code>.</li>
+<li><b>Size per-warp shared-memory arrays from <code>blockDim.x / warpSize</code></b> (or a maximum that covers the smallest lane count), not from <code>blockDim.x / 32</code>.</li>
+<li><b>Keep lane masks in 64-bit types</b> (<code>unsigned long long</code> or <code>uint64_t</code>) in portable code, and count bits with 64-bit population counts.</li>
+<li><b>Make block sizes a multiple of 64</b> where the algorithm needs whole wavefronts.</li>
+<li><b>Test with per-lane outputs.</b> A single total hides which lanes went wrong; writing every lane's value (Listing 1's <code>lanes</code> array) shows the pattern of the bug at once.</li>
+</ul>
+<p>These are the curriculum's own requirements written as code rules: E3 accepts a reduction only if "The same source runs correctly with wave64 on AMD (no hidden 32-lane assumption)", and guide 13.4 forbids a hard-coded warp size in portable code. <a href="../SYSTEMS_CURRICULUM.html#trackE">Curriculum, track E</a>.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Newer HIP versions may add <code>_sync</code> warp functions with 64-bit masks and may change how <code>warpSize</code> is declared (for example, no longer a compile-time constant). The definitions in this chapter are those of the installed HIP 5.7.1 headers (R5). Check the HIP documentation's warp cross-lane functions section and the release notes of your HIP version (D1) before relying on <code>warpSize</code> being usable in constant expressions.</p></div>
+
+<h2 id="F7-07-hardware">How the hardware actually does it</h2>
+<p>On an NVIDIA GPU a shuffle is one SIMT instruction (SASS <code>SHFL</code>, from PTX <code>shfl.sync</code>) that moves 32-bit values between the 32 lanes of a warp through the register file's crossbar; lanes outside the warp are not reachable. <sup class="src"><a href="#F7-07-src-D4">D4</a></sup> On AMD CDNA hardware the HIP shuffle is <code>ds_bpermute_b32</code>, an LDS-unit instruction that lets each of the wavefront's 64 lanes read a value from any lane, addressed by a byte index (hence <code>index &lt;&lt; 2</code> in the header); it uses the LDS hardware's crossbar without allocating LDS memory. <sup class="src"><a href="#F7-07-src-D5">D5</a></sup> <sup class="src"><a href="#F7-07-src-H1">H1</a></sup> R3 shows the instruction counts: five <code>ds_bpermute_b32</code> for the ported loop on both AMD targets, six for the fixed loop on gfx90a. The hardware is capable of crossing the middle of a 64-lane wavefront; the ported loop never asks it to. A wrong answer on AMD here is not a hardware or compiler bug; it is an algorithm written for a 32-lane machine.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The descriptions of <code>SHFL</code> and of <code>ds_bpermute_b32</code>'s use of the LDS crossbar are from memory of D4 and D5, not from opened documents, and nothing was run on either GPU. The instruction names and counts are this build's real compiler output (R3).</p></div>
+
+<h2 id="F7-07-worked">Worked example</h2>
+<p><b>Question.</b> Listing 1 sums one block of 64 threads with inputs 1, 2, …, 64 (expected 64 × 65 / 2 = 2080). Predict every lane's value after the loop and the total, on a 32-lane warp machine and on gfx90a, for the ported loop (first offset 16) and for the fixed loop (first offset <code>warpSize / 2</code>).</p>
+<ol>
+<li><b>32 lanes, ported.</b> Offsets 16, 8, 4, 2, 1 form a complete butterfly over 32 lanes: every lane of warp 0 ends with 1 + … + 32 = 32 × 33 / 2 = 528; every lane of warp 1 with 33 + … + 64 = 2080 − 528 = 1552. Leaders are threads 0 and 32 (<code>% warpSize</code> with 32): total 528 + 1552 = 2080. Correct.</li>
+<li><b>64 lanes, ported.</b> The same offsets stay within lanes 0–31 and within 32–63 (an XOR with a value below 32 never changes bit 5 of the lane number). So lanes 0–31 hold 528, lanes 32–63 hold 1552, exactly as on 32 lanes. But now there is one leader, thread 0 (<code>% 64</code>): total 528. Wrong by 1552.</li>
+<li><b>Fixed, 32 lanes.</b> <code>warpSize / 2</code> = 16: identical to step 1. 2080.</li>
+<li><b>Fixed, 64 lanes.</b> Offsets 32, 16, 8, 4, 2, 1: a complete butterfly over 64 lanes. Every lane holds 2080; one leader adds 2080. Correct.</li>
+</ol>
+<p><b>Check.</b> R6, the university's lane model running the same loop with HIP 5.7's <code>__shfl_xor</code> rule, prints exactly these values for all four cases (lane tables and totals 2080, 528, 2080, 2080). Note the per-lane tables of cases 1 and 2 are <i>identical</i>: the lanes did the same thing on both machines; only the number of leaders changed. That is why the evidence must include per-lane values and the leader rule, not only the total.</p>
+
+<h2 id="F7-07-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>wave_sum.hip</code>: a block sum ported from CUDA, with per-lane evidence.</p>
+<pre class="listing" data-src="F7-07/wave_sum.hip"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line(s)</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–20</td><td><code>waveSum(…)</code>, <code>v = (i &lt; n) ? in[i] : 0</code></td><td>Each lane loads one input (0 if outside)</td><td>All lanes take part in every shuffle</td></tr>
+<tr><td>21–23</td><td><code>for (int offset = 16; …) v += __shfl_xor(v, offset);</code></td><td>Butterfly over offsets 16, 8, 4, 2, 1</td><td>The hidden 32-lane assumption</td></tr>
+<tr><td>24–26</td><td><code>lanes[i] = v;</code></td><td>Writes every lane's value</td><td>Per-lane evidence for diagnosis</td></tr>
+<tr><td>27–29</td><td><code>threadIdx.x % warpSize == 0</code>, <code>atomicAdd</code></td><td>One leader per warp or wavefront adds its value</td><td>Half-ported: the leader rule uses <code>warpSize</code>, the loop does not</td></tr>
+<tr><td>34–40</td><td><code>n = 64</code>, inputs 1…64, <code>expected</code></td><td>One block of 64; expected 2080</td><td>Small enough to read every lane</td></tr>
+<tr><td>49–50</td><td><code>waveSum&lt;&lt;&lt;1, n&gt;&gt;&gt;</code>, <code>hipGetLastError</code></td><td>Launch and check</td><td>CU201 rule</td></tr>
+<tr><td>55–58</td><td>print 8 lanes per line, total</td><td>The evidence table</td><td>Same format as the lane model (R6)</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>wave_sum_fixed.hip</code>: the same program; only line 21 differs (<code>offset = warpSize / 2</code>).</p>
+<pre class="listing" data-src="F7-07/wave_sum_fixed.hip"></pre>
+<p><b>Runs.</b> Both listings were built for gfx90a by the lab runner (R11, R12) and through the NVIDIA back end (R9, R10); all four runs stopped at the first <code>hipMalloc</code>: <sup class="src"><a href="#F7-07-src-R9">R9</a></sup> <sup class="src"><a href="#F7-07-src-R10">R10</a></sup> <sup class="src"><a href="#F7-07-src-R11">R11</a></sup> <sup class="src"><a href="#F7-07-src-R12">R12</a></sup></p>
+<pre class="output" data-run="F7-07/wave_sum"></pre>
+<pre class="output" data-run="F7-07/wave_sum_fixed"></pre>
+<pre class="output" data-run="F7-07/wave_sum_nvidia"></pre>
+<pre class="output" data-run="F7-07/wave_sum_fixed_nvidia"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware, on both vendors.</b> The expected GPU outputs are the lane tables of R6: on an NVIDIA GPU both listings should print total 2080; on a gfx90a GPU Listing 1 should print total 528 and Listing 2 total 2080. These predictions come from the lane model and the headers, not from a GPU run. Run them and record the result; if a GPU disagrees with the model, the GPU wins and the model has a bug.</p></div>
+
+<p><b>Listing 3</b> — <code>lanes_sim.cpp</code>: the university's lock-step lane model (a CPU program, not a GPU).</p>
+<pre class="listing" data-src="F7-07/lanes_sim.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line(s)</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–20</td><td><code>shflXorStep</code></td><td>For every lane, computes the source lane with the header's rule and reads the <i>old</i> value</td><td>Models one shuffle instruction executed by all lanes at once</td></tr>
+<tr><td>15–16</td><td><code>index = self ^ laneMask; index = index &gt;= ((self + width) &amp; ~(width - 1)) ? self : index;</code></td><td>Copied from HIP 5.7's AMD header (R5, lines 405–406)</td><td>The model uses the installed definition, not a guess</td></tr>
+<tr><td>23–43</td><td><code>runBlock</code></td><td>Splits a block into wavefronts of <code>w</code> lanes, runs the loop, records lanes, adds lane 0 of each</td><td>Same leader rule as Listing 1</td></tr>
+<tr><td>45–56</td><td><code>report</code></td><td>Prints the lane table and the total</td><td>Same format as Listing 1's output</td></tr>
+<tr><td>58–64</td><td>four cases</td><td>Ported and fixed, on 32 and 64 lanes</td><td>The four predictions of the Worked example</td></tr>
+</tbody></table></div>
+<p><b>Build</b> (lab runner): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined lanes_sim.cpp</code>. Output (R6):</p>
+<pre class="output" data-run="F7-07/lanes_sim"></pre>
+
+<p><b>Listing 4</b> — <code>warp_size.hip</code> and what <code>warpSize</code> compiles to on each back end (R2, R4, R5), then its run on gfx90a (R13): <sup class="src"><a href="#F7-07-src-R2">R2</a></sup> <sup class="src"><a href="#F7-07-src-R4">R4</a></sup> <sup class="src"><a href="#F7-07-src-R5">R5</a></sup> <sup class="src"><a href="#F7-07-src-R13">R13</a></sup></p>
+<pre class="listing" data-src="F7-07/warp_size.hip"></pre>
+<pre class="output" data-run="F7-07/warp_size_isa"></pre>
+<pre class="output" data-run="F7-07/warp_size_ptx"></pre>
+<pre class="output" data-run="F7-07/header_lines"></pre>
+<pre class="output" data-run="F7-07/warp_size"></pre>
+<p><b>Shuffle counts</b> per kernel and target (R3):</p>
+<pre class="output" data-run="F7-07/shuffle_count"></pre>
+<p><b>The NVIDIA back end at work:</b> hipcc's command (R1), <code>vecAdd</code>'s PTX and SASS (R7), and the contents of the executables (R8):</p>
+<pre class="output" data-run="F7-07/nvidia_driver"></pre>
+<pre class="output" data-run="F7-07/vec_add_ptx"></pre>
+<pre class="output" data-run="F7-07/nvidia_fatbin"></pre>
+<p>The steps are in <code>run.sh</code>; <code>isa_of.sh</code> is the script of <a href="#F7-05">F7-05</a>.</p>
+<pre class="listing" data-src="F7-07/run.sh"></pre>
+
+<h2 id="F7-07-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>"Testing at home" sounds like a weaker version of the real test.</b> It is a different test: it can find bugs the AMD run would also find (API misuse), and it is blind to a whole class (lane-count assumptions), however carefully it is done.</li>
+<li><b>The second building's rows are not always 64.</b> gfx1030 compiled to 32 lanes (R2), so a 32-lane assumption can pass on some AMD GPUs too. "Works on my AMD GPU" is also a statement about one lane count.</li>
+<li><b>In the kitchen, Ines could see the unstirred half.</b> On the GPU nothing is visible: no error, no warning, a plausible number. Only a test against a reference, or per-lane outputs, reveals it.</li>
+</ul>
+
+<h2 id="F7-07-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Sum correct on NVIDIA, a fraction too small on AMD</td><td>Loop starts at 16 on 64 lanes; one leader per wavefront</td><td>Per-lane values: two different plateaus within one wavefront (R6)</td><td>Start at <code>warpSize / 2</code></td></tr>
+<tr><td>Sum correct on both by accident, wrong after "fixing" the leader rule</td><td>Leader <code>% 32</code> counted two half-sums per wavefront (F7-04 forensic)</td><td>Change one assumption at a time and test after each</td><td>Fix loop and leader together</td></tr>
+<tr><td>Vote result loses lanes 32–63</td><td>64-bit <code>__ballot</code> stored in 32 bits</td><td>R5 line 715; compiler warnings with <code>-Wconversion</code></td><td><code>unsigned long long</code> masks</td></tr>
+<tr><td>Port passes on NVIDIA, does not compile for AMD</td><td>Leftover CUDA names or <code>_sync</code> intrinsics</td><td>AMD compile in CI (F7-03, F7-04)</td><td>Port them</td></tr>
+<tr><td>Results claimed "on HIP" were all from NVIDIA</td><td>Back end not recorded</td><td>Error names <code>cuda…</code>; <code>ldd</code> lists <code>libcudart</code> (R8)</td><td>Record platform with every result (<a href="#F7-01">F7-01</a>)</td></tr>
+<tr><td>Fixed loop much slower on NVIDIA than the ported one</td><td>Not unrolled: <code>warpSize</code> is not a compile-time constant in PTX (R3, R4)</td><td>Count shuffles in the PTX</td><td>Measure first; if it matters, specialise per platform with <code>#if</code> on the platform macro, keeping AMD on <code>warpSize</code></td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F7-07-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F7-03">F7-03</a> to <a href="#F7-06">F7-06</a> mapped, translated, read and built HIP code for both back ends; <a href="#CU301">CU301</a> taught warp-shuffle reductions on NVIDIA's 32-lane warps. <b>What carries over:</b> everything about the CUDA runtime and NVIDIA tools, because HIP on NVIDIA is CUDA underneath; the correctness tests; the shuffle-reduction algorithm itself. <sup class="src"><a href="#F7-07-src-R1">R1</a></sup> <sup class="src"><a href="#F7-07-src-R8">R8</a></sup> <b>What changes:</b> a pass on NVIDIA no longer means "done": lane counts (64 on gfx90a, 32 on gfx1030 and NVIDIA), lane-mask widths and the meaning of <code>warpSize</code> (a per-target constant on AMD, <code>WARP_SZ</code> in PTX) differ, and only an AMD run proves wave64 correctness. <sup class="src"><a href="#F7-07-src-R2">R2</a></sup> <sup class="src"><a href="#F7-07-src-R4">R4</a></sup> <sup class="src"><a href="#F7-07-src-R6">R6</a></sup> <b>What comes next:</b> <a href="#HP302">HP302</a> opens the AMD hardware itself, starting with <a href="#F7-08">F7-08</a> on compute units and wavefronts of 64 versus warps of 32.</p></div>
+
+<h2 id="F7-07-check">Check yourself</h2>
+<ol>
+<li>What command does hipcc run on the NVIDIA platform in this build, and which library does the result load at run time?</li>
+<li>Which is true? (a) A HIP port that passes on NVIDIA is correct on AMD if it compiles there. (b) On AMD in HIP 5.7, <code>warpSize</code> is a compile-time constant per target. (c) HIP's <code>__shfl_xor</code> on NVIDIA uses a 64-bit mask. (d) The ported reduction's per-lane values differ between 32 and 64 lanes.</li>
+<li>Why did the fixed kernel compile to one shuffle instruction in PTX but six on gfx90a?</li>
+<li>Explain in your own words why per-lane outputs are better evidence than a total for this kind of bug.</li>
+<li>Apply to a new case: a kernel uses <code>__shared__ float partial[256 / 32];</code> and <code>partial[threadIdx.x / 32] = v;</code> after a warp reduction. What goes wrong on gfx90a, and how do you write it portably?</li>
+<li>Predict, then run: change <code>lanes_sim.cpp</code> so that the leader rule is <code>% 32</code> on both machines (add lane 0 and lane 32 on 64 lanes). What total does the ported loop give on 64 lanes, and why is that answer dangerous?</li>
+<li>You have only an NVIDIA GPU. List the evidence you can produce for an E3 reduction port, and the exact wording you use for what you cannot.</li>
+</ol>
+
+<h2 id="F7-07-lab">Lab</h2>
+<p><b>Goal.</b> Run your E1–E5 HIP ports through the NVIDIA back end, compile them for AMD, remove every lane-count assumption, and record E9's acceptance evidence per back end.</p>
+<p><b>Hardware and software needed.</b> No GPU for steps 1–4: hipcc (<code>HIP version: 5.7.31921-0</code>), nvcc (CUDA 12.0), g++ (13.3.0). Step 5: an NVIDIA GPU (any supported by your CUDA); step 6: an AMD GPU listed in the ROCm compatibility matrix, preferably a wave64 (CDNA) target; or cloud instances. Folder <code>university/labs/F7-07</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F7-07</code>. Compare every <code>.out</code> with the listings and R1–R13.</li>
+<li>For each of your ports from <a href="#F7-04">F7-04</a>: grep device code for <code>32</code>, <code>16</code>, <code>31</code>, <code>0xffffffff</code>, <code>unsigned int mask</code>, <code>/ 32</code>, <code>% 32</code>; rewrite each with <code>warpSize</code> or a 64-bit type.</li>
+<li>Add a per-lane output array to every kernel that uses shuffles or votes, as in Listing 1.</li>
+<li>Build both back ends; for each shuffle loop, count shuffles in the AMD ISA for one wave64 and one wave32 target (Listing 2 of F7-05 with <code>grep -c ds_bpermute_b32</code>) and check the count is log2 of the lane count.</li>
+<li>On an NVIDIA GPU: run every port through the NVIDIA back end; record outputs.</li>
+<li>On an AMD GPU (if available): run every port; record outputs. Otherwise write "untested on AMD hardware" per port.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: R1–R13 as shown; all GPU runs stopped at the runtime's "no device" error. The lane model R6 predicts what steps 5 and 6 should show for Listings 1 and 2. Your own ports' results are yours.</p>
+<p><b>Verification.</b> Curriculum E9's acceptance test, verbatim: "All E1–E8 correctness tests pass on an AMD GPU (and, through HIP's NVIDIA back end, on an NVIDIA GPU)." (HP301: E1–E5.) And E3's: "The same source runs correctly with wave64 on AMD (no hidden 32-lane assumption)." Per port, the record says which back ends passed and which are untested on hardware.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>hipcc for NVIDIA: <code>/usr/local/cuda/bin/nvcc: not found</code> → set <code>CUDA_PATH</code> (this build: <code>/usr</code>).</li>
+<li>nvcc: <code>Don't know what to do with '….hip'</code> → add <code>-x cu</code> (seen in this build).</li>
+<li><code>cuobjdump</code> lists two <code>.cubin</code> entries per architecture → this build saw the same for plain nvcc (R8); compare with a plain nvcc build before suspecting HIP.</li>
+<li>Shuffle count on gfx90a is 5 where you expected 6 → a loop still starts at 16 (R3).</li>
+</ul>
+<p><b>Extension.</b> Write a ballot-based kernel (count lanes with a positive value) that is correct on 32 and 64 lanes, using <code>__ballot</code> and a 64-bit population count; inspect its gfx90a ISA for the 64-bit mask instructions.</p>
+
+<h2 id="F7-07-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "Correct on NVIDIA, wrong on AMD." Chen's team ported their reduction (Listing 1) to HIP, tested it through the NVIDIA back end on their workstation (total 2080, as expected) and shipped it. A partner with an AMD Instinct-class (gfx90a) system reports totals that are far too small, always by the same factor for the same block size. The partner sends per-lane outputs. This build has no GPU, so the evidence pack uses the university's lane model, which applies HIP 5.7's own shuffle rule; its output has the same format as Listing 1's.</p>
+<p><b>Evidence pack.</b> R6 (<code>lanes_sim.out</code>): the first block (32-lane machine: Chen's run) and the second block (64-lane machine: the partner's run). R3 (<code>shuffle_count.out</code>), R5 (<code>header_lines.out</code>), R2 (<code>warp_size_isa.out</code>) and the source of Listing 1.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare the two lane tables and the two totals. What is identical, what differs?</li>
+<li>Hypotheses: give at least three (shuffle implementation bug on AMD; atomics lost on AMD; algorithm assumes 32 lanes; uninitialised total). What evidence rules each in or out?</li>
+<li>Root cause: name the exact lines and explain the total 528 from the lane values.</li>
+<li>Fix: give the corrected loop, predict the new lane table on 64 lanes and the shuffle count on gfx90a, and say which evidence file confirms the count.</li>
+<li>Prevention: which test and which code rule would have caught this before shipping, without an AMD GPU and with one?</li>
+</ol>
+<p><b>Method hints.</b> Look at where the lane values change: at lane 32. Ask what XOR offsets can connect lane 31 to lane 32. Then count leaders per wavefront. The headers tell you how wide a wavefront's shuffle can reach.</p>
+
+<h2 id="F7-07-project">Mini-project</h2>
+<p><b>The HP301 course project: one source tree, two back ends.</b> Bring your E1–E5 ports into the CMake skeleton of <a href="#F7-06">F7-06</a>: every kernel lane-count independent, per-lane debug outputs behind a flag, a CTest suite with each milestone's correctness tests, a CI-style script that builds AMD (explicit targets, bundle checked) and NVIDIA back ends, and a results table per kernel and back end with "passed", "failed" or "untested on hardware".</p>
+<p><b>Rubric.</b> One tree builds both back ends with no source edits (3). No hard-coded lane counts or 32-bit masks (grep clean, justified exceptions only) (3). Correctness tests from the milestones verbatim (2). Honest results table (2).</p>
+
+<h2 id="F7-07-summary">Summary</h2>
+<ul>
+<li>HIP's NVIDIA back end is CUDA: hipcc runs nvcc, HIP names become CUDA calls, the executable is a CUDA fat binary using the CUDA runtime and tools.</li>
+<li>A pass on NVIDIA proves the API use and the algorithm for 32 lanes; it does not prove AMD compilation, wave64 correctness or AMD performance.</li>
+<li>In HIP 5.7, <code>warpSize</code> is a per-target compile-time constant on AMD (64 for gfx90a, 32 for gfx1030) and PTX's <code>WARP_SZ</code> on NVIDIA.</li>
+<li>HIP's <code>__shfl_xor</code> has no mask; on NVIDIA it expands to <code>__shfl_xor_sync(0xffffffff, …)</code>; on AMD it uses <code>ds_bpermute</code> over the whole wavefront.</li>
+<li>A butterfly starting at 16 leaves a 64-lane wavefront in two halves; with one leader per wavefront the total loses one half. Start at <code>warpSize / 2</code>.</li>
+<li>Per-lane outputs make lane-count bugs visible; totals hide them.</li>
+<li>Nothing ran on a GPU in this build: lane values are from the university's model, and GPU results are untested on hardware on both vendors.</li>
+</ul>
+
+<h2 id="F7-07-sources">Sources</h2>
+<ol>
+<li id="F7-07-src-D1">D1 — AMD, HIP documentation: "Porting CUDA code to HIP", NVIDIA platform, warp cross-lane functions, <code>warpSize</code> (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F7-07-src-D2">D2 — NVIDIA, "CUDA Binary Utilities" (cuobjdump) and Compute Sanitizer documentation (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-07-src-D3">D3 — Mark Harris, "Optimizing Parallel Reduction in CUDA" (NVIDIA presentation); CUDA C++ Programming Guide, warp shuffle functions (tree and butterfly reductions) (tier 1/5). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-07-src-D4">D4 — NVIDIA, "CUDA C++ Programming Guide" (warp shuffle functions, <code>warpSize</code>, SIMT) and "Parallel Thread Execution ISA" (<code>shfl.sync</code>, <code>WARP_SZ</code>) (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-07-src-D5">D5 — AMD, "AMD Instinct MI200" (CDNA2) Instruction Set Architecture reference guide: <code>ds_bpermute_b32</code>, wavefronts (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-07-src-H1">H1 — Headers <code>/usr/include/hip/amd_detail/amd_warp_functions.h</code> (line 86 <code>warpSize</code>; lines 403–408 <code>__shfl_xor</code>), <code>amd_detail/amd_device_functions.h</code> (line 715 <code>__ballot</code>), <code>nvidia_detail/nvidia_hip_runtime_api.h</code> (line 558), libamdhip64-dev 5.7.1-3, printed in R5. Tier 4.</li>
+<li id="F7-07-src-H2">H2 — Header <code>/usr/include/hip/hip_common.h</code> lines 44–52: <code>__HIP_PLATFORM_NVIDIA__</code> defined when nvcc compiles (read in this build; see <a href="#F7-06">F7-06</a>). Tier 4.</li>
+<li id="F7-07-src-R1">R1 — hipcc's NVIDIA-platform command (<code>university/labs/F7-07/nvidia_driver.log</code>), HIP 5.7.31921, nvcc 12.0.</li>
+<li id="F7-07-src-R2">R2 — <code>warpSize</code> compiled for gfx90a and gfx1030 (<code>warp_size_isa.log</code>).</li>
+<li id="F7-07-src-R3">R3 — Shuffle instruction counts per kernel and target (<code>shuffle_count.log</code>).</li>
+<li id="F7-07-src-R4">R4 — PTX of <code>writeWarpSize</code> through the NVIDIA back end, <code>sm_80</code> (<code>warp_size_ptx.log</code>).</li>
+<li id="F7-07-src-R5">R5 — Header lines for <code>warpSize</code>, <code>__shfl_xor</code> and <code>__ballot</code> (<code>header_lines.log</code>).</li>
+<li id="F7-07-src-R6">R6 — The university's lane model <code>lanes_sim.cpp</code> (<code>lanes_sim.log</code>), g++ 13.3.0 with sanitizers; exit code 0. A CPU model, not a GPU run.</li>
+<li id="F7-07-src-R7">R7 — PTX and SASS (<code>sm_80</code>) of F7-05's <code>vecAdd</code> through the NVIDIA back end (<code>vec_add_ptx.log</code>).</li>
+<li id="F7-07-src-R8">R8 — Code objects and shared runtime libraries of a HIP-on-NVIDIA executable and a plain nvcc executable (<code>nvidia_fatbin.log</code>).</li>
+<li id="F7-07-src-R9">R9 — NVIDIA-back-end build and run of <code>wave_sum.hip</code> (<code>wave_sum_nvidia.log</code>); untested on hardware, exit code 1.</li>
+<li id="F7-07-src-R10">R10 — NVIDIA-back-end build and run of <code>wave_sum_fixed.hip</code> (<code>wave_sum_fixed_nvidia.log</code>); untested on hardware, exit code 1.</li>
+<li id="F7-07-src-R11">R11 — Build for gfx90a and run of <code>wave_sum.hip</code> (<code>wave_sum.log</code>); untested on hardware, exit code 1.</li>
+<li id="F7-07-src-R12">R12 — Build for gfx90a and run of <code>wave_sum_fixed.hip</code> (<code>wave_sum_fixed.log</code>); untested on hardware, exit code 1.</li>
+<li id="F7-07-src-R13">R13 — Build for gfx90a and run of <code>warp_size.hip</code> (<code>warp_size.log</code>); untested on hardware, exit code 1.</li>
+</ol>
+
+<h2 id="F7-07-glossary">Glossary links</h2>
+<p><a href="#gl-nvidia-back-end-of-hip">NVIDIA back end (of HIP)</a> · <a href="#gl-warpsize-hip">warpSize (HIP)</a> · <a href="#gl-shuffle-cross-lane-exchange">Shuffle (cross-lane exchange)</a> · <a href="#gl-butterfly-reduction">Butterfly reduction</a> · <a href="#gl-untested-on-amd-hardware">Untested on AMD hardware</a> · <a href="#gl-wavefront">Wavefront</a> · <a href="#gl-warp-wavefront">Warp / wavefront</a> · <a href="#gl-lane">Lane</a></p>
+
+<h2 id="F7-07-next">Next chapter</h2>
+<p>This is the last chapter of <a href="#HP301">HP301</a>. Next: <a href="#F7-08">F7-08 Compute units and wavefronts of 64 versus warps of 32</a> in <a href="#HP302">HP302</a>. Previous: <a href="#F7-06">F7-06</a>.</p>
+
+<h2 id="F7-07-answers">Answers to Check yourself</h2>
+<ol>
+<li><code>/usr/bin/nvcc -Wno-deprecated-gpu-targets -lcuda -lcudart -L/usr/lib64 -std=c++17 -x cu</code> plus the file (R1); it loads <code>libcudart.so.12</code>, the CUDA runtime (R8).</li>
+<li>(b): R5 line 86 and R2's constants. (a) is false: it may still assume 32 lanes (Figure 1). (c) is false: the header supplies <code>0xffffffff</code>, 32 bits (R5 line 558). (d) is false: R6's first two lane tables are identical; only the number of leaders changes.</li>
+<li>On AMD, <code>warpSize</code> is a compile-time constant (64 for gfx90a), so the loop has a known trip count (6) and is unrolled into six shuffles; in PTX it is <code>WARP_SZ</code>, unknown to the front-end compiler, so the loop stays a loop with one shuffle inside (R3, R4).</li>
+<li>The total is one number that many different bugs can produce; per-lane values show where values stop combining (here exactly at lane 32), which points at the offsets and the leader rule, and they show which lanes contributed.</li>
+<li>The array and its index assume 8 groups of 32 per 256-thread block. On gfx90a a block has 4 wavefronts; if the reduction covers whole wavefronts and one leader per wavefront writes <code>partial[threadIdx.x / 32]</code>, it writes slots 0, 2, 4 and 6 only, and a final loop over all 8 slots reads 4 slots that were never written. Portable: index with <code>threadIdx.x / warpSize</code>, size the array for the smallest lane count you support (256 / 32 = 8 slots, of which 4 are used on wave64), and loop over <code>blockDim.x / warpSize</code> entries.</li>
+<li>With leaders at lanes 0 and 32, the 64-lane total becomes 528 + 1552 = 2080, the correct value. Dangerous because a wrong algorithm (two separate half-reductions) produces the right number for this particular leader rule; changing either the loop or the leader rule alone then breaks it (the F7-04 forensic). Correctness by accident is not correctness; the per-lane table still shows two plateaus.</li>
+<li>NVIDIA-back-end runs of every correctness test (E3's 2^28-float tolerance test and exact integer sums); AMD compile logs for wave64 and wave32 targets; shuffle counts per target; the lane model for the shuffle loop. For the rest: "untested on AMD hardware: E3's wave64 acceptance test not run" (AH-26).</li>
+</ol>
+<h3 id="F7-07-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> The two lane tables are identical: lanes 0–31 hold 528, lanes 32–63 hold 1552 on both machines. The totals differ: 2080 on the 32-lane machine, 528 on the 64-lane machine (R6). The ported kernel compiles to 5 <code>ds_bpermute_b32</code> on gfx90a (R3), one per offset 16, 8, 4, 2, 1; gfx90a's wavefront is 64 lanes (R2).</p>
+<p><b>Hypotheses.</b> (1) AMD shuffle bug: ruled out; the lane values on 64 lanes are exactly what the header's rule gives for these offsets, the same as on 32 lanes. (2) Lost atomics: ruled out; the total equals exactly lane 0's value, one leader's contribution. (3) 32-lane assumption: confirmed. (4) Uninitialised total: ruled out; the total equals a lane value exactly, and the host sets it to 0 (<code>hipMemset</code>).</p>
+<p><b>Root cause.</b> Line 21 starts the butterfly at 16, so offsets never reach across lane 31/32 on a 64-lane wavefront; line 27's leader rule (<code>% warpSize</code>, correctly ported) makes one leader per 64 lanes. Lane 0 holds only the half-sum 1 + … + 32 = 528, and that is the total.</p>
+<p><b>Fix.</b> <code>for (int offset = warpSize / 2; offset &gt; 0; offset /= 2)</code> (Listing 2). New 64-lane table: every lane 2080 (R6, fourth block); shuffles on gfx90a: 6 (R3, <code>wave_sum_fixed.hip gfx90a … 6</code>).</p>
+<p><b>Prevention.</b> Without an AMD GPU: AMD compile in CI, the grep rules of Layer 3, shuffle counts per target in CI (a wave64 target must show log2(64) = 6), and a lane-model or unit test with 64 lanes. With one: run the correctness tests on a wave64 target (E3's acceptance line). <b>How the evidence was produced:</b> the university's lane model (R6) implementing HIP 5.7's <code>__shfl_xor</code> rule, plus real compiler output (R2, R3, R5). No GPU was used; the scenario's partner output is represented by the model's 64-lane block.</p>
+<p><b>Wrong answers.</b> "AMD's atomics are broken": the total is exactly one lane's value. "Use <code>% 32</code> for the leader": gives 2080 by accident and leaves the algorithm wrong (Check yourself 6).</p>
