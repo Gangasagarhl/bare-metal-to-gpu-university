@@ -110,3 +110,70 @@ Build date: 2026-10-09. Toolchain for every listing: `g++ (Ubuntu 13.3.0-6ubuntu
 - The forensic "adult's note" is a written story, labelled as such (not a real event).
 - Safety wording is general and conservative; it should be checked by the owner and
   extended with the chosen kit's own safety instructions.
+
+## Owner rulings applied
+
+- **Kit not chosen** → ruling **D1**. `build/KIT.md` names the kids' items: BBC micro:bit V2 (board),
+  Kitronik :MOVE Motor (robot: two DC motors, line-following and ultrasonic sensors, 4 × AA holder,
+  power switch), Fluke 17B+ multimeter (adult-held); kids' kits use AA cells, never LiPo. Each
+  chapter F0-40…F0-46 now has a source entry **K1** (reference kit, linked to `#kit-kids`), its
+  kit source (D3/D2/D4) says which items K1 names, and Part B boxes refer to them. Still open (not
+  in KIT.md): the LED, resistor, battery holder and separate switches for F0-40/F0-41, and a light
+  sensor for F0-43. The datasheets of the named items were not opened in this pass.
+- **"Simulator" = our own C++ text programs** → ruling **A2**. Approved. A Note at the start of
+  each Code walk-through (F0-40…F0-45) says the program is the course's own and names the real item
+  it stands for (K1 items; Gazebo for later robot courses, ruling D2).
+- **Pretend LED/battery/pin/motor numbers and thresholds** → ruling **A4**. Approved as exercise
+  values; they were already labelled "exercise numbers" / "pretend" in text and code; kept.
+- **Books title-only** → rulings **C1/C2**. Platt (3rd ed.) and Horowitz & Hill (3rd ed.) could be
+  opened only as tables of contents; they stay as further reading (or are withdrawn where the
+  contents show no matching section) and no claim rests on them. Claims were re-tagged to opened
+  sources approved under C2 (OpenStax University Physics 2 and 3, College Physics 2e, Petzold
+  Chapter Six sample, Feedback Systems 2e v3.1.5, Modern Robotics companion pages, example vendor
+  datasheets, Arduino reference/examples, WHO checklist page, a LiPo maker's instructions).
+- **Physical (kit) steps not performed** → ruling **C3**. Every Part B box is marked "Untested on
+  hardware (owner ruling C3)" and now states what would be needed to test it. Status per **C4**:
+  internally checked · hardware steps untested.
+- **Real-board code not given in F0-42** → rulings **C3/A2**: stays labelled pseudocode until the
+  micro:bit V2 documentation and toolchain are recorded and a supervised run is made.
+- **New analogy mappings** (LED drain, water saver, lever valve, four valves, pressure cooker, water
+  main, burst pipe, ribbon) → ruling **A3**: approved; no change.
+- **F0-43 distance-sensor safety line** → decided by verifier (in the spirit of C3/D1): strengthened
+  with the laser-safety warning of an example time-of-flight datasheet (never through a lens or
+  magnifier; follow the datasheet's laser-safety notes).
+- **F0-46 safety wording** → rulings **D1/C3**: the AA-only rule of the reference kit is stated;
+  the kit and battery makers' own instructions were not opened, so their unverified box stays.
+- **Soft prerequisite KID102 F0-29** → decided by verifier: not added to the chapters' `prereqs`
+  (course prerequisites are the Dean's card); each chapter keeps "a teacher or parent may run the
+  build command".
+- **Accidental re-run of other courses' labs** → decided by verifier: no action in this unit (other
+  units own their folders).
+- **A8 (test keys), A10 (licence), D4 (e-stop)**: not applicable — the unit's labs have no keys,
+  no `LicenseRef-Uni-Lab` placeholder and no e-stop code.
+
+## Verification pass
+
+Date 2026-10-10. Opened (WebFetch, URLs recorded in each dossier): OpenStax University Physics
+Volume 2 (§9.1, 9.4, 9.5, 10.1–10.4, 14.2), Volume 3 (§9.7), College Physics 2e (§17.7, 20.1,
+20.6, 22.8, 23.6); Petzold "Code" 2nd ed. (store page and Chapter Six sample); Platt "Make:
+Electronics" 3rd ed. and Horowitz & Hill "The Art of Electronics" 3rd ed. (tables of contents
+only); Åström & Murray "Feedback Systems" 2e v3.1.5 (Chapter 1 and wiki); Lynch & Park "Modern
+Robotics" (title page and Chapter 13 companion pages); datasheets used as examples only — Vishay
+5 mm LED and TCRT5000, Analog Devices MAX6816, TI MSP430G2x53, TI DRV8833, TI SBOA313A, ST
+VL53L0X, Advanced Photonix PDV-P8001, Conrad tilt switch; Arduino reference (delay, pin modes,
+analogRead, analogWrite) and examples (Blink, Debounce, StateChangeDetection, Smoothing); WHO safe
+surgery page; Stefansliposhop LiPo safety instructions.
+
+Results: dossiers `_dossiers/F0-39…F0-46.dossier.html` and QA records `qa/F0-39…F0-46.json`
+written; 178 tagged claims checked; 26 corrected or rewritten (main ones: F0-42 "special memory
+location" and "non-volatile" wording; F0-44 "inertia smooths PWM" and "transistor thresholds";
+F0-40 "light at the joint" and multimeter "several ranges"; F0-39 capacitor sentence; F0-46
+"pilots" checklist claim; F0-45 "many times per second"); every D1/D2 book tag re-tagged.
+Left unverified (in boxes): LED leg names (F0-40), inside of push buttons and toggle switches
+(F0-41), digital-output sensor chips and all kit sensor details (F0-43), kit pin/motor/driver
+numbers (F0-44), kit and battery makers' rules (F0-46), plus every Part B hardware step
+(untested on hardware, C3). Diagrams: F0-45 description corrected (rows/columns), F0-41 resistor
+label added. Glossary sources updated to the opened documents. Labs: all 18 listings re-run with
+`run_lab.sh` — exit 0, outputs identical; the recorded logs were restored (A5). WebFetch's shared
+budget ran out several times; a Vishay LED datasheet direct link and the Energizer battery SDS
+could not be opened (a distributor copy of the LED datasheet was used; no battery SDS is cited).
