@@ -1,0 +1,382 @@
+<!--meta
+id: F12-09
+title: Continuous integration for kernels, GPU code and robots
+course: SE302
+level: L4
+prereqs: F12-06, F12-07, F12-08; F2-26 (CI), F2-30 (unit tests, test harness, regression tests); OS302 (a Multiboot kernel with serial output) or the curriculum's milestone B1; F0-80 recommended (GPU kernel testing)
+time: 10–14 hours including the course lab and the forensic lab
+hardware: none (g++ 13.3.0, ld.lld 18.1.3, QEMU 8.2.2 qemu-system-x86_64 with TCG and SeaBIOS 1.16.3-2, nvcc 12.0 and cuobjdump); no GPU and no robot were available: the GPU run stage is skipped and every real-hardware run is untested in this build
+maps: Curriculum section 0, "How acceptance tests work for kernel code" (serial output is the oracle; pass/fail exit through isa-debug-exit; timeouts; determinism; real hardware as extra evidence) and the definition of done; workflow step 4 (test harness first); section 5.5 ("Regression: the emulator part runs in the harness on every commit"); milestone B1 acceptance (a failed assertion prints the panic line and exits QEMU with the failure status); milestone B3 acceptance (random allocate/free against a reference model)
+analogy: F12 — building a house as a team (proposed mapping, see SE302 NOTES.md: CI = the site inspector who checks each day's work before the next trade may build on it)
+-->
+
+<h2 id="F12-09-hook">Story hook</h2>
+<p>On a building site, the plumber finishes the pipes on Monday. On Tuesday the plasterers arrive and close the walls. If a pipe leaks, nobody will see it until the paint bubbles in March, and then the walls must be opened again.</p>
+<p>So the site has an inspector. Every evening, before anybody may build on top of today's work, she checks it: the pipes are pressure-tested, the wiring is tested with a meter, the stairs are measured. She writes "pass" or "fail" in the site book. A trade may start only when the work under it has passed.</p>
+<p>One autumn the inspector is replaced by a cheaper service. Its reports are always "pass". In spring, the third floor's heating does not work. The site book says the pipes were tested every day. They were not: the new service checked only that the plumber had written "done" on the door.</p>
+<p>Continuous integration is the evening inspection of software. This chapter builds one for a kernel, a GPU program and a robot controller, and then shows how a pipeline can say "pass" every day while the thing it guards is broken.</p>
+
+<h2 id="F12-09-able">What you will be able to do</h2>
+<ul>
+<li><b>Design</b> a CI pipeline in stages (host tests, freestanding build, emulator tests, harness self-tests, GPU build, GPU run, robot simulation) and justify their order.</li>
+<li><b>Implement</b> the curriculum's acceptance-test rules for kernel code: serial output as the oracle, pass/fail through QEMU's isa-debug-exit device, a wall-clock limit on every run, a fixed and recorded machine.</li>
+<li><b>Prove</b> that a harness can fail: run planted panics, hangs and empty runs and require the harness to report each as a failure.</li>
+<li><b>Handle</b> stages that cannot run on a given runner (no GPU, no robot) as "skipped", never as "passed", and say what evidence is missing.</li>
+<li><b>Diagnose</b> a pipeline that reports success for a broken commit, from its script and its log alone.</li>
+</ul>
+
+<div class="co jargon" id="F12-09-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>CI pipeline</dt><dd><b>Simple words:</b> the list of checks a computer runs, in order, on every change before the change is accepted. <b>Analogy:</b> the inspector's evening round: pipes first, then wiring, then stairs. <b>Precise:</b> an ordered set of stages (build, tests, analyses) run automatically for each commit or merge request; each stage has a pass, fail or skipped result, a failing stage stops the pipeline, and the overall result gates the merge. <sup class="src"><a href="#F12-09-src-D1">D1</a></sup> <sup class="src"><a href="#F12-09-src-R1">R1</a></sup></dd>
+<dt>isa-debug-exit</dt><dd><b>Simple words:</b> a pretend device in QEMU that a kernel can write a number to, which makes QEMU stop with an exit status. <b>Analogy:</b> the plumber flips a green or red card that the inspector can read from the road. <b>Precise:</b> a QEMU device on the ISA I/O port bus (here at port 0xf4); a write of value <i>v</i> ends the emulator with exit status (<i>v</i> &lt;&lt; 1) | 1, as observed in this build (0x10 gave 33, 0x11 gave 35); the status is therefore always odd, and the harness must map one chosen value to "pass". <sup class="src"><a href="#F12-09-src-D2">D2</a></sup> <sup class="src"><a href="#F12-09-src-D3">D3</a></sup> <sup class="src"><a href="#F12-09-src-R2">R2</a></sup></dd>
+<dt>Wall-clock limit (test timeout)</dt><dd><b>Simple words:</b> the most time a test may take; if it takes longer, it has failed. <b>Analogy:</b> the inspector does not wait all night for a pressure test to finish. <b>Precise:</b> a limit on real elapsed time enforced from outside the test (here by <code>timeout</code>, exit status 124 when it fires); the curriculum's rule: "a hang is a failure, not 'probably fine'". <sup class="src"><a href="#F12-09-src-D2">D2</a></sup> <sup class="src"><a href="#F12-09-src-R1">R1</a></sup></dd>
+<dt>Harness self-test</dt><dd><b>Simple words:</b> a test that is supposed to fail, run to prove that the harness notices failures. <b>Analogy:</b> the inspector checks her gauge on a pipe with a known leak. <b>Precise:</b> a deliberately failing case (panic, hang, no tests run) executed through the real harness in CI, with the stage passing only if every such case is reported as a failure; it protects the oracle itself from regressions. Related to <a href="#gl-mutation-testing">mutation testing</a>. <sup class="src"><a href="#F12-09-src-R1">R1</a></sup></dd>
+<dt>Skipped (test result)</dt><dd><b>Simple words:</b> "this check did not run here", reported as its own result, never as a pass. <b>Analogy:</b> "lift not inspected: lift engineer absent", written in the site book in red. <b>Precise:</b> a third verdict next to pass and fail, for tests whose preconditions (a GPU, a robot rig) are absent; the pipeline's summary names every skipped stage so that missing evidence stays visible, and a policy decides where the skipped test must still run before release. <sup class="src"><a href="#F12-09-src-D2">D2</a></sup> <sup class="src"><a href="#F12-09-src-R1">R1</a></sup></dd>
+<dt>pipefail (shell option)</dt><dd><b>Simple words:</b> a shell setting that makes a chain of commands joined by <code>|</code> fail if any command in the chain fails. <b>Analogy:</b> the report says "fail" if any trade failed, not only the last one to sign. <b>Precise:</b> in bash, <code>set -o pipefail</code> makes the exit status of a <a href="#gl-pipeline-shell">pipeline</a> the status of the last command that failed (or 0 if all succeeded); without it the status is that of the last command only, so <code>qemu ... | tee log</code> reports <code>tee</code>'s success. <sup class="src"><a href="#F12-09-src-D4">D4</a></sup> <sup class="src"><a href="#F12-09-src-R6">R6</a></sup></dd>
+</dl></div>
+<p>Also used: <a href="#gl-continuous-integration-ci">continuous integration (CI)</a> (<a href="#F2-26">F2-26</a>), <a href="#gl-test-harness">test harness</a> and <a href="#gl-regression-test">regression test</a> (<a href="#F2-30">F2-30</a>), <a href="#gl-bisect">bisect</a> (<a href="#F2-31">F2-31</a>), <a href="#gl-multiboot">Multiboot</a> and <a href="#gl-serial-port-uart">serial port (UART)</a> (<a href="#F3-18">F3-18</a>), <a href="#gl-gdb-stub-qemu">GDB stub (QEMU)</a> (<a href="#F3-09">F3-09</a>), <a href="#gl-exit-status">exit status</a>, <a href="#gl-acceptance-test">acceptance test</a>, <a href="#gl-reproducible-build">reproducible build</a>, <a href="#gl-test-plan">test plan</a>.</p>
+
+<h2 id="F12-09-pictures">The idea in pictures</h2>
+<p>Figure 1 is the pipeline of the course lab. Read it left to right: the cheapest, fastest checks come first, so a broken commit is rejected in seconds; the emulator tests come next; then the harness checks itself; then the stages that need special machines. The bottom row is the harness's verdict rule for one QEMU run.</p>
+<figure id="F12-09-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F12-09-f1t F12-09-f1d">
+<title id="F12-09-f1t">Figure 1: the SE302 CI pipeline and the verdict rule of one QEMU test</title>
+<desc id="F12-09-f1d">Top row, seven stages left to right with their results in this build: host unit tests with sanitizers, PASS; freestanding kernel build with zero undefined symbols, PASS; QEMU kernel tests with time limits, PASS; harness self-tests where a panic, a hang and an empty run must all be reported as failures, PASS; GPU build checked with cuobjdump, PASS; GPU run, SKIPPED because there is no GPU on the runner; robot scenario matrix, PASS. A failing stage stops the pipeline. Overall result: PASS with skipped stages: gpu-run. Bottom row, the verdict rule for one QEMU run: if timeout exit status is 124, fail as a hang; else if the serial log contains PANIC, fail; else if QEMU exit status is 33 and the summary line says 0 failed, pass; otherwise fail.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="24">Stages (ci.sh), cheapest first; a failure stops the pipeline</text>
+<rect class="sv-b3" x="10" y="40" width="96" height="70" rx="6"/>
+<text class="sv-tb" x="18" y="60">1 host</text>
+<text class="sv-ts" x="18" y="78">unit tests,</text>
+<text class="sv-ts" x="18" y="94">ASan, UBSan</text>
+<rect class="sv-b3" x="116" y="40" width="96" height="70" rx="6"/>
+<text class="sv-tb" x="124" y="60">2 kernel</text>
+<text class="sv-ts" x="124" y="78">-Werror,</text>
+<text class="sv-ts" x="124" y="94">0 undefined</text>
+<rect class="sv-b5" x="222" y="40" width="96" height="70" rx="6"/>
+<text class="sv-tb" x="230" y="60">3 qemu</text>
+<text class="sv-ts" x="230" y="78">serial oracle,</text>
+<text class="sv-ts" x="230" y="94">time limits</text>
+<rect class="sv-b5" x="328" y="40" width="96" height="70" rx="6"/>
+<text class="sv-tb" x="336" y="60">4 harness</text>
+<text class="sv-ts" x="336" y="78">panic, hang,</text>
+<text class="sv-ts" x="336" y="94">none must FAIL</text>
+<rect class="sv-b6" x="434" y="40" width="96" height="70" rx="6"/>
+<text class="sv-tb" x="442" y="60">5 gpu-build</text>
+<text class="sv-ts" x="442" y="78">nvcc -Werror,</text>
+<text class="sv-ts" x="442" y="94">cuobjdump</text>
+<rect class="sv-b8" x="540" y="40" width="96" height="70" rx="6"/>
+<text class="sv-tb" x="548" y="60">6 gpu-run</text>
+<text class="sv-ts" x="548" y="78">needs a GPU</text>
+<text class="sv-ts" x="548" y="94">or SKIPPED</text>
+<rect class="sv-b2" x="646" y="40" width="104" height="70" rx="6"/>
+<text class="sv-tb" x="654" y="60">7 robot</text>
+<text class="sv-ts" x="654" y="78">scenario matrix</text>
+<text class="sv-ts" x="654" y="94">(F12-07)</text>
+<line class="sv-line" x1="106" y1="75" x2="110" y2="75"/>
+<line class="sv-line" x1="212" y1="75" x2="216" y2="75"/>
+<line class="sv-line" x1="318" y1="75" x2="322" y2="75"/>
+<line class="sv-line" x1="424" y1="75" x2="428" y2="75"/>
+<line class="sv-line" x1="530" y1="75" x2="534" y2="75"/>
+<line class="sv-line" x1="636" y1="75" x2="640" y2="75"/>
+<text class="sv-tm" x="34" y="132">PASS</text>
+<text class="sv-tm" x="140" y="132">PASS</text>
+<text class="sv-tm" x="246" y="132">PASS</text>
+<text class="sv-tm" x="352" y="132">PASS</text>
+<text class="sv-tm" x="458" y="132">PASS</text>
+<text class="sv-tm" x="556" y="132">SKIPPED</text>
+<text class="sv-tm" x="676" y="132">PASS</text>
+<text class="sv-t" x="20" y="160">Overall: "CI result: PASS with skipped stages: gpu-run" (the skip is named, not hidden)</text>
+<line class="sv-line2" x1="10" y1="174" x2="750" y2="174"/>
+<text class="sv-tb" x="20" y="198">Verdict rule for one QEMU run (qemu_test.sh)</text>
+<rect class="sv-b8" x="10" y="212" width="170" height="56" rx="6"/>
+<text class="sv-t" x="18" y="234">timeout status 124?</text>
+<text class="sv-ts" x="18" y="254">yes: FAIL (hang)</text>
+<line class="sv-line" x1="180" y1="240" x2="192" y2="240"/>
+<polygon class="sv-head" points="202,240 190,234 190,246"/>
+<rect class="sv-b8" x="204" y="212" width="170" height="56" rx="6"/>
+<text class="sv-t" x="212" y="234">"PANIC" in serial log?</text>
+<text class="sv-ts" x="212" y="254">yes: FAIL</text>
+<line class="sv-line" x1="374" y1="240" x2="386" y2="240"/>
+<polygon class="sv-head" points="396,240 384,234 384,246"/>
+<rect class="sv-b2" x="398" y="212" width="200" height="56" rx="6"/>
+<text class="sv-t" x="406" y="234">status 33 and "summary</text>
+<text class="sv-t" x="406" y="254">... 0 failed"? yes: PASS</text>
+<line class="sv-line" x1="598" y1="240" x2="610" y2="240"/>
+<polygon class="sv-head" points="620,240 608,234 608,246"/>
+<rect class="sv-b8" x="622" y="212" width="128" height="56" rx="6"/>
+<text class="sv-t" x="630" y="234">anything else:</text>
+<text class="sv-ts" x="630" y="254">FAIL</text>
+<text class="sv-ts" x="20" y="296">Each "no" moves right. Pass needs two independent signals: the exit status written by the kernel and the summary line on the serial port.</text>
+<text class="sv-ts" x="20" y="316">Machine fixed and printed in every verdict line: -machine q35 -m 64M -smp 1, with the time limit and the command line.</text>
+</svg></div><figcaption><b>Figure 1.</b> The course-lab pipeline with its results in this build (R1), and the harness's verdict rule (Listing 3). <sup class="src"><a href="#F12-09-src-R1">R1</a></sup> <sup class="src"><a href="#F12-09-src-D2">D2</a></sup></figcaption></figure>
+
+<h2 id="F12-09-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The evening inspection. Mapping: each day's work = a commit; the inspector's round = the pipeline; pressure-testing the pipes = running the tests; "nobody builds on work that failed" = a failing pipeline blocks the merge; the inspector testing her own gauge on a known leak = the harness self-tests; "lift not inspected" in red = a skipped stage; the cheap service that read the "done" sign on the door = a pipeline that checks the wrong thing.</p></div>
+<p>When many people change the same program, a mistake by one person can break everyone's work. So every change is checked by a computer before it joins the rest, every time, in the same way. That is continuous integration.</p>
+<p>A kernel is hard to check because it runs on a whole computer, not inside one. So we start a pretend computer, an emulator, and let the kernel run tests inside it. The kernel writes its results on a pretend cable, and at the end it presses a pretend button that says "all good" or "something failed".</p>
+<p>The most important rule: the checker must be able to say "fail". If it cannot notice a crash, or if it waits forever when the kernel freezes, it is worse than no checker, because everybody trusts it.</p>
+
+<h2 id="F12-09-layer2">Layer 2 — the student explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The inspector checks the cheap things first (are the pipes connected?) and the expensive things later (a pressure test). If the pipes are not connected, there is no point in the pressure test.</p></div>
+<h3 id="F12-09-l2-rules">The rules from the curriculum</h3>
+<p>Curriculum section 0 states how acceptance tests work for kernel code. Quoted, because the lab implements each sentence: <sup class="src"><a href="#F12-09-src-D2">D2</a></sup></p>
+<ul>
+<li>"Serial output is the oracle. The kernel prints structured lines on the emulated 16550 UART; QEMU writes them to a file or to the terminal; the harness checks for expected lines and for the absence of "PANIC"."</li>
+<li>"Pass/fail exit. QEMU's isa-debug-exit device lets the kernel end the run with a chosen exit status, so a test run is a normal process that passes or fails in CI."</li>
+<li>"Timeouts. Every QEMU test has a wall-clock limit; a hang is a failure, not "probably fine"."</li>
+<li>"Determinism. Fixed QEMU machine type, memory size, CPU count and firmware build per test; the harness records them in the log."</li>
+<li>"Real hardware runs are recorded as extra evidence, never as a replacement for the QEMU test."</li>
+</ul>
+<p>Section 5.5 adds the rule for drivers: "Regression: the emulator part runs in the harness on every commit; real-hardware runs are recorded in the log as separate evidence". <sup class="src"><a href="#F12-09-src-D2">D2</a></sup></p>
+<h3 id="F12-09-l2-kernel">The test kernel</h3>
+<p>Listing 2 (<code>kmain.cc</code>) is a small Multiboot kernel built only for tests. QEMU loads it with <code>-kernel</code> and passes the <code>-append</code> string as its command line; the kernel reads the command line from the Multiboot information and runs the tests it names. Each test prints one structured line, <code>KTEST &lt;name&gt; ok</code> or <code>KTEST &lt;name&gt; FAILED</code>, on COM1. At the end it prints <code>KTEST summary N passed M failed</code> and writes 0x10 (all passed) or 0x11 (something failed) to the isa-debug-exit port. A failed assertion prints a <code>PANIC</code> line and writes 0x11.</p>
+<p>The real test is the frame allocator of Listing 1 (<code>bitmap.hpp</code>), the kind of allocator milestone B3 asks for. It is pure logic, so the same header is tested twice: on the host with AddressSanitizer and UBSan, including the B3 test "random allocate/free sequences against a reference model" (Listing 5), and inside the kernel. Host first: bugs in logic are found in a second with a full debugger and sanitizers; the kernel run then proves it works freestanding, compiled with kernel flags, on the emulated machine.</p>
+<h3 id="F12-09-l2-harness">The harness and its verdict</h3>
+<p>Listing 3 (<code>qemu_test.sh</code>) boots the kernel once, under <code>timeout</code>, with a fixed machine (<code>-machine q35 -m 64M -smp 1</code>), the serial port written to a file, and the debug-exit device at port 0xf4. Its verdict rule is the bottom row of Figure 1. A pass needs two independent signals: the exit status 33 <i>and</i> the summary line with 0 failures. Either alone can lie: a kernel that crashes in the summary code could still have written 0x10 earlier; a log can contain "0 failed" from a previous run if it is not deleted first (line 11 deletes it).</p>
+<h3 id="F12-09-l2-selftest">The harness must fail when it should</h3>
+<p>Stage 4 of Listing 4 (<code>ci.sh</code>) runs three kernels that must fail: one that panics on a wrong assertion, one that halts with interrupts off and never ends, and one with an empty command line, so that no test runs. The stage passes only if the harness reports all three as failures. In this build it did: the panic gave "FAIL (PANIC in the serial log; QEMU exit status 35)", the hang gave "FAIL (no result within 10 s: a hang is a failure)", the empty run gave "FAIL (QEMU exit status 35; last serial line: KTEST summary 0 passed 1 failed)". <sup class="src"><a href="#F12-09-src-R1">R1</a></sup> The third case matters as much as the others: a typing mistake in the command line (<code>test=bitmpa</code>) would otherwise run nothing and pass.</p>
+<p>Here is everything the panicking kernel printed, and the hanging one: <sup class="src"><a href="#F12-09-src-R3">R3</a></sup> <sup class="src"><a href="#F12-09-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F12-09/serial_panic"></pre>
+<pre class="output" data-run="F12-09/serial_hang"></pre>
+<h3 id="F12-09-l2-gpu">GPU and robot stages</h3>
+<p>GPU code needs a GPU to run, and CI runners often have none. The pipeline still checks what it can on every commit: that the CUDA code compiles with warnings as errors, and that the produced machine code contains the kernel function (stage 5, <code>cuobjdump</code> lists <code>_Z6vecAddPKfS0_Pfi</code>). Stage 6 asks the CUDA runtime for devices; when there are none, the program exits with 77 and the pipeline reports the stage as SKIPPED, by name, in the final line. <sup class="src"><a href="#F12-09-src-R1">R1</a></sup> The robot stage builds and runs the scenario matrix of <a href="#F12-07">F12-07</a>; a controller change that breaks the latency requirement now fails CI.</p>
+
+<h2 id="F12-09-layer3">Layer 3 — the engineer's depth</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>A site book full of "pass" is worth exactly as much as the inspector's method. Engineers audit the method, not the book.</p></div>
+<h3 id="F12-09-l3-order">Ordering stages: cost, information, and dependency</h3>
+<p>Order stages by three questions. <b>Dependency:</b> nothing can be emulated before it builds. <b>Cost:</b> host tests take seconds; a QEMU boot takes longer; a GPU or HIL runner is a scarce machine; cheap stages first save expensive ones. <b>Information:</b> a host test failure points at one function with a sanitizer report; a QEMU failure says "something in the kernel"; run the most precise check first, so the failure message is the most useful one. The harness stage comes after the QEMU stage here so that a harness change is tested on the same kernel image the real tests used. A real pipeline can run independent stages in parallel (the GPU build does not depend on the kernel), which most CI services support; their configuration languages are not covered here (see the unverified box).</p>
+<h3 id="F12-09-l3-oracle">The oracle: exit status and log, both</h3>
+<p>Why not only the exit status? The kernel writes it, so a kernel bug can write the wrong one. Why not only the log? Logs are text; a pattern can match old or partial text, and a missing line is easy to miss. Using both gives two independent witnesses that must agree. The structure of the log lines matters: <code>KTEST &lt;name&gt; ok</code> is easy to match exactly; free text such as "bitmap seems fine" is not. Line 20 of Listing 3 anchors the summary pattern at the start of a line (<code>^KTEST summary</code>), so a test that prints the word "summary" in its own output cannot fake it.</p>
+<h3 id="F12-09-l3-limits">Choosing the time limit</h3>
+<p>A limit that is too short makes a slow but correct run fail on a loaded runner (a flaky test, <a href="#F12-10">F12-10</a>); a limit that is too long wastes a runner for every hang. Measure the normal duration on the runner, under load, and set the limit at a generous multiple of it; record the limit in the verdict line (Listing 3 prints it). The hang self-test uses a shorter limit (10 s) than the real tests (20 s) because it can only end by the limit. The limit is enforced from outside the emulator: <code>timeout</code> sent signal 15 (SIGTERM) and QEMU printed "terminating on signal 15 from pid ... (timeout)" before the harness recorded the hang. <sup class="src"><a href="#F12-09-src-R1">R1</a></sup> A kernel cannot be trusted to enforce its own time limit, for the same reason it cannot be trusted to write its own exit status alone.</p>
+<h3 id="F12-09-l3-determinism">Determinism and the record</h3>
+<p>The curriculum asks for a fixed machine type, memory size, CPU count and firmware build per test, recorded in the log. <sup class="src"><a href="#F12-09-src-D2">D2</a></sup> The verdict line records the first three; the run record of this build adds the QEMU version (8.2.2) and the firmware package (SeaBIOS 1.16.3-2), because a different firmware or QEMU version can change what a kernel sees at boot. <sup class="src"><a href="#F12-09-src-R1">R1</a></sup> Emulation with TCG (no hardware acceleration) is the most predictable choice for early milestones, as the curriculum notes. <sup class="src"><a href="#F12-09-src-D2">D2</a></sup> The section 0 rule on debugger reproducibility ("Every failing test can be re-run with QEMU's GDB stub enabled and the CPU halted at start") is a lab step below: a failing CI run is only useful if a developer can repeat it on their own machine, with the same command line, and step through it.</p>
+<h3 id="F12-09-l3-skip">Skips are evidence that is missing</h3>
+<p>A skipped stage is not a pass. The pipeline prints "PASS with skipped stages: gpu-run" so the gap is visible in every summary. The policy that turns skips into evidence belongs in the test plan (curriculum 5.5): which machine runs the GPU tests, how often (every commit on a GPU runner, nightly, or before a release), and who looks at the result. The curriculum's definition of done rules out the dangerous version: "The agent never marks a milestone done with a test skipped, weakened or "to be added later"." <sup class="src"><a href="#F12-09-src-D2">D2</a></sup> A skip on a commit is acceptable; a skip at the milestone gate is not.</p>
+<h3 id="F12-09-l3-gpu">What a GPU-less runner can still check</h3>
+<ul>
+<li>The code compiles for every target architecture in the support matrix, with warnings as errors (stage 5).</li>
+<li>The produced binary contains the kernels you expect (stage 5, <code>cuobjdump</code>); a refactoring that silently removed a kernel or changed its signature shows up as a changed name.</li>
+<li>The host-side logic (sizes, launch configuration, the CPU reference used by the GPU tests) is tested with ordinary host tests and sanitizers.</li>
+<li>Not checkable without a GPU: correctness of the device code, races on the device (<a href="#F0-80">F0-80</a> uses the GPU sanitizers for that), performance. These are the gpu-run stage's job on a runner with a GPU.</li>
+</ul>
+<h3 id="F12-09-l3-robots">Robots in CI</h3>
+<p>For robots the ladder of <a href="#F12-07">F12-07</a> maps onto CI frequencies: SIL scenarios on every commit (stage 7 here), PIL with an emulator on every commit or nightly, HIL on a rig as a scheduled job or a release gate, field tests as planned events. A HIL rig in CI is a physical machine that moves; it needs the same safety rules as a lab bench, and an unattended job must not be able to command motion beyond what the rig is built to contain.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>No hosted CI service was used in this build, and the configuration syntax of any CI service (pipeline files, runner labels, caches, artifacts, matrix builds, GPU runners) is deliberately not given here; read the documentation of the service your team uses. ROS 2 and PX4 have their own test launch and simulation tools for CI; none of their commands or parameters are given here (see <a href="#F9-44">F9-44</a>, <a href="#F10-34">F10-34</a>). The Multiboot header values in <code>entry.S</code> and the offset of the command-line field were written from memory of the Multiboot Specification (D5); the runs show QEMU accepting the header and the kernel reading its command line (<code>'kernel.elf test=all'</code>), which is evidence for this QEMU only. The isa-debug-exit formula is inferred from two observed values (0x10 to 33, 0x11 to 35); D3 must confirm it. The 16550 transmitter-empty bit used by <code>putc</code> is from memory of the datasheet (D6).</p></div>
+
+<h2 id="F12-09-hardware">How the hardware actually does it</h2>
+<p>On a real PC, a write to an I/O port with the <code>out</code> instruction goes to whatever device decodes that port. Under QEMU with TCG, the guest's instructions are translated into host code; an <code>out</code> to port 0xf4 becomes a call into QEMU's device model, and the isa-debug-exit device's handler ends the QEMU process with the computed status. <sup class="src"><a href="#F12-09-src-D3">D3</a></sup> No such device exists on a real PC: the same kernel on hardware would write to an unused port and continue, so a hardware run needs another way to end (here the <code>cli; hlt</code> loop after the write) and another way to report (a person or a script reading the serial line). The serial port is the emulated 16550: <code>putc</code> waits until bit 5 of the line status register (port 0x3f8 + 5) says the transmitter can take a byte, then writes the byte to port 0x3f8; QEMU's model is ready at once and writes the byte to the log file. <sup class="src"><a href="#F12-09-src-D6">D6</a></sup> On real hardware the same loop waits for the bits to leave the wire at the configured baud rate, which this kernel never sets; that is one reason the hardware run is untested.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p><b>Untested on hardware.</b> Every kernel run in this chapter ran in QEMU 8.2.2 with TCG and SeaBIOS; no physical PC booted this kernel. The CUDA program was compiled and its machine code inspected, but it never ran on a GPU: the runtime reported "no CUDA-capable device is detected". <sup class="src"><a href="#F12-09-src-R1">R1</a></sup> <sup class="src"><a href="#F12-09-src-R9">R9</a></sup> The robot stage is simulation only.</p></div>
+<pre class="output" data-run="F12-09/vadd"></pre>
+
+<h2 id="F12-09-worked">Worked example</h2>
+<p><b>Task.</b> The harness sees two signals: QEMU's exit status <i>s</i> and the serial log. List the cases, decide each verdict, and check that no failure can be reported as a pass.</p>
+<ol>
+<li><b>Exit status values.</b> The device gives (<i>v</i> &lt;&lt; 1) | 1. For <i>v</i> = 0x10 = 16: 32 | 1 = 33. For <i>v</i> = 0x11 = 17: 34 | 1 = 35. Both match the runs (R1, R2). The status is odd for every <i>v</i>, so QEMU's own "normal" status 0 can never mean "the kernel said pass", which is why the kernel's pass is mapped to 33.</li>
+<li><b>Other statuses.</b> 124 comes from <code>timeout</code> (hang). 0 would mean QEMU ended without the device (for example a guest shutdown); 1 an emulator error such as a missing kernel file. Neither is a pass.</li>
+<li><b>Decision table.</b>
+<div class="tw"><table>
+<thead><tr><th>Case</th><th>Status</th><th>Log</th><th>Verdict</th><th>Seen in</th></tr></thead>
+<tbody>
+<tr><td>all tests pass</td><td>33</td><td>"summary 2 passed 0 failed"</td><td>PASS</td><td>R1 (all)</td></tr>
+<tr><td>assertion fails</td><td>35</td><td>PANIC line</td><td>FAIL</td><td>R1 (panic), R7</td></tr>
+<tr><td>kernel hangs</td><td>124</td><td>stops after "KTEST hang"</td><td>FAIL</td><td>R1 (hang)</td></tr>
+<tr><td>no test selected</td><td>35</td><td>"summary 0 passed 1 failed"</td><td>FAIL</td><td>R1 (none)</td></tr>
+<tr><td>kernel writes 0x10, but a test printed FAILED</td><td>33</td><td>"summary 1 passed 1 failed"</td><td>FAIL (summary check)</td><td>not run; lab step 4</td></tr>
+<tr><td>QEMU cannot start</td><td>1</td><td>empty</td><td>FAIL</td><td>not run; lab step 4</td></tr>
+</tbody></table></div></li>
+<li><b>Check.</b> PASS requires status 33 <i>and</i> the anchored summary with 0 failed <i>and</i> no PANIC. Each failing case breaks at least one of the three. The two cases marked "not run" are your lab exercise: a claim about a harness is only as good as the cases you have run through it.</li>
+</ol>
+
+<h2 id="F12-09-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>bitmap.hpp</code>, the code under test, shared by host and kernel.</p>
+<pre class="listing" data-src="F12-09/bitmap.hpp"></pre>
+<p>Pure logic with no library calls (lines 5–6 include only <code>stddef.h</code> and <code>stdint.h</code>, available freestanding). <code>release</code> refuses bad and double frees and changes nothing (lines 34–46), which the host tests check explicitly.</p>
+<p><b>Listing 2</b> — <code>entry.S</code>, <code>kernel.ld</code> and <code>kmain.cc</code>, the test kernel.</p>
+<pre class="listing" data-src="F12-09/entry.S"></pre>
+<pre class="listing" data-src="F12-09/kernel.ld"></pre>
+<pre class="listing" data-src="F12-09/kmain.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>File, lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>entry.S 5–12</td><td>Multiboot header</td><td>Magic, flags, checksum: the three words QEMU's loader looks for.</td><td>Lets QEMU boot the kernel directly with <code>-kernel</code>; no boot loader or disk image needed in CI. Values from memory of the specification. <sup class="src"><a href="#F12-09-src-D5">D5</a></sup></td></tr>
+<tr><td>entry.S 17–24</td><td><code>_start</code></td><td>Sets a stack, passes EAX (magic) and EBX (information address) to <code>kmain</code>.</td><td>The command line arrives through the information structure.</td></tr>
+<tr><td>kernel.ld 5–6</td><td><code>. = 0x100000</code></td><td>Links at 1 MiB with the header first.</td><td>The header must be near the start of the file.</td></tr>
+<tr><td>kmain.cc 20–25</td><td><code>putc</code></td><td>Waits for the transmitter, writes a byte to COM1.</td><td>The serial port is the oracle's channel.</td></tr>
+<tr><td>kmain.cc 46–52</td><td><code>qemu_exit</code></td><td>Writes the code to port 0xf4, then halts forever.</td><td>Ends the run with a status; on hardware it halts instead.</td></tr>
+<tr><td>kmain.cc 54–69</td><td><code>panic</code>, <code>KASSERT</code></td><td>Prints "PANIC: assertion failed: <i>expr</i> at kmain.cc:<i>line</i>" and exits with 0x11.</td><td>Milestone B1's acceptance test: a failed assertion prints the panic line and exits with the failure status.</td></tr>
+<tr><td>kmain.cc 87–109</td><td><code>test_bitmap</code></td><td>Allocates all 128 frames, checks no duplicate, frees all, checks the count.</td><td>The same logic as the host test, now freestanding with kernel flags.</td></tr>
+<tr><td>kmain.cc 124–129</td><td>command line</td><td>Reads the Multiboot command-line field if flags bit 2 is set.</td><td>One kernel image runs any subset of tests: the harness chooses.</td></tr>
+<tr><td>kmain.cc 134–139</td><td><code>report</code></td><td>One structured line per test; counts passes and failures.</td><td>Structured lines are easy to match exactly.</td></tr>
+<tr><td>kmain.cc 146–157</td><td>panic and hang</td><td>Deliberate failures for the harness self-tests.</td><td>Kept in the test kernel, selected only by name.</td></tr>
+<tr><td>kmain.cc 158–161</td><td>no test selected</td><td>Counts "nothing ran" as a failure.</td><td>A misspelt test name must not pass.</td></tr>
+<tr><td>kmain.cc 162–167</td><td>summary and exit</td><td>Prints the summary, writes 0x10 or 0x11.</td><td>The two signals the harness requires.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>qemu_test.sh</code>, the harness for one QEMU run.</p>
+<pre class="listing" data-src="F12-09/qemu_test.sh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10</td><td><code>MACHINE=...</code></td><td>Fixed machine type, memory, CPU count.</td><td>Determinism; printed in the verdict line (line 25).</td></tr>
+<tr><td>11</td><td><code>rm -f "$log"</code></td><td>Deletes an old log.</td><td>An old "0 failed" must not satisfy the check.</td></tr>
+<tr><td>12–14</td><td><code>timeout ... qemu-system-x86_64 ...</code></td><td>No display, no reboot, no network, serial to a file, debug-exit device.</td><td><code>-no-reboot</code> turns a triple fault into an exit instead of an endless reboot loop.</td></tr>
+<tr><td>16–24</td><td>verdict</td><td>Hang, then PANIC, then the pass condition, else fail.</td><td>Pass is the narrow case; everything unknown is a failure.</td></tr>
+<tr><td>26</td><td><code>[ "$verdict" = PASS ]</code></td><td>The script's own exit status.</td><td>CI reads this, not the text.</td></tr>
+</tbody></table></div>
+<p><b>Listing 4</b> — <code>ci.sh</code>, the pipeline, and its complete output.</p>
+<pre class="listing" data-src="F12-09/ci.sh"></pre>
+<pre class="output" data-run="F12-09/ci"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11</td><td><code>set -u -o pipefail</code></td><td>Unset variables are errors; a pipeline fails if any part fails.</td><td>The forensic lab is about the missing <code>pipefail</code>.</td></tr>
+<tr><td>17</td><td><code>fail()</code></td><td>Prints the stage and "CI result: FAIL", exits 1.</td><td>A failing stage stops the pipeline.</td></tr>
+<tr><td>20–23</td><td>stage host</td><td>Builds and runs the host tests with ASan and UBSan.</td><td>Logic bugs are found here first.</td></tr>
+<tr><td>26–33</td><td>stage kernel</td><td>Freestanding flags, <code>-Werror</code>; counts undefined symbols with <code>readelf</code>.</td><td>A kernel calling a host library function would fail to link or load; caught before booting.</td></tr>
+<tr><td>36–39</td><td>stage qemu</td><td>Two runs through the harness: all tests, and the bitmap test alone.</td><td>Selecting one test checks that selection works.</td></tr>
+<tr><td>41–52</td><td>stage harness</td><td>Panic, hang and empty runs must each be reported as failures.</td><td>A harness that cannot fail would be caught here.</td></tr>
+<tr><td>54–57</td><td>stage gpu-build</td><td>nvcc with all warnings as errors; <code>cuobjdump</code> must list a function.</td><td>What a GPU-less runner can check.</td></tr>
+<tr><td>59–68</td><td>stage gpu-run</td><td>Exit 77 from the probe means no GPU: SKIPPED; otherwise run and check.</td><td>A skip is recorded and named, never counted as a pass.</td></tr>
+<tr><td>70–73</td><td>stage robot</td><td>Builds and runs the latency scenario matrix from <a href="#F12-07">F12-07</a>.</td><td>The forensic lab of F12-07 becomes a permanent gate.</td></tr>
+<tr><td>75–79</td><td>result</td><td>Names skipped stages in the last line.</td><td>Missing evidence stays visible.</td></tr>
+</tbody></table></div>
+<p><b>Listing 5</b> — <code>host_tests.cpp</code> (stage 1) and <code>vadd.cu</code> (stages 5 and 6).</p>
+<pre class="listing" data-src="F12-09/host_tests.cpp"></pre>
+<pre class="output" data-run="F12-09/host_tests"></pre>
+<pre class="listing" data-src="F12-09/vadd.cu"></pre>
+<p><code>random_against_model</code> (host_tests.cpp lines 50–78) is the B3 acceptance test: 50 rounds of 1,000 random operations each against a <code>std::set</code>, with "never handed out twice" and the free count checked after every step, and "all frames returned" at the end; the seed is fixed (302), so the test is deterministic. <sup class="src"><a href="#F12-09-src-R8">R8</a></sup> <code>vadd.cu</code> lines 29–32 are the probe: exit 77 when no device exists, which <code>ci.sh</code> maps to SKIPPED.</p>
+<p>The serial log of the passing run, and of the run with no test selected: <sup class="src"><a href="#F12-09-src-R2">R2</a></sup> <sup class="src"><a href="#F12-09-src-R5">R5</a></sup></p>
+<pre class="output" data-run="F12-09/serial_all"></pre>
+<pre class="output" data-run="F12-09/serial_none"></pre>
+
+<h2 id="F12-09-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>An inspector looks at the real house; CI looks at a model of the machine.</b> QEMU is not a PC. A kernel can pass every emulated test and fail on hardware (timing, firmware quirks, devices QEMU models differently). That is why the curriculum records real-hardware runs as separate evidence, and why this chapter's hardware column says "untested".</li>
+<li><b>An inspector comes once a day; CI runs on every change.</b> The value of CI comes from the small size of each change: when a test fails, the cause is in the last commit, not in a week of work. Running the pipeline nightly over many commits loses that and turns every failure into a <a href="#gl-bisect">bisect</a>.</li>
+<li><b>An inspector can use judgement; a pipeline cannot.</b> Anything a script does not check, it does not see: the forensic lab's pipeline "checked" a log for one good line. A human inspector who saw "PANIC" on the page would have stopped.</li>
+</ul>
+
+<h2 id="F12-09-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> CI passes although the kernel panicked. <b>Cause:</b> the stage's status comes from the last command of a pipeline (<code>| tee</code>), or the check looks only for a good line. <b>How to find it:</b> run the harness self-tests; read the stage's script for <code>|</code> without <code>pipefail</code>. <b>Fix:</b> <code>set -o pipefail</code>, check for PANIC, require the exit status.</li>
+<li><b>Symptom:</b> a CI job runs for hours and is killed by the service. <b>Cause:</b> no time limit around QEMU. <b>Fix:</b> <code>timeout</code> on every emulator run, with a limit recorded in the log.</li>
+<li><b>Symptom:</b> passes locally, fails in CI (or the reverse). <b>Cause:</b> a different QEMU, firmware or machine type; a different compiler; files left in the working tree. <b>How to find it:</b> compare the recorded versions and machine lines. <b>Fix:</b> pin and record versions; build from a clean tree (curriculum: "pass from a clean build").</li>
+<li><b>Symptom:</b> a test "passes" that never ran. <b>Cause:</b> a misspelt test name, an empty selection, a skipped stage counted as success. <b>Fix:</b> count "no test selected" as a failure (kmain.cc 158–161); report skips by name.</li>
+<li><b>Symptom:</b> QEMU reboots forever after a crash. <b>Cause:</b> a triple fault resets the emulated machine. <b>Fix:</b> <code>-no-reboot</code>, and a time limit.</li>
+<li><b>Symptom:</b> a failure in CI cannot be debugged. <b>Cause:</b> the command line and versions are not recorded. <b>Fix:</b> print the full QEMU command, and keep the serial log as a CI artifact; re-run locally with the GDB stub.</li>
+</ul>
+
+<div class="co transition" id="F12-09-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F12-06">F12-06</a> to <a href="#F12-08">F12-08</a> built tests at every level: unit, integration, system, simulation, property-based and fuzz tests. <b>What carries over:</b> every test has an oracle, a recorded environment and a deterministic seed; failures become regression tests. <sup class="src"><a href="#F12-09-src-R1">R1</a></sup> <b>What changes:</b> the tests now run automatically on every commit, unattended, on machines nobody is watching; so the harness itself must be proven able to fail, every run needs a time limit, and anything that cannot run on a runner must be reported as skipped (R1, R6, R7). <sup class="src"><a href="#F12-09-src-D2">D2</a></sup> <b>What comes next:</b> <a href="#F12-10">F12-10</a> deals with what makes unattended pipelines lose trust fastest: tests that pass and fail on the same code.</p></div>
+
+<h2 id="F12-09-check">Check yourself</h2>
+<ol>
+<li>Quote or paraphrase the five rules of curriculum section 0 for kernel acceptance tests, and name the line of Listing 3 or 4 that implements each.</li>
+<li>Why does the harness require both QEMU exit status 33 and the summary line? Give one failure each signal alone would miss.</li>
+<li>Compute the exit status QEMU gives for a write of 0x00 and of 0x7f to the debug-exit port. Why can no value give status 0?</li>
+<li>Which statement is true? (a) A skipped GPU stage means the GPU code is correct. (b) A harness self-test is a test that must fail through the real harness for the CI stage to pass. (c) A time limit is unnecessary if the kernel has its own watchdog. (d) Real-hardware runs can replace the QEMU test once they pass.</li>
+<li>Explain why the empty-command-line self-test matters with an example of a change that it would catch.</li>
+<li>Order these stages and justify the order: GPU run, host unit tests, QEMU tests, freestanding build, HIL rig test.</li>
+<li>Design: what would you add to the pipeline so that the gpu-run stage still provides evidence before each release? Write it as two lines of a test plan.</li>
+<li>Predict, then run: remove <code>-no-reboot</code> from Listing 3 and make the panic test cause a triple fault instead of a debug-exit write. What verdict do you expect, and after how long?</li>
+</ol>
+
+<h2 id="F12-09-lab">Lab</h2>
+<p><b>Course lab: a CI pipeline running QEMU kernel tests with timeouts (curriculum section 0).</b></p>
+<p><b>Goal.</b> Run the pipeline, extend the test kernel with a new test, prove the harness catches two new failure kinds, and repeat a failing run under the debugger.</p>
+<p><b>Hardware and software needed.</b> A Linux machine with g++ (with 32-bit multilib support for <code>-m32</code>), ld.lld, qemu-system-x86_64, and optionally nvcc and cuobjdump (stage 5; without them the stage fails, so remove it and record that you did). This build used g++ 13.3.0, LLD 18.1.3, QEMU 8.2.2 with SeaBIOS 1.16.3-2, CUDA 12.0. Folder <code>university/labs/F12-09</code>; from the repository root run <code>university/labs/run_lab.sh university/labs/F12-09</code>.</p>
+<div class="co safety"><span class="lbl">Safety</span><p>This lab runs only in an emulator; nothing touches real hardware. If you later boot the test kernel on a spare PC, follow the curriculum's real-hardware rules: a machine whose data you do not need, disks you care about disconnected, and the QEMU test kept as the primary evidence. If you add a HIL stage for a robot, the rig must contain any motion it can command, with an emergency stop, and the job must not run unattended on a robot that can leave the bench (BR-08).</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Read <code>ci.out</code>; find the verdict line of each QEMU run and the final result line.</li>
+<li>Add a kernel test <code>bitmap_refuse</code>: release frame 200 of a 128-frame bitmap and a frame twice; both must be refused, the free count unchanged. Select it with <code>test=bitmap_refuse</code> in a new <code>qemu_test.sh</code> call in stage 3. Add its line to the expected output.</li>
+<li>Break your test on purpose (expect the wrong count) and confirm the pipeline fails at stage 3 with a clear message. Restore it.</li>
+<li>Run the two "not run" cases of the worked example through <code>qemu_test.sh</code>: a kernel that prints a FAILED line but exits with 0x10 (temporary change to <code>kmain.cc</code>), and a missing <code>kernel.elf</code>. Both must be reported as FAIL. Add them to stage 4 if you think they belong there.</li>
+<li>Debugger reproducibility: re-run the panic test by hand with QEMU's GDB stub enabled and the CPU halted at start (the curriculum's rule; the options are in your QEMU's documentation and in <a href="#F3-09">F3-09</a>), attach GDB to <code>kernel.elf</code>, set a breakpoint on <code>panic</code>, and print the line argument.</li>
+<li>Write a one-page test plan section in the format of curriculum 5.5 for this kernel: emulator tests, host unit tests, real-hardware matrix (what you would record), regression rule.</li>
+</ol>
+<p><b>Expected observations.</b> Step 1 as R1. Step 2: a new <code>KTEST bitmap_refuse ok</code> line and a PASS verdict. Step 3: <code>CI stage qemu: FAIL</code> and <code>CI result: FAIL</code>; the later stages do not run. Step 4: "FAIL (QEMU exit status 33; last serial line: ...)" for the first case, because the summary says 1 failed; a QEMU error and FAIL for the second. Step 5: GDB stops in <code>panic</code> with <code>line</code> = 150.</p>
+<p><b>Verification.</b> <code>run_lab.sh</code> still exits 0 with your test added; stage 4 reports every planted failure as a failure; your notes contain the GDB session and the test plan.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>-m32</code> build fails with missing headers → install your distribution's 32-bit multilib package for g++, or build with a cross compiler (OS302).</li>
+<li>QEMU prints nothing and the run times out → check that the Multiboot header is in the first part of the file (<code>readelf -S kernel.elf</code>: <code>.multiboot</code> first) and that the kernel is linked at 1 MiB.</li>
+<li>Exit status 1 instead of 33 or 35 → QEMU itself failed (wrong option, missing file); read its message in the CI output.</li>
+<li>The hang test passes → your <code>timeout</code> is not around QEMU, or the harness checks the wrong status.</li>
+</ul>
+<p><b>Extension.</b> Run the same kernel with <code>-smp 2</code> and a different memory size, as a second fixed configuration, and record both in the verdict lines; explain why each configuration is still deterministic.</p>
+
+<h2 id="F12-09-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A team's CI dashboard had been green for three weeks. Then a developer booting the kernel by hand saw a panic in the frame allocator test, on a commit that CI had marked as passed. The team lead asks you: was CI broken, since when, and what else might have slipped through? You get the QEMU stage script the team used (they had not yet adopted <code>qemu_test.sh</code>) and the CI log of that commit.</p>
+<p><b>Evidence pack.</b> The stage script:</p>
+<pre class="listing" data-src="F12-09/ci_broken.sh"></pre>
+<p>The CI log of the commit (the kernel built by <code>ci.sh</code>, booted with the commit's command line <code>test=all,panic</code>):</p>
+<pre class="output" data-run="F12-09/ci_broken"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what did the kernel print, and what did the stage report? What was QEMU's exit status (you may infer it from the kernel source)?</li>
+<li>Hypotheses: list at least three reasons the stage could report PASS for a panicking kernel, and say which lines of the script support or exclude each.</li>
+<li>Root cause: explain exactly why line 11 saw status 0, and why line 14 then passed.</li>
+<li>Fix and verification: rewrite the stage (or use Listing 3) and show the evidence that it reports this commit as a failure. What else must you add so that the fix itself stays tested?</li>
+<li>Scope: which other failures could this stage have missed? What would you do to find out which earlier commits were affected?</li>
+</ol>
+<p><b>Method hints.</b> In a shell, the exit status of <code>a | b</code> is <code>b</code>'s unless <code>pipefail</code> is set. Read every line of a CI script as "what would this do with a failing kernel?". The kernel's source tells you what it writes to port 0xf4 on a panic.</p>
+
+<h2 id="F12-09-project">Mini-project</h2>
+<p><b>CI for the mega project (course project, part 4).</b> Build the pipeline your mega project needs: host tests with sanitizers, the emulator tests of your kernel or firmware milestone with the section 0 rules, harness self-tests, the GPU build stage (and the GPU run stage on a GPU machine, or a documented skip with a plan), and the robot or drone simulation scenarios. Every stage records its tools and versions. The pipeline runs locally from one script, so it can be ported to any CI service.</p>
+<p><b>Rubric.</b> Section 0 rules each implemented and pointed to in the script (3). Harness self-tests cover panic, hang, empty run, and one failure kind of your own (2). Skips named in the result and covered by the test plan (2). One real regression caught by the pipeline during the project, or a planted one, with the log (2). A clean-checkout run documented (1).</p>
+
+<h2 id="F12-09-summary">Summary</h2>
+<ul>
+<li>CI checks every change automatically, in ordered stages, cheapest and most precise first; a failing stage stops the pipeline.</li>
+<li>Kernel tests follow curriculum section 0: serial lines as the oracle, a pass/fail exit through isa-debug-exit (status (<i>v</i> &lt;&lt; 1) | 1: 33 for pass, 35 for fail here), a wall-clock limit on every run, a fixed and recorded machine.</li>
+<li>Pass requires two signals that agree: the exit status and the summary line, with no PANIC.</li>
+<li>Prove the harness can fail: a panic, a hang and an empty run must each be reported as failures (R1).</li>
+<li>Test pure logic on the host first (with sanitizers), then the same code in the kernel.</li>
+<li>Without a GPU, check compilation and the machine code; report the run as SKIPPED by name; a skip is missing evidence.</li>
+<li>A pipe without <code>pipefail</code> can turn a failing kernel into a green pipeline (R6).</li>
+</ul>
+
+<h2 id="F12-09-sources">Sources</h2>
+<ol>
+<li id="F12-09-src-D1">D1 — Titus Winters, Tom Manshreck, Hyrum Wright (editors), "Software Engineering at Google" (tier 3), the chapter on continuous integration. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F12-09-src-D2">D2 — Systems Curriculum (this project): section 0, "How acceptance tests work for kernel code" (quoted), the workflow (step 4, step 6) and the universal definition of done; section 5.5, the test plan (quoted); milestones B1 and B3 acceptance tests. Read during this build. A map, not a source (AH-4).</li>
+<li id="F12-09-src-D3">D3 — QEMU documentation (tier 2), the device documentation for isa-debug-exit and the system emulation options (<code>-kernel</code>, <code>-append</code>, <code>-serial</code>, <code>-no-reboot</code>). <i>Title only — not opened during this build; the Source Researcher must confirm the version and section (dossier gate G1 open).</i> Behaviour shown by R1, R2, R7.</li>
+<li id="F12-09-src-D4">D4 — GNU Bash Reference Manual (tier 2), "Pipelines" and the <code>set</code> builtin (<code>pipefail</code>). <i>Title only — not opened during this build; the Source Researcher must confirm the version and section (dossier gate G1 open).</i> Behaviour shown by R6.</li>
+<li id="F12-09-src-D5">D5 — Multiboot Specification, version 0.6.96 (tier 1), header format and boot information (command-line field). <i>Title only — not opened during this build; the values in entry.S were written from memory, pending verification (dossier gate G1 open).</i></li>
+<li id="F12-09-src-D6">D6 — PC16550D UART datasheet (National Semiconductor, now Texas Instruments; tier 1), the line status register. <i>Title only — not opened during this build; the Source Researcher must confirm the revision (dossier gate G1 open).</i></li>
+<li id="F12-09-src-R1">R1 — run <code>ci.log</code>: <code>./ci.sh</code> (g++ 13.3.0, LLD 18.1.3, QEMU 8.2.2 with TCG and SeaBIOS 1.16.3-2, CUDA 12.0), exit code 0; untested on hardware; gpu-run skipped (no GPU).</li>
+<li id="F12-09-src-R2">R2 — serial log <code>serial_all</code> of the passing QEMU run (from R1).</li>
+<li id="F12-09-src-R3">R3 — serial log <code>serial_panic</code> (from R1).</li>
+<li id="F12-09-src-R4">R4 — serial log <code>serial_hang</code> (from R1).</li>
+<li id="F12-09-src-R5">R5 — serial log <code>serial_none</code> (from R1).</li>
+<li id="F12-09-src-R6">R6 — forensic run <code>ci_broken.log</code>: the old stage script on a panicking commit, exit code 0 (the script reported success).</li>
+<li id="F12-09-src-R7">R7 — run <code>forensic_fixed.log</code>: the same commit through <code>qemu_test.sh</code>, exit code 1 (expected).</li>
+<li id="F12-09-src-R8">R8 — lab run <code>host_tests.log</code> (run_lab.sh, g++ 13.3.0 with ASan and UBSan), exit code 0.</li>
+<li id="F12-09-src-R9">R9 — lab run <code>vadd.log</code> (run_lab.sh, nvcc 12.0), exit code 1: no CUDA device in the build container (expected; untested on hardware).</li>
+</ol>
+
+<h2 id="F12-09-glossary">Glossary links</h2>
+<p><a href="#gl-ci-pipeline">CI pipeline</a> · <a href="#gl-test-harness">Test harness</a> · <a href="#gl-isa-debug-exit">isa-debug-exit</a> · <a href="#gl-wall-clock-limit-test-timeout">Wall-clock limit (test timeout)</a> · <a href="#gl-harness-self-test">Harness self-test</a> · <a href="#gl-skipped-test-result">Skipped (test result)</a> · <a href="#gl-pipefail-shell-option">pipefail (shell option)</a> · <a href="#gl-continuous-integration-ci">Continuous integration (CI)</a> · <a href="#gl-multiboot">Multiboot</a> · <a href="#gl-serial-port-uart">Serial port (UART)</a> · <a href="#gl-acceptance-test">Acceptance test</a> · <a href="#gl-test-plan">Test plan</a></p>
+
+<h2 id="F12-09-next">Next chapter</h2>
+<p>Next: <a href="#F12-10">F12-10 Flaky tests</a>. Previous: <a href="#F12-08">F12-08 Property-based and fuzz testing</a>. Back to the course: <a href="#SE302">SE302</a>.</p>
+
+<h2 id="F12-09-answers">Answers to Check yourself</h2>
+<ol>
+<li>Serial output is the oracle (qemu_test.sh lines 13, 18, 20: serial to a file, PANIC and summary checks); pass/fail exit through isa-debug-exit (kmain.cc 46–52, qemu_test.sh 14 and 20); timeouts (qemu_test.sh 12 and 16–17); determinism, a fixed and recorded machine (qemu_test.sh 10 and 25, plus the run record's versions); real hardware as extra evidence only (no line: a policy, in the test plan).</li>
+<li>Status alone: a kernel that wrote 0x10 after a test printed FAILED (a bug in the counting) would pass. Log alone: an old log, or a kernel that printed the summary and then hung or crashed before reporting, could match; and the pattern could match text a test printed. Requiring both makes a single fault insufficient for a false pass.</li>
+<li>0x00: (0 &lt;&lt; 1) | 1 = 1. 0x7f: (127 &lt;&lt; 1) | 1 = 255. The low bit is always set, so the status is always odd and cannot be 0 (D3 must confirm the formula; R1 shows 33 and 35).</li>
+<li>(b). (a): a skip means nothing was checked. (c): a kernel watchdog runs inside the thing that may be broken; the time limit must be outside. (d): the curriculum says real hardware is "extra evidence, never a replacement for the QEMU test".</li>
+<li>A change to the harness or to the test names (renaming <code>bitmap</code> to <code>frame_bitmap</code> in the kernel but not in <code>ci.sh</code>) would otherwise run no test and still exit 0x10 with "0 failed"; the self-test proves that "nothing ran" is reported as a failure (R5).</li>
+<li>Host unit tests first (seconds, precise), then the freestanding build (needed to boot), then QEMU tests, then the GPU run (scarce runner), then the HIL rig (scarcest, physical, often scheduled). Independent stages may run in parallel.</li>
+<li>For example: "gpu-run runs on the team's GPU runner nightly and on every release candidate; a release is blocked unless gpu-run passed on the candidate commit." and "Results are recorded with the GPU model, driver and toolkit versions."</li>
+<li>Prediction: without <code>-no-reboot</code>, a triple fault resets the emulated machine; the kernel boots again, runs the tests again and faults again, forever; the harness reports "FAIL (no result within 20 s: a hang is a failure)" after the time limit. With <code>-no-reboot</code>, QEMU exits at once with a status that is not 33, so the harness reports FAIL immediately. Run it to confirm the status you see.</li>
+</ol>
+<h3 id="F12-09-forensic-key">Forensic lab answer key</h3>
+<p><b>How the evidence was produced.</b> <code>run.sh</code> built the kernel with <code>ci.sh</code>, then ran <code>ci_broken.sh</code>, which boots it with <code>test=all,panic</code>; its output was captured unchanged except for path cleaning. The same commit was then run through <code>qemu_test.sh</code> (R7). <sup class="src"><a href="#F12-09-src-R6">R6</a></sup> <sup class="src"><a href="#F12-09-src-R7">R7</a></sup></p>
+<p><b>Observation.</b> The kernel ran the bitmap and selfcheck tests (both ok), then panicked: "PANIC: assertion failed: b.free_count() == 127 at kmain.cc:150". The stage printed "CI stage qemu: PASS". From <code>panic</code> (kmain.cc line 61), the kernel wrote 0x11, so QEMU exited with status 35; R7 shows exactly that status for the same command line.</p>
+<p><b>Hypotheses.</b> (1) QEMU's status was lost: line 11 tests <code>$?</code> after a pipeline <code>qemu ... | tee</code>. Supported. (2) The log check looks for a good line instead of a complete result: line 14 greps "KTEST bitmap ok". Supported. (3) The check runs on an old log: excluded, <code>tee</code> rewrites <code>serial_ci.log</code> on each run. (4) The kernel wrote the wrong exit code: excluded by R7 (status 35).</p>
+<p><b>Root cause.</b> Without <code>pipefail</code> the status of the pipeline on lines 8–10 is <code>tee</code>'s, and <code>tee</code> succeeded, so <code>$?</code> was 0 at line 11. Line 14 then found "KTEST bitmap ok", which the kernel printed before the panic, and declared PASS. Neither check could see the panic, and the script never looks for "PANIC" or for the summary line. Two further defects did not cause this failure but would cause others: no time limit (a hanging kernel would block the job until the CI service killed it, reported as an infrastructure error, not a test failure), and the machine is not recorded.</p>
+<p><b>Fix and verification.</b> Replace the stage with <code>qemu_test.sh</code>: status checked directly, PANIC and the anchored summary checked, a time limit, the machine recorded. On the same commit it reports "FAIL (PANIC in the serial log; QEMU exit status 35)" and exits 1 (R7). Keep the fix tested: the harness self-test stage (panic, hang, empty run) fails the pipeline if any later change makes the harness blind again (R1). If a pipe is wanted for live output, add <code>set -o pipefail</code> as <code>ci.sh</code> does (line 11).</p>
+<p><b>Scope.</b> Since the stage was introduced, any commit whose kernel panicked after printing "KTEST bitmap ok", hung after it, or failed another test, passed. To find affected commits: re-run the fixed harness on every commit of the three weeks (the kernel builds are reproducible from the commits), or <a href="#gl-bisect">bisect</a> for the first commit with the panic; then check what was merged on top of it.</p>
+<p><b>Wrong answers and why.</b> "Add <code>grep -q PANIC</code> and done": the exit status would still be ignored and hangs would still block. "The kernel should not panic in CI": the job of CI is to report the panic, and this one hid it.</p>
