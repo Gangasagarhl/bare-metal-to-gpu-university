@@ -1,0 +1,326 @@
+<!--meta
+id: F6-40
+title: The same kernels in Triton: a productivity comparison
+course: CU401
+level: L4
+prereqs: F6-35 to F6-39; F6-14 (reductions); F6-22 (GEMM tiling); F6-38 (softmax); SP101 or any course where you used Python (basic Python reading only)
+time: 8–12 hours including the lab
+hardware: Lab steps 4–7 need an NVIDIA GPU (or an AMD GPU that your Triton version supports; check its documentation) with Python, PyTorch and Triton installed (record all versions), or a cloud GPU. The block-program model, the line counts and the forensic lab need only Python 3 with NumPy (this build had no GPU, no Triton and no PyTorch)
+maps: Curriculum E11 (Triton comparison: reduction, softmax and GEMM); 13.2 topic 13 (higher-level kernel languages)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-40-hook">Story hook</h2>
+<p>For a whole course, Rahul has written recipe cards for single helpers: "you are helper number <i>i</i>; fetch jar <i>i</i>; if <i>i</i> is past the end, do nothing; after this step wait for your table". He knows exactly what every helper does, and his dishes are fast. But each new dish takes him a week.</p>
+<p>A visiting cook shows him a different kind of card. It does not talk to single helpers at all. It talks to a whole table: "take this tray of jars; where the tray runs past the shelf, fill the empty places with this; find the largest jar on the tray; divide the whole tray by it". Who fetches which jar, where the tray waits on the table, how the helpers share the work: the head of the hall decides that, from the card. Rahul writes his softmax card in an afternoon.</p>
+<p>Is it as fast? Is it always correct? What did he give up? This chapter answers those questions honestly, including one evening when the tray's empty places were filled with the wrong thing.</p>
+
+<h2 id="F6-40-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the block-program model of Triton (a program per tile, operations on whole tiles, masked loads with a fill value) and how it differs from CUDA's thread-level SIMT model.</li>
+<li><b>Read and write</b> a reduction, a row softmax and a tiled matrix multiply in Triton, after checking every API name against the documentation of your installed version.</li>
+<li><b>Model</b> the block-program style on the CPU, and test the kernels' logic (masks, fill values, odd sizes) without a GPU.</li>
+<li><b>Compare</b> Triton and CUDA kernels on correctness, performance and development effort with a fair protocol (milestone E11), and say what each measure does and does not show.</li>
+<li><b>Diagnose</b> a softmax that is wrong only for some row lengths and some input ranges, from the fill value of a masked load.</li>
+</ul>
+
+<div class="co jargon" id="F6-40-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Triton</dt><dd><b>Simple words:</b> a way to write GPU kernels in Python where you describe what happens to whole blocks of data, and a compiler works out what each GPU thread does. <b>Analogy:</b> a recipe card written for a whole table instead of for one helper. <b>Precise:</b> a Python-embedded language and compiler for tile-based GPU programs, introduced by Tillet, Kung and Cox ("Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations"); functions decorated as Triton kernels are compiled just in time for the GPU. <sup class="src"><a href="#F6-40-src-D2">D2</a></sup> <sup class="src"><a href="#F6-40-src-D1">D1</a></sup></dd>
+<dt>Block program (program instance)</dt><dd><b>Simple words:</b> one running copy of a Triton kernel, which handles one tile of the work. <b>Analogy:</b> one table following the table-level card. <b>Precise:</b> a Triton kernel is launched over a grid of program instances; each instance obtains its index with <code>tl.program_id(axis)</code> and operates on tiles (blocks of values) created with <code>tl.arange</code>; how the instance is mapped onto warps and threads is chosen by the compiler. <sup class="src"><a href="#F6-40-src-D1">D1</a></sup> <sup class="src"><a href="#F6-40-src-D2">D2</a></sup></dd>
+<dt>Tile (in Triton)</dt><dd><b>Simple words:</b> a small block of values that the program treats as one thing. <b>Analogy:</b> a tray of jars. <b>Precise:</b> a block-shaped value (1-D or 2-D) whose shape is a compile-time constant (a <code>tl.constexpr</code> parameter, usually a power of two); arithmetic, comparisons, reductions (<code>tl.sum</code>, <code>tl.max</code>) and matrix products (<code>tl.dot</code>) apply to whole tiles. <sup class="src"><a href="#F6-40-src-D1">D1</a></sup></dd>
+<dt>Masked load and fill value</dt><dd><b>Simple words:</b> loading a tile where some places are "outside the data", and saying what to put there instead. <b>Analogy:</b> where the tray runs past the shelf, fill the empty places with something that cannot change the dish. <b>Precise:</b> <code>tl.load(ptrs, mask=m, other=v)</code> reads only where <code>m</code> is true and returns <code>v</code> elsewhere; <code>tl.store(ptrs, x, mask=m)</code> writes only where <code>m</code> is true. The fill value must be the identity of what follows: 0 for a sum, −∞ for a maximum (and therefore for softmax). <sup class="src"><a href="#F6-40-src-D1">D1</a></sup> <sup class="src"><a href="#F6-40-src-R3">R3</a></sup></dd>
+<dt>Just-in-time (JIT) compilation</dt><dd><b>Simple words:</b> compiling the kernel when the program first runs it, not before. <b>Analogy:</b> the head of the hall reads the card the first time the dish is ordered and plans the table then. <b>Precise:</b> a Triton kernel is compiled when first launched with a given set of constant parameters and argument types, and cached; the first call therefore includes compile time, which a benchmark must exclude by warming up (<a href="#F6-06">F6-06</a>). <sup class="src"><a href="#F6-40-src-D1">D1</a></sup></dd>
+<dt>Productivity (of a kernel language)</dt><dd><b>Simple words:</b> how much useful, correct, fast code you get for your effort. <b>Analogy:</b> how many good dishes per week of card writing. <b>Precise:</b> in this chapter, a set of measures reported together, never one number: development time (logged), lines of code (Listing 3), defects found by tests, performance as a percentage of a reference, and portability across GPUs; each measure is labelled with how it was taken. <sup class="src"><a href="#F6-40-src-D3">D3</a></sup></dd>
+<dt>Kernel (GPU)</dt><dd>As in <a href="#F6-01">F6-01</a>; a Triton kernel is also a kernel in this sense once compiled. Not the operating-system kernel of <a href="#OS301">OS301</a>.</dd>
+</dl></div>
+
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Read this before the rest of the chapter.</b> Triton, PyTorch and a GPU were not available in this build (R2 shows <code>ModuleNotFoundError: No module named 'triton'</code>). Every Triton name in this chapter (<code>triton.jit</code>, <code>tl.program_id</code>, <code>tl.arange</code>, <code>tl.load</code>, <code>tl.store</code>, <code>tl.sum</code>, <code>tl.max</code>, <code>tl.exp</code>, <code>tl.dot</code>, <code>tl.zeros</code>, <code>tl.constexpr</code>, <code>triton.cdiv</code>, <code>triton.next_power_of_2</code>, the <code>kernel[grid](…)</code> launch syntax) and every statement about what the Triton compiler does is written from memory of the Triton documentation and tutorials and of the Triton paper, none of which was opened here. Listing 1 was only checked to be valid Python syntax (R1). Before running anything, compare each name with the documentation of the Triton version you install, and record the version. What <i>was</i> run is Listing 2, the university's own NumPy model of the block-program idea.</p></div>
+
+<h2 id="F6-40-pictures">The idea in pictures</h2>
+<p>Figure 1 puts the same row softmax side by side as a CUDA warp program (<a href="#F6-38">F6-38</a>) and as a Triton block program. Figure 2 lists who decides what in each model.</p>
+<figure id="F6-40-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 310" role="img" aria-labelledby="F6-40-f1t F6-40-f1d">
+<title id="F6-40-f1t">Figure 1: one softmax row as a CUDA warp program and as a Triton block program</title>
+<desc id="F6-40-f1d">Left, labelled CUDA (F6-38): a row of 1000 values split among 32 lanes; each lane loops over every 32nd element with its own index, keeps its own running maximum and normaliser, then five shuffle steps merge the 32 lane states, then each lane writes its elements. The programmer writes per-lane code, the loop, the shuffles and the bounds check. Right, labelled Triton (Listing 1): the same row loaded as one tile of BLOCK = 1024 positions; positions 1000 to 1023 are masked and filled with minus infinity; one statement subtracts the tile maximum, one exponentiates, one sums, one divides, and a masked store writes positions 0 to 999. The programmer writes tile code; the compiler maps the tile onto threads.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="310"/>
+<text class="sv-tb" x="16" y="22">CUDA (F6-38): you program one lane</text>
+<g>
+<rect class="sv-b2" x="16" y="36" width="20" height="20"/><rect class="sv-b2" x="38" y="36" width="20" height="20"/><rect class="sv-b2" x="60" y="36" width="20" height="20"/><rect class="sv-b2" x="82" y="36" width="20" height="20"/>
+<rect class="sv-b2" x="104" y="36" width="20" height="20"/><rect class="sv-b2" x="126" y="36" width="20" height="20"/><rect class="sv-b2" x="148" y="36" width="20" height="20"/><rect class="sv-b2" x="170" y="36" width="20" height="20"/>
+</g>
+<text class="sv-ts" x="196" y="51">… 32 lanes</text>
+<text class="sv-ts" x="16" y="80">lane i: elements i, i+32, i+64, … (loop)</text>
+<text class="sv-ts" x="16" y="98">own state (m, d) per lane</text>
+<text class="sv-ts" x="16" y="116">5 shuffle steps merge the 32 states</text>
+<text class="sv-ts" x="16" y="134">each lane writes its own elements</text>
+<text class="sv-ts" x="16" y="152">you write: index, loop, bounds check,</text>
+<text class="sv-ts" x="16" y="168">shuffles, mask of active lanes</text>
+<line class="sv-dash" x1="370" y1="16" x2="370" y2="296"/>
+<text class="sv-tb" x="390" y="22">Triton (Listing 1): you program one tile</text>
+<rect class="sv-b4" x="390" y="36" width="300" height="22"/><rect class="sv-b8" x="690" y="36" width="54" height="22"/>
+<text class="sv-ts" x="396" y="52">columns 0 … 999: loaded</text><text class="sv-ts" x="694" y="52">masked</text>
+<text class="sv-ts" x="390" y="80">BLOCK = 1024 (next power of two)</text>
+<text class="sv-ts" x="390" y="98">masked places filled with −∞ (other=)</text>
+<text class="sv-tm" x="390" y="122">x = x − max(x)</text>
+<text class="sv-tm" x="390" y="142">num = exp(x);  den = sum(num)</text>
+<text class="sv-tm" x="390" y="162">store(num / den, mask)</text>
+<text class="sv-ts" x="390" y="186">you write: tile shape, mask, fill value</text>
+<text class="sv-ts" x="390" y="202">the compiler maps the tile onto threads</text>
+<rect class="sv-b7" x="16" y="226" width="728" height="62" rx="6"/>
+<text class="sv-ts" x="28" y="248">Same mathematics (safe softmax, F6-38). Different unit of programming: lane versus tile.</text>
+<text class="sv-ts" x="28" y="266">The Triton version holds the whole row in one tile, so it suits rows up to a size limit;</text>
+<text class="sv-ts" x="28" y="282">longer rows need a loop over tiles and the online normaliser, exactly as in F6-38.</text>
+</svg></div><figcaption><b>Figure 1.</b> One row of the softmax in each model. The CUDA side is <a href="#F6-38">F6-38</a>'s Listing 4; the Triton side is Listing 1's <code>softmax_kernel</code>, whose tile logic is executed for real by the NumPy model (R3). Statements about the Triton compiler are from D1–D2 (not opened in this build). <sup class="src"><a href="#F6-40-src-D1">D1</a></sup> <sup class="src"><a href="#F6-40-src-D2">D2</a></sup> <sup class="src"><a href="#F6-40-src-R3">R3</a></sup></figcaption></figure>
+
+<figure id="F6-40-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 280" role="img" aria-labelledby="F6-40-f2t F6-40-f2d">
+<title id="F6-40-f2t">Figure 2: who decides what in CUDA C++ and in Triton</title>
+<desc id="F6-40-f2d">A table drawn as boxes with three columns: decision, CUDA C++, Triton. Rows: what one program instance handles: CUDA a thread, Triton a tile. Mapping work to threads and warps: CUDA you, Triton the compiler. Staging data in shared memory: CUDA you, with barriers; Triton the compiler. Coalescing and vector widths: CUDA you; Triton the compiler, from the tile's layout. Tensor-core instructions: CUDA you, through WMMA or libraries; Triton the compiler, for tl.dot. Tile sizes: both you, in Triton often by autotuning. Bounds: CUDA if statements per thread; Triton masks with fill values. Warp-level tricks such as shuffles: CUDA available; Triton not directly expressed. A note says the Triton column summarises the Triton paper and documentation, not verified in this build.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="280"/>
+<rect class="sv-b7" x="16" y="10" width="728" height="26" rx="4"/>
+<text class="sv-tb" x="24" y="28">decision</text><text class="sv-tb" x="310" y="28">CUDA C++</text><text class="sv-tb" x="540" y="28">Triton</text>
+<text class="sv-ts" x="24" y="56">unit you program</text><text class="sv-ts" x="310" y="56">one thread</text><text class="sv-ts" x="540" y="56">one tile (program instance)</text>
+<text class="sv-ts" x="24" y="80">map work to threads and warps</text><text class="sv-ts" x="310" y="80">you</text><text class="sv-ts" x="540" y="80">compiler</text>
+<text class="sv-ts" x="24" y="104">stage data in shared memory</text><text class="sv-ts" x="310" y="104">you (with barriers)</text><text class="sv-ts" x="540" y="104">compiler</text>
+<text class="sv-ts" x="24" y="128">coalescing, vector widths</text><text class="sv-ts" x="310" y="128">you</text><text class="sv-ts" x="540" y="128">compiler (from tile layout)</text>
+<text class="sv-ts" x="24" y="152">tensor-core instructions</text><text class="sv-ts" x="310" y="152">you (WMMA, F6-26) or a library</text><text class="sv-ts" x="540" y="152">compiler, for tl.dot</text>
+<text class="sv-ts" x="24" y="176">tile sizes</text><text class="sv-ts" x="310" y="176">you</text><text class="sv-ts" x="540" y="176">you (often autotuned)</text>
+<text class="sv-ts" x="24" y="200">bounds and edges</text><text class="sv-ts" x="310" y="200">if-statements per thread</text><text class="sv-ts" x="540" y="200">masks with fill values</text>
+<text class="sv-ts" x="24" y="224">shuffles, per-lane tricks</text><text class="sv-ts" x="310" y="224">available</text><text class="sv-ts" x="540" y="224">not expressed directly</text>
+<line class="sv-line" x1="300" y1="40" x2="300" y2="232"/><line class="sv-line" x1="530" y1="40" x2="530" y2="232"/>
+<text class="sv-ts" x="24" y="258">Triton column: summary of the Triton paper and documentation (D1, D2), not verified in this build.</text>
+</svg></div><figcaption><b>Figure 2.</b> The division of labour between programmer and compiler. The CUDA column summarises <a href="#F6-08">F6-08</a>–<a href="#F6-34">F6-34</a>; the Triton column is the design described in the Triton paper and documentation (D1, D2), to be checked against your version's documentation and against the generated code (Lab step 6). <sup class="src"><a href="#F6-40-src-D1">D1</a></sup> <sup class="src"><a href="#F6-40-src-D2">D2</a></sup></figcaption></figure>
+
+<h2 id="F6-40-layer1">Layer 1 — the kid explanation</h2>
+<p>A CUDA recipe card talks to one helper: "you are number <i>i</i>, do this to jar <i>i</i>". A Triton card talks to a whole table: "take this tray, do this to the whole tray". The head of the hall then decides which helper does which jar, and where the tray rests on the table.</p>
+<p>Table cards are shorter and quicker to write. But you can no longer tell a single helper to do something clever on their own. And you must be careful with the empty places at the edge of the tray. If you fill them with the wrong thing, the dish comes out wrong, and only for some trays.</p>
+
+<h2 id="F6-40-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-40-l2-model">The block-program model</h3>
+<p>One analogy sentence: you stop programming helpers and start programming trays. A Triton kernel is a Python function marked as a Triton kernel; a launch runs a grid of <b>program instances</b>, and each instance asks for its index with <code>tl.program_id</code>, builds index tiles with <code>tl.arange</code>, loads tiles with <code>tl.load</code>, computes on whole tiles and writes with <code>tl.store</code>. <sup class="src"><a href="#F6-40-src-D1">D1</a></sup> <sup class="src"><a href="#F6-40-src-D2">D2</a></sup> Tile shapes are compile-time constants (<code>tl.constexpr</code>), which is why the softmax launcher rounds the row length up to a power of two and masks the rest (Listing 1, lines 24–26 and 56). How the instance's tile is spread over warps and threads, whether it passes through shared memory, and which instructions implement <code>tl.dot</code> are decisions of the compiler (Figure 2). <sup class="src"><a href="#F6-40-src-D2">D2</a></sup></p>
+<p>Because none of this could run in the build container, Listing 2 implements the model itself in NumPy: a tiny <code>tl</code> stand-in with <code>arange</code>, a masked <code>load</code> with a fill value and a masked <code>store</code>, and the three kernels written in the same shape as Listing 1, launched by a Python loop that plays the grid. It is the university's teaching model, not Triton; it checks the <i>logic</i> of the kernels (indices, masks, fill values, odd sizes), not their speed. Its run (R3):</p>
+<pre class="output" data-run="F6-40/tile_model"></pre>
+<p>Read the three results. The sum of 100,003 values by 98 programs of 1,024 differs from a float64 sum by 1.86 × 10<sup>−5</sup>: FP32 partial sums, as in <a href="#F6-14">F6-14</a>. The softmax with 1,000 columns (tile 1,024, 24 masked places) has the same tiny error as the one with exactly 1,024 columns: the −∞ fill makes the masked places vanish. The 300 × 100 × 200 matmul with 64 × 64 output tiles and K-steps of 32 (none of the sizes a multiple of the tiles) agrees with a float64 product to 1.02 × 10<sup>−5</sup>, because masked loads fill A and B with 0 outside the matrices, and 0 is the identity of the sum inside a dot product.</p>
+
+<h3 id="F6-40-l2-three">The three kernels</h3>
+<ul>
+<li><b>Reduction</b> (Listing 1, lines 12–18): one program per 1,024 elements; masked load with fill 0; <code>tl.sum</code> of the tile; one partial per program. The second level (summing the partials) is a second launch or a host sum, as in your <a href="#F6-14">F6-14</a> version. There is no shuffle, no shared memory and no barrier in the source: the compiler produces the block reduction.</li>
+<li><b>Softmax</b> (lines 21–30, 53–57): one program per row; the whole row in one tile; fill −∞; safe softmax in four tile statements. This is the three-pass algorithm of <a href="#F6-38">F6-38</a> in one read, possible because the row stays in the tile between the passes. Rows longer than the largest practical tile need a loop over tiles with the online normaliser: the same algorithm as F6-38's kernel, written per tile.</li>
+<li><b>Matmul</b> (lines 33–50, 60–67): a 2-D grid of programs, each owning a BM × BN tile of C; a loop over K in steps of BK with masked 2-D loads; <code>tl.dot</code> accumulates in an FP32 tile. Compare with your <a href="#F6-22">F6-22</a>–<a href="#F6-24">F6-24</a> kernels: the tiling structure is the same, but shared-memory staging, double buffering and the use of tensor cores are left to the compiler. <sup class="src"><a href="#F6-40-src-D2">D2</a></sup></li>
+</ul>
+
+<h3 id="F6-40-l2-measure">Measuring productivity fairly</h3>
+<p>Milestone E11 asks you to "compare development time and performance with your hand-written kernels". <sup class="src"><a href="#F6-40-src-D3">D3</a></sup> Each half has traps.</p>
+<ul>
+<li><b>Size of code</b> is the easiest number and the weakest. Listing 3 counts non-blank, non-comment lines of the kernels and their launchers: the CUDA softmax of F6-38 is 35 lines, the Triton softmax 15, the Triton matmul 26, the CUDA attention of F6-39 57 (R4). Lines do not include the error checking, tests and harness that both need, and say nothing about how long the code took to get right or how fast it is.</li>
+<li><b>Development time</b> must be logged while you work (start, first correct run, first run within tolerance, final tuned version), for both languages, by the same person, with the same tests. Your second implementation of anything is faster than your first, whatever the language: say which came first.</li>
+<li><b>Performance</b> needs the same harness, sizes and precision, warm-up runs that include the JIT compilation of the Triton kernel, and the median of 20 timed runs (<a href="#F6-06">F6-06</a>, curriculum 13.4). Report each kernel as a percentage of a common reference (cuBLAS for GEMM, CUB for reduction, <a href="#F6-35">F6-35</a>).</li>
+<li><b>Correctness</b> is not optional for the faster-to-write version: E11 accepts results that "match your C++ kernels within tolerance". <sup class="src"><a href="#F6-40-src-D3">D3</a></sup></li>
+</ul>
+<pre class="output" data-run="F6-40/loc"></pre>
+
+<h2 id="F6-40-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: a table-level card is only as good as the head of the hall who turns it into helper-level work, so an engineer reads what the head decided. This section covers what to inspect, where the model's limits are, and how to decide between the two languages.</p>
+<h3 id="F6-40-l3-inspect">Inspecting what the compiler did</h3>
+<p>A Triton kernel compiles to the same kind of machine code as a CUDA kernel (PTX and SASS on NVIDIA GPUs), so every tool from <a href="#CU303">CU303</a> applies: Nsight Systems shows its launches, Nsight Compute shows its registers, shared memory, occupancy and roofline position, and the SASS can be read like your own (<a href="#F6-34">F6-34</a>). <sup class="src"><a href="#F6-40-src-D1">D1</a></sup> For the matmul, check that the inner loop contains the tensor-core instructions you saw in <a href="#F6-26">F6-26</a> when the input types allow them; for the softmax, check the number of global loads per element. If the profile disagrees with Figure 2's promise, the profile wins.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>How to obtain the PTX or SASS of a compiled Triton kernel (through attributes of the compiled kernel object, environment variables, or a cache directory) differs between Triton versions and is not written here from memory. Check the documentation of your installed version. That Triton targets NVIDIA and AMD GPUs is stated in the curriculum's topic 13.2 and must be confirmed in the Triton documentation for your GPU and version.</p></div>
+<h3 id="F6-40-l3-limits">Where the block-program model fits, and where it does not</h3>
+<ul>
+<li><b>Fits:</b> dense, regular tiles: element-wise chains (fusion is natural: several statements on one tile before one store), row-wise reductions and normalisations, GEMM-like kernels, attention forward passes (the published Triton tutorials include a fused attention; <a href="#F6-39">F6-39</a>'s algorithm is tile-shaped). <sup class="src"><a href="#F6-40-src-D1">D1</a></sup></li>
+<li><b>Fits less well:</b> irregular, data-dependent control per element (graph traversals, sparse formats with per-thread work lists), algorithms built on warp-level primitives (shuffle-based scans, warp-aggregated atomics, <a href="#F6-15">F6-15</a>, <a href="#F6-17">F6-17</a>), cross-block protocols such as decoupled look-back (<a href="#F6-16">F6-16</a>) or grid barriers (<a href="#F6-36">F6-36</a>), and multi-GPU peer access patterns (<a href="#F6-37">F6-37</a>). For these, CUDA C++ (or a library) remains the tool.</li>
+<li><b>Tile shapes are compile-time.</b> Each new BLOCK value is a new compilation; a softmax launcher that passes the next power of two of the row length compiles one kernel per distinct rounded length. Autotuning over tile sizes is common practice and costs compile time too. <sup class="src"><a href="#F6-40-src-D1">D1</a></sup></li>
+<li><b>Edges are masks.</b> Every edge case becomes a mask and a fill value. That is concise and easy to get wrong in exactly one way: a fill value that is not the identity of the following operation (forensic lab).</li>
+</ul>
+<h3 id="F6-40-l3-decide">A decision procedure</h3>
+<ol>
+<li>Is there a library routine (<a href="#F6-35">F6-35</a>)? Use it, and use it as the reference.</li>
+<li>Is the kernel tile-shaped and mostly dense? Write it in Triton first; it is the fastest way to a correct fused kernel and a performance baseline.</li>
+<li>Measure against the library and against the roofline bound. If Triton reaches your target, stop: the maintenance cost of the shorter code is lower.</li>
+<li>If not, profile; if the gap comes from something the block model cannot express (a warp-level trick, a cross-block protocol, a precise shared-memory layout), write that kernel in CUDA C++ and record why.</li>
+<li>Re-run the comparison when the GPU, the Triton version or the CUDA toolkit changes: compiler improvements can move the answer in either direction.</li>
+</ol>
+
+<h2 id="F6-40-hardware">How the hardware actually does it</h2>
+<p>The GPU does not know which language a kernel came from. A Triton program instance becomes a thread block (a CTA) of some number of warps chosen at compile time; its tiles become registers spread across the lanes of those warps, with shared memory used where the compiler needs to change a tile's layout or to stage operands for matrix instructions; masks become predicated loads and stores (<a href="#F1-57">F1-57</a>, <a href="#F6-03">F6-03</a>). <sup class="src"><a href="#F6-40-src-D2">D2</a></sup> Everything you learned about coalescing, occupancy, bank conflicts and tensor cores therefore still decides the speed; the difference is who chose the mapping. A performance gap between a Triton kernel and a hand-written one is explained with the same evidence as always: registers and occupancy from the compiler report, memory traffic and stalls from the profiler, instructions from the SASS.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The description of how Triton maps program instances, tiles and masks onto CTAs, warps, registers, shared memory and predicated instructions is a summary of the Triton paper's design (D2) written from memory; no Triton-generated code was produced or read in this build. Confirm it on your machine by inspecting the PTX or SASS of Listing 1's kernels (Lab step 6).</p></div>
+
+<h2 id="F6-40-worked">Worked example</h2>
+<p>Trace Listing 2's softmax program for one row of n_cols = 5 with BLOCK = 8, values x = (1, 3, 2, 0, 4), to see exactly what the mask and fill do.</p>
+<ol>
+<li><b>Indices.</b> <code>cols = arange(0, 8)</code> = 0 … 7; <code>mask = cols &lt; 5</code> = (T, T, T, T, T, F, F, F).</li>
+<li><b>Masked load with fill −∞.</b> v = (1, 3, 2, 0, 4, −∞, −∞, −∞).</li>
+<li><b>Subtract the maximum.</b> max(v) = 4 (the fill cannot win a maximum); v − 4 = (−3, −1, −2, −4, 0, −∞, −∞, −∞).</li>
+<li><b>Exponentiate.</b> e<sup>v</sup> = (0.049787, 0.367879, 0.135335, 0.018316, 1, 0, 0, 0). The masked places become exactly 0.</li>
+<li><b>Sum.</b> den = 1.571317: only the five real values contribute.</li>
+<li><b>Divide and masked store.</b> y = (0.031685, 0.234122, 0.086129, 0.011656, 0.636409), written to places 0–4 only; the sum is 1.</li>
+<li><b>With fill 0 instead</b> (the forensic bug): v = (1, 3, 2, 0, 4, 0, 0, 0); the maximum is still 4, but the three fill places contribute 3 × e<sup>0−4</sup> = 0.054947 to den, which becomes 1.626264, and every stored output is 3.4 % too small; the stored values now sum to 0.966. If all real values were below 0, the fill 0 would even become the maximum.</li>
+</ol>
+<p>The program in the lab folder runs the full-size versions of steps 1–6 (R3) and of step 7 (R5).</p>
+
+<h2 id="F6-40-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>triton_kernels.py</code>: reduction, softmax and matmul in Triton, with launchers. <b>Not run in this build</b>: syntax-checked only (R1); see the unverified box at the top of the chapter.</p>
+<pre class="listing" data-src="F6-40/triton_kernels.py"></pre>
+<p><b>What was run</b>: a syntax check with <code>py_compile</code> (R1), and an import attempt that failed because Triton is not installed (R2, expected).</p>
+<pre class="output" data-run="F6-40/pycheck"></pre>
+<pre class="output" data-run="F6-40/triton_import"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–13</td><td><code>@triton.jit</code>, <code>BLOCK: tl.constexpr</code></td><td>Marks a kernel; BLOCK is a compile-time constant.</td><td>Tile shapes must be known at compile time.</td></tr>
+<tr><td>14–16</td><td><code>tl.program_id</code>, <code>tl.arange</code>, <code>mask</code></td><td>Which tile; the tile's indices; which are inside the data.</td><td>Replaces <code>blockIdx</code>, <code>threadIdx</code> and the bounds check.</td></tr>
+<tr><td>17–18</td><td><code>tl.load(…, other=0.0)</code>, <code>tl.sum</code></td><td>Masked load with fill 0, then a tile sum.</td><td>0 is the identity of addition.</td></tr>
+<tr><td>24–26</td><td><code>cols</code>, <code>mask</code>, <code>other=-float("inf")</code></td><td>The whole row in one tile; fill −∞.</td><td>−∞ is the identity of max and gives e<sup>−∞</sup> = 0.</td></tr>
+<tr><td>27–30</td><td>max, exp, sum, store</td><td>Safe softmax on the tile; masked store.</td><td>Four statements for <a href="#F6-38">F6-38</a>'s three passes.</td></tr>
+<tr><td>37–42</td><td>2-D program ids, row and column ranges, <code>tl.zeros</code></td><td>Each program owns a BM × BN tile of C, accumulated in FP32.</td><td>The output tiling of <a href="#F6-22">F6-22</a>.</td></tr>
+<tr><td>43–48</td><td>K loop, 2-D masked loads, <code>tl.dot</code></td><td>Tiles of A and B, filled with 0 outside; tile product.</td><td>Staging and matrix instructions are the compiler's job.</td></tr>
+<tr><td>53–57</td><td><code>softmax_kernel[(rows,)](…, BLOCK=…)</code></td><td>Launch one program per row with BLOCK the next power of two.</td><td>Each distinct BLOCK compiles a new kernel.</td></tr>
+<tr><td>70–75</td><td><code>__main__</code></td><td>Compares with PyTorch's softmax and matmul on the GPU.</td><td>The library is the reference (<a href="#F6-35">F6-35</a>).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>tile_model.py</code>: the NumPy model of the block-program style, run in this build (output in Layer 2, R3).</p>
+<pre class="listing" data-src="F6-40/tile_model.py"></pre>
+<p><b>Run command</b> (the one actually used): <code>python3 -I tile_model.py</code>; the forensic variant adds <code>--forensic</code>.</p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–25</td><td><code>TileLang</code></td><td>Stand-ins for <code>arange</code>, masked <code>load</code> with a fill, masked <code>store</code>.</td><td>Only the semantics the kernels need, nothing more.</td></tr>
+<tr><td>19–21</td><td><code>np.where(mask, offs, 0)</code></td><td>Never indexes outside the buffer, even for masked places.</td><td>The model must not hide an out-of-bounds read.</td></tr>
+<tr><td>31–58</td><td>three kernels</td><td>The same structure as Listing 1, line for line.</td><td>Tests the logic of Listing 1 without Triton.</td></tr>
+<tr><td>68–74</td><td><code>run_softmax</code></td><td>A Python loop over rows plays the launch grid.</td><td>Program instances are independent, so order does not matter.</td></tr>
+<tr><td>94–97</td><td>1,000 and 1,024 columns</td><td>A masked and an unmasked case.</td><td>Edge handling is tested, not assumed.</td></tr>
+<tr><td>99–109</td><td>matmul 300 × 100 × 200</td><td>No size is a multiple of its tile.</td><td>Exercises all three masks.</td></tr>
+<tr><td>112–120</td><td><code>forensic()</code></td><td>Softmax with fill 0.0 on four inputs.</td><td>The forensic lab's evidence.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>loc.py</code>: counts lines of code of named kernels (output in Layer 2, R4).</p>
+<pre class="listing" data-src="F6-40/loc.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>7–17</td><td><code>cxx_function</code></td><td>Finds a C++/CUDA function by name and brace matching.</td><td>Counts exactly the kernel, not the file.</td></tr>
+<tr><td>20–30</td><td><code>py_function</code></td><td>Finds a Python function and its decorator by indentation.</td><td>The decorator is part of a Triton kernel.</td></tr>
+<tr><td>33–34</td><td><code>count</code></td><td>Skips blank and comment-only lines.</td><td>Comments are not code; both sides treated alike.</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-40-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The "head of the hall" is a compiler, not a manager at run time.</b> The mapping from tiles to threads is decided once, at compile time, for each set of constant parameters; nothing adapts while the kernel runs. A tile size that was good for one input shape is used for all shapes that compile to the same kernel.</li>
+<li><b>Helpers still exist.</b> The table card hides individual helpers, but they are still there with their registers, their warps and their divergence; a Triton kernel can have low occupancy, bank conflicts or spills like any CUDA kernel, and the profiler will show them.</li>
+<li><b>The tray has no physical size limit in the story.</b> In reality a tile larger than what fits in registers spills or fails to compile efficiently; "load the whole row as one tile" works only up to a size you must find by measurement.</li>
+</ul>
+
+<h2 id="F6-40-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Softmax rows sum to less than 1, only for lengths that are not powers of two (forensic lab)</td><td>Fill value 0 instead of −∞</td><td>Test lengths 2<sup>k</sup> and 2<sup>k</sup> − 24 and negative inputs (R5)</td><td>Fill with the identity of the next operation</td></tr>
+<tr><td>Matmul wrong at the edges only</td><td>A mask missing on one of the K loads, or a non-zero fill</td><td>Sizes not multiples of BM, BN, BK (R3)</td><td>Mask every dimension; fill 0</td></tr>
+<tr><td>First call very slow, later calls fast</td><td>JIT compilation</td><td>Time the first call separately</td><td>Warm up before timing</td></tr>
+<tr><td>Many compilations at run time</td><td>A new BLOCK per distinct row length</td><td>Count distinct constant values</td><td>Round to a few bucket sizes</td></tr>
+<tr><td>Kernel does not compile or is slow for long rows</td><td>Whole row in one tile</td><td>Increase the row length until it fails</td><td>Loop over tiles with the online normaliser</td></tr>
+<tr><td><code>AttributeError</code> or <code>NameError</code> on a <code>tl.</code> function</td><td>API differs in your version (names here unverified)</td><td>The installed version's documentation</td><td>Use the documented name; record the version</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-40-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> CUDA C++ kernels written thread by thread: reductions (<a href="#F6-14">F6-14</a>), GEMM tiling (<a href="#F6-22">F6-22</a>), fused softmax (<a href="#F6-38">F6-38</a>) and attention (<a href="#F6-39">F6-39</a>), measured against libraries (<a href="#F6-35">F6-35</a>). <b>What carries over:</b> the algorithms, the tiling, the identities of reductions, the online normaliser, the measurement protocol, the profilers and the habit of reading generated code; the hardware is the same. <sup class="src"><a href="#F6-40-src-D2">D2</a></sup> <b>What changes:</b> most dangerous first: edges become masks with fill values, and a wrong fill is silent (forensic lab); the unit of programming is a tile, so per-lane tricks are not available and the thread mapping is the compiler's; compilation happens at run time, per constant set; the language is Python, so types and shapes are checked later than in C++. <sup class="src"><a href="#F6-40-src-D1">D1</a></sup> <b>What comes next:</b> the end of the CUDA faculty's core. <a href="#CU401">CU401</a>'s practical exam asks you to defend a library-versus-custom decision with measurements, and your MP3 project now has every piece. <a href="#HP301">HP301</a> takes the same kernels to AMD GPUs with HIP, and <a href="#DG401">DG401</a> to many GPUs.</p></div>
+
+<h2 id="F6-40-check">Check yourself</h2>
+<ol>
+<li>What does one Triton program instance correspond to, and what does it correspond to in CUDA terms after compilation?</li>
+<li>Explain in your own words why a masked load needs a fill value, and why the right fill value depends on the operation that follows.</li>
+<li>Which fill value is correct for each: (a) a tile sum, (b) a tile maximum, (c) a tile minimum, (d) a tile product, (e) the A and B tiles of a matmul?</li>
+<li>Predict, then run: in Listing 2, change the softmax fill to <code>-1e30</code> instead of <code>-np.inf</code>. Does the error change for the 1,000-column case? What would happen with values around −10<sup>31</sup>?</li>
+<li>Apply to a new case: write, in the block-program style of Listing 2, a kernel that computes the maximum absolute value of each row of a matrix. State the mask and the fill.</li>
+<li>Listing 3 reports 15 lines for the Triton softmax and 35 for the CUDA one. Give three reasons this ratio is not a measure of productivity on its own.</li>
+<li>Name two kinds of kernels from this faculty that you would not write in Triton, and say why.</li>
+<li>Your benchmark shows the Triton softmax 30 times slower than the CUDA one on the first call and equal on later calls. Explain.</li>
+</ol>
+
+<h2 id="F6-40-lab">Lab</h2>
+<p><b>Goal.</b> Milestone E11: "Write the same reduction, softmax and GEMM in Triton; compare development time and performance with your hand-written kernels."</p>
+<p><b>Hardware and software needed.</b> Steps 1–3: Python 3 with NumPy only (this build: <code>Python 3.13.16</code>, <code>numpy 2.5.3</code>; no Triton, no PyTorch, no GPU). Steps 4–7: an NVIDIA GPU (or an AMD GPU listed as supported by your Triton version's documentation), Python, PyTorch and Triton; record all versions as the tools print them; or a cloud GPU. Your CUDA kernels from <a href="#F6-14">F6-14</a>, <a href="#F6-22">F6-22</a> and <a href="#F6-38">F6-38</a> in your benchmark harness. Lab folder <code>university/labs/F6-40</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use. Install Python packages in a virtual environment, not into the system Python.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-40</code>. Compare the outputs with this chapter.</li>
+<li>Extend Listing 2 with a softmax for long rows: a loop over tiles of 1,024 with the online normaliser of <a href="#F6-38">F6-38</a>; test rows of 1, 1,000, 5,000 and 100,000 columns against <code>ref_softmax</code>.</li>
+<li>Start a development log now (date, time, what you did, what failed) and keep it for steps 4–7.</li>
+<li>On a GPU: install PyTorch and Triton, record their versions, and check every name in Listing 1 against the Triton documentation of that version; fix any difference and note it.</li>
+<li>Run Listing 1. Then add the Triton kernels to your harness and check correctness against your CUDA kernels and the libraries, including sizes that are not multiples of the tiles.</li>
+<li>Inspect the generated code of the matmul and the softmax (see the unverified box in Layer 3) and record: registers, shared memory, whether tensor-core instructions appear in the matmul's inner loop.</li>
+<li>Time all six kernels (three Triton, three CUDA) and the references (CUB, cuBLAS, a library softmax), median of 20 after warm-up including JIT, and fill the comparison table with development time, lines (Listing 3) and percentage of reference.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: R1–R5 as shown; the model's three kernels agree with float64 references to the FP32 level. On a GPU: your numbers, labelled "measured on &lt;GPU, driver, CUDA, PyTorch and Triton versions, date&gt;" (AH-23). Nothing in steps 4–7 has been observed in this build.</p>
+<p><b>Verification.</b> The E11 acceptance test, verbatim: "Results match your C++ kernels within tolerance; performance table filled for both vendors where Triton supports them."</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>ModuleNotFoundError: No module named 'triton'</code> (R2) → Triton not installed in the environment that runs the script → install it in your virtual environment and check <code>python -c "import triton"</code>.</li>
+<li>Errors that mention an unknown <code>tl</code> attribute → the API of your version differs from Listing 1 → use the documentation; record the change.</li>
+<li>Matmul results differ from PyTorch more than expected → TF32 or reduced-precision settings in PyTorch or in <code>tl.dot</code> → set and record the precision on both sides (<a href="#F6-35">F6-35</a>).</li>
+</ul>
+<p><b>Extension.</b> Write the fused attention forward pass of <a href="#F6-39">F6-39</a> in Triton (a loop over key tiles with the online normaliser), compare it with your CUDA version, and log the development time of both.</p>
+
+<h2 id="F6-40-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Chen ported the team's softmax to the block-program style and, to avoid "infinities in the code", filled masked lanes with 0.0. The unit tests use rows of 1,024 columns and pass. In production, models with 1,000-wide rows report slightly low probabilities, and one model whose scores are strongly negative (log-probabilities around −30 and below) produces near-zero outputs for every row. The evidence is a real run of the team's model of the kernel (Listing 2, <code>--forensic</code>) with fill 0.0 on four configurations; each line gives the row length, the value range, the tile size, the largest error against a float64 reference and the smallest row sum.</p>
+<p><b>Evidence pack.</b></p>
+<pre class="output" data-run="F6-40/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which configurations are wrong, and how do error and row sum change with the value range?</li>
+<li>Hypotheses: list two causes (a wrong maximum; an inflated denominator; underflow of the exponentials). Which line rules out which?</li>
+<li>Root cause: for the 1,000-column, values-around-0 case, compute how much the 24 filled places add to the denominator and compare with the observed row sum.</li>
+<li>Explain the −30 and −120 lines: what is the maximum of the tile there, and what happens to the real values?</li>
+<li>Fix and verification: what should the fill be, and which run in this chapter verifies it?</li>
+<li>Prevention: which test sizes and value ranges would have caught this, and which assertion on the output?</li>
+</ol>
+<p><b>Method hints.</b> Ask which tile sizes have masked places at all. Then, for a masked place with value 0, compute what it contributes to max and to the sum, for real values near 0 and far below 0.</p>
+
+<h2 id="F6-40-project">Mini-project</h2>
+<p><b>The MP3 kernel language report.</b> For your MP3 model, pick the three kernels with the largest share of time. Implement each in Triton if it is not already, and produce a one-page report: for each kernel, the CUDA and Triton versions' correctness, time as a percentage of the library or roofline bound, lines of code, logged development time, and a recommendation (keep CUDA, switch to Triton, use the library), with the evidence that would change the recommendation.</p>
+<p><b>Rubric.</b> All versions tested against a common reference with a justified tolerance (3). Fair measurement: same harness, warm-up including JIT, median of 20, versions recorded (3). Development time logged during the work, not estimated afterwards (2). Recommendation consistent with the evidence and honest about its limits (2).</p>
+
+<h2 id="F6-40-summary">Summary</h2>
+<ul>
+<li>Triton programs tiles, not threads: a grid of program instances, each loading, computing on and storing whole tiles.</li>
+<li>The compiler, not you, maps tiles onto warps, threads, registers and shared memory, and chooses matrix instructions for <code>tl.dot</code>.</li>
+<li>Edges are masked loads with fill values; the fill must be the identity of the next operation (0 for sums and products in a dot, −∞ for max and softmax).</li>
+<li>The block model fits dense, tile-shaped kernels and fusion; warp-level tricks and cross-block protocols stay in CUDA C++.</li>
+<li>Productivity is several measures together: correctness, logged development time, lines of code, performance against a reference; JIT compile time is excluded from timing by warm-up.</li>
+<li>In this build only the logic was run (a NumPy model); every Triton name and every claim about its compiler must be checked against the installed version's documentation.</li>
+</ul>
+
+<h2 id="F6-40-sources">Sources</h2>
+<ol>
+<li id="F6-40-src-D1">D1 — Triton documentation and tutorials (OpenAI and Triton contributors; curriculum reading list item 74) (tier 2): language reference (<code>triton.jit</code>, <code>triton.language</code>), launch syntax, autotuning, supported GPUs. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F6-40-src-D2">D2 — Philippe Tillet, H. T. Kung, David Cox, "Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations" (MAPL 2019) (tier 5, paper): the tile-based programming model and the compiler's responsibilities. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-40-src-D3">D3 — <a href="../SYSTEMS_CURRICULUM.html#trackE">Systems Curriculum, Track E</a> (milestone E11, sections 13.2 topic 13 and 13.4; a map, not a technical source, AH-4): goal and acceptance test quoted verbatim.</li>
+<li id="F6-40-src-R1">R1 — syntax check of Listing 1 with <code>py_compile</code> (<code>pycheck.log</code>), <code>Python 3.13.16</code>; not imported, not run; exit code 0.</li>
+<li id="F6-40-src-R2">R2 — import attempt of Triton (<code>triton_import.log</code>), <code>Python 3.13.16</code>; failed as expected (Triton not installed), exit code 1.</li>
+<li id="F6-40-src-R3">R3 — run of Listing 2 (<code>tile_model.log</code>), <code>Python 3.13.16</code>, numpy 2.5.3, exit code 0.</li>
+<li id="F6-40-src-R4">R4 — run of Listing 3 (<code>loc.log</code>) on <code>F6-38/softmax_fused.cu</code>, <code>F6-39/attn_fwd.cu</code> and Listing 1, exit code 0.</li>
+<li id="F6-40-src-R5">R5 — run of Listing 2 with <code>--forensic</code> (<code>forensic.log</code>), exit code 0.</li>
+</ol>
+
+<h2 id="F6-40-glossary">Glossary links</h2>
+<p><a href="#gl-triton">Triton</a> · <a href="#gl-block-program-program-instance">Block program (program instance)</a> · <a href="#gl-tile-in-triton">Tile (in Triton)</a> · <a href="#gl-masked-load-and-fill-value">Masked load and fill value</a> · <a href="#gl-just-in-time-jit-compilation">Just-in-time (JIT) compilation</a> · <a href="#gl-productivity-of-a-kernel-language">Productivity (of a kernel language)</a> · <a href="#gl-kernel-fusion">Kernel fusion</a> · <a href="#gl-online-normaliser">Online normaliser</a></p>
+
+<h2 id="F6-40-next">Next chapter</h2>
+<p>This is the last chapter of <a href="#CU401">CU401</a> and of the CUDA faculty's core sequence. Previous: <a href="#F6-39">F6-39</a>. Continue with <a href="#HP301">HP301</a> (the same kernels on AMD GPUs with HIP) or <a href="#DG401">DG401</a> (many GPUs). Back to the course: <a href="#CU401">CU401</a>.</p>
+
+<h2 id="F6-40-answers">Answers to Check yourself</h2>
+<ol>
+<li>One instance handles one tile of the work (a row, a block of a vector, a tile of C). After compilation it runs as one thread block (CTA) with a compiler-chosen number of warps.</li>
+<li>Tiles have a fixed, compile-time shape, so the tile at an edge has places outside the data. Those places must hold a value that does not change the result of the following operation: the identity element of that operation. 0 changes no sum but can change a maximum; −∞ changes no maximum but would make a sum −∞.</li>
+<li>(a) 0; (b) −∞; (c) +∞; (d) 1; (e) 0 in both (a product with 0 adds nothing to the dot product's sum).</li>
+<li>For values around 0, e<sup>−10<sup>30</sup>−max</sup> underflows to 0 in FP32, so the result is the same as with −∞. With values around −10<sup>31</sup>, −10<sup>30</sup> would be the maximum of the tile and the real values would all underflow: the fill must be below every possible input, which only −∞ guarantees.</li>
+<li><code>offs = row * stride + arange(0, BLOCK)</code>; <code>mask = cols &lt; n_cols</code>; <code>v = load(x, offs, mask, 0.0)</code>; <code>store(out, row, max(abs(v)))</code>. Fill 0 is correct here because |x| ≥ 0 for every real value, so 0 never wins the maximum of absolute values. (−∞ would be wrong: the kernel takes the absolute value first, and |−∞| = +∞ would win.)</li>
+<li>Any three: lines exclude tests, error handling and the harness that both need; development time and the number of attempts are not visible; performance may differ; the CUDA version handles arbitrary row lengths with the online normaliser while the Triton one holds a row in one tile; one was written after the other (learning effect); comment and formatting style differ.</li>
+<li>For example: a decoupled look-back scan (<a href="#F6-16">F6-16</a>) and a cooperative kernel with a grid barrier (<a href="#F6-36">F6-36</a>), because both depend on cross-block protocols the block model does not express; warp-aggregated atomics (<a href="#F6-17">F6-17</a>), because they are per-lane tricks; peer-access kernels (<a href="#F6-37">F6-37</a>).</li>
+<li>The first call includes the JIT compilation of the Triton kernel for that BLOCK value; later calls use the cached binary. Warm up before timing and report compile time separately if it matters for the application.</li>
+</ol>
+<h3 id="F6-40-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> 1,024 columns: error 2.09 × 10<sup>−7</sup>, row sums 1 (correct). 1,000 columns around 0: error 2.24 × 10<sup>−4</sup>, worst row sum 0.999. Around −30: error 0.863, row sum 9.95 × 10<sup>−11</sup>. Around −120: error 0.979, row sum 0. The error appears only when BLOCK (1,024) is larger than the row (1,000), and grows as the values fall below 0.</p>
+<p><b>Hypotheses.</b> With 1,024 columns there are no masked places and the result is correct, so the arithmetic of the kernel is fine; the problem is in the masked places. An inflated denominator explains the values-around-0 line (row sum slightly below 1). A wrong maximum explains the negative lines (the fill 0 becomes the maximum). Underflow alone would also affect the 1,024-column case if values were negative; it did not occur there because the values were around 0.</p>
+<p><b>Root cause.</b> Around 0 (spread 3), the row maximum m is several units above 0, so each of the 24 filled places adds e<sup>0−m</sup> to the denominator: a small amount, but not zero. Dividing by a denominator that is too large makes the outputs add up to less than 1; the evidence's worst row sum of 0.999 says the filled places made up about 10<sup>−3</sup> of that row's denominator. Around −30 and −120, the fill 0 is the largest value in the tile, so max = 0, every real e<sup>x−0</sup> is tiny (about e<sup>−30</sup>) or underflows to 0 (e<sup>−120</sup> in FP32), and the denominator is about 24 (the filled places): outputs ≈ e<sup>x</sup>/24, row sums near 0.</p>
+<p><b>Fix and verification.</b> Fill with −∞ (<code>other=-float("inf")</code> in Listing 1, <code>fill = -np.inf</code> in the model). Verified by R3: the 1,000-column softmax has error 1.61 × 10<sup>−7</sup>.</p>
+<p><b>Prevention.</b> Tests with row lengths that are not powers of two (and lengths just above a power of two), values far below 0 and far above 0; an assertion that every row sums to 1 within n·ε. <b>How the evidence was produced:</b> real runs of Listing 2 with fill 0.0 on random rows (NumPy generator seed 11); no GPU or Triton involved.</p>

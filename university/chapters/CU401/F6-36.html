@@ -1,0 +1,342 @@
+<!--meta
+id: F6-36
+title: Cooperative groups
+course: CU401
+level: L4
+prereqs: F6-35; F6-12 (barriers, and why there is no simple grid barrier); F6-14 and F6-15 (reductions, warp shuffles); F6-20 (occupancy); F6-34 (reading SASS)
+time: 10–14 hours including the lab
+hardware: Lab steps 4–6 need an NVIDIA GPU with a CUDA Toolkit and driver (record both, and the device's cooperative-launch attribute) or a cloud GPU. The residency model, the tile model, the SASS reading and the forensic lab need only g++ and nvcc (this build had no GPU)
+maps: Curriculum E3 (reductions; the device-wide sum in one launch as a variant); 13.2 topic 5 (parallel primitives); prepares E12 (fused kernels) and F2 (one thread per GPU)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-36-hook">Story hook</h2>
+<p>In the great kitchen hall, helpers have always known two kinds of "wait for each other". The row of helpers moves together step by step, so a row never needs to wait. And the helpers at one table can call "everyone stop until the whole table is done", the table barrier you met in <a href="#F6-12">F6-12</a>. Nothing else existed: no word for "the four helpers at the end of the row", and certainly no way to say "the whole hall, stop".</p>
+<p>Sofia, the new head of the morning shift, wants both. Some of her dishes need groups of four helpers; one dish needs every table in the hall to finish its sauce before anyone starts the next step. The second wish has a catch that she discovers the hard way: on a busy morning, not every table group is in the hall at once. Some wait outside for a free table. If the groups inside wait for the groups outside, and the groups outside wait for a free table, nobody ever moves again.</p>
+<p>This chapter gives names to every group, from a few helpers to the whole hall, and shows when the whole-hall stop is safe.</p>
+
+<h2 id="F6-36-able">What you will be able to do</h2>
+<ul>
+<li><b>Use</b> the cooperative groups API: <code>this_thread_block</code>, <code>tiled_partition</code>, <code>thread_block_tile</code>, <code>cg::reduce</code>, <code>this_grid</code> and <code>grid.sync()</code>.</li>
+<li><b>Write</b> a device-wide sum in one launch with a grid barrier, launched with <code>cudaLaunchCooperativeKernel</code> and a grid sized from the occupancy query.</li>
+<li><b>Explain</b> why a grid-wide barrier requires every block to be resident at once, and predict the hang of a hand-made barrier from a residency model.</li>
+<li><b>Read</b> what <code>grid.sync()</code> becomes in SASS and connect each instruction to the barrier algorithm in the installed header.</li>
+<li><b>Diagnose</b> a kernel that hangs only after an unrelated change raised its register count.</li>
+</ul>
+
+<div class="co jargon" id="F6-36-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Cooperative groups</dt><dd><b>Simple words:</b> a way to name a set of GPU threads and let only that set share data and wait for each other. <b>Analogy:</b> naming "these four helpers", "this table", "the whole hall" and giving each name its own "stop until we are all done". <b>Precise:</b> a CUDA C++ device API (header <code>cooperative_groups.h</code>, namespace <code>cooperative_groups</code>) whose group objects expose <code>size()</code>, <code>thread_rank()</code> and <code>sync()</code>, with group types for a thread block, statically sized tiles of a block, coalesced (active) threads and the whole grid. <sup class="src"><a href="#F6-36-src-D1">D1</a></sup> <sup class="src"><a href="#F6-36-src-H1">H1</a></sup></dd>
+<dt>Thread block tile</dt><dd><b>Simple words:</b> a fixed-size slice of a block (2, 4, …, 32 threads) that can exchange values directly. <b>Analogy:</b> a few neighbouring helpers in one row who pass things hand to hand. <b>Precise:</b> <code>thread_block_tile&lt;Size&gt;</code>, made by <code>tiled_partition&lt;Size&gt;(block)</code>; the installed header allows single-warp sizes "1/2/4/8/16/32" (and, separately, 64/128/256/512 for multi-warp tiles); <code>meta_group_rank()</code> is the tile's index in the block, computed as the parent's thread rank divided by Size. <sup class="src"><a href="#F6-36-src-H1">H1</a></sup></dd>
+<dt>Grid group and grid barrier</dt><dd><b>Simple words:</b> all the threads of one kernel launch, and a stop that waits for all of them. <b>Analogy:</b> "the whole hall, stop until every table is done". <b>Precise:</b> <code>cg::grid_group</code> from <code>this_grid()</code>; the header states its threads "are guaranteed to be co-resident on the same device", that the kernel "must have been launched with cuLaunchCooperativeKernel (or the CUDA Runtime equivalent)", and its <code>sync()</code> calls <code>_CG_ABORT()</code> if the group is not valid. <sup class="src"><a href="#F6-36-src-H1">H1</a></sup></dd>
+<dt>Cooperative launch</dt><dd><b>Simple words:</b> a kernel launch that promises every block is running at the same time, or fails. <b>Analogy:</b> the hall manager admits the dish only if all its table groups fit at once. <b>Precise:</b> <code>cudaLaunchCooperativeKernel(func, gridDim, blockDim, args, sharedMem, stream)</code>; the device must report a non-zero <code>cudaDevAttrCooperativeLaunch</code>, and the number of blocks "cannot exceed" the occupancy result times the SM count, otherwise the launch returns <code>cudaErrorCooperativeLaunchTooLarge</code>. <sup class="src"><a href="#F6-36-src-H2">H2</a></sup> <sup class="src"><a href="#F6-36-src-H3">H3</a></sup></dd>
+<dt>Resident (block)</dt><dd><b>Simple words, analogy, precise:</b> as in <a href="#F1-56">F1-56</a> and <a href="#F6-20">F6-20</a>: a block that has been given an SM and its registers and shared memory, and stays there until it finishes. How many blocks can be resident per SM depends on the kernel's resources; <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> returns that number. <sup class="src"><a href="#F6-36-src-H2">H2</a></sup></dd>
+<dt>Deadlock (of a barrier)</dt><dd><b>Simple words:</b> everyone waits for someone who can never arrive. <b>Analogy:</b> the tables inside wait for the groups outside; the groups outside wait for a free table. <b>Precise:</b> a state where every resident block spins at a barrier that counts blocks not yet scheduled, while the scheduler can only start them when a resident block exits; the kernel never finishes (Listing 2 shows it in a model). <sup class="src"><a href="#F6-36-src-D2">D2</a></sup> <sup class="src"><a href="#F6-36-src-R2">R2</a></sup></dd>
+<dt>Kernel (GPU)</dt><dd>As in <a href="#F6-01">F6-01</a>: the function every GPU thread of a launch runs; not the operating-system kernel of <a href="#OS301">OS301</a>.</dd>
+</dl></div>
+
+<h2 id="F6-36-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the group sizes and, for each, the kind of synchronisation it offers. Figure 2 shows why the largest group, the grid, is special: its barrier only works when every block of the grid is resident at the same time.</p>
+<figure id="F6-36-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 290" role="img" aria-labelledby="F6-36-f1t F6-36-f1d">
+<title id="F6-36-f1t">Figure 1: the cooperative groups from a tile to the grid</title>
+<desc id="F6-36-f1d">Four nested levels, drawn as boxes from left to right and from small to large. A tile of 8 threads (thread_block_tile of 8): exchange with shuffles, sync is a warp-level operation. A tile of 32 threads, one warp: cg::reduce uses five butterfly shuffles. A thread block of 256 threads made of 8 tiles of 32, each tile with a meta_group_rank 0 to 7: block.sync() is the same barrier as __syncthreads. A grid of many blocks: grid.sync() works only with a cooperative launch, and only if every block is resident at once. Below, an arrow labelled "cost and conditions grow" points from left to right.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="290"/>
+<rect class="sv-b1" x="16" y="20" width="150" height="150" rx="6"/>
+<text class="sv-tb" x="26" y="42">tile of 8</text><text class="sv-ts" x="26" y="60">thread_block_tile&lt;8&gt;</text>
+<g><rect class="sv-b2" x="26" y="74" width="14" height="14"/><rect class="sv-b2" x="42" y="74" width="14" height="14"/><rect class="sv-b2" x="58" y="74" width="14" height="14"/><rect class="sv-b2" x="74" y="74" width="14" height="14"/><rect class="sv-b2" x="90" y="74" width="14" height="14"/><rect class="sv-b2" x="106" y="74" width="14" height="14"/><rect class="sv-b2" x="122" y="74" width="14" height="14"/><rect class="sv-b2" x="138" y="74" width="14" height="14"/></g>
+<text class="sv-ts" x="26" y="112">shuffles inside</text><text class="sv-ts" x="26" y="128">the tile</text><text class="sv-ts" x="26" y="152">sync: warp level</text>
+<rect class="sv-b3" x="182" y="20" width="160" height="150" rx="6"/>
+<text class="sv-tb" x="192" y="42">tile of 32 (a warp)</text><text class="sv-ts" x="192" y="60">tiled_partition&lt;32&gt;</text>
+<rect class="sv-b2" x="192" y="74" width="140" height="14"/><text class="sv-ts" x="196" y="85">32 lanes</text>
+<text class="sv-ts" x="192" y="112">cg::reduce:</text><text class="sv-ts" x="192" y="128">5 butterfly shuffles (R4)</text><text class="sv-ts" x="192" y="152">sync: warp level</text>
+<rect class="sv-b4" x="358" y="20" width="180" height="150" rx="6"/>
+<text class="sv-tb" x="368" y="42">thread block (256)</text><text class="sv-ts" x="368" y="60">this_thread_block()</text>
+<g><rect class="sv-b3" x="368" y="72" width="38" height="12"/><rect class="sv-b3" x="410" y="72" width="38" height="12"/><rect class="sv-b3" x="452" y="72" width="38" height="12"/><rect class="sv-b3" x="494" y="72" width="38" height="12"/><rect class="sv-b3" x="368" y="88" width="38" height="12"/><rect class="sv-b3" x="410" y="88" width="38" height="12"/><rect class="sv-b3" x="452" y="88" width="38" height="12"/><rect class="sv-b3" x="494" y="88" width="38" height="12"/></g>
+<text class="sv-ts" x="368" y="118">8 tiles, meta_group_rank 0–7</text><text class="sv-ts" x="368" y="136">shared memory between tiles</text><text class="sv-ts" x="368" y="152">block.sync() = __syncthreads()</text>
+<rect class="sv-b5" x="554" y="20" width="190" height="150" rx="6"/>
+<text class="sv-tb" x="564" y="42">grid (all blocks)</text><text class="sv-ts" x="564" y="60">this_grid()</text>
+<g><rect class="sv-b4" x="564" y="72" width="22" height="12"/><rect class="sv-b4" x="590" y="72" width="22" height="12"/><rect class="sv-b4" x="616" y="72" width="22" height="12"/><rect class="sv-b4" x="642" y="72" width="22" height="12"/><rect class="sv-b4" x="668" y="72" width="22" height="12"/><rect class="sv-b4" x="694" y="72" width="22" height="12"/><rect class="sv-b4" x="720" y="72" width="16" height="12"/></g>
+<text class="sv-ts" x="564" y="104">global memory between blocks</text><text class="sv-ts" x="564" y="122">grid.sync(): only with a</text><text class="sv-ts" x="564" y="138">cooperative launch, and all</text><text class="sv-ts" x="564" y="154">blocks resident at once</text>
+<line class="sv-line" x1="40" y1="210" x2="720" y2="210"/><polygon class="sv-head" points="714,205 714,215 722,210"/>
+<text class="sv-ts" x="40" y="234">smaller group: cheaper sync, data passed in registers</text>
+<text class="sv-ts" x="420" y="234">larger group: costlier sync, conditions on the launch</text>
+<text class="sv-ts" x="40" y="266">Sizes as in Listing 1 (blocks of 256, tiles of 32) and Listing 3 (tiles of 16 and 8); not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> Group sizes and their synchronisation. Tile sizes and the meaning of <code>meta_group_rank</code> are from the installed header (H1); the five butterfly shuffles of <code>cg::reduce</code> on a tile of 32 and the single block barrier are counted in the compiled SASS (R4). <sup class="src"><a href="#F6-36-src-H1">H1</a></sup> <sup class="src"><a href="#F6-36-src-D1">D1</a></sup></figcaption></figure>
+
+<figure id="F6-36-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F6-36-f2t F6-36-f2d">
+<title id="F6-36-f2t">Figure 2: a grid barrier with every block resident, and the deadlock without it</title>
+<desc id="F6-36-f2d">Left panel, "grid of 16 blocks, 16 slots": four SMs drawn as boxes, each with four slots, all filled with blocks 0 to 15, all at the barrier; the barrier opens and all finish. Right panel, "grid of 20 blocks, 16 slots": the same four SMs with 16 blocks waiting at the barrier, and four blocks, 16 to 19, outside in a queue labelled "never started: no free slot". Arrows show resident blocks waiting for the queued blocks, and queued blocks waiting for a free slot: a cycle, so the kernel hangs. A note says the cooperative launch refuses this grid instead of hanging.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="16" y="22">grid of 16 blocks, 16 slots (4 SMs × 4)</text>
+<g>
+<rect class="sv-b4" x="16" y="34" width="160" height="40" rx="4"/><rect class="sv-b4" x="190" y="34" width="160" height="40" rx="4"/>
+<rect class="sv-b4" x="16" y="84" width="160" height="40" rx="4"/><rect class="sv-b4" x="190" y="84" width="160" height="40" rx="4"/>
+</g>
+<text class="sv-ts" x="24" y="58">SM 0: blocks 0–3</text><text class="sv-ts" x="198" y="58">SM 1: blocks 4–7</text>
+<text class="sv-ts" x="24" y="108">SM 2: blocks 8–11</text><text class="sv-ts" x="198" y="108">SM 3: blocks 12–15</text>
+<line class="sv-dash" x1="16" y1="140" x2="350" y2="140"/><text class="sv-ts" x="20" y="158">grid.sync(): 16 of 16 arrived → opens</text>
+<text class="sv-ts" x="20" y="176">all 16 finish (R2, case "fits")</text>
+<text class="sv-tb" x="400" y="22">grid of 20 blocks, 16 slots</text>
+<rect class="sv-b6" x="400" y="34" width="160" height="40" rx="4"/><rect class="sv-b6" x="574" y="34" width="160" height="40" rx="4"/>
+<rect class="sv-b6" x="400" y="84" width="160" height="40" rx="4"/><rect class="sv-b6" x="574" y="84" width="160" height="40" rx="4"/>
+<text class="sv-ts" x="408" y="58">SM 0: 0–3 waiting</text><text class="sv-ts" x="582" y="58">SM 1: 4–7 waiting</text>
+<text class="sv-ts" x="408" y="108">SM 2: 8–11 waiting</text><text class="sv-ts" x="582" y="108">SM 3: 12–15 waiting</text>
+<line class="sv-dash" x1="400" y1="140" x2="734" y2="140"/><text class="sv-ts" x="404" y="158">barrier: 16 of 20 arrived → stays shut</text>
+<rect class="sv-b8" x="470" y="190" width="200" height="34" rx="4"/><text class="sv-ts" x="480" y="212">blocks 16–19: never started</text>
+<line class="sv-line" x1="560" y1="188" x2="560" y2="128"/><polygon class="sv-head" points="555,134 565,134 560,126"/><text class="sv-ts" x="566" y="176">waits for a free slot</text>
+<line class="sv-line" x1="690" y1="128" x2="690" y2="196"/><line class="sv-line" x1="690" y1="196" x2="672" y2="207"/><polygon class="sv-head" points="680,200 676,210 670,207"/><text class="sv-ts" x="696" y="176">waits for 16–19</text>
+<text class="sv-ts" x="400" y="248">a cycle: the kernel hangs (R2, case "too_big")</text>
+<text class="sv-ts" x="400" y="266">cudaLaunchCooperativeKernel refuses this grid:</text>
+<text class="sv-ts" x="400" y="282">cudaErrorCooperativeLaunchTooLarge (H2, H3)</text>
+<text class="sv-ts" x="16" y="248">Slot counts are those of the model (TG-1, invented);</text>
+<text class="sv-ts" x="16" y="266">a real GPU's count comes from the occupancy query.</text>
+</svg></div><figcaption><b>Figure 2.</b> Residency decides whether a grid barrier can open. Arrows are "waits for". Left: every block is resident, so all arrive. Right: four blocks cannot start until a slot frees, and no slot frees until the barrier opens. The numbers are the residency model's (Listing 2, R2), with TG-1's invented four SMs. <sup class="src"><a href="#F6-36-src-H1">H1</a></sup> <sup class="src"><a href="#F6-36-src-H2">H2</a></sup></figcaption></figure>
+
+<h2 id="F6-36-layer1">Layer 1 — the kid explanation</h2>
+<p>Helpers in the hall work in groups of different sizes. A few helpers side by side can pass a spoon hand to hand. A whole row moves step by step together. A table can call "stop until the whole table is ready". Cooperative groups give every one of these groups a name, so a recipe can say exactly which group should wait.</p>
+<p>The biggest group is the whole hall. A "whole hall, stop" only works if every table group of the dish is inside the hall at the same time. If some are still waiting at the door for a free table, the groups inside wait for them forever, and they never get a table. So the manager has a rule: a dish with a whole-hall stop is accepted only if all its groups fit inside at once.</p>
+
+<h2 id="F6-36-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-36-l2-api">Groups as objects</h3>
+<p>One analogy sentence: before, the recipe could only say "my table" (<code>__syncthreads</code>) or rely on the row moving together; now it can name any group and hand that name to a function. Cooperative groups represent a set of threads as a C++ object with three basic members: <code>size()</code>, <code>thread_rank()</code> (my number inside the group) and <code>sync()</code>. <sup class="src"><a href="#F6-36-src-D1">D1</a></sup> Listing 1 uses three of them:</p>
+<ul>
+<li><code>cg::thread_block block = cg::this_thread_block();</code> — the block; <code>block.sync()</code> is the block barrier of <a href="#F6-12">F6-12</a>. In the compiled SASS, the <code>tileSum</code> kernel's one <code>block.sync()</code> is its single <code>BAR.SYNC</code> (R4).</li>
+<li><code>cg::thread_block_tile&lt;32&gt; tile = cg::tiled_partition&lt;32&gt;(block);</code> — the block cut into tiles of 32. Each tile knows its index in the block, <code>meta_group_rank()</code>, which the installed header computes as the parent's <code>thread_rank() / Size</code>, and how many tiles there are, <code>meta_group_size()</code>. <sup class="src"><a href="#F6-36-src-H1">H1</a></sup> Listing 3 prints the mapping for a block of 64 cut into tiles of 16: block thread 26 is in tile 1 with rank 10 (R3).</li>
+<li><code>cg::reduce(tile, v, cg::plus&lt;float&gt;())</code> — a reduction over the tile, written once for any tile size and operator. In SASS it is five <code>SHFL.BFLY</code> instructions for a tile of 32 (R4): the butterfly pattern of <a href="#F6-15">F6-15</a>, after which every lane holds the sum.</li>
+</ul>
+<pre class="output" data-run="F6-36/tiles"></pre>
+<p>The value of naming groups is composability. A function that takes a <code>thread_block_tile&lt;16&gt;</code> parameter documents in its signature which threads must call it together, and the compiler knows the size. Writing <code>__shfl_down_sync(0xffffffff, …)</code> by hand inside a helper function instead hides an assumption ("all 32 lanes of my warp call this") that breaks as soon as someone calls the helper from divergent code or from a 16-thread sub-group. The header restricts statically sized single-warp tiles to sizes "1/2/4/8/16/32" with a <code>static_assert</code>, so a wrong size is a compile error, not a wrong answer. <sup class="src"><a href="#F6-36-src-H1">H1</a></sup></p>
+
+<h3 id="F6-36-l2-grid">The grid group and the grid barrier</h3>
+<p><a href="#F6-12">F6-12</a> explained why an ordinary kernel cannot have a grid-wide barrier: blocks may run in any order and need not all be in the hall at once. That is the reason reductions so far needed two launches (a kernel per level) or atomics. Cooperative groups add a grid barrier, under a contract the header states explicitly: threads of a <code>grid_group</code> "are guaranteed to be co-resident on the same device within the same launched kernel", and to use it "the kernel must have been launched with cuLaunchCooperativeKernel (or the CUDA Runtime equivalent), and the device must support it". <sup class="src"><a href="#F6-36-src-H1">H1</a></sup></p>
+<p>The runtime side of the contract is in <code>cuda_runtime_api.h</code>: the device "must have a non-zero value for the device attribute <code>cudaDevAttrCooperativeLaunch</code>", and "The total number of blocks launched cannot exceed the maximum number of blocks per multiprocessor as returned by <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> … times the number of multiprocessors". <sup class="src"><a href="#F6-36-src-H2">H2</a></sup> If you ask for more, the launch fails with <code>cudaErrorCooperativeLaunchTooLarge</code> (value 720 in the installed <code>driver_types.h</code>). <sup class="src"><a href="#F6-36-src-H3">H3</a></sup> Listing 1's <code>main</code> follows the contract line by line: it reads the attribute, the SM count and the occupancy for <code>gridSum</code> with 256 threads, multiplies, and launches exactly that many blocks. The kernel then uses a grid-stride loop (<a href="#F6-04">F6-04</a>) so that any number of elements fits any number of blocks.</p>
+<p>What happens if you break the contract? Two different things, both bad:</p>
+<ul>
+<li><b>An ordinary launch of a kernel that calls <code>grid.sync()</code>.</b> In the installed header, <code>grid_group::sync()</code> begins with <code>if (!is_valid()) { _CG_ABORT(); }</code>, and <code>_CG_ABORT()</code> is defined as <code>__trap()</code> in device code (or <code>assert(0)</code>). <sup class="src"><a href="#F6-36-src-H1">H1</a></sup> The SASS of <code>gridSum</code> contains the matching <code>BPT.TRAP</code> (R4). The kernel aborts with an error instead of hanging.</li>
+<li><b>A hand-made grid barrier</b> (an atomic counter plus a spin loop, written without cooperative groups) launched with too many blocks. Nothing checks anything: the blocks that are resident spin forever, waiting for blocks that can only start when a resident block exits. Listing 2 models it. With 16 slots and 20 blocks, round 1 starts 16 blocks that all wait, round 2 starts nobody, and the model reports the hang (R2). The forensic lab is this bug in a real-looking team.</li>
+</ul>
+<pre class="output" data-run="F6-36/residency"></pre>
+
+<h3 id="F6-36-l2-when">When to use which group</h3>
+<ul>
+<li><b>Tiles smaller than a warp</b> for short rows: a row of 16 values handled by a <code>thread_block_tile&lt;16&gt;</code>, two rows per warp. <a href="#F6-38">F6-38</a> uses this for short softmax rows.</li>
+<li><b>Tiles of 32</b> instead of hand-written shuffles, for clarity and for the size check.</li>
+<li><b>The block</b> exactly as before; <code>block.sync()</code> and <code>__syncthreads()</code> are interchangeable.</li>
+<li><b>The grid</b> when a kernel has phases that each need all results of the previous phase, and launching one kernel per phase costs too much: iterative solvers, a reduction followed by a normalisation in one kernel, persistent kernels. Measure against the multi-launch version (with CUDA Graphs, <a href="#F6-30">F6-30</a>) before choosing it: the grid size is now limited by residency, so the kernel may have fewer threads than the data would like.</li>
+</ul>
+
+<h2 id="F6-36-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: a whole-hall stop is a messenger who counts the tables as they report in, and every table pays for the walk. Here is what the installed toolkit actually does, and what follows for design.</p>
+<h3 id="F6-36-l3-impl">How <code>grid.sync()</code> is implemented in this toolkit</h3>
+<p>The header <code>cooperative_groups/details/sync.h</code> of CUDA 12.0 contains the barrier algorithm, <code>sync_grids</code>. <sup class="src"><a href="#F6-36-src-H1">H1</a></sup> Paraphrased:</p>
+<ol>
+<li>Every block first runs a block barrier (<code>__barrier_sync(0)</code>), so all its threads have arrived.</li>
+<li>One thread per block (the "cta master", thread (0, 0, 0)) atomically adds to a counter in global memory: 1 for most blocks, and for block 0 the value <code>0x80000000 - (expected - 1)</code>. When every block has added, the sum has changed the counter's top bit.</li>
+<li>For compute capability 7.0 and newer, the add is a PTX <code>atom.add.release.gpu.u32</code> and the waiting is a loop of <code>ld.acquire.gpu.u32</code> until the top bit has flipped (<code>bar_has_flipped</code>); older architectures use <code>__threadfence()</code>, <code>atomicAdd</code> and volatile polling.</li>
+<li>A second block barrier releases the other threads of each block.</li>
+</ol>
+<p>The header lines quoted in this chapter, extracted by the lab's <code>header_quotes</code> step so that anyone can reproduce them (R7):</p>
+<pre class="output" data-run="F6-36/header_quotes"></pre>
+<p>The SASS of <code>gridSum</code> for sm_80 (R4) contains each of these pieces: the extra <code>BAR.SYNC</code> instructions, one <code>ATOM.E.ADD.STRONG.GPU</code> (the release add), one <code>LD.E.STRONG.GPU</code> (the acquire poll), a <code>MEMBAR.ALL.GPU</code> and a <code>CCTL.IVALL</code> around them, and the <code>BPT.TRAP</code> of the validity check. Flipping a bit rather than resetting the counter lets the same counter serve the next barrier without a reset race.</p>
+<pre class="output" data-run="F6-36/sass_sync"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The roles of <code>MEMBAR.ALL.GPU</code> and <code>CCTL.IVALL</code> (a memory fence and a cache invalidation that implement the release/acquire semantics in SASS) are inferred from the instruction names and the PTX in the header; NVIDIA does not document SASS semantics in detail. Check the CUDA Binary Utilities instruction-set overview and the PTX ISA memory-consistency chapter (release and acquire at <code>.gpu</code> scope).</p></div>
+<h3 id="F6-36-l3-cost">Costs and consequences</h3>
+<ul>
+<li><b>Latency of one barrier.</b> One atomic per block on a single counter, then every block polls the same address: the barrier time grows with the number of blocks and with the latency of global atomics (<a href="#F6-13">F6-13</a>). It is not free, and it is not obviously cheaper than ending a kernel and launching the next one in a graph. Only a measurement on your GPU decides (Lab step 5).</li>
+<li><b>Grid size is capped by occupancy.</b> <code>gridSum</code> must be launched with SMs × resident-blocks-per-SM blocks at most. Raising the kernel's register or shared-memory use lowers the cap (R5 shows 29 registers for <code>gridSum</code> and 28 for <code>tileSum</code> on sm_80). Code that hard-codes a grid size computed once will break when the kernel changes; always query.</li>
+<li><b>Memory visibility.</b> After <code>grid.sync()</code>, writes made by any block before the barrier are visible to all blocks after it; that is what the release/acquire pair is for. Without the barrier (for example, block 0 reading partials written by others with only a flag) you need explicit fences (<a href="#F6-16">F6-16</a>'s decoupled look-back does exactly that). <sup class="src"><a href="#F6-36-src-H1">H1</a></sup> <sup class="src"><a href="#F6-36-src-D3">D3</a></sup></li>
+<li><b>Other users of the GPU.</b> The co-residency guarantee is about this kernel's blocks. Other kernels running concurrently (other streams, other processes, <a href="#F6-37">F6-37</a>'s IPC peers) reduce the free slots; the cooperative launch accounts for this by refusing or waiting, a hand-made barrier does not.</li>
+<li><b>Multi-device groups.</b> The header also declares a <code>multi_grid_group</code>, marked <code>_CG_DEPRECATED</code> in this toolkit. <sup class="src"><a href="#F6-36-src-H1">H1</a></sup> Do not start new designs on it; <a href="#F6-37">F6-37</a> shows the multi-GPU tools to use instead.</li>
+</ul>
+<h3 id="F6-36-l3-other">Groups you have not used yet</h3>
+<p>The header also provides <code>coalesced_threads()</code>, the group of currently active threads of a warp (useful inside divergent branches, for example for warp-aggregated atomics in <a href="#F6-17">F6-17</a>), and cluster groups for GPUs that support thread block clusters. <sup class="src"><a href="#F6-36-src-H1">H1</a></sup> <sup class="src"><a href="#F6-36-src-D1">D1</a></sup> Their semantics, and the compute capabilities that support clusters, are in the Programming Guide's cooperative groups chapter; this chapter's listings do not use them.</p>
+
+<h2 id="F6-36-hardware">How the hardware actually does it</h2>
+<p>Every group in Figure 1 maps to a hardware mechanism you have met. Tiles up to 32 threads live inside one warp; their data exchange is the warp shuffle network that moves register values between lanes (<code>SHFL.BFLY</code>, <code>SHFL.IDX</code> in R4), and their synchronisation is a warp-level operation (<code>WARPSYNC</code>). The block's barrier is the SM's hardware barrier (<code>BAR.SYNC</code>), which is cheap because all the block's warps are on one SM (<a href="#F1-57">F1-57</a>, <a href="#F1-60">F1-60</a>). The grid has no hardware barrier of its own in this toolkit's implementation: it is built from global-memory atomics, memory-ordering instructions and polling (Layer 3), so it runs at the speed of the memory system and L2, not of an SM. <sup class="src"><a href="#F6-36-src-H1">H1</a></sup> <sup class="src"><a href="#F6-36-src-D2">D2</a></sup> Residency is decided by the block scheduler using each kernel's registers and shared memory against each SM's limits (<a href="#F6-20">F6-20</a>); the occupancy API performs that calculation for you, which is why the cooperative launch rule is phrased in its terms. <sup class="src"><a href="#F6-36-src-H2">H2</a></sup></p>
+<pre class="output" data-run="F6-36/resources"></pre>
+
+<h2 id="F6-36-worked">Worked example</h2>
+<p>Size a cooperative launch and check it with the model. Suppose your GPU's device report (<a href="#F6-07">F6-07</a>) gives S SMs and the occupancy query for <code>gridSum</code> at 256 threads returns b. Use TG-1's invented S = 4 for the arithmetic.</p>
+<ol>
+<li><b>Build A</b>: the occupancy query returns b = 4. Maximum cooperative grid = 4 × 4 = 16 blocks. A grid of 16 is accepted; R2's case <code>fits</code> shows all 16 finishing in one round.</li>
+<li><b>Fewer blocks are always fine</b>: case <code>small_grid</code> (8 blocks) also finishes; the grid-stride loop gives each thread more elements.</li>
+<li><b>Build B</b> raises register use so that b = 3. The maximum becomes 12. A cooperative launch of 16 blocks now fails with <code>cudaErrorCooperativeLaunchTooLarge</code> (H3); Listing 1 never asks for 16, because it recomputes S × b at run time.</li>
+<li><b>Elements per thread.</b> Listing 1 sums n = 10,000,000 floats. With 16 blocks of 256 threads (4,096 threads), each thread adds ⌈10,000,000 / 4,096⌉ = 2,442 or 2,441 elements in its grid-stride loop; with 12 blocks (3,072 threads), 3,256 or 3,255. The work per thread grows as the grid shrinks; correctness does not change.</li>
+<li><b>The tile reduction by hand</b>: values 3, 1, 4, 1, 5, 9, 2, 6 in a tile of 8. Offset 4: lane 0 gets 3 + 5 = 8, lane 1 gets 1 + 9 = 10, lane 2 gets 4 + 2 = 6, lane 3 gets 1 + 6 = 7. Offset 2: lane 0 gets 8 + 6 = 14, lane 1 gets 10 + 7 = 17. Offset 1: lane 0 gets 14 + 17 = 31. R3 prints the same rows; the sum is 31.</li>
+</ol>
+
+<h2 id="F6-36-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>cg_sum.cu</code>: a block reduction with tiles, and a whole-array sum in one cooperative launch.</p>
+<pre class="listing" data-src="F6-36/cg_sum.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings cg_sum.cu -o cg_sum</code>, then <code>./cg_sum</code>.</p>
+<pre class="output" data-run="F6-36/cg_sum"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The build is real and warning-free; the run stopped at the first runtime call with <code>cudaErrorNoDevice</code> (R1). On a GPU the program should print the cooperative-launch attribute, the grid it computed and two sums of 5000000.0. Neither the sums nor the time of <code>grid.sync()</code> has been observed in this build. Whether some build flag (for example relocatable device code) is required for grid synchronisation on your toolkit version is a question for the Programming Guide's cooperative groups chapter: this build compiled and linked without one.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–9, 15</td><td>includes, <code>namespace cg</code></td><td>The cooperative groups API and its reduce header.</td><td><code>cg::reduce</code> lives in a separate header (H1).</td></tr>
+<tr><td>30–31</td><td><code>this_thread_block()</code>, <code>tiled_partition&lt;32&gt;</code></td><td>Names the block and cuts it into tiles of 32.</td><td>Size known at compile time: shuffles, no shared memory.</td></tr>
+<tr><td>34–37</td><td>grid-stride loop</td><td>Each thread sums elements i, i + stride, …</td><td>Any n fits any grid; 64-bit indices for large n.</td></tr>
+<tr><td>38</td><td><code>cg::reduce(tile, v, cg::plus&lt;float&gt;())</code></td><td>Tile sum; five butterfly shuffles (R4).</td><td>Every lane gets the result.</td></tr>
+<tr><td>39–42</td><td><code>tileSums[tile.meta_group_rank()]</code>, <code>block.sync()</code></td><td>One slot per tile; block barrier.</td><td>The barrier makes the slots visible to thread 0.</td></tr>
+<tr><td>43–48</td><td>thread 0 adds the tile sums</td><td>Eight additions.</td><td>Result valid in thread 0, like CUB's <code>BlockReduce</code> (<a href="#F6-35">F6-35</a>).</td></tr>
+<tr><td>62</td><td><code>cg::this_grid()</code></td><td>The grid group, valid only under a cooperative launch.</td><td>Its <code>sync()</code> traps otherwise (H1).</td></tr>
+<tr><td>67</td><td><code>grid.sync()</code></td><td>Waits for every block; partials visible afterwards.</td><td>Replaces a second kernel launch.</td></tr>
+<tr><td>68–74</td><td>block 0 adds partials</td><td>A serial sum of at most a few hundred values.</td><td>Simple, not optimal: a second <code>cg::reduce</code> would be faster.</td></tr>
+<tr><td>84–91</td><td>attribute, SM count, occupancy, grid</td><td>The cooperative-launch rule computed at run time (H2).</td><td>Never hard-code the grid.</td></tr>
+<tr><td>103–106</td><td><code>args[]</code>, <code>cudaLaunchCooperativeKernel</code></td><td>Arguments passed as an array of pointers to each argument.</td><td>The header's rule: N parameters, N pointers (H2).</td></tr>
+<tr><td>111–112</td><td><code>tileSum&lt;&lt;&lt;…&gt;&gt;&gt;</code></td><td>Ordinary launch of the kernel without <code>grid.sync()</code>.</td><td>Allowed: only kernels that sync the grid need the cooperative launch.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>residency.cpp</code>: a model of the block scheduler with a grid barrier (input <code>residency.in</code>: name, SMs, resident blocks per SM, grid; output in Layer 2, R2).</p>
+<pre class="listing" data-src="F6-36/residency.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>22–26</td><td><code>slots</code>, the rule</td><td>Prints whether a cooperative launch would accept the grid.</td><td>The same comparison the runtime makes (H2).</td></tr>
+<tr><td>36–42</td><td>fill free slots</td><td>Starts blocks in order while slots are free.</td><td>A started block keeps its slot until it finishes.</td></tr>
+<tr><td>43–45</td><td>release</td><td>The barrier opens only when all <code>grid</code> blocks have arrived.</td><td>A hand-made barrier counts the whole grid, resident or not.</td></tr>
+<tr><td>60–62</td><td>hang detection</td><td>No block started and none can leave: stop and report.</td><td>On a GPU there is no such report: the kernel just never ends.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>tiles.cpp</code>: what <code>meta_group_rank</code> and <code>thread_rank</code> are for tiles of 16, and a tree reduction in a tile of 8 (output in Layer 2, R3).</p>
+<pre class="listing" data-src="F6-36/tiles.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–16</td><td><code>t / tileSize</code>, <code>t % tileSize</code></td><td>The header's formulas for tile index and rank (H1).</td><td>No hidden magic: integer division.</td></tr>
+<tr><td>24–36</td><td>offsets 4, 2, 1</td><td>Each lane adds the value of lane + offset.</td><td>log<sub>2</sub>(8) = 3 steps; a tile of 32 needs 5.</td></tr>
+<tr><td>27–28</td><td><code>(src &lt; n) ? … : 0</code></td><td>Lanes whose source is outside the tile add nothing.</td><td>A real shuffle-down returns the lane's own value there; only lane 0's result is used, so both give 31.</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-36-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>There is no messenger.</b> "The whole hall stops" suggests a person who sees all tables. In reality each block's thread 0 adds to a counter in memory and then repeatedly reads it (Layer 3); nobody watches, and if a block never arrives, nobody notices. A hang has no error message.</li>
+<li><b>Waiting at the door is not visible.</b> In the kitchen you could see the queue at the door. On the GPU, blocks that are not yet resident do not exist anywhere you can inspect from the kernel; the only way to know the limit is the occupancy query before launch.</li>
+<li><b>Helpers passing things hand to hand do not pay attention to who is listening.</b> A shuffle in a tile requires every named lane to execute it; in the kitchen, a helper can hand a spoon to a neighbour who is busy. On the GPU, a lane that is not participating makes the result undefined (<a href="#F6-15">F6-15</a>).</li>
+</ul>
+
+<h2 id="F6-36-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Kernel with <code>grid.sync()</code> aborts with a trap / launch failure</td><td>Launched with <code>&lt;&lt;&lt;&gt;&gt;&gt;</code>, not cooperatively</td><td>The header's validity check (H1); <code>BPT.TRAP</code> in SASS (R4)</td><td><code>cudaLaunchCooperativeKernel</code></td></tr>
+<tr><td><code>cudaErrorCooperativeLaunchTooLarge</code></td><td>Grid larger than SMs × resident blocks per SM</td><td>Print the occupancy result and the grid</td><td>Compute the grid at run time (Listing 1, lines 84–91)</td></tr>
+<tr><td>Kernel never finishes; GPU looks busy (forensic lab)</td><td>A hand-made grid barrier with more blocks than slots</td><td>Residency model (Listing 2) with your occupancy numbers</td><td>Cooperative groups and a queried grid, or split the kernel</td></tr>
+<tr><td>Hang or wrong result in a tile reduction</td><td>Some lanes of the tile returned early or took another branch</td><td>Check that the whole tile reaches the call</td><td>Keep returns per tile; use <code>coalesced_threads()</code> in divergent code</td></tr>
+<tr><td>Compile error <code>Size must be one of 1/2/4/8/16/32</code></td><td>Tile size not supported (H1)</td><td>Read the error</td><td>Use a supported size</td></tr>
+<tr><td>Grid barrier version slower than two launches</td><td>Barrier cost and a smaller grid</td><td>Time both; Nsight Systems</td><td>Keep the multi-launch version (perhaps in a graph)</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-36-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-12">F6-12</a> (block barriers and why ordinary kernels have no grid barrier), <a href="#F6-15">F6-15</a> (warp shuffles with explicit masks) and <a href="#F6-35">F6-35</a> (CUB's block primitives). <b>What carries over:</b> the barrier rule (all members must reach it), shuffles and butterfly reductions, occupancy and residency from <a href="#F6-20">F6-20</a>, checking every runtime call. <sup class="src"><a href="#F6-36-src-D1">D1</a></sup> <b>What changes:</b> most dangerous first: a grid barrier is now possible, but only under a launch contract (cooperative launch, grid ≤ resident capacity) that a hand-made barrier silently ignores; groups become typed objects, so sizes are checked at compile time; the grid barrier is built from memory atomics, so it costs time you must measure. <sup class="src"><a href="#F6-36-src-H1">H1</a></sup> <sup class="src"><a href="#F6-36-src-H2">H2</a></sup> <b>What comes next:</b> <a href="#F6-37">F6-37</a> goes beyond one GPU: several devices in one machine, with peer access and memory shared between processes; "co-resident" becomes "connected by which link".</p></div>
+
+<h2 id="F6-36-check">Check yourself</h2>
+<ol>
+<li>Name the three basic members every cooperative group offers and say what each returns.</li>
+<li>Explain in your own words why a grid-wide barrier can deadlock when the grid has more blocks than can be resident at once.</li>
+<li>Which statement is true for CUDA 12.0's installed headers? (a) <code>grid.sync()</code> in an ordinarily launched kernel waits forever. (b) <code>grid.sync()</code> in an ordinarily launched kernel traps. (c) A cooperative launch with too many blocks is silently trimmed. (d) Tiles of 24 threads are allowed.</li>
+<li>Compute <code>meta_group_rank()</code> and <code>thread_rank()</code> for block thread 45 with tiles of 16 and with tiles of 8.</li>
+<li>Predict, then run: add a line <code>tight 4 2 9</code> to <code>residency.in</code>. Predict each round before running Listing 2.</li>
+<li>Apply to a new case: a kernel needs three phases, each depending on all results of the previous one. List two designs (one with cooperative groups, one without) and what you would measure to choose.</li>
+<li>Which SASS instructions in R4 implement the grid barrier, and which implements the validity check?</li>
+<li>A colleague hard-codes <code>blocks = 132 * 4</code> for a cooperative launch "because our GPU has 132 SMs and we get 4 blocks per SM". Give two reasons this will fail later.</li>
+</ol>
+
+<h2 id="F6-36-lab">Lab</h2>
+<p><b>Goal.</b> Build the device-wide sum of milestone E3 in one cooperative launch, compare it with your two-launch reduction and with CUB DeviceReduce (<a href="#F6-35">F6-35</a>), and verify the residency limit on your GPU. Acceptance test from E3, verbatim: "Sum of 2^28 floats matches a Kahan-summed CPU reference within your stated tolerance; integer sums are exact."</p>
+<p><b>Hardware and software needed.</b> Steps 1–3: g++ and nvcc only (this build: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>Cuda compilation tools, release 12.0, V12.0.140</code>, no GPU). Steps 4–6: an NVIDIA GPU whose <code>cudaDevAttrCooperativeLaunch</code> is non-zero, with toolkit and driver recorded, or a cloud GPU. Lab folder <code>university/labs/F6-36</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use. A hanging kernel can make a desktop GPU unresponsive until the driver's watchdog (if any) resets it: run step 6's deliberate hang only on a GPU that is not driving your display, and save your work first.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-36</code>. Compare the outputs with this chapter.</li>
+<li>Read <code>sass_sync.out</code>, then dump the full SASS of <code>gridSum</code> (<code>cuobjdump -sass</code>, <a href="#F6-34">F6-34</a>) and find the atomic, the polling loop and the trap. Mark them with the steps of Layer 3.</li>
+<li>Change <code>kThreads</code> to 1024 and re-read <code>resources.out</code>. Predict the effect on the occupancy result before step 4.</li>
+<li>On a GPU: run <code>cg_sum</code>. Record the attribute, SM count, occupancy and grid it prints, and check both sums.</li>
+<li>Extend the program to 2<sup>28</sup> floats with random values, add a Kahan-summed CPU reference, and time three versions (median of 20 after warm-up): cooperative one-launch, your two-launch reduction, CUB DeviceReduce. Fill the table and explain the ranking.</li>
+<li>Optional, on a non-display GPU: launch <code>gridSum</code> cooperatively with one block more than the computed maximum and record the error. Do not launch it with <code>&lt;&lt;&lt;&gt;&gt;&gt;</code> and a hand-made barrier.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: R1–R6 as shown. On a GPU: both sums equal 5000000.0 for the constant input; the too-large cooperative launch returns <code>cudaErrorCooperativeLaunchTooLarge</code>. Your times, labelled "measured on &lt;GPU, driver, toolkit, date&gt;" (AH-23). Nothing in steps 4–6 has been observed in this build.</p>
+<p><b>Verification.</b> The E3 acceptance test above; Compute Sanitizer reports no errors (<a href="#F6-05">F6-05</a>); the grid printed equals SMs × occupancy.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"cooperative launch supported: 0" → the device or its mode does not support it → use the two-launch version; record the attribute.</li>
+<li>Sum slightly off for random data → summation order differs from the CPU → compare against the Kahan reference with a tolerance (<a href="#F6-25">F6-25</a>).</li>
+<li>Kernel failed with a launch error after you raised <code>kThreads</code> → occupancy returned 0 blocks per SM → the program refuses to launch (line 92); reduce resources.</li>
+</ul>
+<p><b>Extension.</b> Replace block 0's serial loop with a second level of tile reduction after <code>grid.sync()</code>, and measure. Then write the same kernel without cooperative groups using a "last block done" atomic counter (no barrier at all) and compare.</p>
+
+<h2 id="F6-36-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Daniel's team wrote a hand-made grid barrier (one atomic counter and a spin loop) for an iterative solver, launched with <code>&lt;&lt;&lt;16, 256&gt;&gt;&gt;</code> on their TG-1 test card. The grid size 16 had been chosen from a profiler run months ago. Tests with a small problem (12 blocks) and the production configuration (16 blocks) passed for weeks. After a change that added a few local variables to the kernel ("build B"), the production run never finished; the test run had been switched to the new build only a day earlier. The team's lab notes record, for each build, the resident blocks per SM that the occupancy query reported. The evidence below is the residency model (Listing 2) run on those numbers (<code>forensic.in</code>).</p>
+<p><b>Evidence pack.</b></p>
+<pre class="listing" data-src="F6-36/forensic.in"></pre>
+<pre class="output" data-run="F6-36/forensic"></pre>
+<p>Also in the pack: <code>resources.out</code> (shown under "How the hardware actually does it") as an example of the register report the team should have attached for each build.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what changed between build A and build B in the evidence, and what stayed the same?</li>
+<li>Hypotheses: list at least two causes for a kernel that never finishes (an infinite loop in the solver; a barrier that cannot open; a deadlock on a lock). Which line of the evidence supports which?</li>
+<li>Root cause: explain with the slot arithmetic why build B hangs with 16 blocks.</li>
+<li>Why did nothing report an error?</li>
+<li>Fix: give two fixes, one with cooperative groups and one without a grid barrier at all.</li>
+<li>Prevention: which check at launch time, and which test, would have caught this before production?</li>
+</ol>
+<p><b>Method hints.</b> Compare "slots" with "grid" for each line. Ask what a block that has arrived at the barrier does with its slot. Then ask which component of the system would have to notice the problem.</p>
+
+<h2 id="F6-36-project">Mini-project</h2>
+<p><b>One-kernel layer norm statistics for MP3.</b> Write a kernel that computes the mean and variance of a whole tensor (all rows together) and then normalises it, in one cooperative launch: phase 1 per-block Welford states (<a href="#F6-38">F6-38</a>), <code>grid.sync()</code>, phase 2 a merge by block 0 written to global memory, <code>grid.sync()</code>, phase 3 normalisation by all blocks. Compare with a three-kernel version in a CUDA Graph.</p>
+<p><b>Rubric.</b> Correct against a double-precision CPU reference with a justified tolerance (4). Grid computed from the occupancy query, with the launch error handled (2). Measurement of both versions with the protocol of <a href="#F6-06">F6-06</a> (2). A paragraph explaining the result with the barrier's cost and the grid-size cap (2).</p>
+
+<h2 id="F6-36-summary">Summary</h2>
+<ul>
+<li>Cooperative groups name sets of threads as objects with <code>size()</code>, <code>thread_rank()</code> and <code>sync()</code>.</li>
+<li>Tiles of 1–32 threads use shuffles; <code>cg::reduce</code> on a tile of 32 compiles to five butterfly shuffles.</li>
+<li><code>block.sync()</code> is the familiar block barrier.</li>
+<li><code>grid.sync()</code> requires a cooperative launch and a grid no larger than SMs × resident blocks per SM; otherwise the launch fails or the kernel traps.</li>
+<li>A hand-made grid barrier with too many blocks deadlocks silently.</li>
+<li>In CUDA 12.0 the grid barrier is a global atomic with release/acquire ordering and polling, so it has a cost to measure.</li>
+<li>Always compute the cooperative grid at run time from the occupancy query.</li>
+</ul>
+
+<h2 id="F6-36-sources">Sources</h2>
+<ol>
+<li id="F6-36-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1; the guide's registry records the page title "CUDA Programming Guide", version 13.x, when opened): cooperative groups chapter (group types, tiled partitions, grid synchronisation, cooperative launch). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-36-src-D2">D2 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): block scheduling, barriers, why blocks cannot wait for each other. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-36-src-D3">D3 — NVIDIA, "Parallel Thread Execution ISA" (tier 1): memory consistency model, release and acquire at <code>.gpu</code> scope, <code>atom</code> and <code>ld</code> with ordering qualifiers. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-36-src-H1">H1 — CUDA 12.0 headers as installed (Ubuntu package nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>cooperative_groups.h</code> (the <code>grid_group</code> comment on co-residency and cooperative launch; <code>sync()</code> calling <code>_CG_ABORT()</code> when not valid; <code>meta_group_rank()</code> = parent <code>thread_rank() / Size</code>; the <code>static_assert</code> "Size must be one of 1/2/4/8/16/32"; <code>multi_grid_group</code> marked <code>_CG_DEPRECATED</code>; <code>coalesced_threads</code>), <code>cooperative_groups/details/info.h</code> (<code>_CG_ABORT()</code> as <code>__trap()</code> or <code>assert(0)</code>), <code>cooperative_groups/details/sync.h</code> (<code>sync_grids</code>: block barrier, release add by one thread per block, acquire polling of the top bit, block barrier). Key lines reproduced by R7. Tier 1 (vendor files).</li>
+<li id="F6-36-src-H2">H2 — same installation, <code>cuda_runtime_api.h</code>: documentation of <code>cudaLaunchCooperativeKernel</code> (attribute requirement, grid limit, argument array, error list) and <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code>. Tier 1.</li>
+<li id="F6-36-src-H3">H3 — same installation, <code>driver_types.h</code>: <code>cudaErrorCooperativeLaunchTooLarge = 720</code> with its comment; <code>cudaDevAttrCooperativeLaunch = 95</code>. Tier 1.</li>
+<li id="F6-36-src-R1">R1 — build and run of Listing 1 (<code>cg_sum.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>; untested on hardware, exit code 1.</li>
+<li id="F6-36-src-R2">R2 — run of Listing 2 (<code>residency.log</code>, input <code>residency.in</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with sanitizers, exit code 0. A model with TG-1's invented SM count.</li>
+<li id="F6-36-src-R3">R3 — run of Listing 3 (<code>tiles.log</code>), same g++, exit code 0.</li>
+<li id="F6-36-src-R4">R4 — SASS instruction counts of <code>tileSum</code> and <code>gridSum</code> for sm_80 (<code>sass_sync.log</code>), CUDA 12.0 <code>cuobjdump</code>, compiled only.</li>
+<li id="F6-36-src-R5">R5 — ptxas register report for sm_80 (<code>resources.log</code>), compiled only.</li>
+<li id="F6-36-src-R7">R7 — header excerpts for H1 printed by <code>grep</code> (<code>header_quotes.log</code>), read only.</li>
+<li id="F6-36-src-R6">R6 — run of Listing 2 on the forensic input (<code>forensic.log</code>), same g++, exit code 0.</li>
+</ol>
+
+<h2 id="F6-36-glossary">Glossary links</h2>
+<p><a href="#gl-cooperative-groups">Cooperative groups</a> · <a href="#gl-thread-block-tile">Thread block tile</a> · <a href="#gl-grid-group-and-grid-barrier">Grid group and grid barrier</a> · <a href="#gl-cooperative-launch">Cooperative launch</a> · <a href="#gl-resident">Resident</a> · <a href="#gl-deadlock-of-a-barrier">Deadlock (of a barrier)</a> · <a href="#gl-occupancy">Occupancy</a> · <a href="#gl-barrier-syncthreads">Barrier (__syncthreads)</a> · <a href="#gl-tg-1-teaching-gpu">TG-1 (teaching GPU)</a></p>
+
+<h2 id="F6-36-next">Next chapter</h2>
+<p>Next: <a href="#F6-37">F6-37 Multi-GPU on one node: peer access and IPC</a>. Previous: <a href="#F6-35">F6-35</a>. Back to the course: <a href="#CU401">CU401</a>.</p>
+
+<h2 id="F6-36-answers">Answers to Check yourself</h2>
+<ol>
+<li><code>size()</code> (number of threads in the group), <code>thread_rank()</code> (this thread's index in the group, 0 to size − 1) and <code>sync()</code> (wait until all threads of the group arrive).</li>
+<li>A grid barrier opens only when every block has arrived. Blocks that are not resident cannot arrive until they get a slot; slots are freed only when resident blocks finish; resident blocks cannot finish because they wait at the barrier. That is a cycle of waiting: a deadlock (Figure 2).</li>
+<li>(b): <code>sync()</code> checks <code>is_valid()</code> and calls <code>_CG_ABORT()</code>, which is <code>__trap()</code> in device code (H1). (a) describes a hand-made barrier, not cooperative groups. (c) is false: the launch fails with <code>cudaErrorCooperativeLaunchTooLarge</code> (H2, H3). (d) is false: the <code>static_assert</code> allows 1/2/4/8/16/32 (and 64–512 for multi-warp tiles).</li>
+<li>Tiles of 16: 45 / 16 = 2, 45 % 16 = 13. Tiles of 8: 45 / 8 = 5, 45 % 8 = 5.</li>
+<li>8 slots, grid 9: the rule says "launch refused". Round 1: 8 blocks start and wait, 1 never starts, 0 finished. Round 2: 0 started, 8 waiting, 1 never started: the model reports the hang.</li>
+<li>Design 1: one cooperative kernel with two <code>grid.sync()</code> calls, grid from the occupancy query. Design 2: three kernels launched in order on one stream (or captured in a CUDA Graph, <a href="#F6-30">F6-30</a>). Measure the end-to-end time of both (median of 20), the time per phase, and how the grid-size cap of design 1 affects the phases' throughput.</li>
+<li>The barrier: the extra <code>BAR.SYNC</code>, <code>ATOM.E.ADD.STRONG.GPU</code>, <code>LD.E.STRONG.GPU</code> (polling), <code>MEMBAR.ALL.GPU</code> and <code>CCTL.IVALL</code>. The validity check: <code>BPT.TRAP</code>.</li>
+<li>The number of resident blocks per SM changes whenever the kernel's registers or shared memory change (a code or compiler change, as in the forensic lab), and the SM count changes with the GPU (or with partitioning or other work sharing it). Query both at run time.</li>
+</ol>
+<h3 id="F6-36-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Build A: 4 resident blocks per SM, 16 slots; grids of 12 and 16 finish in one round. Build B: 3 per SM, 12 slots; with a grid of 16, round 1 starts 12 blocks, all 12 wait at the barrier, 4 never start, and round 2 starts nobody. The grid size (16) and SM count (4) did not change; only the per-SM residency did.</p>
+<p><b>Hypotheses.</b> An infinite loop in the solver would also appear in build A or in the test configuration (it does not). A lock deadlock would not depend on the number of resident blocks. A barrier that cannot open is exactly what the model shows for build B, grid 16, and only there.</p>
+<p><b>Root cause.</b> The extra local variables raised register use, so fewer blocks fit per SM (4 → 3), and the slots fell from 16 to 12, below the hard-coded grid of 16. The hand-made barrier counts 16 arrivals; at most 12 blocks can ever be resident while the others wait for a slot that no waiting block will release.</p>
+<p><b>Why no error.</b> An ordinary launch has no co-residency check, and a spin loop on a counter is legal code; nothing in the runtime knows it is a barrier. (A cooperative launch would have returned <code>cudaErrorCooperativeLaunchTooLarge</code>, H2.)</p>
+<p><b>Fix.</b> (1) Use <code>cg::this_grid().sync()</code> with <code>cudaLaunchCooperativeKernel</code> and a grid computed from the occupancy query at run time (Listing 1). (2) Remove the grid barrier: one kernel per iteration phase, launched in sequence or captured in a CUDA Graph.</p>
+<p><b>Prevention.</b> At launch: assert grid ≤ SMs × occupancy result (or let the cooperative launch do it). In CI: attach the <code>ptxas</code> register report per build and a test that runs the production grid size with a timeout. <b>How the evidence was produced:</b> real runs of Listing 2 with the occupancy numbers of the scenario (TG-1's invented 4 SMs); no GPU was involved.</p>
