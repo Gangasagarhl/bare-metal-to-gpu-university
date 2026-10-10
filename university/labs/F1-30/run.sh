@@ -29,4 +29,18 @@ sed -i "s#$(pwd)/##g; s# (BuildId: [0-9a-f]*)##g; s#\.bin_tsan#race_tsan#g" race
 rec race_tsan "$T && ./race_tsan" "$rc" \
     "note:      the program itself returns 0; the non-zero exit code comes from ThreadSanitizer after it reported a race"
 rm -f .bin_race .bin_tsan
-[ -s race_tsan.out ]
+# the atomic fetch_add of Listing 1 as x86-64 machine code: build threads.cpp at -O2 without
+# sanitizers and show the lines of the disassembly around the lock-prefixed instruction
+g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror threads.cpp -o .bin_t2 \
+    && objdump -d --no-show-raw-insn -M intel -C .bin_t2 | grep -B2 -A1 'lock ' > threads_lock.out; rc=$?
+{
+    echo "listing:   threads.cpp"
+    echo "toolchain: $(g++ --version | head -n 1); $(objdump --version | head -n 1)"
+    echo "command:   g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror threads.cpp -o threads && objdump -d --no-show-raw-insn -M intel -C threads | grep -B2 -A1 'lock '"
+    echo "date:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "machine:   $(uname -s) $(uname -m) (cloud build container)"
+    echo "exit code: $rc"
+    echo "note:      added in the verification pass of 2026-10-10; shows the instruction GCC emitted for chunksDone.fetch_add(1)"
+} > threads_lock.log
+rm -f .bin_t2
+[ -s race_tsan.out ] && [ -s threads_lock.out ]

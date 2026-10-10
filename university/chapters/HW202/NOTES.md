@@ -143,3 +143,94 @@ Jonas in F1-29, Tomás in F1-26 and F1-30, Ana in F1-31); none is a real person.
 8. **Compiler Explorer** named on the course card was unreachable; F1-31 uses local compilers and says
    so in the lab text.
 9. **Course-card title**: F1-30 uses the card's title "Multicore processors".
+
+## Owner rulings applied
+
+Verification pass of 2026-10-10 (rulings in `university/OWNER_RULINGS.md`). Each numbered item answers the
+decision of the same number in "Decisions for the owner" above.
+
+1. **The U16 teaching ISA** → ruling **A2**: approved as a teaching stand-in. F1-23 says it is designed for this
+   course and names the real machines it stands for (the Hack machine of Nisan & Schocken, the MIPS/RISC-V subsets
+   of the textbooks); every fact about U16 is tagged to the code that ran (R1). No change to the ISA.
+2. **The pipeline timing model** (`pipe.h`) → ruling **A2**: approved; F1-26 Layer 3 says plainly that it is a
+   rule-based timing model, not a gate-level simulation. Kept.
+3. **Verilog in F1-25** → no ruling covers it; **decided by verifier:** keep. Icarus Verilog 12.0 and Yosys 0.33 are
+   in the recorded toolchain, the lab re-ran cleanly, and the chapter's "Hardware and software needed" names them.
+4. **Invented delay units** → ruling **A4**: exercise values, approved; the chapter calls them made-up "delay units"
+   and the R3 source entry now says "exercise values, owner ruling A4".
+5. **Real timings vary between runs** → ruling **A5**: the recorded runs are kept. The re-run of 2026-10-10 gave
+   `accum` ratio 3.38 (recorded 1.45), `vanish_O0` 257.888 ms (recorded 238.466 ms) and `race_plain` 200000,
+   200000, 100346 (recorded 115041, 109539, 104955); all differences are run-to-run noise, the recorded files were
+   restored with `git checkout`, and the prose stays qualitative. F1-30's forensic key now says that a racy
+   program can print the right total by luck.
+6. **perf unavailable** → ruling **C3**: the F1-28 and F1-29 boxes mark the hardware measurement as untested and say
+   what is needed (a machine with working `perf stat`, the vendor's optimisation manual, tool version and machine
+   recorded). `perf` still prints "perf not found for kernel 6.18.44-fc" in the verification container.
+7. **Cross-compiled code not executed** → ruling **C3**: F1-23 and F1-31 now mark the ARM64 and RISC-V objects
+   "untested on hardware" and say what a test needs. Correction: the user-mode emulators `qemu-aarch64` and
+   `qemu-riscv64` (QEMU 8.2.2) *are* installed in the container; the chapters' claim that none was available
+   was wrong and has been fixed. The objects still were not run (they have no `main`); an emulated run is listed
+   as a first check, not as a hardware test.
+8. **Compiler Explorer unreachable** → no ruling; **decided by verifier:** keep the local compilers; the F1-31 lab
+   text says the online tool was unreachable and that the same compilers run locally.
+9. **F1-30 title "Multicore processors"** → no ruling; **decided by verifier:** keep the course-card title.
+- Ruling **A1**: all nine chapters are above the L2 target of about 3,000 words; nothing was trimmed.
+- Ruling **A3**: the fifteen analogy mappings proposed above are approved and registered; no wording changed.
+- Ruling **A7**: terms that other courses also define (Register, Program counter, Thread, Data race, Atomic
+  operation, Cache coherence, Assembler, Disassembler) keep HW202's wording here; the Integrator merges per A7.
+- Rulings **A8**, **A10**, **D4** do not apply: the HW202 labs contain no keys, no `LicenseRef-Uni-Lab` marker and
+  no robot image.
+- Ruling **B4**: exams are written by the Exam Writer pass, not here.
+- Rulings **C1**, **C4**: every chapter has a dossier and a QA record; status "internally checked", with
+  "hardware steps untested" for F1-23 and F1-31 (the ARM64 and RISC-V objects).
+
+## Verification pass
+
+Fact-Checker / Source Researcher / Editor / Accessibility agent, 2026-10-10. Dossiers:
+`university/_dossiers/F1-23…F1-31.dossier.html`; QA records: `university/qa/F1-23…F1-31.json` (all
+`"factcheck": "done"`). The shared web-fetch budget ran out part-way through the pass, so the documents below
+were opened in the order of value and the rest are recorded as not opened.
+
+**Opened (tier, what was confirmed).** GCC 13.3.0 manual §3.11 "Options That Control Optimization" (tier 2:
+-O0/-O2/-O3 wording, `-fassociative-math`, `-ffast-math`); GNU binutils 2.42 `objdump` documentation (tier 2:
+`-d`, `-C`, `-M intel`/`-M att`, `--no-show-raw-insn`); System V AMD64 psABI draft 0.99.6 (tier 1: §3.2.1–3.2.3,
+argument/return/callee-saved registers, stack alignment, red zone); AAPCS64 release 2025Q4 (tier 1: register
+roles r0–r7, r16–r18, r19–r28, r29, r30); RISC-V Calling Conventions `riscv-cc.adoc` (tier 1: a0–a7, a0/a1 return,
+s-registers callee-saved, x0 zero immutable); the C++ working draft at eel.is ([intro.races]/17,
+[thread.thread.member]/4, [intro.abstract]/1 and /8, [expr.pre]/4; tier 1); OSTEP chapter 26 "Concurrency: An
+Introduction", version 1.10 (tier 3: threads, lost update, three-instruction increment, race/critical
+section/atomicity); Nisan & Schocken chapter 4 "Machine Language" (pre-publication chapter PDF; tier 3) and the
+nand2tetris book page; the publishers' contents pages of Patterson & Hennessy COD RISC-V 2nd ed. (2020), Harris &
+Harris DDCA RISC-V ed. (2021) and Hennessy & Patterson CAQA 6th ed. (2017) (editions and chapter titles only);
+Intel's SDM catalogue page (volumes, version 093); the RISC-V ISA manual's release page (release
+riscv-isa-release-1b9ca13-2026-10-08).
+
+**Not opened.** The three textbooks' text (not freely readable): the concept claims tagged to them keep their tags,
+each Sources entry says the chapter was located but the text not opened, and the unverified boxes name the
+real-processor statements that rest on them. Intel SDM volumes 1 and 2, the Arm Architecture Reference Manual (the
+Arm site returned no readable content), the RISC-V Unprivileged ISA document (download refused to the fetch tool),
+the C++ atomics clause, the GCC instrumentation-options page (`-fcf-protection`), the cppreference pages (dropped
+as sources). The Dive into Systems open textbook and the ScienceDirect/O'Reilly section-level contents were tried
+as further sources and could not be fetched within the budget.
+
+**Corrected.** F1-23: the "no user-mode emulator" claim (QEMU user-mode binaries are installed); AT&T-default claim
+retagged to the objdump manual. F1-30: the untagged "GCC emits a lock-prefixed instruction" sentence replaced by a
+recorded run (`labs/F1-30/threads_lock.*`, `lock add QWORD PTR [rax],0x1`; run.sh extended). F1-31: the jargon
+entry on optimisation levels (GCC 13 vectorises at `-O2` with a cheap cost model; `-O3` adds loop transformations
+and the dynamic cost model); the `paddd` description; the `@plt` claim retagged to the run that shows it; the ABI
+statements moved out of the unverified box and callee-saved registers added; tiers of the GCC and binutils manuals
+corrected to 2. All nine Sources sections rewritten with editions, chapters and the honest "text not opened"
+statement; all "title only" wording removed where a source was opened. `glossary.json` source fields updated.
+
+**Left unverified (in boxes).** Register counts/widths and fixed-field/reserved-encoding statements about the real
+ISAs (F1-23); real-processor cache and multicycle remarks (F1-24); microcode use by real processors (F1-25); real
+pipeline depths (F1-26); real hazard costs and the exposed-load-delay history (F1-27); real predictor organisation
+(F1-28); real core width/window/latency (F1-29); real coherence protocols, memory models, the multicore history and
+the thread speed-up (F1-30); cmov/csel/paddd/addw/sext.w semantics, upper-half clearing, base RISC-V without
+conditional move, `endbr64`/`-fcf-protection` default (F1-31).
+
+**Labs.** All nine labs re-run with `run_lab.sh` on 2026-10-10, every one exit 0; outputs identical except the
+timing/race/pid noise listed under ruling A5 (recorded files restored). Diagrams (G4), edit (G7, average sentence
+length 15–18 words against the L2 target of about 20; no phrases from guide 13.8) and accessibility (G8: every SVG
+has role, title, desc and caption; every table has header cells; headings in order) passed with no changes needed
+beyond the text edits above.
