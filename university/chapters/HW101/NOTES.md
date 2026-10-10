@@ -105,3 +105,65 @@ an exercise ("pretend") value or must be copied from a datasheet.
 
 `#KID103`, `#F0-40`, `#HW101`, `#HW102`, `#F1-09` (first HW102 chapter), `#safety`, `#gl-…` (own glossary).
 Later chapters mentioned by id in prose only (no link): F1-15, F1-18, F1-64, HW204, HW301, HW302.
+
+## Owner rulings applied
+
+Verification pass of 2026-10-10 (rulings in `university/OWNER_RULINGS.md`).
+
+1. **Choose the HW101 kit and meter** → ruling **D1**. `build/KIT.md` names the Fluke 17B+ multimeter and the
+   Digilent Analog Discovery 3 (RC timing); the HW101 breadboard component set (battery, resistors, capacitors,
+   LEDs, Schmitt-trigger inverter) is still a specification, not a named product. Every chapter's D4 entry now
+   says so. The Fluke 17B+ manual was not opened, so all meter numbers stay labelled pretend values (F1-07).
+2. **Course project part** (Schmitt-trigger inverter or timer chip) → no ruling covers it; **decided by verifier:**
+   keep the Schmitt-trigger inverter. The Nexperia 74HC14 data sheet (D15 of F1-08, section 13) shows the same
+   R–C relaxation circuit; its own period formula (K-factor graph) was not legible and is noted in F1-08's Part B
+   box. No timer-chip formula is given.
+3. **Analogy registrations** (rubber-wall tank, flap valve, plumber's gauges, spice mill / warm pipe, oven
+   thermometer / order bell) → ruling **A3**: approved. "Analogy (proposed)" labels changed to "Analogy" in
+   F1-05, F1-06, F1-07, F1-08; meta lines and `glossary.json` say "approved mapping, owner ruling A3".
+4. **Publication with unverified boxes** → rulings **C1/C3/C4**: allowed. Every Part B box now says
+   "Untested on hardware" and what is needed to test it. Status: "internally checked · hardware steps untested".
+5. **Glossary overlaps with KID103** (Voltage, Current, Resistor, Ohm's law, LED, Diode, Anode and cathode,
+   Forward voltage, Multimeter) → ruling **A7**: KID103's wording (earlier in build order) is canonical when the
+   meaning is the same; the HW101 entries stay as the more precise definitions and are merged by the Integrator.
+   No change made in this unit's files beyond the source fields.
+6. **Exams** → ruling **B4**: written by the Exam Writer pass (EXAM_BRIEF.md), not in this verification pass.
+7. **Length above the L1 target** → ruling **A1**: accepted as written; nothing trimmed for length.
+- Ruling **A5** applied to the lab re-runs (see below). Rulings A8 (keys), A10 (licence placeholder) and D4
+  (e-stop) do not apply: HW101's labs contain no keys, no `LicenseRef-Uni-Lab` marker and no robot image.
+
+## Verification pass
+
+Fact-Checker / Source Researcher agent, 2026-10-10. Dossiers: `university/_dossiers/F1-01…F1-08.dossier.html`;
+QA records: `university/qa/F1-01…F1-08.json` (all "factcheck": "done").
+
+**Opened (web, 2026-10-10):** BIPM SI Brochure 9th ed. (V4.01, June 2026) §2.3.1, §2.3.4 Table 4, Table 7;
+OpenStax University Physics Vol. 2 §7.2, 8.1, 9.1–9.5, 10.1–10.5 (summaries of ch. 9 and 10); Vol. 1 §14.7;
+Vol. 3 §9.6–9.7; McLaughlin and Howe, "Applied Electrical Engineering Fundamentals" §3.3–3.5; Vishay resistor
+datasheet 28766; NIC Components aluminium electrolytic guideline; TI AN-1656 (SNVA253A), SCEA046B, SZZA036C,
+SDAA011A, SCAA035B; Nexperia 74HC_HCT14 Rev. 10; ADI MT-001, MT-002; Fluke "Can you live with the burden?";
+UC Berkeley EECS 100 "Multimeters"; Nobel Prize 2014 popular information "Blue LEDs".
+**Not opened:** "Make: Electronics" and "The Art of Electronics" (not freely readable; kept as further reading,
+no claim relies on them); Petzold "Code" (same); Fluke multimeter manuals (failed to load); the OSRAM LED
+application note (robots disallowed); the web-fetch budget ran out near the end of the pass.
+
+**Claims:** about 247 tagged claims checked across the eight chapters; every D1/D2/D3(Code) tag replaced by an
+opened source with its section (tags now read e.g. "D5 §9.1"). 26 corrections, the main ones:
+- F1-02: pipe flow *is* proportional to pressure while laminar; turbulence raises its resistance (analogy break).
+- F1-03: "a small LED loop uses a few hundredths of a watt" contradicted Figure 1 (0.12 W); Musa's 30× power
+  now explained with P = V² ÷ R.
+- F1-04: code-table row said Req prints without decimals (it prints 3000.000).
+- F1-05: capacitance/propagation-delay claim not supported → power only (TI SCAA035B), delay deferred to F1-15.
+- F1-06: forward voltage not set by material in the opened source (colour only); diode-use examples removed.
+- F1-07: Lab Part A output has thirteen lines, not twelve; DMM internals trimmed to what D5 §10.4 and D13 say.
+- F1-08: Schmitt "internal feedback" and ADC "comparison with references" not found → generalised.
+Unverified items kept in boxes: kit/meter values (D4) in every chapter; resistor colour code (IEC 60062,
+paywalled); diode symbol convention, LED brightness/reverse-voltage statements; meter accuracy format, range
+habit and "OL" display; D15's period formula; timer-chip formula.
+
+**Labs:** all 19 listings of F1-01…F1-08 re-run with `run_lab.sh` on 2026-10-10: every one passes (exit 0) with
+identical output; only the log dates changed, so the recorded `.out`/`.log` files were restored (ruling A5).
+No lab code, input or output changed. All Part B (kit) steps remain untested on hardware.
+
+**Build:** `python3 university/build/build.py` reports no PROBLEM line for HW101, F1-01…F1-08 or their dossiers;
+`UNIVERSITY.html` restored afterwards.
