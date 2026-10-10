@@ -53,7 +53,8 @@ STATUS_LABEL = {
     "planned": ("planned", "ts"),
     "draft": ("draft", "twarn"),
     "tested": ("draft · code run", "tdev"),
-    "checked": ("draft · code run · internally checked", "tok"),
+    "checked": ("code run · internally checked", "tok"),
+    "checked-hw": ("code run · internally checked · hardware steps untested", "tok"),
 }
 
 # Extra classes appended to the canonical style block (guide 7.5 says to add .front).
@@ -71,6 +72,17 @@ pre.output{background:var(--code)}
 sup.src{font-size:11px;line-height:0}
 sup.src a{text-decoration:none}
 .back{font-size:13px}
+nav.chtoc{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:8px 14px;margin:10px 0 16px;font-size:13.5px;line-height:1.9}
+nav.chtoc b{margin-right:6px}
+nav.chtoc a{margin-right:10px;white-space:nowrap}
+details.labfiles,details.tree{border:1px solid var(--line);border-radius:10px;padding:6px 12px;margin:14px 0;background:var(--paper)}
+details.labfiles>summary,details.tree>summary{cursor:pointer;font-weight:700}
+details.labfiles h4{margin:14px 0 4px;font-family:var(--mono,monospace);font-size:13px}
+details.tree details.tree{margin:6px 0 6px 10px}
+ul.tree{margin:4px 0 8px 18px;padding:0}
+ul.tree li{margin:2px 0}
+ul.tree ul{font-size:13px;margin:2px 0 6px 16px}
+section.exams,div.keys,div.dossier{border-top:4px solid var(--line);margin-top:40px;padding-top:6px}
 """
 
 
@@ -87,6 +99,106 @@ def esc(s):
 
 def slug(term):
     return "gl-" + re.sub(r"[^a-z0-9]+", "-", term.lower()).strip("-")
+
+
+def md_to_html(text):
+    """Tiny Markdown subset (headings, bullets, bold, code, links, paragraphs) for the owner files."""
+    out, para, lst = [], [], []
+
+    def inline(t):
+        t = esc(t)
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+        t = re.sub(r"`([^`]+)`", r"<code>\1</code>", t)
+        t = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<code>\1</code>", t)
+        return t
+
+    def flush():
+        if para:
+            out.append("<p>%s</p>" % inline(" ".join(para)))
+            para.clear()
+        if lst:
+            out.append("<ul>%s</ul>" % "".join("<li>%s</li>" % inline(x) for x in lst))
+            lst.clear()
+
+    for line in text.splitlines():
+        m = re.match(r"(#{1,4})\s+(.*)", line)
+        if m:
+            flush()
+            lvl = min(len(m.group(1)) + 2, 5)
+            out.append("<h%d>%s</h%d>" % (lvl, inline(m.group(2)), lvl))
+        elif re.match(r"\s*[-*]\s+", line) and not line.startswith("  "):
+            if para:
+                flush()
+            lst.append(re.sub(r"^\s*[-*]\s+", "", line))
+        elif line.strip() == "":
+            flush()
+        elif lst:
+            lst[-1] += " " + line.strip()
+        else:
+            para.append(line.strip())
+    flush()
+    return "\n".join(out)
+
+
+def load_extra(path):
+    """An HTML fragment with an optional meta comment; returns its body or None."""
+    if not os.path.exists(path):
+        return None
+    src = read(path)
+    m = re.match(r"\s*<!--meta.*?-->", src, re.S)
+    return src[m.end():] if m else src
+
+
+def chapter_toc(cid, body, extra):
+    items = re.findall(r'<h2[^>]*\sid="(%s-[^"]+)"[^>]*>(.*?)</h2>' % re.escape(cid), body, re.S)
+    links = []
+    for i, t in items:
+        links.append('<a href="#%s">%s</a>' % (i, re.sub(r"<[^>]+>", "", t).strip()))
+        if i.endswith("-able") and ('id="%s-jargon"' % cid) in body:
+            links.append('<a href="#%s-jargon">Jargon box</a>' % cid)
+        if i.endswith("-mistakes") and ('id="%s-transition"' % cid) in body:
+            links.append('<a href="#%s-transition">Transition box</a>' % cid)
+    links += extra
+    return '<nav class="chtoc" id="%s-toc"><b>In this chapter:</b>%s</nav>' % (cid, " ".join(links))
+
+
+TEXT_LIMIT = 300_000
+
+
+def render_lab_files(cid, shown=()):
+    """Every file of a lab folder; files already printed in the chapter are referenced, not repeated."""
+    shown = set(shown)
+    d = os.path.join(UNI, "labs", cid)
+    if not os.path.isdir(d):
+        return ""
+    files = []
+    for root, dirs, fns in os.walk(d):
+        dirs.sort()
+        for fn in sorted(fns):
+            files.append(os.path.relpath(os.path.join(root, fn), d))
+    parts = []
+    for rel in files:
+        p = os.path.join(d, rel)
+        size = os.path.getsize(p)
+        if "%s/%s" % (cid, rel) in shown:
+            parts.append("<h4>%s</h4><p class=\"sub\">Shown in full in the chapter above.</p>" % esc(rel))
+            continue
+        try:
+            raw = open(p, "rb").read()
+            if b"\0" in raw[:4096]:
+                raise UnicodeDecodeError("bin", b"", 0, 1, "binary")
+            txt = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            parts.append("<h4>%s</h4><p class=\"sub\">Binary file (%d bytes), kept in the repository; not shown.</p>" % (esc(rel), size))
+            continue
+        if size > TEXT_LIMIT:
+            parts.append("<h4>%s</h4><p class=\"sub\">Text file of %d bytes, too large to show here; it is in "
+                         "<code>university/labs/%s/%s</code>.</p>" % (esc(rel), size, esc(cid), esc(rel)))
+            continue
+        parts.append("<h4>%s</h4><pre><code>%s</code></pre>" % (esc(rel), html.escape(txt, quote=True) if txt.strip() else "(empty file)"))
+    return ('<details class="labfiles" id="%s-labfiles"><summary>Lab files of %s: every source, input, real output and '
+            'run record (%d files, from <code>university/labs/%s/</code>)</summary>%s</details>'
+            % (cid, cid, len(files), esc(cid), "".join(parts)))
 
 
 def heading_blocks(doc):
@@ -308,7 +420,7 @@ def chapter_status(cid, chapters):
     runs = lab_runs(cid)
     qa = load_qa(cid)
     if qa and qa.get("factcheck") == "done":
-        return "checked"
+        return "checked-hw" if qa.get("hardware_untested") else "checked"
     if runs and all(run_ok(l) for _, l in runs):
         return "tested"
     if not runs and "data-run" not in chapters[cid]["body"]:
@@ -356,19 +468,33 @@ def render_chapter(meta, course_title, known, problems, nxt, prev):
         ("Prerequisites", linkify_ids(esc(meta.get("prereqs", "none")), known)),
         ("Time to study", esc(meta.get("time", ""))),
         ("Hardware needed", esc(meta.get("hardware", ""))),
-        ("Sources dossier", 'Not yet written: this build had no internet access, so no official document could be opened. '
-                            'Sources are named by title in the chapter\'s Sources section and marked "pending verification" (gate G1 open).'),
+        ("Sources dossier", ('<a href="#dossier-%s">Source dossier of %s</a> (in this file): the documents opened, the facts used '
+                             'and what could not be confirmed.' % (cid, cid))
+         if os.path.exists(os.path.join(UNI, "_dossiers", cid + ".dossier.html")) else
+         'Not yet written: sources are named by title in the chapter\'s Sources section and marked "pending verification" (gate G1 open).'),
         ("QA record", '<a href="#qa-%s">QA record of %s</a> (in this file)' % (cid, cid)),
-        ("Version", "v0.1 draft · %s · not yet verified against sources" % status_tag(st)),
+        ("Version", ("v0.2 · %s · verified against the sources in its dossier" % status_tag(st)) if st.startswith("checked")
+         else "v0.1 draft · %s · not yet verified against sources" % status_tag(st)),
         ("Maps to", linkify_ids(esc(meta.get("maps", "")), known)),
     ]
     fm = "".join("<dt>%s</dt><dd>%s</dd>" % (k, v) for k, v in front)
+    extra = []
+    shown = set(re.findall(r'data-src="([^"]+)"', meta["body"]))
+    for r in re.findall(r'data-run="([^"]+)"', meta["body"]):
+        shown.add(r + ".out")
+    labs_html = render_lab_files(cid, shown)
+    if labs_html:
+        extra.append('<a href="#%s-labfiles">Lab files</a>' % cid)
+    if os.path.exists(os.path.join(UNI, "_dossiers", cid + ".dossier.html")):
+        extra.append('<a href="#dossier-%s">Source dossier</a>' % cid)
+    extra.append('<a href="#qa-%s">QA record</a>' % cid)
+    body = chapter_toc(cid, body, extra) + "\n" + body + "\n" + labs_html
     return (
         '<article class="chapter" id="%s">\n<div class="kicker">%s · Chapter %s</div>\n'
         '<h2 class="chtitle">%s</h2>\n<p class="back">%s</p>\n<dl class="front">%s</dl>\n%s\n'
-        '<footer>Corrections log: <a href="#qa-%s-corrections">%s corrections</a> (none recorded yet). %s</footer>\n</article>\n'
+        '<footer>Corrections log: <a href="#qa-%s-corrections">%s corrections</a> (%d recorded). %s</footer>\n</article>\n'
         % (cid, esc(meta["course"] + " · " + course_title), cid, esc(meta["title"]), " · ".join(nav), fm, body, cid, cid,
-           " · ".join(nav))
+           len((qa or {}).get("corrections") or []), " · ".join(nav))
     )
 
 
@@ -377,16 +503,17 @@ def render_qa(cid, meta, st):
     qa = load_qa(cid) or {}
     rows = [
         ("G0", "Planned (course card)", "Dean (this build)", "ok — scope copied from the guide's course card"),
-        ("G1", "Dossier approved", "—", "open — no official source could be opened in this build (no internet access)"),
+        ("G1", "Dossier approved", qa.get("checker", "—") if qa.get("dossier") else "—",
+         esc(qa.get("dossier", "open — no official source opened yet"))),
         ("G2", "Outline approved", "—", "skipped in batch 1 (Author wrote directly to the template)"),
         ("G3", "Draft complete", "Author agent", "ok — all 21 template sections present" if meta else "—"),
-        ("G4", "Diagrams reviewed", "—", qa.get("diagrams", "open")),
+        ("G4", "Diagrams reviewed", "Diagram reviewer agent" if qa.get("diagrams") else "—", esc(qa.get("diagrams", "open"))),
         ("G5", "Labs and code tested", "Lab Engineer agent",
          ("ok — %d listing run(s), records below" % len(runs)) if runs and all(run_ok(l) for _, l in runs)
          else ("no listings" if not runs else "FAILED — see records")),
-        ("G6", "Fact-check passed", qa.get("checker", "—"), qa.get("factcheck_note", "open")),
-        ("G7", "Edit + reading level", "—", qa.get("edit", "open")),
-        ("G8", "Accessibility", "—", "open"),
+        ("G6", "Fact-check passed", esc(qa.get("checker", "—")), esc(qa.get("factcheck_note", "open"))),
+        ("G7", "Edit + reading level", "Editor agent" if qa.get("edit") else "—", esc(qa.get("edit", "open"))),
+        ("G8", "Accessibility", "Accessibility reviewer agent" if qa.get("accessibility") else "—", esc(qa.get("accessibility", "open"))),
         ("G9", "Integrated", "Integrator (build.py)", "ok — assembled into this file; links and ids checked"),
     ]
     t = "".join("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % r for r in rows)
@@ -396,11 +523,22 @@ def render_qa(cid, meta, st):
             "<tr><td><code>labs/%s/%s</code></td><td><pre>%s</pre></td></tr>" % (cid, esc(n), esc(l.strip())) for n, l in runs)
     findings = ""
     if qa.get("findings"):
-        findings = "<h4>Fact-check findings</h4><ul>%s</ul>" % "".join("<li>%s</li>" % esc(f) for f in qa["findings"])
+        findings = "<h4>Fact-check findings</h4><ul>%s</ul>" % "".join("<li>%s</li>" % esc(str(f)) for f in qa["findings"])
+    if qa.get("hardware_untested"):
+        findings += ("<h4>Untested on hardware (approved by the owner, ruling C3)</h4><ul>%s</ul>"
+                     % "".join("<li>%s</li>" % esc(str(f)) for f in qa["hardware_untested"]))
+    corr = qa.get("corrections") or []
+    if corr:
+        rows_c = "".join("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % tuple(
+            esc(str(c.get(k, ""))) if isinstance(c, dict) else (esc(str(c)) if k == "now" else "")
+            for k in ("where", "was", "now", "source")) for c in corr)
+        corr_html = ('<div class="tw"><table><tr><th>Where</th><th>Was</th><th>Now</th><th>Source</th></tr>%s</table></div>' % rows_c)
+    else:
+        corr_html = "no corrections recorded."
     return ('<div class="card" id="qa-%s"><h4>QA record — %s %s %s</h4><div class="tw"><table><tr><th>Gate</th><th>What</th>'
-            '<th>By</th><th>Result</th></tr>%s</table></div>%s%s<p id="qa-%s-corrections"><b>Corrections log:</b> no corrections yet.</p>'
+            '<th>By</th><th>Result</th></tr>%s</table></div>%s%s<div id="qa-%s-corrections"><b>Corrections log:</b> %s</div>'
             '<p><a href="#%s">back to the chapter</a></p></div>\n'
-            % (cid, cid, esc(meta.get("title", "")), status_tag(st), t, runs_html, findings, cid, cid))
+            % (cid, cid, esc(meta.get("title", "")), status_tag(st), t, runs_html, findings, cid, corr_html, cid))
 
 
 def render_glossary(proposals, curr_items):
@@ -436,6 +574,46 @@ def render_glossary(proposals, curr_items):
         parts.append("<dt%s>%s</dt><dd>%s <span class=\"tag twarn\">needs verification</span></dd>" % (idattr, dt, dd))
     parts.append("</dl>")
     return "\n".join(parts)
+
+
+def render_contents(cards, courses_by_fac, chapters, bridges, mps):
+    """Full contents tree: faculty > course > chapter > sections, labs, Q&A (no JavaScript: <details>)."""
+    def chapter_items(chid):
+        if chid not in chapters:
+            return ""
+        body = chapters[chid]["body"]
+        secs = re.findall(r'<h2[^>]*\sid="(%s-[^"]+)"[^>]*>(.*?)</h2>' % re.escape(chid), body, re.S)
+        links = ['<a href="#%s">%s</a>' % (i, re.sub(r"<[^>]+>", "", t).strip()) for i, t in secs]
+        if os.path.isdir(os.path.join(UNI, "labs", chid)):
+            links.append('<a href="#%s-labfiles">lab files</a>' % chid)
+        return "<ul><li>%s</li></ul>" % " · ".join(links)
+
+    def ch_line(chid, title):
+        t = esc(chapters[chid]["title"]) if chid in chapters else esc(title)
+        return '<li><a href="#%s">%s</a> %s%s</li>' % (chid, chid, t, chapter_items(chid))
+
+    out = ['<h2 id="contents">Contents</h2><p>Every faculty, course, chapter and chapter section, with the labs and the '
+           'questions and answers (each chapter\'s "Check yourself" and "Answers to Check yourself"). Open a branch to see '
+           'what is inside.</p>']
+    for f, fname, _ in FACULTIES:
+        courses = courses_by_fac[f]
+        inner = []
+        for c in courses:
+            ctitle, _ = card_title_level(cards[c]["html"])
+            chs = "".join(ch_line(chid, t) for chid, t in card_chapters(cards[c]["html"]))
+            ex = ('<li><a href="#%s-exams">%s exams and course project</a> · <a href="#keys-%s">answer key</a></li>' % (c, c, c)
+                  if os.path.exists(os.path.join(UNI, "chapters", c, "EXAMS.html")) else "")
+            inner.append('<details class="tree"><summary><a href="#%s">%s</a> %s</summary><ul class="tree">%s%s</ul></details>'
+                         % (c, c, esc(ctitle), chs, ex))
+        out.append('<details class="tree"><summary><a href="#fac-%s">Faculty %s</a> · %s (%d courses)</summary>%s</details>'
+                   % (f, f, esc(fname), len(courses), "".join(inner)))
+    for gid, title, group in (("bridges", "Bridge chapters", bridges), ("mega", "Mega projects", mps)):
+        items = "".join(ch_line(b, card_title_level(cards[b]["html"])[0]) for b in group)
+        out.append('<details class="tree"><summary><a href="#%s">%s</a> (%d)</summary><ul class="tree">%s</ul></details>'
+                   % (gid, title, len(group), items))
+    out.append('<p><a href="#keys">Answer keys</a> · <a href="#dossiers">Source dossiers</a> · <a href="#qa">QA records</a> · '
+               '<a href="#glossary">Glossary</a></p>')
+    return "\n".join(out)
 
 
 # ----------------------------------------------------------------------------- main build
@@ -483,10 +661,12 @@ def build():
     P.append('<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
              '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
              '<title>Bare Metal to GPU University</title>\n<style>%s%s</style>\n</head>\n<body>\n' % (style, EXTRA_CSS))
-    toc = [("home", "Home"), ("start", "Start here"), ("ladder", "Levels"), ("paths", "Goal paths"), ("years", "Years"),
-           ("catalogue", "Catalogue"), ("safety", "Safety"), ("analogies", "Analogies"), ("glossary", "Glossary")]
+    toc = [("home", "Home"), ("contents", "Contents"), ("start", "Start here"), ("ladder", "Levels"), ("paths", "Goal paths"), ("years", "Years"),
+           ("catalogue", "Catalogue"), ("safety", "Safety"), ("kit", "Kit"), ("rulings", "Owner rulings"), ("analogies", "Analogies"),
+           ("glossary", "Glossary")]
     toc += [("fac-" + f, f) for f, _, _ in FACULTIES]
-    toc += [("bridges", "Bridges"), ("mega", "Mega projects"), ("qa", "QA records"), ("about", "How this file was built")]
+    toc += [("bridges", "Bridges"), ("mega", "Mega projects"), ("keys", "Answer keys"), ("dossiers", "Source dossiers"),
+            ("qa", "QA records"), ("about", "How this file was built")]
     P.append('<header><div class="wrap"><div class="kicker">One-file edition · built %s from the University Authoring Guide · no JavaScript</div>'
              '<h1>Bare Metal to GPU University</h1>'
              '<p class="lead">From a curious kid who has never programmed to an engineer who can build an operating system for any '
@@ -499,14 +679,18 @@ def build():
     # --- home
     written = len([c for c in all_chapters if c[0] in chapters])
     P.append('<h2 id="home">Welcome</h2>')
-    P.append('<div class="co note"><span class="lbl">Build status of this edition</span><p>%d of %d chapters are written as '
-             '<b>drafts</b>; the others are listed in the <a href="#catalogue">catalogue</a> as <i>planned</i>. Status counts: %s.</p>'
-             '<p>Every code listing in a written chapter was compiled and run in this build and its real output is pasted in. '
-             'This build had <b>no internet access</b>, so no official document could be opened: sources are named by title and '
-             'marked pending verification, and no chapter is yet "published" in the sense of the guide (gates G1, G6–G8 are open). '
-             'Each chapter links to its QA record.</p></div>'
-             % (written, len(all_chapters), ", ".join("%s %d" % (STATUS_LABEL[k][0], v) for k, v in sorted(stat.items()))))
+    n_checked = stat.get("checked", 0) + stat.get("checked-hw", 0)
+    P.append('<div class="co note"><span class="lbl">Build status of this edition</span><p>%d of %d chapters are written, plus '
+             'the 10 bridge chapters and the 8 mega-project handbooks. %d of the %d chapters are verified against their sources '
+             '(each has a <a href="#dossiers">source dossier</a> and a QA record). Status counts: %s.</p>'
+             '<p>Every code listing was compiled and run in the build container and its real output is pasted in. The container '
+             'has no GPU, boards, robot or drone: GPU code was compiled with the real compilers, firmware ran in QEMU and robots '
+             'and drones in simulators, and every such step is marked <i>untested on hardware</i>. The owner\'s decisions are in '
+             '<a href="#rulings">Owner rulings</a> and the chosen hardware in <a href="#kit">Reference kit</a>.</p></div>'
+             % (written, len(all_chapters), n_checked, len(all_chapters),
+                ", ".join("%s %d" % (STATUS_LABEL[k][0], v) for k, v in sorted(stat.items()))))
     P.append(section(guide, blocks, "honest"))
+    P.append(render_contents(cards, courses_by_fac, chapters, bridges, mps))
     P.append('<h2 id="start">Start here</h2><div class="grid3">'
              '<div class="card"><h4>A curious kid (about 10–12)</h4><p>Start with <a href="#KID101">KID101 How computers think</a>, '
              'chapter <a href="#F0-01">F0-01</a>. Go at your own pace, in short sessions, with a grown-up for anything physical.</p></div>'
@@ -551,10 +735,20 @@ def build():
 
     P.append('<h2 id="safety">Safety</h2><p>Read before any robot, drone, firmware or GPU lab. Every lab links here.</p>'
              + re.search(r'(<div class="note b">.*?</ul>\s*</div>)', section(guide, blocks, "honest"), re.S).group(1))
+    kit = load_extra(os.path.join(UNI, "build", "KIT.fragment.html"))
+    P.append('<h2 id="kit">Reference kit</h2><p>The hardware and software versions the labs refer to, chosen by the owner '
+             '(ruling D1) and checked against the vendors\' and projects\' own pages.</p>'
+             + (kit if kit is not None else "<p>Not chosen yet.</p>"))
+    rul = os.path.join(UNI, "OWNER_RULINGS.md")
+    P.append('<div id="rulings">%s</div>' % (md_to_html(read(rul)) if os.path.exists(rul) else "<p>No rulings yet.</p>"))
     P.append('<h2 id="analogies">Analogy registry</h2>' + section(guide, blocks, "s8"))
+    adds = load_extra(os.path.join(UNI, "chapters", "ANALOGY_ADDITIONS.html"))
+    if adds is not None:
+        P.append('<h3 id="analogy-additions">Analogy registry additions (approved by the owner, ruling A3)</h3>' + adds)
     P.append('<h2 id="glossary">Glossary</h2>' + render_glossary(load_glossary_proposals(), curriculum_glossary(curr)))
 
     # --- faculties, courses, chapters
+    exam_courses = []
     for f, fname, fclass in FACULTIES:
         fid = "f" + f[1:]
         P.append('<h2 class="fac" id="fac-%s">Faculty %s · %s</h2>' % (f, f, esc(fname)))
@@ -576,11 +770,25 @@ def build():
             P.append('<h3 id="%s">%s · %s</h3>' % (course, course, esc(ctitle)))
             P.append(card2)
             P.append('<p class="sub">Chapters of %s:</p><ul>%s</ul>' % (course, "".join(items)))
-            P.append('<p class="sub">Exams and the course project are planned (guide 11.4–11.5); answer keys will live in a separate file.</p>')
+            exams = load_extra(os.path.join(UNI, "chapters", course, "EXAMS.html"))
+            if exams is not None:
+                P.append('<p class="sub">Exams and the course project: <a href="#%s-exams">%s exams</a>, after the chapters; '
+                         'answer keys in the <a href="#keys">Answer keys</a> appendix.</p>' % (course, course))
+            else:
+                P.append('<p class="sub">Exams and the course project are planned (guide 11.4–11.5).</p>')
             seq = [c for c, _ in card_chapters(card) if c in chapters]
             for i, chid in enumerate(seq):
                 P.append(render_chapter(chapters[chid], ctitle, written_known, problems,
                                         seq[i + 1] if i + 1 < len(seq) else None, seq[i - 1] if i > 0 else None))
+            if exams is not None:
+                P.append('<section class="exams" id="%s-exams"><div class="kicker">%s · Exams and course project</div>'
+                         '<h2 class="chtitle">%s exams and course project</h2>%s'
+                         '<p class="back"><a href="#keys-%s">answer key</a> · <a href="#%s">course %s</a></p></section>'
+                         % (course, course, course, exams, course, course, course))
+                exam_courses.append(course)
+                plab = os.path.join(UNI, "labs", course + "-P")
+                if os.path.isdir(plab):
+                    P.append(render_lab_files(course + "-P"))
 
     # --- bridges and mega projects
     for hid, sec, group, gtitle in (("bridges", "s6", bridges, "Bridge chapters"), ("mega", "s11-6", mps, "Mega projects")):
@@ -593,6 +801,30 @@ def build():
         for i, b in enumerate(seq):
             P.append(render_chapter(chapters[b], gtitle, written_known, problems,
                                     seq[i + 1] if i + 1 < len(seq) else None, seq[i - 1] if i > 0 else None))
+
+    # --- appendices: answer keys and source dossiers
+    keys = [(c, load_extra(os.path.join(UNI, "_keys", c + ".keys.html"))) for c in exam_courses]
+    keys = [(c, k) for c, k in keys if k is not None]
+    P.append('<h2 class="fac" id="keys">Answer keys</h2><p>Model answers and marking points for every course\'s midterm, final '
+             'and practical (guide 11.4). Chapter quiz answers are at the end of each chapter ("Answers to Check yourself"). '
+             'Learners: try the exam first.</p>')
+    for c, k in keys:
+        P.append('<div class="keys" id="keys-%s"><h3>%s answer key</h3>%s<p class="back"><a href="#%s-exams">back to the %s exams</a></p></div>'
+                 % (c, c, k, c, c))
+    if not keys:
+        P.append("<p>No answer keys yet.</p>")
+    P.append('<h2 class="fac" id="dossiers">Source dossiers</h2><p>One dossier per chapter (guide 3.2): every document the '
+             'Source Researcher opened, its version, the sections used, the date and how it was accessed, the facts the chapter '
+             'may use, and the facts that could not be confirmed. Web addresses are shown as plain text.</p>')
+    n_dos = 0
+    for chid in [c[0] for c in all_chapters] + bridges + mps:
+        d = load_extra(os.path.join(UNI, "_dossiers", chid + ".dossier.html"))
+        if d is not None and chid in chapters:
+            n_dos += 1
+            P.append('<div class="dossier" id="dossier-%s"><h3>Source dossier — %s %s</h3>%s<p class="back"><a href="#%s">back to '
+                     'the chapter</a></p></div>' % (chid, chid, esc(chapters[chid]["title"]), d, chid))
+    if not n_dos:
+        P.append("<p>No dossiers yet.</p>")
 
     # --- QA records
     P.append('<h2 class="fac" id="qa">QA records</h2><p>One record per written chapter (guide 3.7). Gates follow guide 12.3.</p>')
