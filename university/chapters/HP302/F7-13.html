@@ -1,0 +1,326 @@
+<!--meta
+id: F7-13
+title: Reading AMD ISA
+course: HP302
+level: L4
+prereqs: F7-10; F7-11; F7-12; HW301 (F1-60); CU303 (reading PTX and SASS) recommended
+time: 10–16 hours including the lab
+hardware: none: every step reads compiler output (this build: no GPU); confirming a predicted change in a profiler needs an AMD GPU listed in the ROCm compatibility matrix
+maps: Curriculum E10 (AMD part: annotated listings of inner loops; identify loads and their width, LDS accesses, synchronization, FMA or matrix instructions, spills; predict one change and confirm it); course exam P "annotate an AMD ISA inner loop"; ISA guides (item 69); LLVM AMDGPU user guide (item 70)
+analogy: F7 — the great kitchen hall (second building: AMD)
+-->
+
+<h2 id="F7-13-hook">Story hook</h2>
+<p>Recipe cards in the second building are written in the house language: short lines, one action each, with the counter or hand named in every line. "Fetch four jars from the pantry into hands 4 to 7." "Wait until the pantry jars have arrived." "Multiply hands 4 and 5 by hands 8 and 9, two at a time." Most cooks never read these cards; they write recipes in the common language and let the translator produce the house version.</p>
+<p>Ravi reads them anyway. When a recipe is slow, the common-language version tells him what the cook wanted; the house version tells him what the helpers actually do. Today he is looking at a card for a dot product. The cook wrote <code>a*b + c</code> and expected a single "multiply-add" step; the house card has a multiply and a separate add. The cook used an atomic add at the end and expected one step; the house card has a small loop that tries, checks and tries again. Each surprise has a reason, and each reason can be changed.</p>
+<p>This chapter teaches you to read AMD's house language for your own kernels: where the assembly comes from, how a code object is organised, how to read a kernel from its first scalar load to <code>s_endpgm</code>, how to annotate an inner loop line by line, and how to confirm a prediction by changing one thing.</p>
+
+<h2 id="F7-13-able">What you will be able to do</h2>
+<ul>
+<li><b>Produce</b> AMD assembly and code objects for any kernel without a GPU, and list the code objects inside a HIP executable.</li>
+<li><b>Decode</b> instruction names: prefix (<code>s_</code>, <code>v_</code>, <code>ds_</code>, <code>global_</code>, <code>buffer_</code>), operation, data type, encoding suffix (<code>_e32</code>, <code>_e64</code>), operands.</li>
+<li><b>Read</b> a kernel's prologue: kernel-argument loads from the kernarg pointer, the workgroup id in an SGPR, the work-item id in <code>v0</code>.</li>
+<li><b>Annotate</b> an inner loop line by line, identifying global loads and their width, LDS and cross-lane accesses, waits, the FMA instructions, the EXEC-mask loop control and any spills (curriculum E10).</li>
+<li><b>Read</b> the kernel descriptor and the metadata (register counts, LDS and scratch sizes, kernel-argument size, wave size) and relate them to F7-10's occupancy.</li>
+<li><b>Predict</b> the effect of a source or option change on the ISA, make it, and check it with an instruction census.</li>
+</ul>
+
+<div class="co jargon" id="F7-13-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>AMD ISA (GCN/CDNA/RDNA)</dt><dd><b>Simple words:</b> the machine language of AMD GPUs, the instructions the hardware runs. <b>Analogy:</b> the house language of the second building's recipe cards. <b>Precise:</b> the instruction set documented per generation in AMD's ISA reference guides (for gfx90a, the MI200 / CDNA2 guide); the LLVM AMDGPU back end emits it as assembly text and as binary in a code object. <sup class="src"><a href="#F7-13-src-D2">D2</a></sup> <sup class="src"><a href="#F7-13-src-D5">D5</a></sup></dd>
+<dt>Code object</dt><dd><b>Simple words:</b> the file that holds a GPU's compiled kernels for one target. <b>Analogy:</b> the bound book of house-language cards for one building. <b>Precise:</b> an ELF file for the AMD GPU architecture (in this build: "ELF 64-bit LSB shared object, AMD GPU architecture version 1"), with one function symbol per kernel, one 64-byte <code>.kd</code> object per kernel (the kernel descriptor), and metadata in an ELF note; a HIP executable bundles one code object per <code>--offload-arch</code> target (R4, R7). <sup class="src"><a href="#F7-13-src-D5">D5</a></sup> <sup class="src"><a href="#F7-13-src-R4">R4</a></sup></dd>
+<dt>Kernel descriptor</dt><dd><b>Simple words:</b> a small block of settings the hardware reads before it starts a kernel. <b>Analogy:</b> the header card of a recipe: how many hands, how much table, where the first line is. <b>Precise:</b> a 64-byte structure (<code>&lt;kernel&gt;.kd</code> in R4) that the assembler builds from the <code>.amdhsa_*</code> directives: LDS and scratch sizes, kernel-argument size, user SGPR count, VGPR and SGPR allocation, accumulation offset, floating-point modes (R5). <sup class="src"><a href="#F7-13-src-D5">D5</a></sup> <sup class="src"><a href="#F7-13-src-R5">R5</a></sup></dd>
+<dt>Kernarg segment</dt><dd><b>Simple words:</b> the memory block that holds a kernel's arguments. <b>Analogy:</b> the order slip clipped to the recipe card. <b>Precise:</b> a buffer whose address the kernel receives in an SGPR pair; the kernel reads its arguments with scalar loads at fixed offsets; its size is <code>.kernarg_segment_size</code> (28 bytes for <code>dot()</code>, R4). <sup class="src"><a href="#F7-13-src-D5">D5</a></sup></dd>
+<dt><code>s_waitcnt</code></dt><dd><b>Simple words:</b> the instruction where a wave waits for earlier memory operations to finish. <b>Analogy:</b> "wait until the pantry jars have arrived." <b>Precise:</b> waits until the counter of outstanding vector-memory operations (<code>vmcnt</code>) or of LDS, scalar-memory and message operations (<code>lgkmcnt</code>) falls to the given value; AMD code issues loads early and waits only before the first use (F1-60). <sup class="src"><a href="#F7-13-src-D2">D2</a></sup></dd>
+<dt>Encoding suffix (<code>_e32</code>, <code>_e64</code>)</dt><dd><b>Simple words:</b> a tag that tells which of two binary forms an instruction uses. <b>Analogy:</b> a short card and a long card for the same step. <b>Precise:</b> the 32-bit and 64-bit encodings of vector instructions; in R4, <code>v_mov_b32_e32 v2, 0</code> is 4 bytes and an instruction with a 32-bit literal such as <code>s_and_b32 s6, s12, 0xffff</code> is 8; the 64-bit form allows more operands, for example a compare result written to an SGPR pair instead of VCC (F7-09). <sup class="src"><a href="#F7-13-src-R4">R4</a></sup> <sup class="src"><a href="#F7-13-src-D2">D2</a></sup></dd>
+</dl></div>
+
+<h2 id="F7-13-pictures">The idea in pictures</h2>
+<p>Figure 1 shows where each view of a kernel comes from, and what each one is good for. The assembly text (left) is for reading; the code object (middle) is what the runtime loads; the bundle (right) is what your executable carries. Every arrow is a command that this chapter's lab ran.</p>
+<figure id="F7-13-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F7-13-f1t F7-13-f1d">
+<title id="F7-13-f1t">Figure 1: from HIP source to assembly, code object and bundled executable</title>
+<desc id="F7-13-f1d">Left: box dot.hip. An arrow labelled "hipcc --cuda-device-only -S" goes to box "assembly text (.s)" containing three lines: kernel instructions, .amdhsa_* kernel-descriptor directives, and metadata. A second arrow from dot.hip labelled "--cuda-device-only --no-gpu-bundle-output -c" goes to box "code object (ELF for AMD GPU)" containing: function symbol dot (524 bytes of code), object dot.kd (64 bytes, kernel descriptor), note with metadata (register counts, sizes, wave size). A third arrow labelled "hipcc --offload-arch=gfx90a --offload-arch=gfx1100" goes to box "host executable" containing a host part and two bundle entries, gfx90a and gfx1100. Below the code object box, two tool arrows: llvm-objdump -d gives disassembly with encodings; llvm-readelf -s and -n give symbols and metadata. Below the executable, roc-obj-ls lists the bundle entries. At runtime the loader picks the entry for the GPU and the dispatch reads the kernel descriptor.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<rect class="sv-b3" x="20" y="130" width="110" height="40"/><text class="sv-tb" x="34" y="155">dot.hip</text>
+<line class="sv-line" x1="130" y1="140" x2="214" y2="62"/><polygon class="sv-head" points="220,58 208,60 214,68"/>
+<text class="sv-ts" x="120" y="88">-S</text>
+<rect class="sv-b2" x="220" y="20" width="230" height="86"/>
+<text class="sv-tb" x="230" y="40">assembly text (.s)</text>
+<text class="sv-ts" x="230" y="58">instructions (dot_isa, R1)</text>
+<text class="sv-ts" x="230" y="74">.amdhsa_* directives (kd, R5)</text>
+<text class="sv-ts" x="230" y="90">metadata, register comments</text>
+<line class="sv-line" x1="130" y1="150" x2="214" y2="150"/><polygon class="sv-head" points="220,150 210,145 210,155"/>
+<text class="sv-ts" x="138" y="142">-c</text>
+<rect class="sv-b4" x="220" y="120" width="230" height="100"/>
+<text class="sv-tb" x="230" y="140">code object (ELF, AMD GPU)</text>
+<text class="sv-ts" x="230" y="158">FUNC dot: 524 bytes of code</text>
+<text class="sv-ts" x="230" y="174">OBJECT dot.kd: 64 bytes</text>
+<text class="sv-ts" x="230" y="190">note: metadata (R4)</text>
+<text class="sv-ts" x="230" y="206">one per target</text>
+<line class="sv-line" x1="130" y1="162" x2="214" y2="262"/><polygon class="sv-head" points="220,268 208,264 214,256"/>
+<text class="sv-ts" x="96" y="230">two targets</text>
+<rect class="sv-b6" x="220" y="240" width="230" height="74"/>
+<text class="sv-tb" x="230" y="260">host executable</text>
+<text class="sv-ts" x="230" y="278">host code + bundle entries:</text>
+<text class="sv-ts" x="230" y="294">gfx90a, gfx1100 (R7)</text>
+<line class="sv-dash" x1="450" y1="150" x2="520" y2="150"/>
+<rect class="sv-box" x="520" y="120" width="220" height="100"/>
+<text class="sv-ts" x="530" y="140">llvm-objdump -d: disassembly</text>
+<text class="sv-ts" x="530" y="156">with encodings (4 or 8 bytes)</text>
+<text class="sv-ts" x="530" y="176">llvm-readelf -s: symbols</text>
+<text class="sv-ts" x="530" y="196">llvm-readelf -n: metadata</text>
+<line class="sv-dash" x1="450" y1="277" x2="520" y2="277"/>
+<rect class="sv-box" x="520" y="250" width="220" height="54"/>
+<text class="sv-ts" x="530" y="270">roc-obj-ls: bundle entries</text>
+<text class="sv-ts" x="530" y="290">runtime picks the GPU's entry</text>
+<line class="sv-dash" x1="450" y1="62" x2="520" y2="62"/>
+<rect class="sv-box" x="520" y="30" width="220" height="64"/>
+<text class="sv-ts" x="530" y="50">read it; census tool (R3);</text>
+<text class="sv-ts" x="530" y="66">resource remarks (F7-10)</text>
+<text class="sv-ts" x="530" y="82">-Rpass-analysis=…</text>
+</svg></div><figcaption><b>Figure 1.</b> Three views of one kernel and the tools that read them. Solid arrows are compiler commands; dashed lines connect a view to the tools that read it. Sizes (524 bytes of code, 64-byte descriptor) and bundle entries are from R4 and R7; the roles of the descriptor and the bundle are from D5 (pending). <sup class="src"><a href="#F7-13-src-R4">R4</a></sup> <sup class="src"><a href="#F7-13-src-R7">R7</a></sup> <sup class="src"><a href="#F7-13-src-D5">D5</a></sup></figcaption></figure>
+
+<h2 id="F7-13-layer1">Layer 1 — the kid explanation</h2>
+<p>You write a recipe in your own words. A translator turns it into very short lines that the helpers follow exactly. Reading those short lines is like reading the real instructions on the helpers' cards: you see every fetch from the pantry, every wait, every multiplication.</p>
+<p>Sometimes the translator does something you did not expect. It might do two multiplications in one line, or turn one "add to the shared tally" into "try, check, try again". Reading the short lines is how an engineer finds out what the GPU is really asked to do, and then changes the recipe or the translator's settings on purpose.</p>
+
+<h2 id="F7-13-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F7-13-l2-get">Getting the code</h3>
+<p>The lab used three commands, all without a GPU (R1, R4, R7). <code>hipcc … --cuda-device-only -S dot.hip -o dot.s</code> writes the device assembly for the <code>--offload-arch</code> target. <code>hipcc … --cuda-device-only --no-gpu-bundle-output -c dot.hip -o dot.co</code> writes the code object as an ELF file, which <code>llvm-objdump -d</code> disassembles and <code>llvm-readelf -s</code> / <code>-n</code> lists. A normal build with two <code>--offload-arch</code> options produces an executable whose bundle contains a host entry and one device entry per target; <code>roc-obj-ls</code> lists them (R7). <sup class="src"><a href="#F7-13-src-R7">R7</a></sup> HP301 (F7-06) showed the bundle from the build side; the curriculum also names <code>hipcc --save-temps</code>, which keeps all intermediate files including the assembly. <sup class="src"><a href="#F7-13-src-D1">D1</a></sup></p>
+<h3 id="F7-13-l2-names">Reading instruction names</h3>
+<p>An AMD instruction name is built from parts. Take <code>v_add_co_u32_e32 v12, vcc, s0, v4</code> from R1: <code>v_</code> = vector (per lane); <code>add_co</code> = add with carry-out; <code>u32</code> = unsigned 32-bit; <code>_e32</code> = the 32-bit encoding; operands: destination <code>v12</code>, carry-out <code>vcc</code>, sources <code>s0</code> (a scalar, the same for all lanes) and <code>v4</code>. <sup class="src"><a href="#F7-13-src-D2">D2</a></sup> The prefixes you will meet most:</p>
+<div class="tw"><table>
+<thead><tr><th>Prefix</th><th>Meaning</th><th>Example in this chapter</th></tr></thead>
+<tbody>
+<tr><td><code>s_</code></td><td>scalar ALU, branches, waits, scalar memory (<code>s_load</code>)</td><td><code>s_load_dwordx4 s[0:3], s[6:7], 0x0</code></td></tr>
+<tr><td><code>v_</code></td><td>vector ALU (per lane), including compares into VCC</td><td><code>v_pk_mul_f32 v[4:5], v[4:5], v[8:9]</code></td></tr>
+<tr><td><code>global_</code>, <code>buffer_</code>, <code>flat_</code></td><td>vector memory: global, buffer (scratch spills in F7-10), flat</td><td><code>global_load_dwordx4 v[4:7], v[12:13], off</code></td></tr>
+<tr><td><code>ds_</code></td><td>LDS and the LDS hardware (F7-11, F7-12)</td><td><code>ds_bpermute_b32 v1, v1, v2</code></td></tr>
+<tr><td><code>v_accvgpr_</code>, <code>v_mfma</code></td><td>AGPR moves; matrix instructions (HP401)</td><td><code>v_accvgpr_write_b32 a0, v6</code> (F7-10)</td></tr>
+</tbody></table></div>
+<p>Sizes are written in dwords (4 bytes) in the gfx9 assembly of this build: <code>dwordx4</code> is 16 bytes, <code>b32</code> 4 bytes, <code>b64</code> 8 bytes; the RDNA3 assembler writes <code>b128</code> for the same (F7-09). Register ranges are inclusive: <code>v[4:7]</code> is four VGPRs. <sup class="src"><a href="#F7-13-src-R1">R1</a></sup> <sup class="src"><a href="#F7-13-src-D2">D2</a></sup></p>
+<h3 id="F7-13-l2-prologue">The prologue: where the arguments come from</h3>
+<p><code>dot(const float4* a, const float4* b, float* result, int n4)</code> has 8 + 8 + 8 + 4 = 28 bytes of arguments, and the metadata says <code>.kernarg_segment_size: 28</code> (R4). The first lines of R1 load them through the SGPR pair <code>s[6:7]</code>: <code>s_load_dwordx4 s[0:3], s[6:7], 0x0</code> brings <code>a</code> and <code>b</code> (offsets 0 and 8), <code>s_load_dwordx2 s[10:11], s[6:7], 0x10</code> brings <code>result</code> (offset 16), <code>s_load_dword s9, s[6:7], 0x18</code> brings <code>n4</code> (offset 24) (R1). <sup class="src"><a href="#F7-13-src-R1">R1</a></sup> So <code>s[6:7]</code> is the kernarg pointer, and the arguments are laid out in order with natural alignment.</p>
+<p>Two more loads use <code>s[4:5]</code>: offset 0x4 (<code>s_load_dword s12</code>, then masked to 16 bits with <code>0xffff</code> and multiplied by <code>s8</code>) and offset 0xc (<code>s_load_dword s8</code>, added to <code>i</code> on every loop iteration). The code uses them as <code>blockDim.x</code> and as the grid-stride <code>gridDim.x × blockDim.x</code>; <code>s8</code> before that is the workgroup id, and <code>v0</code> on entry is <code>threadIdx.x</code> (R1). <sup class="src"><a href="#F7-13-src-R1">R1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That <code>s[4:5]</code> holds the address of the dispatch packet, that its offset 4 is the 16-bit workgroup size in X and offset 12 the grid size in X (in work-items), that <code>s[0:3]</code> before the first instruction held the private-segment buffer descriptor, and that <code>s8</code> is the first system SGPR after 8 user SGPRs (<code>.amdhsa_user_sgpr_count 8</code>, R5): these readings are consistent with every use in R1 but were not read in a document in this build. Check: LLVM "User Guide for AMDGPU Backend", sections on the kernel descriptor, initial kernel execution state and the HSA dispatch packet (D5); the HSA Platform System Architecture specification for the packet layout (D11).</p></div>
+
+<h2 id="F7-13-layer3">Layer 3 — the engineer's depth</h2>
+<p>In the analogy: an engineer who annotates the house card line by line can say, for every line, which part of the cook's recipe it came from, and why the translator chose it.</p>
+<h3 id="F7-13-l3-loop">Annotating the inner loop of <code>dot()</code></h3>
+<p>Lines 17–41 of R1 are the grid-stride loop. This is the annotation that exam P asks for, in the form E10 requires: every line explained, then the summary of loads, LDS, synchronization, FMA and spills.</p>
+<div class="tw"><table>
+<thead><tr><th>R1 line</th><th>Instruction</th><th>Meaning</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td>17</td><td><code>.LBB0_2:</code></td><td>Loop head (a backward branch target).</td><td><code>for (…; i &lt; n4; …)</code></td></tr>
+<tr><td>18–19</td><td><code>v_ashrrev_i32 v1, 31, v0</code>; <code>v_lshlrev_b64 v[4:5], 4, v[0:1]</code></td><td>Sign-extend <code>i</code> to 64 bits; multiply by 16 (shift by 4).</td><td><code>a[i]</code> with 16-byte <code>float4</code></td></tr>
+<tr><td>20–22</td><td><code>v_mov_b32 v1, s1</code>; <code>v_add_co_u32 v12, vcc, s0, v4</code>; <code>v_addc_co_u32 v13, vcc, v1, v5, vcc</code></td><td>64-bit address <code>a + 16i</code>: low half with carry out, high half with carry in.</td><td><code>&amp;a[i]</code></td></tr>
+<tr><td>23–25</td><td>same with <code>s[2:3]</code></td><td>64-bit address <code>b + 16i</code>.</td><td><code>&amp;b[i]</code></td></tr>
+<tr><td>26–27</td><td><code>global_load_dwordx4 v[4:7], v[12:13], off</code>; <code>… v[8:11], v[14:15], off</code></td><td>Two 16-byte vector loads per lane.</td><td><code>x = a[i]; y = b[i];</code></td></tr>
+<tr><td>28</td><td><code>s_waitcnt lgkmcnt(0)</code></td><td>Wait for the scalar load of the stride (<code>s8</code>, issued at line 14).</td><td>—</td></tr>
+<tr><td>29–31</td><td><code>v_add_u32 v0, s8, v0</code>; <code>v_cmp_le_i32 vcc, s9, v0</code>; <code>s_or_b64 s[4:5], vcc, s[4:5]</code></td><td>Next <code>i</code>; lanes with <code>i ≥ n4</code> are done; add them to the "done" mask in <code>s[4:5]</code>.</td><td><code>i += gridDim.x * blockDim.x</code>; <code>i &lt; n4</code></td></tr>
+<tr><td>32</td><td><code>s_waitcnt vmcnt(0)</code></td><td>Wait for both global loads; the index work above overlapped with them.</td><td>—</td></tr>
+<tr><td>33–34</td><td><code>v_pk_mul_f32 v[4:5], v[4:5], v[8:9]</code>; <code>v_pk_mul_f32 v[6:7], …</code></td><td>Packed multiplies: two products per instruction.</td><td><code>x.x*y.x</code>, <code>x.y*y.y</code>, <code>x.z*y.z</code>, <code>x.w*y.w</code></td></tr>
+<tr><td>35–38</td><td>four <code>v_add_f32_e32</code></td><td>Sum of the four products, then <code>acc +=</code>.</td><td><code>acc += … + … + … + …</code></td></tr>
+<tr><td>39</td><td><code>s_andn2_b64 exec, exec, s[4:5]</code></td><td>Switch off the lanes that are done.</td><td>loop exit, per lane</td></tr>
+<tr><td>40</td><td><code>s_cbranch_execnz .LBB0_2</code></td><td>Loop again while any lane is still on.</td><td>the loop as a whole</td></tr>
+<tr><td>41</td><td><code>s_or_b64 exec, exec, s[4:5]</code></td><td>After the loop: switch the finished lanes back on.</td><td>code after the loop</td></tr>
+</tbody></table></div>
+<p><b>E10 summary for this loop.</b> Global loads: two per iteration, 16 bytes each (<code>dwordx4</code>). LDS: none in the loop; six <code>ds_bpermute_b32</code> after it for the wave sum (lines 51–86, F7-12). Synchronization: no barrier; two <code>s_waitcnt</code> per iteration. FMA: none; two packed multiplies and four adds. Spills: none (<code>.vgpr_spill_count: 0</code>, R4). <sup class="src"><a href="#F7-13-src-R1">R1</a></sup> <sup class="src"><a href="#F7-13-src-R4">R4</a></sup></p>
+<p>Two details deserve attention. First, the loop is controlled by EXEC, not by a scalar counter: each lane has its own <code>i</code>, so lanes leave the loop at different iterations, and the wave loops until its last lane is done (F1-57's divergence, applied to a loop). Second, the register <code>s[4:5]</code>, which held the dispatch-packet pointer in the prologue, is reused as the "done" mask once its two loads were issued (line 15, <code>s_mov_b64 s[4:5], 0</code>): register names in assembly are storage, not variables. <sup class="src"><a href="#F7-13-src-R1">R1</a></sup></p>
+<h3 id="F7-13-l3-predict">Predict, change, confirm</h3>
+<p>Milestone E10 asks for one predicted change. The lab made three, each from a question raised by the annotation:</p>
+<ol>
+<li><b>"Why no FMA?"</b> Prediction: writing the arithmetic as a chain of <code>fmaf</code> calls (<code>dotFma</code>) gives four fused multiply-adds per iteration and fewer instructions. Result: <code>v_fmac_f32_e32 v2, v4, v8</code> four times, no <code>v_pk_mul</code> and no <code>v_add_f32</code> in the loop; the census counts 21 loop instructions against 23 (R2, R3). <sup class="src"><a href="#F7-13-src-R2">R2</a></sup> <sup class="src"><a href="#F7-13-src-R3">R3</a></sup> The two versions round differently: <code>dotFma</code> rounds once per multiply-add, <code>dot</code> once per multiply and once per add (MA302). <sup class="src"><a href="#F7-13-src-D12">D12</a></sup></li>
+<li><b>"Will <code>-ffp-contract=fast</code> do the same?"</b> Prediction: the compiler might contract <code>a*b + c</code> into FMAs. Result: no change in the loop (2 <code>v_pk_mul_f32</code>, 0 FMA, 4 <code>v_add_f32</code>, R6). With this compiler and these flags, the packed multiply was chosen before contraction could apply; the explicit <code>fmaf</code> is the reliable way. <sup class="src"><a href="#F7-13-src-R6">R6</a></sup></li>
+<li><b>"Why is the atomic a loop?"</b> The end of <code>dot()</code> (lines 95–103) is a loop around <code>global_atomic_cmpswap … glc</code>: load, add, compare-and-swap, retry while another wave changed the value. Prediction: <code>-munsafe-fp-atomics</code> replaces it with a hardware float add. Result: <code>global_atomic_cmpswap</code> 1 → 0, <code>global_atomic_add_f32</code> 0 → 1 (R6). <sup class="src"><a href="#F7-13-src-R6">R6</a></sup></li>
+</ol>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>What "unsafe" means in <code>-munsafe-fp-atomics</code>.</b> The option changed the instruction (R6), but what the hardware float atomic does differently from the compare-and-swap loop (for example with denormals or on particular memory types), and on which memory it is supported, were not read in a document in this build. Do not enable it without checking: HIP Programming Guide, section on atomics and the unsafe floating-point atomics option, and the CDNA2 ISA guide for <code>global_atomic_add_f32</code> (D1, D2). The "profiler confirmation" part of E10 needs a GPU (F7-14).</p></div>
+<h3 id="F7-13-l3-object">The code object, the descriptor and the metadata</h3>
+<p>The <code>code_object</code> step shows the ELF view (R4). <code>dot</code> is a 524-byte <code>FUNC</code> symbol in section 7 and <code>dot.kd</code> a 64-byte <code>OBJECT</code> in section 6. The disassembly prints each instruction with its address and encoding: <code>s_load_dword s12, s[4:5], 0x4</code> is 8 bytes (<code>C0020302 00000004</code>), <code>v_mov_b32_e32 v2, 0</code> 4 bytes (<code>7E040280</code>), <code>s_and_b32 s6, s12, 0xffff</code> 8 bytes because the literal 0xffff follows the instruction word. <sup class="src"><a href="#F7-13-src-R4">R4</a></sup> The branch <code>s_cbranch_execz 33</code> at address 0x1A40 targets <code>dot+0xc8</code>: 0x1A40 + 4 + 33 × 4 = 0x1AC8 = 0x1A00 + 0xC8, so the branch offset counts 4-byte words from the next instruction — arithmetic you can check on the listing.</p>
+<p>The metadata gives the facts that F7-10's calculator needs: <code>.vgpr_count: 16</code>, <code>.agpr_count: 0</code>, <code>.sgpr_count: 17</code>, <code>.group_segment_fixed_size: 0</code> (no LDS), <code>.private_segment_fixed_size: 0</code> (no scratch), <code>.max_flat_workgroup_size: 1024</code> (no launch bounds, so the 128-VGPR cap of F7-10 applies), <code>.wavefront_size: 64</code> (R4). The kernel descriptor directives (R5) repeat some of them in the form the hardware reads: <code>.amdhsa_next_free_vgpr 16</code>, <code>.amdhsa_accum_offset 16</code> (where AGPRs would start), <code>.amdhsa_next_free_sgpr 13</code>, <code>.amdhsa_user_sgpr_count 8</code>, <code>.amdhsa_kernarg_size 28</code>, <code>.amdhsa_ieee_mode 1</code>. <sup class="src"><a href="#F7-13-src-R5">R5</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The metadata's <code>.sgpr_count</code> (17) is larger than the descriptor's <code>.amdhsa_next_free_sgpr</code> (13). The difference is presumably registers the hardware reserves in addition (such as VCC), but which ones, and how the descriptor's fields are encoded in the 64 bytes, was not read in a document in this build. Check: LLVM AMDGPU user guide, "Kernel Descriptor" and "Code Object Metadata" sections (D5).</p></div>
+<h3 id="F7-13-l3-census">A census for every kernel</h3>
+<p>Reading 100 lines by eye is possible; reading a 3,000-line kernel is not. Listing 2 counts instruction classes per kernel and per loop (a loop is a label that a later branch jumps back to). For <code>dot()</code> it reports 100 instructions, of which 58 are vector ALU, 6 LDS/cross-lane, 3 vector memory, 10 waits; the main loop has 23 (R3). Run it on the kernels of F7-10 and it finds the spills ("scratch (spill)" class); on HP401's GEMM it will find <code>v_mfma</code>. A census does not replace reading; it tells you where to read. <sup class="src"><a href="#F7-13-src-R3">R3</a></sup></p>
+
+<h2 id="F7-13-hardware">How the hardware actually does it</h2>
+<p>To start a kernel, the runtime writes a dispatch packet into a queue; the packet points at the kernel descriptor in the loaded code object and at the kernarg buffer. <sup class="src"><a href="#F7-13-src-D5">D5</a></sup> <sup class="src"><a href="#F7-13-src-D11">D11</a></sup> The hardware allocates the resources the descriptor asks for (VGPRs, SGPRs, LDS, scratch; F7-10, F7-11), initialises the requested SGPRs (user SGPRs such as the kernarg pointer, then system SGPRs such as the workgroup id) and VGPRs (the work-item ids), sets EXEC for the wave's active lanes, and starts fetching instructions at the kernel's entry. <sup class="src"><a href="#F7-13-src-D5">D5</a></sup> Scalar instructions execute once per wave in the scalar unit; vector instructions in the SIMD for all lanes whose EXEC bit is set; memory instructions are issued and counted, and <code>s_waitcnt</code> stalls the wave until the counts fall (F1-60). <sup class="src"><a href="#F7-13-src-D2">D2</a></sup> <code>s_endpgm</code> ends the wave and frees its resources. <sup class="src"><a href="#F7-13-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The exact initial register state (which SGPRs and VGPRs are set, in which order, for which descriptor bits), the queue and packet formats, and the instruction issue rules (how many instructions of which types a CU issues per cycle) were not read in a document in this build. Check: D5 (initial kernel execution state), D11 (dispatch packet), D2 (instruction issue and dependency rules).</p></div>
+
+<h2 id="F7-13-worked">Worked example</h2>
+<p><b>Task.</b> Using only R1, R4 and R5, answer: (a) how many bytes does one iteration of <code>dot()</code>'s loop load per wave, and per instruction of the loop? (b) What is the loop's ratio of floating-point operations to loaded bytes? (c) Which resource would limit occupancy, by F7-10's model?</p>
+<ol>
+<li>(a) Two <code>global_load_dwordx4</code> per lane = 32 bytes per lane; per wave of 64 lanes, 2,048 bytes. The loop has 23 instructions (R3), so about 89 bytes per instruction issued.</li>
+<li>(b) Per lane and iteration: 4 multiplies and 4 adds = 8 floating-point operations for 32 bytes: 0.25 FLOP per byte. A kernel is memory-bound when its intensity lies below the machine's ridge point (SP302's roofline model); F7-14 shows how to compute the ridge point for the lab GPU from its documented peaks and place this kernel on it. <sup class="src"><a href="#F7-13-src-D13">D13</a></sup></li>
+<li>(c) <code>.vgpr_count: 16</code>, no LDS, no scratch (R4): ⌊512 / 16⌋ = 32 → 8 waves per SIMD. Nothing limits it but the wave slots.</li>
+</ol>
+
+<h2 id="F7-13-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>dot.hip</code>: a dot product with a grid-stride loop, 16-byte loads and a wave reduction, in two arithmetic forms (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-13/dot.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a dot.hip -o dot</code>, then <code>./dot</code>.</p>
+<pre class="output" data-run="F7-13/dot"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 1 was built for real; its run stopped at the first runtime call with the runtime's own error (no AMD GPU in the build container). Expected on a GPU, from the code: <code>dot 524288.0, dotFma 524288.0, expected 524288.0</code> (every product is 0.5, exactly representable, and every partial sum is a multiple of 0.5 well below 2<sup>24</sup>, so both forms are exact here). Needed: an AMD GPU from the ROCm compatibility matrix (D8).</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–15</td><td><code>waveSum</code></td><td>Shuffle-down reduction from <code>warpSize / 2</code>.</td><td>Six <code>ds_bpermute_b32</code> after the loop (R1, F7-12).</td></tr>
+<tr><td>17–29</td><td><code>dot</code></td><td>Grid-stride loop over <code>float4</code>; one expression for the four products.</td><td>Compiled to packed multiplies and adds (R1).</td></tr>
+<tr><td>20</td><td>loop header</td><td><code>i += gridDim.x * blockDim.x</code></td><td>The stride comes from the dispatch packet via <code>s8</code> (R1, unverified box).</td></tr>
+<tr><td>26–28</td><td><code>atomicAdd(result, acc)</code></td><td>One atomic per wave.</td><td>A compare-and-swap loop by default (R1 lines 95–103).</td></tr>
+<tr><td>31–46</td><td><code>dotFma</code></td><td>The same with four <code>fmaf</code>.</td><td>Four <code>v_fmac_f32</code> (R2).</td></tr>
+<tr><td>68–71</td><td>launches</td><td>256 workgroups of 256 for 2<sup>18</sup> <code>float4</code>.</td><td>Each lane runs 4 iterations.</td></tr>
+</tbody></table></div>
+<p>The <code>dot_isa</code> step: the complete gfx90a assembly of <code>dot()</code>, numbered (the line numbers used in the annotation).</p>
+<pre class="output" data-run="F7-13/dot_isa"></pre>
+<p>The <code>loop_fma</code> step: the loop of <code>dotFma()</code>.</p>
+<pre class="output" data-run="F7-13/loop_fma"></pre>
+<p>The <code>options</code> step: two compiler options, predicted and checked.</p>
+<pre class="output" data-run="F7-13/options"></pre>
+<p>The <code>code_object</code> step: the ELF view.</p>
+<pre class="output" data-run="F7-13/code_object"></pre>
+<p>The <code>kd</code> step: the kernel-descriptor directives of <code>dot()</code>.</p>
+<pre class="output" data-run="F7-13/kd"></pre>
+<p>The <code>bundle</code> step: the code objects inside an executable built for gfx90a and gfx1100.</p>
+<pre class="output" data-run="F7-13/bundle"></pre>
+
+<p><b>Listing 2</b> — <code>tools/isa_census.cpp</code>: counts instruction classes per kernel and per loop in AMD assembly.</p>
+<pre class="listing" data-src="F7-13/tools/isa_census.cpp"></pre>
+<p><b>Build command</b> (the one actually used, inside the <code>census</code> step): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined tools/isa_census.cpp -o isa_census</code>, then <code>./isa_census &lt; dot.s</code>.</p>
+<pre class="output" data-run="F7-13/census"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>25–44</td><td><code>classify</code></td><td>Maps an opcode (and the compiler's comment) to a class; spills first.</td><td>The classes are those of the E10 acceptance test.</td></tr>
+<tr><td>46–56</td><td><code>report</code></td><td>Prints counts per class.</td><td>Sorted by class name, so outputs can be diffed.</td></tr>
+<tr><td>63–85</td><td><code>finish</code></td><td>Reports a kernel, then every backward branch's body as a loop.</td><td>Loops are where time goes; a census per loop shows them.</td></tr>
+<tr><td>86–108</td><td>read loop</td><td>Labels <code>.LBB…</code> are recorded; <code>_Z…:</code> starts a kernel; <code>s_endpgm</code> ends it.</td><td>Works on the <code>.s</code> text that <code>hipcc -S</code> writes.</td></tr>
+</tbody></table></div>
+
+<h2 id="F7-13-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The house card is not a translation line by line.</b> One source line became twelve instructions (the loop header and address arithmetic), and four multiplies became two (packed). Do not look for a one-to-one mapping (R1).</li>
+<li><b>The card names storage, not ingredients.</b> <code>s[4:5]</code> is first a pointer and later a lane mask (R1); a register is a place, not a variable.</li>
+<li><b>Not every line is an action on food.</b> <code>s_waitcnt</code>, EXEC updates and branches are control, not work; in <code>dot()</code>'s loop, 5 of 23 instructions are scalar control (one EXEC update, one branch, one scalar mask operation, two waits; R3).</li>
+</ul>
+
+<h2 id="F7-13-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>The <code>.s</code> file contains only host code</td><td>Missing <code>--cuda-device-only</code></td><td>Look for <code>s_endpgm</code></td><td>Add the option; one <code>--offload-arch</code> at a time</td></tr>
+<tr><td>Expected FMA, found <code>v_mul</code>/<code>v_add</code></td><td>The compiler did not contract (R6)</td><td>Census of the loop</td><td><code>fmaf</code> where the rounding change is acceptable</td></tr>
+<tr><td>A short atomic became a loop</td><td>Float atomic as compare-and-swap by default</td><td><code>global_atomic_cmpswap</code> and a backward branch</td><td>Fewer atomics (one per wave), or the option after checking D1</td></tr>
+<tr><td>Register counts in the assembly comment differ from the profiler</td><td>Different compile (options, target) or AGPRs counted differently</td><td>Compare <code>.vgpr_count</code>, <code>.agpr_count</code> and the report (F7-10)</td><td>Read the metadata of the binary you actually ran</td></tr>
+<tr><td>Annotation does not match the source after a small change</td><td>Labels and registers renamed</td><td>Diff the census, not the text</td><td>Annotate by role, not by register number</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F7-13-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F7-10">F7-10</a>, <a href="#F7-11">F7-11</a> and <a href="#F7-12">F7-12</a> read pieces of AMD ISA (spills, LDS, cross-lane); CU303 read PTX and SASS. <b>What carries over:</b> the method of reading machine code (find the loop, find the loads and their width, find the waits and the arithmetic), and the E10 acceptance test. <sup class="src"><a href="#F7-13-src-D2">D2</a></sup> <b>What changes:</b> the executable carries one machine-code object per target and no PTX-like virtual ISA (R7); the assembly is split into scalar and vector halves; loop control can be per-lane through EXEC; kernel arguments and dispatch values arrive in SGPRs; the code object carries a kernel descriptor and metadata you can read without a GPU. <sup class="src"><a href="#F7-13-src-R1">R1</a></sup> <sup class="src"><a href="#F7-13-src-R4">R4</a></sup> <sup class="src"><a href="#F7-13-src-R7">R7</a></sup> <b>What comes next:</b> <a href="#F7-14">F7-14</a> confirms predictions on a GPU with rocprofv3, ROCm Compute Profiler and ROCm Systems Profiler, and turns raw counts into rooflines and timelines.</p></div>
+
+<h2 id="F7-13-check">Check yourself</h2>
+<ol>
+<li>Decode <code>global_load_dwordx4 v[8:11], v[14:15], off</code>: unit, width, destination, address.</li>
+<li>How do you know from R1 that <code>s[6:7]</code> is the kernarg pointer? Give two pieces of evidence.</li>
+<li>Which statement is true about <code>dot()</code>'s loop? (a) It counts iterations in an SGPR. (b) It runs until every lane's <code>i</code> reaches <code>n4</code>, switching lanes off with EXEC. (c) It contains a barrier. (d) It contains four FMAs.</li>
+<li>Why is <code>s_and_b32 s6, s12, 0xffff</code> 8 bytes long while <code>v_mov_b32_e32 v2, 0</code> is 4?</li>
+<li>Explain in your own words why the float <code>atomicAdd</code> became a loop, and what the loop does.</li>
+<li>Apply: a kernel's metadata says <code>.vgpr_count: 90</code>, <code>.group_segment_fixed_size: 20480</code>, <code>.max_flat_workgroup_size: 256</code>, wave64. Predict its occupancy with F7-10's model and name the limiter.</li>
+<li>Predict, then run: change <code>dot()</code>'s loads to <code>float2</code> (twice as many iterations). Predict the load instruction, the number of loads per iteration and the effect on the census of the loop; then make the change and run the lab.</li>
+<li>Check the branch arithmetic of R4: at which address does <code>s_cbranch_execz 33</code> land, and which instruction of R1 is there (hint: R1 line 42–43)?</li>
+</ol>
+
+<h2 id="F7-13-lab">Lab</h2>
+<p><b>Goal.</b> Produce an annotated listing of a kernel's inner loop on AMD, with loads and widths, LDS, synchronization, FMA and spills identified, and predict, make and confirm one change (curriculum milestone E10, AMD part; practice for exam P).</p>
+<p><b>Hardware and software needed.</b> g++ 13.3; hipcc (HIP 5.7) driving clang 17.0.6; llvm-objdump-17 and llvm-readelf-17; roc-obj-ls; as recorded in the run logs; folder <code>university/labs/F7-13</code>. No GPU for steps 1–6; an AMD GPU and a profiler (F7-14) for step 7.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F7-13</code>. Every log ends with an exit code; <code>dot</code> ends with exit code 1 and the runtime's no-device error.</li>
+<li>Annotate <code>loop_fma.out</code> in the table format of Layer 3 (every line: meaning and source).</li>
+<li>Run the census on F7-10's <code>pressure.hip</code> assembly and find the kernels with spills; compare with F7-10's <code>spill_isa</code>.</li>
+<li>Do Check-yourself question 7 (the <code>float2</code> change): predict, change, re-run, compare.</li>
+<li>Compile <code>dot.hip</code> for gfx1100 and annotate the same loop in RDNA3 syntax; list the differences (F7-09).</li>
+<li>Take the inner loop of your own E3 or E6 kernel (curriculum) and annotate it the same way.</li>
+<li>On a GPU: time <code>dot</code> and <code>dotFma</code> with the profiler (F7-14), and confirm or reject your prediction about their speed.</li>
+</ol>
+<p><b>Expected observations.</b> Two 16-byte loads per iteration; EXEC-controlled loop; no FMA in <code>dot()</code>, four in <code>dotFma()</code>; a compare-and-swap loop for the atomic; a 64-byte descriptor; counts that match the metadata.</p>
+<p><b>Verification.</b> Milestone E10's acceptance test, verbatim: "For each listing you identify: global loads and their width, shared/LDS accesses, synchronization, the FMA or matrix instructions, any register spills; and you predict one change, make it, and confirm the predicted effect in the profiler." The census and the annotation table are the identification; step 4 is the predicted change, confirmed in the census now and in the profiler in step 7.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>llvm-objdump</code> prints "unknown target" → pass <code>--mcpu=gfx90a</code> or use the versioned tool (<code>llvm-objdump-17</code>) that matches the compiler.</li>
+<li>The census reports no loop → the loop was fully unrolled; check for <code>#pragma unroll</code> or a constant trip count.</li>
+<li><code>roc-obj-ls</code> prints nothing → the file is not a HIP executable with device code, or it was built with <code>--cuda-device-only</code>.</li>
+</ul>
+<p><b>Extension.</b> Extend the census with a class for <code>v_pk_*</code> instructions and count "useful operations" (two per packed instruction) as well as instructions.</p>
+
+<h2 id="F7-13-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A colleague replaced <code>dot()</code> by <code>dotFma()</code> in a production build "for speed" and also turned on <code>-munsafe-fp-atomics</code>. The results changed in the last digits on some inputs, and the reviewer wants to know which change caused what, before any GPU time is spent. You have the build evidence.</p>
+<p><b>Evidence pack.</b> The loop of <code>dotFma()</code> (R2), the census (R3) and the options step (R6):</p>
+<pre class="output" data-run="F7-13/loop_fma"></pre>
+<pre class="output" data-run="F7-13/census"></pre>
+<pre class="output" data-run="F7-13/options"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what changed in the loop's instructions, and what changed in the atomic?</li>
+<li>Hypotheses: (a) the last-digit changes come from FMA rounding; (b) they come from the atomic's order of additions; (c) they come from the packed multiply. What does the evidence say about each, and what does it not say?</li>
+<li>Which change can alter the result even with identical inputs on the same GPU from one run to the next, and why?</li>
+<li>How would you decide, on the GPU, which change gives the speed, and which gives the difference in digits?</li>
+<li>Prevention: what should a numerical test for this kernel accept, and what should it reject (MA302)?</li>
+</ol>
+<p><b>Method hints.</b> Separate "different rounding, same every time" from "different order, varying". The ISA tells you which operations exist; it cannot tell you the order in which waves reach an atomic.</p>
+
+<h2 id="F7-13-project">Mini-project</h2>
+<p><b>Tuning notes, ISA section.</b> For the lab GPU's target: an annotated inner loop of one of your kernels (table format), its census, the metadata relevant to occupancy, and one predicted-and-confirmed change. Add to the passport the tools and versions you used to produce each view (TOOL), and the ISA guide edition for your target (DOC).</p>
+<p><b>Rubric.</b> Annotation complete and correct, every line (4). E10 classes identified (3). Prediction stated before the change, confirmed with evidence (3).</p>
+
+<h2 id="F7-13-summary">Summary</h2>
+<ul>
+<li>Device assembly: <code>hipcc --cuda-device-only -S</code>; code object: <code>--no-gpu-bundle-output -c</code>; bundle: <code>roc-obj-ls</code>. No GPU needed.</li>
+<li>Names: prefix (unit), operation, type, encoding; sizes in dwords; register ranges inclusive.</li>
+<li>Kernel arguments arrive through the kernarg pointer in SGPRs at offsets that follow the argument order.</li>
+<li>Loops can be controlled per lane through EXEC (<code>s_andn2_b64 exec</code>, <code>s_cbranch_execnz</code>).</li>
+<li>In this build, <code>a*b + c</code> in an expression did not become FMA; <code>fmaf</code> did; float <code>atomicAdd</code> is a CAS loop unless <code>-munsafe-fp-atomics</code>.</li>
+<li>The code object has a 64-byte kernel descriptor and metadata with register counts, sizes and wave size.</li>
+</ul>
+
+<h2 id="F7-13-sources">Sources</h2>
+<ol>
+<li id="F7-13-src-D1">D1 — AMD, HIP documentation: HIP Programming Guide (compilation, <code>--save-temps</code>, atomics, unsafe floating-point atomics) (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F7-13-src-D2">D2 — AMD, "AMD Instinct MI200" Instruction Set Architecture reference guide (CDNA2) (tier 1): instruction formats and encodings, scalar and vector memory, <code>s_waitcnt</code>, branches, EXEC, atomics. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-13-src-D5">D5 — LLVM project, "User Guide for AMDGPU Backend" (tier 2): code objects, kernel descriptor, code object metadata, initial kernel execution state, assembler syntax. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-13-src-D8">D8 — AMD, ROCm documentation: compatibility matrix (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-13-src-D11">D11 — HSA Foundation, "HSA Platform System Architecture Specification" (tier 1): queues and the kernel dispatch packet. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-13-src-D12">D12 — MA302 of this university and the sources it cites on floating point (IEEE 754 rounding, fused multiply-add). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-13-src-D13">D13 — SP302 of this university (roofline model) and the paper it cites (Williams, Waterman and Patterson, "Roofline: An Insightful Visual Performance Model for Multicore Architectures"). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-13-src-R1">R1 — <code>dot_isa</code> step (<code>university/labs/F7-13/dot_isa.log</code>), Ubuntu clang 17.0.6 (the compiler hipcc drives; HIP 5.7), compiled only, exit code 0.</li>
+<li id="F7-13-src-R2">R2 — <code>loop_fma</code> step (<code>loop_fma.log</code>), compiled only, exit code 0.</li>
+<li id="F7-13-src-R3">R3 — <code>census</code> step (<code>census.log</code>): Listing 2 built with g++ 13.3.0 and run on the assembly, exit code 0.</li>
+<li id="F7-13-src-R4">R4 — <code>code_object</code> step (<code>code_object.log</code>), clang 17.0.6 and llvm-objdump-17 / llvm-readelf-17 (LLVM 17.0.6), exit code 0.</li>
+<li id="F7-13-src-R5">R5 — <code>kd</code> step (<code>kd.log</code>), compiled only, exit code 0.</li>
+<li id="F7-13-src-R6">R6 — <code>options</code> step (<code>options.log</code>), compiled only, exit code 0.</li>
+<li id="F7-13-src-R7">R7 — <code>bundle</code> step (<code>bundle.log</code>), hipcc and roc-obj-ls, exit code 0.</li>
+</ol>
+
+<h2 id="F7-13-glossary">Glossary links</h2>
+<p><a href="#gl-amd-isa-gcn-cdna-rdna">AMD ISA (GCN/CDNA/RDNA)</a> · <a href="#gl-instruction-set-architecture-isa">Instruction set architecture (ISA)</a> · <a href="#gl-code-object">Code object</a> · <a href="#gl-kernel-descriptor">Kernel descriptor</a> · <a href="#gl-kernarg-segment">Kernarg segment</a> · <a href="#gl-s-waitcnt">s_waitcnt</a> · <a href="#gl-encoding-suffix-e32-e64">Encoding suffix (_e32, _e64)</a> · <a href="#gl-disassembler">Disassembler</a> · <a href="#gl-offload-bundle-fat-binary">Offload bundle (fat binary)</a></p>
+
+<h2 id="F7-13-next">Next chapter</h2>
+<p>Next: <a href="#F7-14">F7-14 Profiling: rocprofv3, ROCm Compute Profiler, ROCm Systems Profiler</a>. Previous: <a href="#F7-12">F7-12 Cross-lane operations and 64-bit lane masks</a>. Course: <a href="#HP302">HP302</a>.</p>
+
+<h2 id="F7-13-answers">Answers to Check yourself</h2>
+<ol>
+<li>Vector memory (<code>global_</code>), load of 4 dwords = 16 bytes per lane, into <code>v8</code>–<code>v11</code>, from the 64-bit per-lane address in <code>v14</code>–<code>v15</code>; <code>off</code> means no scalar base register (R1 line 27).</li>
+<li>Its loads at offsets 0x0 (16 bytes), 0x10 (8 bytes) and 0x18 (4 bytes) match the argument layout <code>a</code>, <code>b</code>, <code>result</code>, <code>n4</code>; the loaded values are used as the base of the <code>a</code>/<code>b</code> addresses (<code>s0</code>–<code>s3</code>), as the atomic's address (<code>s[10:11]</code>) and as the loop bound (<code>s9</code>); and the segment size is 28 bytes (R4).</li>
+<li>(b). (a): no scalar counter; each lane has its own <code>i</code> in <code>v0</code>. (c): no <code>s_barrier</code>. (d): <code>dot()</code> has packed multiplies and adds; the FMAs are in <code>dotFma()</code> (R2).</li>
+<li>The scalar instruction carries a 32-bit literal (0xffff) that does not fit an inline constant, so a second dword follows (<code>8606FF0C 0000FFFF</code>); <code>0</code> is an inline constant and fits the 4-byte encoding (R4).</li>
+<li>With the default options this compiler did not use a hardware float atomic add; it reads the old value, adds, and uses <code>global_atomic_cmpswap</code> to store only if nobody changed it meanwhile; if the returned value differs, it retries with the new value (R1 lines 95–103).</li>
+<li>VGPRs: 512 / 96 = 5.3 → 5. LDS: 65,536 / 20,480 = 3 workgroups × 4 waves / 4 SIMDs = 3. Occupancy 3, limited by LDS.</li>
+<li><code>global_load_dwordx2</code> (8 bytes), still two per iteration, twice as many iterations; the per-iteration census keeps the same loop overhead (index, compare, EXEC, branch, waits) for half the data, so the share of control instructions grows. (Prediction; make the change and run the lab to confirm.)</li>
+<li>0x1A40 + 4 + 33 × 4 = 0x1AC8 = <code>dot+0xc8</code>. That is the instruction after the loop's exit path, <code>s_or_b64 exec, exec, s[6:7]</code> at label <code>.LBB0_4</code> (R1 line 43): lanes with no work skip the loop entirely.</li>
+</ol>
+<h3 id="F7-13-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Loop: <code>v_pk_mul_f32</code> ×2 and <code>v_add_f32</code> ×4 replaced by <code>v_fmac_f32</code> ×4; 23 → 21 instructions (R2, R3). Atomic: <code>global_atomic_cmpswap</code> loop replaced by one <code>global_atomic_add_f32</code> (R6).</p>
+<p><b>Hypotheses.</b> (a) Supported: FMA rounds once per multiply-add instead of twice; results can differ in the last digits, deterministically. (b) Possible: both atomic forms add per-wave partial sums in the order the waves arrive, which is not fixed; the evidence shows the instruction changed, not that the order did. (c) The packed multiply rounds each product like a scalar multiply (D2); it is not a new source of difference.</p>
+<p><b>Run-to-run variation.</b> The atomic accumulation: floating-point addition is not associative, and the arrival order of waves can vary between runs with either atomic form. The FMA change gives a different but repeatable result.</p>
+<p><b>On the GPU.</b> Time four builds (each change alone and both) under the profiler (F7-14); for digits, run each build several times and compare with a high-precision CPU reference.</p>
+<p><b>Prevention.</b> Tests compare with a reference within a tolerance derived from the length of the sum and the precision (MA302), never bit-exact; reproducibility, if required, needs a fixed reduction order (for example per-wave results written to memory and summed in a second pass). <b>How the evidence was produced:</b> the Lab Engineer compiled Listing 1 with each option and ran the census; the colleague and the production build are a scenario.</p>

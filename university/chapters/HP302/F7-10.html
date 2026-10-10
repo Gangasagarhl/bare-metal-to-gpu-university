@@ -1,0 +1,324 @@
+<!--meta
+id: F7-10
+title: Vector and scalar registers and occupancy
+course: HP302
+level: L3
+prereqs: F7-08; F7-09; HW301 (F1-58, F1-60)
+time: 8–12 hours including the lab
+hardware: none for the calculator, the compiler reports, the ISA steps and the forensic lab (this build: no GPU); running Listings 2–4 and confirming occupancy in a profiler needs an AMD GPU listed in the ROCm compatibility matrix
+maps: Curriculum E10 (AMD part: register spills in the ISA; predict one change and confirm it); course lab "occupancy experiments varying register use"; course forensic "ROCm kernel with low occupancy"; 13.1 vocabulary table (registers: VGPRs, SGPRs, accumulation registers); LLVM AMDGPU user guide (item 70)
+analogy: F7 — the great kitchen hall (second building: AMD)
+-->
+
+<h2 id="F7-10-hook">Story hook</h2>
+<p>In the second building, every helper has two hands, and the hall manager has noticed something odd. A recipe card that asks each helper to hold eight things at once fills the hall with rows. A card that asks each helper to hold a hundred things leaves most of the hall empty, because each row needs so many hands that only a few rows fit at the counters. And a card that asks for two hundred things is worse than that: the helpers start putting bowls down on a shelf in the far pantry and walking back for them.</p>
+<p>Wei, who writes recipe cards, wants to know the rule. How many rows fit, for a card that needs so many hands? What is on the row's shared notepad, which only needs one copy per row? And can she tell the building in advance "my workgroups are small", so that it lets each helper hold more?</p>
+<p>This chapter answers Wei with the compiler's own reports. AMD GPUs have two kinds of registers: vector registers (VGPRs), one copy per lane, and scalar registers (SGPRs), one copy per wave. The number of VGPRs a kernel needs decides how many waves fit on a SIMD, its occupancy. You will build a calculator that reproduces every occupancy figure the compiler reported in this build, and use it to find why a kernel lost occupancy.</p>
+
+<h2 id="F7-10-able">What you will be able to do</h2>
+<ul>
+<li><b>Distinguish</b> VGPRs (per lane), SGPRs (per wave) and, on gfx90a, AGPRs (accumulation registers), and say which values the compiler puts in each.</li>
+<li><b>Read</b> the compiler's resource report (<code>-Rpass-analysis=kernel-resource-usage</code>): VGPRs, SGPRs, AGPRs, scratch size, spills, occupancy.</li>
+<li><b>Compute</b> occupancy in waves per SIMD from VGPR count and LDS size with this build's model of gfx90a, and name the limiting resource.</li>
+<li><b>Explain</b> why the default maximum workgroup size of 1,024 caps a gfx90a kernel at 128 VGPRs, and what <code>__launch_bounds__</code> changes in HIP 5.7.</li>
+<li><b>Recognise</b> spills in AMD assembly (<code>buffer_store_dword … Spill</code>) and spills to AGPRs (<code>v_accvgpr_write</code>), and choose between spilling and losing occupancy.</li>
+<li><b>Diagnose</b> a VGPR-limited kernel from a resource report and its ISA, and fix it.</li>
+</ul>
+
+<div class="co jargon" id="F7-10-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>VGPR (vector general-purpose register)</dt><dd><b>Simple words:</b> a register that holds one value for every lane of a wave. <b>Analogy:</b> one hand of every helper in the row. <b>Precise:</b> a 32-bit register of the vector register file with one copy per lane; <code>v_</code> instructions read and write VGPRs; a kernel's VGPR count is fixed at compile time and reported as <code>.vgpr_count</code> and in the resource report. <sup class="src"><a href="#F7-10-src-D2">D2</a></sup> <sup class="src"><a href="#F7-10-src-D5">D5</a></sup> <sup class="src"><a href="#F7-10-src-R1">R1</a></sup></dd>
+<dt>SGPR (scalar general-purpose register)</dt><dd><b>Simple words:</b> a register that holds one value for the whole wave. <b>Analogy:</b> the row's shared notepad. <b>Precise:</b> a 32-bit register of the scalar register file, one copy per wave; <code>s_</code> instructions operate on SGPRs; values that are the same for every lane (kernel-argument pointers, uniform loop counters, data loaded with <code>s_load</code>) live there. <sup class="src"><a href="#F7-10-src-D2">D2</a></sup></dd>
+<dt>AGPR (accumulation register)</dt><dd><b>Simple words:</b> on CDNA targets such as gfx90a, a second set of per-lane registers made for matrix instructions. <b>Analogy:</b> a tray each helper can also hold, meant for the matrix machine. <b>Precise:</b> accumulation VGPRs (<code>a0</code>, <code>a1</code>, …) used as operands of MFMA instructions and readable with <code>v_accvgpr_read</code>, writable with <code>v_accvgpr_write</code>; the compiler also uses them as spill space (R3). On gfx90a the compiler counts them together with VGPRs for occupancy (R2). <sup class="src"><a href="#F7-10-src-D2">D2</a></sup> <sup class="src"><a href="#F7-10-src-R2">R2</a></sup> <sup class="src"><a href="#F7-10-src-R3">R3</a></sup></dd>
+<dt>Occupancy (AMD)</dt><dd><b>Simple words:</b> how many waves can be resident on one SIMD at the same time. <b>Analogy:</b> how many rows fit at one counter. <b>Precise:</b> the number of waves per SIMD that the scarcest resource allows: wave slots, VGPRs (allocated in granules), LDS per workgroup, and further limits; the compiler reports it as "Occupancy [waves/SIMD]". <sup class="src"><a href="#F7-10-src-D2">D2</a></sup> <sup class="src"><a href="#F7-10-src-R1">R1</a></sup></dd>
+<dt>Spill (AMD)</dt><dd><b>Simple words:</b> a value the compiler could not keep in a register, so it stores it in memory and loads it back. <b>Analogy:</b> a bowl put down on a shelf in the far pantry. <b>Precise:</b> the compiler stores the register to the wave's private scratch memory (in this build's gfx90a code, <code>buffer_store_dword</code> marked "Folded Spill") and reloads it ("Folded Reload"); the resource report gives the count ("VGPRs Spill") and the bytes per lane ("ScratchSize"). <sup class="src"><a href="#F7-10-src-D5">D5</a></sup> <sup class="src"><a href="#F7-10-src-R3">R3</a></sup></dd>
+<dt><code>__launch_bounds__</code> (HIP)</dt><dd><b>Simple words:</b> a promise you write on a kernel about the largest workgroup you will launch, and optionally how many waves you want per SIMD. <b>Analogy:</b> telling the building "my groups are small", so it can give each helper more hands. <b>Precise:</b> in HIP 5.7, <code>__launch_bounds__(N)</code> expands to <code>__attribute__((amdgpu_flat_work_group_size(1, N)))</code>, and <code>__launch_bounds__(N, M)</code> adds <code>amdgpu_waves_per_eu(M)</code>; the second argument therefore means "waves per execution unit", not CUDA's "minimum blocks per multiprocessor". <sup class="src"><a href="#F7-10-src-H1">H1</a></sup> <sup class="src"><a href="#F7-10-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F7-10-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the vector register file of one SIMD as the compiler of this build models it for gfx90a: a budget of 512 registers per lane, shared by the waves resident on that SIMD, allocated in granules of 8. A kernel that needs 64 registers lets 8 waves fit (the wave-slot limit); one that needs 128 lets 4 fit; one that needs 262 (256 VGPRs plus 6 AGPRs) leaves room for only 1. The SGPRs are drawn separately: one set per wave, not per lane.</p>
+<figure id="F7-10-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 360" role="img" aria-labelledby="F7-10-f1t F7-10-f1d">
+<title id="F7-10-f1t">Figure 1: how the VGPR count of a kernel decides how many waves fit on one SIMD</title>
+<desc id="F7-10-f1d">Three vertical bars, each the vector register budget of one SIMD, labelled 512 registers per lane (model of this build's compiler for gfx90a). Bar 1, kernel with 64 VGPRs: divided into 8 blocks labelled wave 0 to wave 7, each 64 registers; label: 8 waves, limited by wave slots. Bar 2, kernel with 128 VGPRs: 4 blocks of 128, label: 4 waves, limited by VGPRs. Bar 3, kernel with 262 registers (256 VGPRs plus 6 AGPRs), rounded to 264: one block of 264 and an unused remainder of 248, label: 1 wave, a second wave would need 528. To the right, a separate small box: SGPRs, one set per wave, for values the same in every lane, such as the kernel-argument pointer. Below: occupancy equals the minimum of 8 wave slots, 512 divided by the rounded VGPR count, and the LDS limit of F7-11. Not to scale.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="360"/>
+<text class="sv-tb" x="20" y="24">VGPR budget of one SIMD (512 per lane, compiler's model for gfx90a)</text>
+<rect class="sv-box" x="40" y="40" width="120" height="256"/>
+<rect class="sv-b2" x="40" y="40" width="120" height="32"/><text class="sv-ts" x="48" y="61">wave 0: 64</text>
+<rect class="sv-b2" x="40" y="72" width="120" height="32"/><text class="sv-ts" x="48" y="93">wave 1: 64</text>
+<rect class="sv-b2" x="40" y="104" width="120" height="32"/><text class="sv-ts" x="48" y="125">wave 2</text>
+<rect class="sv-b2" x="40" y="136" width="120" height="32"/><text class="sv-ts" x="48" y="157">wave 3</text>
+<rect class="sv-b2" x="40" y="168" width="120" height="32"/><text class="sv-ts" x="48" y="189">wave 4</text>
+<rect class="sv-b2" x="40" y="200" width="120" height="32"/><text class="sv-ts" x="48" y="221">wave 5</text>
+<rect class="sv-b2" x="40" y="232" width="120" height="32"/><text class="sv-ts" x="48" y="253">wave 6</text>
+<rect class="sv-b2" x="40" y="264" width="120" height="32"/><text class="sv-ts" x="48" y="285">wave 7</text>
+<text class="sv-ts" x="30" y="316">64 VGPRs: 8 waves</text><text class="sv-ts" x="30" y="332">(limit: wave slots)</text>
+<rect class="sv-box" x="230" y="40" width="120" height="256"/>
+<rect class="sv-b4" x="230" y="40" width="120" height="64"/><text class="sv-ts" x="238" y="76">wave 0: 128</text>
+<rect class="sv-b4" x="230" y="104" width="120" height="64"/><text class="sv-ts" x="238" y="140">wave 1: 128</text>
+<rect class="sv-b4" x="230" y="168" width="120" height="64"/><text class="sv-ts" x="238" y="204">wave 2: 128</text>
+<rect class="sv-b4" x="230" y="232" width="120" height="64"/><text class="sv-ts" x="238" y="268">wave 3: 128</text>
+<text class="sv-ts" x="220" y="316">128 VGPRs: 4 waves</text><text class="sv-ts" x="220" y="332">(limit: VGPRs)</text>
+<rect class="sv-box" x="420" y="40" width="120" height="256"/>
+<rect class="sv-b5" x="420" y="40" width="120" height="132"/><text class="sv-ts" x="428" y="100">wave 0: 264</text><text class="sv-ts" x="428" y="116">(256 V + 6 A,</text><text class="sv-ts" x="428" y="132">rounded)</text>
+<rect class="sv-dash" x="420" y="172" width="120" height="124"/><text class="sv-ts" x="428" y="230">248 unused:</text><text class="sv-ts" x="428" y="246">too few for a</text><text class="sv-ts" x="428" y="262">second wave</text>
+<text class="sv-ts" x="410" y="316">262 registers: 1 wave</text><text class="sv-ts" x="410" y="332">(limit: VGPRs)</text>
+<rect class="sv-b6" x="590" y="40" width="150" height="96"/>
+<text class="sv-tb" x="600" y="60">SGPRs</text>
+<text class="sv-ts" x="600" y="78">one set per wave,</text>
+<text class="sv-ts" x="600" y="94">not per lane: kernel</text>
+<text class="sv-ts" x="600" y="110">arguments, uniform</text>
+<text class="sv-ts" x="600" y="126">values (s_load)</text>
+<text class="sv-ts" x="590" y="170">occupancy = min(</text>
+<text class="sv-ts" x="590" y="186">  8 wave slots,</text>
+<text class="sv-ts" x="590" y="202">  512 / rounded VGPRs,</text>
+<text class="sv-ts" x="590" y="218">  LDS limit (F7-11) )</text>
+<text class="sv-ts" x="590" y="250">model of this build;</text>
+<text class="sv-ts" x="590" y="266">not a datasheet (D6).</text>
+<text class="sv-ts" x="590" y="282">Not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> The register budget of one SIMD, divided among resident waves. The values 512, 8 (granule), 8 (wave slots) are the calculator's model, which reproduced all fourteen occupancy figures the compiler reported for Listing 2 (R2); they are not datasheet values. The 262-register kernel is <code>accumLB&lt;256&gt;</code> (R1, R2). <sup class="src"><a href="#F7-10-src-R1">R1</a></sup> <sup class="src"><a href="#F7-10-src-R2">R2</a></sup> <sup class="src"><a href="#F7-10-src-D2">D2</a></sup> <sup class="src"><a href="#F7-10-src-D6">D6</a></sup></figcaption></figure>
+
+<h2 id="F7-10-layer1">Layer 1 — the kid explanation</h2>
+<p>Each helper has hands to hold things while cooking. The more things a recipe asks each helper to hold, the more hands each row needs. A counter has only so many hands' worth of space. So a recipe that needs many hands lets fewer rows work at the counter at once.</p>
+<p>Some things are the same for every helper in a row, like the page number of the recipe. Nobody needs to hold that in their own hand: one notepad per row is enough. A clever cook writes the shared things on the notepad and keeps hands free for the things that differ between helpers.</p>
+<p>When a recipe needs more hands than there are, helpers put things down on a far shelf and fetch them back later. That keeps more rows at the counter, but all the walking takes time. Choosing between "fewer rows" and "more walking" is the question of this chapter.</p>
+
+<h2 id="F7-10-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F7-10-l2-two">Two register files</h3>
+<p>Every AMD instruction you have read so far starts with <code>v_</code> or <code>s_</code>. A <code>v_</code> instruction works on vector registers: <code>v_add_u32 v0, s8, v0</code> adds, in every active lane, a scalar to that lane's own <code>v0</code>. An <code>s_</code> instruction works on scalar registers once for the whole wave: <code>s_mul_i32 s8, s8, s4</code> multiplies the workgroup id by the workgroup size (F7-09, R4 there). <sup class="src"><a href="#F7-10-src-D2">D2</a></sup> The compiler decides, for each value, whether it can be the same in every lane ("uniform") and puts uniform values in SGPRs.</p>
+<p>The <code>taps_isa</code> step shows this in Listing 3, a filter with 32 taps. Every work-item uses the same taps, so the compiler loaded them with two scalar loads, <code>s_load_dwordx16 s[0:15], …</code> and <code>s_load_dwordx16 s[16:31], …</code>: 32 floats, one copy per wave, in 32 SGPRs. Each work-item's input window is different, so it came with vector loads, <code>global_load_dwordx4 v[24:27], …</code>: 16 bytes per lane per instruction (R4). <sup class="src"><a href="#F7-10-src-R4">R4</a></sup> A value in an SGPR costs one register per wave; the same value in a VGPR would cost one register per lane, that is, 64 copies on gfx90a.</p>
+<h3 id="F7-10-l2-report">The compiler's resource report</h3>
+<p>You do not need a GPU to learn a kernel's register use. With <code>-Rpass-analysis=kernel-resource-usage</code>, the compiler of this build prints one block of remarks per kernel: SGPRs, VGPRs, AGPRs, ScratchSize (bytes per lane), Occupancy (waves per SIMD), SGPRs Spill, VGPRs Spill and LDS Size (bytes per workgroup) (R1). <sup class="src"><a href="#F7-10-src-R1">R1</a></sup> The same numbers are in the code object's metadata (<code>.vgpr_count</code>, <code>.sgpr_count</code>, F7-13) and in the profiler's kernel table on a GPU (F7-14; the exact columns depend on the profiler version, D7). <sup class="src"><a href="#F7-10-src-D5">D5</a></sup> <sup class="src"><a href="#F7-10-src-D7">D7</a></sup></p>
+<p>Listing 2 creates register pressure on purpose: each work-item keeps <code>K</code> running values that all stay live across a loop. The <code>resources</code> step reports, for <code>accum&lt;K&gt;</code> with the default launch bounds: K = 8 needs 26 VGPRs and gets occupancy 8; K = 64 needs 68 and gets 7; K = 96 needs 110 and gets 4; from K = 128 on, the VGPR count stops at exactly 128 and the compiler starts to spill (5 spills at K = 128, 406 at K = 200, 487 at K = 256) (R1).</p>
+<h3 id="F7-10-l2-calc">A calculator that agrees with the compiler</h3>
+<p>Listing 1 computes occupancy with three rules: (1) at most 8 waves per SIMD; (2) VGPRs are allocated in granules of 8 out of a budget of 512 per lane, so waves by VGPR = ⌊512 / roundUp(VGPRs, 8)⌋; (3) waves by LDS = (65,536 / LDS per workgroup) × (waves per workgroup) / 4 SIMDs. The result is the minimum. The <code>occ_check</code> step fed it the compiler's own VGPR and LDS numbers for all fourteen kernels of Listing 2: every prediction matches the compiler's figure (R2), and F7-11 adds seven more LDS cases that also match. <sup class="src"><a href="#F7-10-src-R2">R2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>The calculator's constants are inferred, not documented here.</b> 512 registers per lane per SIMD (VGPRs and AGPRs together), a granule of 8, 8 wave slots per SIMD, 4 SIMDs per CU and 64 KiB of LDS per CU are the values that make Listing 1 reproduce this build's compiler (21 of 21 cases, R2 and F7-11). They were not read in an AMD document, and other targets (gfx942, RDNA) have other rules. Check: the CDNA2 ISA guide (register file and wave limits), the CDNA architecture whitepaper for the named product (D2, D6), the LLVM AMDGPU user guide (register allocation granularity, D5), and the occupancy view of your profiler (D7).</p></div>
+<p>The worked example uses the calculator on six planned kernels (<code>occ.in</code>), before any code exists.</p>
+
+<h2 id="F7-10-layer3">Layer 3 — the engineer's depth</h2>
+<p>In the analogy: the building must be sure that a whole group of rows fits at once before it lets any row of that group start, so the size of the biggest group you might send decides how many hands each helper may have.</p>
+<h3 id="F7-10-l3-cap">Why 128 VGPRs: the default workgroup size</h3>
+<p>A workgroup must be resident on one CU in its entirety, because its waves can meet at a barrier (F7-08, F7-11). <sup class="src"><a href="#F7-10-src-D2">D2</a></sup> When a kernel has no launch bounds, the compiler must allow the largest workgroup, 1,024 work-items (the metadata records <code>.max_flat_workgroup_size: 1024</code>, F7-13 R3). On gfx90a that is 1,024 / 64 = 16 waves, spread over 4 SIMDs: 4 waves per SIMD must fit at once. With the 512-register budget, each wave may use at most 512 / 4 = 128 VGPRs. That is exactly where <code>accum&lt;K&gt;</code> stopped (R1). The compiler does not choose a lower occupancy for a large kernel; it must keep the possibility of a 1,024-item workgroup, so it spills instead.</p>
+<p><code>accumLB&lt;K&gt;</code> differs only by <code>__launch_bounds__(256)</code>. A workgroup of at most 256 work-items is 4 waves, one per SIMD, so a single wave may use the whole budget. The compiler then used 142 VGPRs at K = 128 (occupancy 3, no spill), 214 at K = 200 (occupancy 2), and 256 VGPRs plus 6 AGPRs at K = 256 (occupancy 1, no spill) (R1, R2). <sup class="src"><a href="#F7-10-src-R1">R1</a></sup> In HIP 5.7, <code>__launch_bounds__(256)</code> is <code>amdgpu_flat_work_group_size(1, 256)</code> (H1): it is a promise. Launching that kernel with 512 work-items breaks the promise; what happens then must be checked in the HIP documentation (D1). <sup class="src"><a href="#F7-10-src-H1">H1</a></sup></p>
+<h3 id="F7-10-l3-spill">What a spill looks like</h3>
+<p>The <code>spill_isa</code> step counts the evidence in the assembly (R3):</p>
+<ul>
+<li><code>accum&lt;128&gt;</code>: 5 stores marked "Spill" and 13 loads marked "Reload", for example <code>buffer_store_dword v0, off, s[12:15], 0 offset:12 ; 4-byte Folded Spill</code>. The four SGPRs <code>s[12:15]</code> hold the descriptor of the wave's scratch buffer; <code>offset:12</code> is the slot in each lane's private area. The report says ScratchSize 24 bytes per lane. <sup class="src"><a href="#F7-10-src-R3">R3</a></sup> <sup class="src"><a href="#F7-10-src-R1">R1</a></sup></li>
+<li><code>accum&lt;256&gt;</code>: 487 spill stores and 491 reloads, 976 bytes of scratch per lane (R1, R3). Scratch is private memory in device memory behind the caches, so every reload that misses is a trip to the far pantry. <sup class="src"><a href="#F7-10-src-D2">D2</a></sup></li>
+<li><code>accumLB&lt;256&gt;</code>: no spill stores, but 2 <code>v_accvgpr_write</code> and 6 <code>v_accvgpr_read</code>: the compiler parked values in AGPRs (<code>v_accvgpr_write_b32 a0, v6</code>) instead of memory (R3). On gfx90a, AGPRs that a kernel uses count against the same budget (262 total, R2).</li>
+</ul>
+<h3 id="F7-10-l3-tradeoff">Spill or lose occupancy?</h3>
+<p>There is no rule that higher occupancy is faster. HW301 (F1-60) showed that latency is hidden by enough independent work in flight, from more waves or from more independent instructions per wave. <sup class="src"><a href="#F7-10-src-D9">D9</a></sup> A kernel with occupancy 2 and no spills may beat the same kernel with occupancy 4 and 406 spills, or it may not. The compiler reports cannot decide this; a measurement can (F7-14). What the reports do tell you is the shape of the choice: <code>accum&lt;200&gt;</code> (occupancy 4, 812 bytes of scratch per lane) against <code>accumLB&lt;200&gt;</code> (occupancy 2, no scratch).</p>
+<p>The second argument of <code>__launch_bounds__</code> lets you push the compiler the other way. In HIP 5.7 it becomes <code>amdgpu_waves_per_eu(M)</code> (H1). The <code>forensic_fix</code> step compiled Listing 3's 32-output filter with M = 6 and M = 8: with 6 the compiler fitted the kernel into 80 VGPRs (occupancy 6, no spill); with 8 it used 64 VGPRs and spilled 22 registers into 92 bytes of scratch per lane (R5). <sup class="src"><a href="#F7-10-src-R5">R5</a></sup> Asking for occupancy you cannot afford buys it with spills.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p><b>The second argument means something else in CUDA.</b> In CUDA, <code>__launch_bounds__(maxThreads, minBlocks)</code> names a minimum number of resident <i>blocks</i> per multiprocessor (D10). HIP 5.7 maps the same position to <code>amdgpu_waves_per_eu</code>, a number of <i>waves</i> per SIMD (H1). A hipified kernel with <code>__launch_bounds__(256, 2)</code> asks AMD for 2 waves per SIMD, not 2 workgroups per CU. Recompute the value for AMD rather than copying it. <sup class="src"><a href="#F7-10-src-H1">H1</a></sup> <sup class="src"><a href="#F7-10-src-D10">D10</a></sup></p></div>
+<h3 id="F7-10-l3-sgpr">SGPRs and occupancy</h3>
+<p>Every kernel in this chapter's reports used between 16 and 64 SGPRs (R1, R5, R7), and none of their occupancy figures needed an SGPR rule to be reproduced (R2; the forensic kernels by the same arithmetic in the answer key). SGPRs are also allocated per wave and have a per-SIMD budget; on some targets they can limit occupancy. <sup class="src"><a href="#F7-10-src-D2">D2</a></sup> This chapter's calculator ignores them; that is a known gap, listed in the unverified box above.</p>
+
+<h2 id="F7-10-hardware">How the hardware actually does it</h2>
+<p>When a workgroup is dispatched, the hardware allocates for each of its waves a block of VGPRs in the register file of the SIMD that receives the wave, a block of SGPRs, and, if the kernel needs it, LDS for the workgroup and scratch space in memory. <sup class="src"><a href="#F7-10-src-D2">D2</a></sup> The sizes come from the kernel descriptor that the compiler wrote into the code object (<code>.amdhsa_next_free_vgpr</code>, <code>.amdhsa_next_free_sgpr</code>, <code>.amdhsa_accum_offset</code>, F7-13). <sup class="src"><a href="#F7-10-src-D5">D5</a></sup> A wave whose registers cannot be allocated waits until a resident wave finishes; nothing is swapped out. Each register stays with its wave from its first instruction to <code>s_endpgm</code>, which is why switching between resident waves costs nothing (F1-60). <sup class="src"><a href="#F7-10-src-D9">D9</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The size of the register file of a gfx90a SIMD in bytes, how AGPRs and VGPRs share it, the SGPR budget per SIMD, whether allocation granules differ between VGPRs and AGPRs, and how many cycles a scratch access takes were not read in a document in this build; Figure 1 and Listing 1 use the compiler's model. Check: CDNA2 ISA guide, chapters on the register files and on scratch (private) memory (D2); LLVM AMDGPU user guide, sections on the kernel descriptor and on register allocation (D5).</p></div>
+
+<h2 id="F7-10-worked">Worked example</h2>
+<p><b>Task.</b> Before writing code, a team plans six kernels for gfx90a, all with workgroups of 256 (four waves): A uses about 24 VGPRs; B 64; C 65; D 100; E 40 VGPRs and a 16 KiB LDS tile; F 40 VGPRs and a 24 KiB tile. Predict each occupancy and its limiter.</p>
+<ol>
+<li>A: roundUp(24, 8) = 24; 512 / 24 = 21.3 → capped at 8 wave slots. Limiter: wave slots.</li>
+<li>B: 64 → 512 / 64 = 8. Still 8: exactly at the edge.</li>
+<li>C: 65 → rounded to 72; 512 / 72 = 7.1 → 7. One register more than B costs one wave per SIMD.</li>
+<li>D: 100 → 104; 512 / 104 = 4.9 → 4. Limiter: VGPRs.</li>
+<li>E: VGPRs allow 8; LDS: 65,536 / 16,384 = 4 workgroups per CU × 4 waves = 16 waves / 4 SIMDs = 4. Limiter: LDS.</li>
+<li>F: 65,536 / 24,576 = 2.67 → 2 workgroups × 4 waves / 4 SIMDs = 2. Limiter: LDS.</li>
+</ol>
+<p>Listing 1 prints the same six results (R6). The lesson of B and C: occupancy falls in steps. Read the step edges for your target (here, by the same formula, at most 64, 72, 80, 96, 128, 168 and 256 registers give 8, 7, 6, 5, 4, 3 and 2 waves) and aim slightly below one.</p>
+
+<h2 id="F7-10-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>occ.cpp</code>: an occupancy calculator for gfx90a with the limits this build's compiler applies.</p>
+<pre class="listing" data-src="F7-10/occ.cpp"></pre>
+<p><b>Build command</b> (the one actually used): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined occ.cpp -o occ</code>, then <code>./occ &lt; occ.in</code>.</p>
+<p>Input <code>occ.in</code>:</p>
+<pre class="listing" data-src="F7-10/occ.in"></pre>
+<pre class="output" data-run="F7-10/occ"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–17</td><td><code>struct Target</code></td><td>The six numbers of the model.</td><td>Every assumption is named in one place, ready to be replaced by documented values.</td></tr>
+<tr><td>20</td><td><code>kGfx90a{512, 8, 8, 4, 65536, 64}</code></td><td>The inferred gfx90a values.</td><td>See the unverified box.</td></tr>
+<tr><td>22–25</td><td><code>roundUp</code></td><td>Rounds up to the allocation granule.</td><td>Why 65 registers cost as much as 72.</td></tr>
+<tr><td>42</td><td><code>byVgpr</code></td><td>⌊512 / rounded VGPRs⌋, at most 8.</td><td>The register limit.</td></tr>
+<tr><td>43–48</td><td><code>byLds</code></td><td>Workgroups per CU by LDS, times waves per workgroup, over 4 SIMDs.</td><td>The LDS limit (F7-11).</td></tr>
+<tr><td>50–57</td><td>limiter, verdict</td><td>Names the scarcest resource; compares with the compiler's figure if given.</td><td>Turns the calculator into a test of the model.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>pressure.hip</code>: register pressure on purpose, with and without <code>__launch_bounds__(256)</code> (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-10/pressure.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a pressure.hip -o pressure</code>, then <code>./pressure</code>.</p>
+<pre class="output" data-run="F7-10/pressure"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–29</td><td><code>work&lt;K&gt;</code></td><td>Loads K values, updates each from its neighbour <code>iters</code> times, sums them.</td><td>All K values are live in every iteration: the compiler needs about K VGPRs.</td></tr>
+<tr><td>13, 18, 24</td><td><code>#pragma unroll</code></td><td>Unrolls the loops over <code>k</code>.</td><td>An unrolled array index is a register, not memory.</td></tr>
+<tr><td>31–38</td><td><code>accum&lt;K&gt;</code></td><td>Default launch bounds.</td><td>Capped at 128 VGPRs (R1).</td></tr>
+<tr><td>40–47</td><td><code>__launch_bounds__(256) accumLB&lt;K&gt;</code></td><td>Promises at most 256 work-items.</td><td>May use the whole budget; no spills, lower occupancy.</td></tr>
+<tr><td>57–64</td><td><code>launchBoth</code></td><td>Launches both with 256 work-items and checks each launch.</td><td>The launch respects the promise.</td></tr>
+</tbody></table></div>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listings 2, 3 and 4 were built for real; each run stopped at its first runtime call with the runtime's own error, because the build container has no AMD GPU. No time was measured for any kernel. On a GPU, Listing 2 is expected to print "all launches finished"; whether <code>accum</code> or <code>accumLB</code> is faster for each K is exactly what the lab asks you to measure. Needed: an AMD CDNA GPU from the ROCm compatibility matrix (D8).</p></div>
+<p>The <code>resources</code> step: the compiler's report for the fourteen kernels of Listing 2 (one line per kernel; units: ScratchSize in bytes per lane, Occupancy in waves per SIMD, LDS Size in bytes per workgroup).</p>
+<pre class="output" data-run="F7-10/resources"></pre>
+<p>The <code>occ_check</code> step: Listing 1 fed with the compiler's numbers (VGPRs including AGPRs, from the assembly's <code>TotalNumVgprs</code> comment; workgroup size 1,024 for the default bounds, 256 for <code>accumLB</code>).</p>
+<pre class="output" data-run="F7-10/occ_check"></pre>
+<p>The <code>spill_isa</code> step: spill evidence in three kernels.</p>
+<pre class="output" data-run="F7-10/spill_isa"></pre>
+
+<p><b>Listing 3</b> — <code>fir.hip</code>: a 32-tap filter in which each work-item computes <code>OUT</code> outputs (complete program; untested on hardware; used in the forensic lab).</p>
+<pre class="listing" data-src="F7-10/fir.hip"></pre>
+<pre class="output" data-run="F7-10/fir"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–21</td><td><code>float win[OUT + TAPS - 1]</code></td><td>Loads the input window (47 values for OUT = 16, 63 for OUT = 32).</td><td>Per-lane data: VGPRs.</td></tr>
+<tr><td>22–26</td><td><code>float acc[OUT]</code></td><td>OUT running sums.</td><td>More VGPRs as OUT grows.</td></tr>
+<tr><td>28–34</td><td><code>float w = taps[t]</code></td><td>The same tap for every work-item.</td><td>Uniform: loaded into SGPRs with <code>s_load_dwordx16</code> (R4).</td></tr>
+<tr><td>56–59</td><td>two launches</td><td><code>fir&lt;16&gt;</code> then <code>fir&lt;32&gt;</code>; the grid shrinks by half when OUT doubles, so both cover the same input.</td><td>"Before" and "after" the team's change.</td></tr>
+</tbody></table></div>
+<p>The <code>taps_isa</code> step: the scalar and vector loads of <code>fir&lt;16&gt;</code>.</p>
+<pre class="output" data-run="F7-10/taps_isa"></pre>
+
+<p><b>Listing 4</b> — <code>fir_fix.hip</code>: the 32-output filter with <code>__launch_bounds__(256, MINWAVES)</code> (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-10/fir_fix.hip"></pre>
+<pre class="output" data-run="F7-10/fir_fix"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–13</td><td><code>template &lt;int OUT, int MINWAVES&gt; … __launch_bounds__(256, MINWAVES)</code></td><td>Workgroups of at most 256; ask for at least MINWAVES waves per SIMD.</td><td>In HIP 5.7: <code>amdgpu_flat_work_group_size(1, 256)</code> and <code>amdgpu_waves_per_eu(MINWAVES)</code> (H1).</td></tr>
+<tr><td>14–41</td><td>kernel body</td><td>Identical to Listing 3.</td><td>Only the register budget changes.</td></tr>
+<tr><td>58–61</td><td><code>firLB&lt;32, 6&gt;</code>, <code>firLB&lt;32, 8&gt;</code></td><td>Two candidates.</td><td>Compared in the <code>forensic_fix</code> step (R5).</td></tr>
+</tbody></table></div>
+
+<h2 id="F7-10-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Hands are not handed out one at a time.</b> Registers are allocated in granules (8 in this build's model): a 65th register costs as much as 72 (worked example, R6).</li>
+<li><b>The notepad is not free either.</b> SGPRs are a per-wave resource with their own budget; a "row notepad" in the analogy sounds unlimited, but it is not (D2).</li>
+<li><b>The far shelf is not always far.</b> A spill to an AGPR (<code>v_accvgpr_write</code>, R3) stays in the register file; only spills to scratch memory are trips to the pantry. And a scratch reload may be served by a cache.</li>
+<li><b>The building does not check the size of the groups when they arrive.</b> The register budget is fixed when the kernel is compiled, from the launch bounds; a launch that breaks the promise is not rescued by a re-allocation (D1).</li>
+</ul>
+
+<h2 id="F7-10-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>VGPR count stuck at exactly 128 and a non-zero ScratchSize</td><td>Default launch bounds (1,024) cap gfx90a kernels at 128</td><td>Resource report (R1)</td><td><code>__launch_bounds__</code> with the real workgroup size, then re-check occupancy</td></tr>
+<tr><td>Occupancy dropped by one after a small change</td><td>Crossed a granule edge (64 → 65 VGPRs)</td><td>Listing 1 on old and new counts</td><td>Remove one live value; check the step edges</td></tr>
+<tr><td>Hipified kernel spills heavily on AMD</td><td>CUDA's <code>__launch_bounds__(N, minBlocks)</code> copied; on AMD the second argument is waves per SIMD</td><td>Read the attribute (H1); compare with and without it</td><td>Recompute the second argument for AMD or drop it</td></tr>
+<tr><td>A uniform value occupies VGPRs</td><td>The compiler could not prove it uniform (for example it depends on <code>threadIdx</code>)</td><td>Look for <code>v_</code> loads of data you know to be uniform</td><td>Compute it from kernel arguments or <code>blockIdx</code> only</td></tr>
+<tr><td>Kernel fast in isolation, slow when the workgroup grows</td><td>Launch bounds promise broken or not used</td><td>Compare the launch with <code>.max_flat_workgroup_size</code> (F7-13)</td><td>Keep launches inside the promise</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F7-10-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F7-08">F7-08</a> and <a href="#F7-09">F7-09</a> showed waves of 64 or 32 lanes; <a href="#F1-58">F1-58</a> defined occupancy and spills on both vendors. <b>What carries over:</b> registers are private and fixed at compile time; the scarcest resource decides occupancy; spills go to memory; higher occupancy is not automatically faster (F1-60). <sup class="src"><a href="#F7-10-src-D9">D9</a></sup> <b>What changes:</b> AMD splits registers into VGPRs per lane and SGPRs per wave (plus AGPRs on gfx90a); occupancy is counted in waves per SIMD; the default workgroup bound of 1,024 caps gfx90a kernels at 128 VGPRs in this build; and <code>__launch_bounds__</code>'s second argument means waves per SIMD, not blocks. <sup class="src"><a href="#F7-10-src-R1">R1</a></sup> <sup class="src"><a href="#F7-10-src-H1">H1</a></sup> <b>What comes next:</b> <a href="#F7-11">F7-11</a> adds the LDS: its banks, how padding removes conflicts, and how padding itself costs occupancy through the same calculator.</p></div>
+
+<h2 id="F7-10-check">Check yourself</h2>
+<ol>
+<li>Which of these values would the compiler put in an SGPR: (a) the pointer <code>x</code> passed to a kernel; (b) <code>x[threadIdx.x]</code>; (c) <code>blockIdx.x * blockDim.x</code>; (d) a tap value <code>taps[t]</code> with <code>t</code> a loop counter? Explain each.</li>
+<li>A gfx90a kernel reports 90 VGPRs and no LDS. Compute its occupancy with the model, and the largest VGPR count that would give one more wave.</li>
+<li>Why did <code>accum&lt;200&gt;</code> and <code>accum&lt;256&gt;</code> both report exactly 128 VGPRs?</li>
+<li>Which statement is true for HIP 5.7? (a) <code>__launch_bounds__(256, 2)</code> asks for 2 workgroups per CU. (b) It asks for 2 waves per SIMD. (c) The second argument is ignored on AMD. (d) It sets the maximum number of VGPRs to 2 × 256.</li>
+<li>Explain in your own words why a kernel with 256 VGPRs and 6 AGPRs gets occupancy 1 rather than 2.</li>
+<li>Apply: a kernel uses 120 VGPRs and a 32 KiB LDS tile with workgroups of 512. Which resource limits occupancy, and what is it? (Use Listing 1's rules; a workgroup of 512 is 8 waves.)</li>
+<li>Predict, then run: add a line <code>plan_G 168 0 256</code> and <code>plan_H 169 0 256</code> to <code>occ.in</code>. Predict both results; then run Listing 1.</li>
+<li>In the <code>spill_isa</code> output, what does <code>s[12:15]</code> hold, and why is it four scalar registers?</li>
+</ol>
+
+<h2 id="F7-10-lab">Lab</h2>
+<p><b>Goal.</b> Run occupancy experiments that vary register use and LDS (the course lab), check a calculator against the compiler, and find register spills in the ISA (curriculum milestone E10, AMD part).</p>
+<p><b>Hardware and software needed.</b> g++ 13.3; hipcc (HIP 5.7) driving clang 17.0.6, as in the run logs; folder <code>university/labs/F7-10</code>. No GPU for steps 1–6; an AMD CDNA GPU (ROCm compatibility matrix, D8) and a profiler (F7-14) for step 7.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F7-10</code>. Every log ends with an exit code; the GPU runs end with exit code 1 and the runtime's no-device error.</li>
+<li>Open <code>resources.out</code> and <code>occ_check.out</code>. For each K, write down VGPRs, scratch and occupancy for both variants. Every line of <code>occ_check.out</code> should say "match".</li>
+<li>Add <code>launchBoth&lt;160&gt;</code> to Listing 2. Predict the VGPRs, spill and occupancy of both variants before re-running.</li>
+<li>Change <code>accumLB</code> to <code>__launch_bounds__(512)</code>. Predict the new VGPR cap (8 waves per workgroup, 2 per SIMD), re-run, and check.</li>
+<li>Run Listing 1 with your own planned kernels (add lines to <code>occ.in</code>).</li>
+<li>Do the forensic lab below.</li>
+<li>On a GPU: run Listing 2 under the profiler (F7-14), record time per kernel and the profiler's occupancy figure, and decide for each K whether spilling or low occupancy was faster on your GPU.</li>
+</ol>
+<p><b>Expected observations.</b> Occupancy falls in steps as VGPRs grow; the default bounds stop at 128 VGPRs and spill; <code>__launch_bounds__(256)</code> removes spills and lowers occupancy; the calculator matches every compiler figure.</p>
+<p><b>Verification.</b> Milestone E10's acceptance test, verbatim: "For each listing you identify: global loads and their width, shared/LDS accesses, synchronization, the FMA or matrix instructions, any register spills; and you predict one change, make it, and confirm the predicted effect in the profiler." Here: the spills (<code>buffer_store_dword … Spill</code>) and AGPR copies in <code>spill_isa.out</code>; the filter's 16-byte vector loads and 64-byte scalar loads in <code>taps_isa.out</code>; steps 3–4 are the predicted change, confirmed in the compiler report now and in the profiler in step 7.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>occ_check</code> reports MISMATCH → your compiler applies other rules (another version or target). Do not change the calculator to force a match; record the case and look for the rule in D2/D5.</li>
+<li>The remarks print nothing → the option is spelled <code>-Rpass-analysis=kernel-resource-usage</code>, and it needs <code>--cuda-device-only</code> to report the device code.</li>
+<li>Compile time grows a lot for large K → full unrolling of hundreds of values; reduce the K list while experimenting.</li>
+</ul>
+<p><b>Extension.</b> Extend Listing 1 with an SGPR rule once you have found it documented (D2), and add a gfx942 target line. Keep the "match" check.</p>
+
+<h2 id="F7-10-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "ROCm kernel with low occupancy." A signal-processing team changed their filter so that each work-item computes 32 outputs instead of 16, to reuse each loaded tap more often. On the lab GPU the kernel became slower per output. The profiler's kernel table showed an occupancy well below the old version's. You have the compiler's resource report and an ISA census of both versions (in this build no profiler could run; the report's VGPR and occupancy fields are the ones the profiler's table shows on a GPU, D7).</p>
+<p><b>Evidence pack.</b> The <code>forensic</code> step (R7):</p>
+<pre class="output" data-run="F7-10/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what changed between <code>fir&lt;16&gt;</code> and <code>fir&lt;32&gt;</code> in VGPRs, SGPRs, scratch and occupancy?</li>
+<li>Hypotheses: (a) the new version spills; (b) it has more SGPRs and that limits occupancy; (c) its VGPR count crossed occupancy steps. Which evidence line decides each?</li>
+<li>Root cause in the code: which arrays of Listing 3 grow with <code>OUT</code>, and why do they live in VGPRs rather than SGPRs?</li>
+<li>Fix: propose two fixes and predict their VGPRs and occupancy; then compare with the <code>forensic_fix</code> step.</li>
+<li>Prevention: what check in the build would have flagged the change before it reached the GPU?</li>
+</ol>
+<p><b>Method hints.</b> Put both VGPR counts through Listing 1. In the census, compare the instruction counts with the number of multiply-adds; ask whether the extra work per instruction pays for the lost waves, and how you would measure it.</p>
+
+<h2 id="F7-10-project">Mini-project</h2>
+<p><b>Hardware passport, registers and occupancy.</b> Add to your AMD passport: the register rules your compiler applies for your target (TOOL: a table like <code>occ_check.out</code>, at least ten kernels, all "match"), the VGPR cap under default launch bounds (TOOL), the documented register-file size and wave slots per SIMD (DOC, with section, or TBD with the document named). Add a tuning note: the occupancy step edges for your target and one kernel of your own placed slightly below an edge.</p>
+<p><b>Rubric.</b> Calculator agrees with the compiler on all listed kernels, or every mismatch is explained (4). Values tagged DOC/TOOL/MEAS/TBD with records (3). Tuning note cites a resource report before and after (3).</p>
+
+<h2 id="F7-10-summary">Summary</h2>
+<ul>
+<li>VGPRs hold one value per lane; SGPRs one value per wave; uniform data (kernel arguments, shared taps) goes to SGPRs via <code>s_load</code>.</li>
+<li>gfx90a also has AGPRs; the compiler counts them with VGPRs for occupancy and can spill into them.</li>
+<li>The compiler's resource report gives VGPRs, SGPRs, scratch, spills and occupancy without a GPU.</li>
+<li>This build's gfx90a model: occupancy = min(8, ⌊512 / roundUp(VGPRs, 8)⌋, LDS limit); it matched all compiler figures.</li>
+<li>Default bounds (1,024 work-items) cap gfx90a kernels at 128 VGPRs; <code>__launch_bounds__(256)</code> lifts the cap and lowers occupancy.</li>
+<li>In HIP 5.7, <code>__launch_bounds__</code>'s second argument is waves per SIMD; forcing too many waves buys occupancy with spills.</li>
+</ul>
+
+<h2 id="F7-10-sources">Sources</h2>
+<ol>
+<li id="F7-10-src-D1">D1 — AMD, HIP documentation: HIP Programming Guide (launch bounds, register usage) and HIP API reference (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F7-10-src-D2">D2 — AMD, "AMD Instinct MI200" Instruction Set Architecture reference guide (CDNA2) (tier 1): VGPRs, SGPRs, AGPRs, scratch memory, wave limits. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-10-src-D5">D5 — LLVM project, "User Guide for AMDGPU Backend" (tier 2): kernel descriptor, register allocation, code object metadata, scratch. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-10-src-D6">D6 — AMD, CDNA architecture whitepaper for the named product (tier 1): register file and CU organisation. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-10-src-D7">D7 — AMD, rocprofv3, ROCm Compute Profiler and ROCm Systems Profiler documentation (tier 1/2): kernel tables and occupancy views. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-10-src-D8">D8 — AMD, ROCm documentation: compatibility matrix (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-10-src-D9">D9 — HW301, chapter F1-60 "Schedulers and latency hiding" of this university, and the sources it cites (Hennessy and Patterson, "Computer Architecture: A Quantitative Approach"). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-10-src-D10">D10 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): launch bounds. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-10-src-H1">H1 — HIP 5.7 headers installed in the build container, read in this build (tier 4): <code>hip/amd_detail/amd_hip_runtime.h</code> (the <code>__launch_bounds__</code> macro and its two expansions). A fact about HIP 5.7 only.</li>
+<li id="F7-10-src-R1">R1 — <code>resources</code> step (<code>university/labs/F7-10/resources.log</code>), Ubuntu clang 17.0.6 (the compiler hipcc drives; HIP 5.7), compiled only, exit code 0.</li>
+<li id="F7-10-src-R2">R2 — <code>occ_check</code> step (<code>occ_check.log</code>), g++ 13.3.0 and the same clang, exit code 0.</li>
+<li id="F7-10-src-R3">R3 — <code>spill_isa</code> step (<code>spill_isa.log</code>), compiled only, exit code 0.</li>
+<li id="F7-10-src-R4">R4 — <code>taps_isa</code> step (<code>taps_isa.log</code>), compiled only, exit code 0.</li>
+<li id="F7-10-src-R5">R5 — <code>forensic_fix</code> step (<code>forensic_fix.log</code>), compiled only, exit code 0.</li>
+<li id="F7-10-src-R6">R6 — run of Listing 1 with <code>occ.in</code> (<code>occ.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0.</li>
+<li id="F7-10-src-R7">R7 — <code>forensic</code> step (<code>forensic.log</code>), compiled only, exit code 0.</li>
+</ol>
+
+<h2 id="F7-10-glossary">Glossary links</h2>
+<p><a href="#gl-vgpr-vector-general-purpose-register">VGPR</a> · <a href="#gl-sgpr-scalar-general-purpose-register">SGPR</a> · <a href="#gl-scalar-and-vector-registers-amd">Scalar and vector registers (AMD)</a> · <a href="#gl-agpr-accumulation-register">AGPR</a> · <a href="#gl-occupancy">Occupancy</a> · <a href="#gl-occupancy-amd">Occupancy (AMD)</a> · <a href="#gl-spill-local-memory">Spill / local memory</a> · <a href="#gl-spill-amd">Spill (AMD)</a> · <a href="#gl-launch-bounds-hip">__launch_bounds__ (HIP)</a> · <a href="#gl-registers-gpu">Registers (GPU)</a></p>
+
+<h2 id="F7-10-next">Next chapter</h2>
+<p>Next: <a href="#F7-11">F7-11 The Local Data Share and its banks</a>. Previous: <a href="#F7-09">F7-09 Wave32 and wave64 on RDNA</a>. Course: <a href="#HP302">HP302</a>.</p>
+
+<h2 id="F7-10-answers">Answers to Check yourself</h2>
+<ol>
+<li>(a) SGPR: a kernel argument is the same for every lane (in R4 the pointers arrive in <code>s[16:19]</code> and <code>s[20:21]</code>). (b) VGPR: each lane loads its own element. (c) SGPR: <code>blockIdx.x</code> and <code>blockDim.x</code> are the same for the whole wave (<code>s_mul_i32 s8, s8, s4</code> in F7-09's R4). (d) SGPR, if <code>t</code> is a uniform loop counter: R4 shows the taps loaded with <code>s_load_dwordx16</code>. A common wrong answer is "every variable of a kernel is per lane": that is the source-level view, not the compiler's.</li>
+<li>roundUp(90, 8) = 96; 512 / 96 = 5.3 → 5 waves. For 6 waves you need roundUp(v, 8) ≤ 85.3, that is v ≤ 80 (80 / 8 = 10 granules; 512 / 80 = 6.4).</li>
+<li>Both use the default launch bounds: 1,024 work-items = 16 waves = 4 per SIMD must fit, so 512 / 4 = 128 is the cap; the remaining values were spilled (406 and 487 spills, R1).</li>
+<li>(b), by the expansion in H1. (a) is the CUDA meaning of a similar-looking argument (D10). (c) is wrong: the <code>forensic_fix</code> step shows it changes the register count (R5). (d) has no basis in the macro.</li>
+<li>262 registers round up to 264; two waves would need 528, more than the 512 budget, so only one fits (R2: predicted 1, reported 1).</li>
+<li>VGPRs: roundUp(120, 8) = 120; 512 / 120 = 4.3 → 4. LDS: 65,536 / 32,768 = 2 workgroups × 8 waves = 16 waves / 4 SIMDs = 4. Both give 4; Listing 1 names VGPRs as the limiter because its test is <code>byVgpr &lt;= byLds</code>. Both would have to be reduced to gain a wave.</li>
+<li>168 → 168; 512 / 168 = 3.05 → 3. 169 → 176; 512 / 176 = 2.9 → 2. One register crosses a step. (Lab Engineer's check by hand; run the program to confirm.)</li>
+<li>The descriptor of the wave's scratch (private) buffer, which the <code>buffer_</code> instructions use to find the memory. It is the same for every lane, so it lives in SGPRs; the four registers are visible in R3, and that a buffer resource descriptor is 128 bits wide is to be checked in D2 (buffer instructions chapter).</li>
+</ol>
+<h3 id="F7-10-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> <code>fir&lt;16&gt;</code>: 62 VGPRs, 48 SGPRs, no scratch, occupancy 8. <code>fir&lt;32&gt;</code>: 84 VGPRs, 60 SGPRs, no scratch, occupancy 5. Instructions 488 → 896; multiply-adds 231 → 541; vector loads 12 → 16; scalar loads 6 in both (R7).</p>
+<p><b>Hypotheses.</b> (a) Ruled out: ScratchSize 0 and VGPRs Spill 0 in both. (b) Not needed: the calculator reproduces occupancy 5 from VGPRs alone (roundUp(84, 8) = 88; 512 / 88 = 5.8 → 5), and the SGPR increase (48 → 60) follows from the extra address and tap registers. (c) Confirmed: 62 is below the 64 edge (8 waves); 84 is above the 80 edge (6 waves).</p>
+<p><b>Root cause.</b> <code>win[OUT + TAPS − 1]</code> and <code>acc[OUT]</code> are fully unrolled per-lane arrays: each element is a VGPR. Doubling OUT grows the window from 47 to 63 values and the sums from 16 to 32. The taps stay in SGPRs because they are uniform, which is why they did not grow the VGPR count.</p>
+<p><b>Fix and verification.</b> Fix 1: return to OUT = 16 (62 VGPRs, occupancy 8). Fix 2: keep OUT = 32 and add <code>__launch_bounds__(256, 6)</code>: the <code>forensic_fix</code> step gives 80 VGPRs, occupancy 6, no spill (R5). Asking for 8 instead gives 64 VGPRs but 22 spills and 92 bytes of scratch per lane (R5): a worse trade. A third option, more structural: slide the window through LDS or registers so that fewer values are live at once. Which fix is fastest must be measured on the GPU (F7-14); the compiler report only predicts occupancy and spills.</p>
+<p><b>Prevention.</b> A CI step that runs the resource report for every kernel and fails when occupancy drops or ScratchSize becomes non-zero compared with a stored baseline. <b>How the evidence was produced:</b> the Lab Engineer compiled Listing 3 for gfx90a and ran the census in <code>run.sh</code>; the team, the slowdown and the profiler table are a scenario, because no GPU was available.</p>

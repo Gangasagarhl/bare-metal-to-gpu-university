@@ -1,0 +1,296 @@
+<!--meta
+id: F7-08
+title: Compute units and wavefronts of 64 versus warps of 32
+course: HP302
+level: L3
+prereqs: HP301; HW301 (F1-56, F1-57, F1-60); BR-03
+time: 6–10 hours including the lab
+hardware: none for the model, the compiler-output steps and the forensic lab (this build: no GPU); running Listing 2 needs an AMD GPU listed in the ROCm compatibility matrix
+maps: Curriculum E10 (AMD part, first step); 13.1 vocabulary table (core building block, lock-step thread group); ISA guides (item 69); LLVM AMDGPU user guide (item 70)
+analogy: F7 — the great kitchen hall (second building: AMD)
+-->
+
+<h2 id="F7-08-hook">Story hook</h2>
+<p>Amara has cooked for years in the first kitchen building, where helpers stand in rows of 32 and move together, one step at a time. Today she carries the same recipe cards across the street to the second building. Everything looks familiar: tables, pantry, rows of helpers. Then she counts a row. There are 64 helpers in it.</p>
+<p>One of her cards says: "pass your bowl to the helper sixteen places along, add, then eight places along, then four, two, one; the first helper now holds the row's total". In the old building that was exactly right. In the new one, the first helper ends up with the total of only the first 32 bowls. The other half of the row's work sits in front of helper 32, and nobody collects it. No error is shouted, nothing spills. The answer is half the size it should be.</p>
+<p>This chapter is about that second building: how an AMD GPU groups its work-items, why the group is 64 wide on the data-centre (CDNA) parts and 32 or 64 wide on the graphics (RDNA) parts, and how to write code that never needs to know the number by heart.</p>
+
+<h2 id="F7-08-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what a compute unit (CU) and a wavefront are, and how they correspond to NVIDIA's SM and warp.</li>
+<li><b>Compute</b> how a workgroup of any size is cut into wavefronts, and how many lanes stay idle.</li>
+<li><b>Show</b> from real compiler output that <code>warpSize</code> is a compile-time constant of the target on AMD (64 for gfx90a and gfx942, 32 for gfx1030 and gfx1100 in this build's toolchain).</li>
+<li><b>Find</b> and fix a reduction that hard-codes 32 lanes, and predict its wrong answer before running it.</li>
+<li><b>Read</b> the instructions that compute a lane's position (<code>v_mbcnt_lo_u32_b32</code>, <code>v_mbcnt_hi_u32_b32</code>) in AMD assembly.</li>
+</ul>
+
+<div class="co jargon" id="F7-08-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Compute unit (CU)</dt><dd><b>Simple words:</b> AMD's name for one building block of the GPU that runs groups of work-items. <b>Analogy:</b> one section of the second kitchen building, with its own rows, table and supervisors. <b>Precise:</b> the replicated processor unit of AMD GCN/CDNA GPUs that runs the wavefronts of the workgroups assigned to it, with vector and scalar execution resources, a register file and the LDS; HIP reports the number of them as <code>multiProcessorCount</code>. It plays the role of NVIDIA's SM. <sup class="src"><a href="#F7-08-src-D2">D2</a></sup> <sup class="src"><a href="#F7-08-src-H1">H1</a></sup></dd>
+<dt>Wavefront (wave)</dt><dd><b>Simple words:</b> the group of AMD work-items that always do the same step together. <b>Analogy:</b> a row of helpers who move in step: 64 in a row on CDNA. <b>Precise:</b> the set of work-items executed together with one instruction stream and one 64-bit or 32-bit execution mask; AMD's counterpart of NVIDIA's warp of 32 threads. NVIDIA calls its group a warp; AMD calls its group a wavefront (a vendor term). <sup class="src"><a href="#F7-08-src-D2">D2</a></sup> <sup class="src"><a href="#F7-08-src-D10">D10</a></sup></dd>
+<dt>Wave64 and wave32</dt><dd><b>Simple words:</b> a wavefront of 64 lanes or of 32 lanes. <b>Analogy:</b> a long row or a short row. <b>Precise:</b> the wavefront size a kernel is compiled for; the compiler records it as <code>.wavefront_size</code> in the kernel metadata (64 for gfx90a and gfx942, 32 by default for gfx1030 and gfx1100 in this build: R2). RDNA can also run wave64 (F7-09). <sup class="src"><a href="#F7-08-src-D4">D4</a></sup> <sup class="src"><a href="#F7-08-src-R2">R2</a></sup></dd>
+<dt>Lane</dt><dd><b>Simple words:</b> one position in a wavefront. <b>Analogy:</b> one helper's place in the row. <b>Precise:</b> the index of a work-item inside its wavefront, 0 to width − 1; HIP returns it from <code>__lane_id()</code>, which the HIP 5.7 header builds from the <code>mbcnt</code> builtins. <sup class="src"><a href="#F7-08-src-H1">H1</a></sup></dd>
+<dt><code>warpSize</code> (HIP)</dt><dd><b>Simple words:</b> the number of lanes in a wave, as a name your code can use. <b>Analogy:</b> the number painted at the start of every row. <b>Precise:</b> in HIP 5.7's device code, <code>static constexpr int warpSize = __AMDGCN_WAVEFRONT_SIZE;</code>, a constant fixed when the kernel is compiled for a target; on the host, the same number comes from <code>hipDeviceProp_t::warpSize</code>. <sup class="src"><a href="#F7-08-src-H1">H1</a></sup> <sup class="src"><a href="#F7-08-src-D1">D1</a></sup></dd>
+<dt>SIMD unit (in an AMD CU)</dt><dd><b>Simple words:</b> the part of a CU that actually performs the vector instructions of the wavefronts assigned to it. <b>Analogy:</b> one supervisor's counter inside a section: the rows assigned to it take turns there. <b>Precise:</b> a vector execution unit with its own wavefront slots and its own part of the vector register file; a CU contains several, and occupancy on AMD is counted in wavefronts per SIMD (F7-10). The count per CU is a product fact to take from the architecture documents. <sup class="src"><a href="#F7-08-src-D2">D2</a></sup> <sup class="src"><a href="#F7-08-src-D6">D6</a></sup></dd>
+</dl></div>
+
+<h2 id="F7-08-pictures">The idea in pictures</h2>
+<p>Figure 1 shows one workgroup of 256 work-items arriving in each building. In the first, it is cut into eight warps of 32; in the second, into four wavefronts of 64. Inside the AMD compute unit, the wavefronts are spread over SIMD units, each with its own slots, while the workgroup's LDS lives in the CU and is shared by all its waves.</p>
+<figure id="F7-08-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 360" role="img" aria-labelledby="F7-08-f1t F7-08-f1d">
+<title id="F7-08-f1t">Figure 1: one workgroup of 256 work-items cut into warps of 32 or wavefronts of 64</title>
+<desc id="F7-08-f1d">Top left: a bar of 256 work-items numbered 0 to 255. Arrow to the left half: an NVIDIA SM with eight rows labelled warp 0 to warp 7, each row 32 lanes, and a bar labelled shared memory. Arrow to the right half: an AMD compute unit containing four columns labelled SIMD 0 to SIMD 3; wavefront 0 sits in SIMD 0, wavefront 1 in SIMD 1, and so on, each a row of 64 lanes; below them a bar labelled LDS shared by the workgroup and a bar labelled vector register file, split per SIMD. Work-item 100 is highlighted: in the SM it is warp 3 lane 4; in the CU it is wavefront 1 lane 36. A note says the number of SIMDs drawn follows the compiler's model and must be confirmed in the product's documentation; not to scale.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="360"/>
+<rect class="sv-b3" x="180" y="12" width="400" height="28"/>
+<text class="sv-t" x="190" y="31">one workgroup: work-items 0 … 255 (blockDim.x = 256)</text>
+<line class="sv-line" x1="300" y1="40" x2="190" y2="70"/><polygon class="sv-head" points="190,70 194,60 200,66"/>
+<line class="sv-line" x1="460" y1="40" x2="570" y2="70"/><polygon class="sv-head" points="570,70 560,66 566,60"/>
+<rect class="sv-box" x="10" y="72" width="330" height="270"/>
+<text class="sv-tb" x="20" y="92">NVIDIA SM: 8 warps of 32</text>
+<rect class="sv-b1" x="20" y="102" width="300" height="18"/><text class="sv-ts" x="26" y="115">warp 0: lanes 0–31 (items 0–31)</text>
+<rect class="sv-b1" x="20" y="124" width="300" height="18"/><text class="sv-ts" x="26" y="137">warp 1: items 32–63</text>
+<rect class="sv-b1" x="20" y="146" width="300" height="18"/><text class="sv-ts" x="26" y="159">warp 2: items 64–95</text>
+<rect class="sv-b5" x="20" y="168" width="300" height="18"/><text class="sv-ts" x="26" y="181">warp 3: items 96–127 ▶ item 100 = lane 4</text>
+<rect class="sv-b1" x="20" y="190" width="300" height="18"/><text class="sv-ts" x="26" y="203">warp 4: items 128–159</text>
+<rect class="sv-b1" x="20" y="212" width="300" height="18"/><text class="sv-ts" x="26" y="225">warp 5: items 160–191</text>
+<rect class="sv-b1" x="20" y="234" width="300" height="18"/><text class="sv-ts" x="26" y="247">warp 6: items 192–223</text>
+<rect class="sv-b1" x="20" y="256" width="300" height="18"/><text class="sv-ts" x="26" y="269">warp 7: items 224–255</text>
+<rect class="sv-b6" x="20" y="290" width="300" height="20"/><text class="sv-ts" x="26" y="304">shared memory (this block)</text>
+<rect class="sv-box" x="360" y="72" width="390" height="270"/>
+<text class="sv-tb" x="370" y="92">AMD compute unit (CU): 4 wavefronts of 64</text>
+<rect class="sv-dash" x="370" y="100" width="88" height="140"/><text class="sv-ts" x="378" y="116">SIMD 0</text>
+<rect class="sv-dash" x="464" y="100" width="88" height="140"/><text class="sv-ts" x="472" y="116">SIMD 1</text>
+<rect class="sv-dash" x="558" y="100" width="88" height="140"/><text class="sv-ts" x="566" y="116">SIMD 2</text>
+<rect class="sv-dash" x="652" y="100" width="88" height="140"/><text class="sv-ts" x="660" y="116">SIMD 3</text>
+<rect class="sv-b2" x="376" y="124" width="76" height="40"/><text class="sv-ts" x="380" y="140">wave 0</text><text class="sv-ts" x="380" y="156">items 0–63</text>
+<rect class="sv-b5" x="470" y="124" width="76" height="40"/><text class="sv-ts" x="474" y="140">wave 1 ▶100</text><text class="sv-ts" x="474" y="156">= lane 36</text>
+<rect class="sv-b2" x="564" y="124" width="76" height="40"/><text class="sv-ts" x="568" y="140">wave 2</text><text class="sv-ts" x="568" y="156">items 128–191</text>
+<rect class="sv-b2" x="658" y="124" width="76" height="40"/><text class="sv-ts" x="662" y="140">wave 3</text><text class="sv-ts" x="662" y="156">items 192–255</text>
+<text class="sv-ts" x="376" y="190">free wave slots in each SIMD</text>
+<text class="sv-ts" x="376" y="206">for waves of other workgroups</text>
+<rect class="sv-b4" x="370" y="250" width="370" height="20"/><text class="sv-ts" x="378" y="264">vector register file (each SIMD has its part)</text>
+<rect class="sv-b6" x="370" y="276" width="370" height="20"/><text class="sv-ts" x="378" y="290">LDS: shared by the waves of one workgroup</text>
+<text class="sv-ts" x="370" y="316">SIMD count drawn as in the compiler's model (F7-10);</text>
+<text class="sv-ts" x="370" y="332">confirm for your product (D6). Not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> The same workgroup becomes eight warps on NVIDIA and four wavefronts on a CDNA target such as gfx90a. Lane and wave of work-item 100 come from the model run R1; the wave width per target from the compiler (R2); the CU's parts from D2 and D6, pending verification. The four SIMDs per CU are the value that reproduced all of the compiler's occupancy figures in F7-10 and F7-11 (R5), not a datasheet value. <sup class="src"><a href="#F7-08-src-R1">R1</a></sup> <sup class="src"><a href="#F7-08-src-R2">R2</a></sup> <sup class="src"><a href="#F7-08-src-D2">D2</a></sup> <sup class="src"><a href="#F7-08-src-D6">D6</a></sup> <sup class="src"><a href="#F7-08-src-R5">R5</a></sup></figcaption></figure>
+
+<h2 id="F7-08-layer1">Layer 1 — the kid explanation</h2>
+<p>A GPU does not move its helpers one by one. It moves them in rows, and every helper in a row does the same step at the same moment. In NVIDIA's building a row has 32 helpers. In AMD's data-centre building a row has 64. In AMD's graphics building, rows can be 32 or 64.</p>
+<p>Most of the time you do not notice. Your recipe says "add your two numbers", and every helper adds. You only notice when the recipe talks about the row itself: "pass to the helper sixteen places along", "the first one in the row writes the answer", "count how many in the row said yes". Then the length of the row matters. A good recipe never writes the row length as a number. It asks the building: "how long are your rows?"</p>
+
+<h2 id="F7-08-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F7-08-l2-cut">How a workgroup is cut into waves</h3>
+<p>A HIP launch creates a grid of workgroups (blocks), exactly as in CUDA; HP301 showed that the launch syntax and the built-in index variables carry over. <sup class="src"><a href="#F7-08-src-D1">D1</a></sup> Each workgroup runs on one compute unit, and the hardware cuts it into wavefronts: work-items 0 to 63 form wave 0, 64 to 127 wave 1, and so on, in the order of their flattened index. <sup class="src"><a href="#F7-08-src-D2">D2</a></sup> The arithmetic is the same as for warps, with a different divisor: wave = <code>threadIdx.x / warpSize</code>, lane = <code>threadIdx.x % warpSize</code> for a one-dimensional workgroup. Listing 1 prints both cuts side by side (R1): work-item 100 is lane 4 of warp 3 on NVIDIA and lane 36 of wave 1 on a 64-wide target.</p>
+<p>A workgroup whose size is not a multiple of the wave width leaves lanes idle in its last wave. The idle lanes are not free: the wave still issues every instruction, with those lanes switched off by the execution mask (HW301, F1-57). <sup class="src"><a href="#F7-08-src-D2">D2</a></sup> Listing 1 shows the effect: a workgroup of 96 work-items is three full warps on NVIDIA, but two wavefronts on gfx90a, the second only half full, so 75.0 % of the lanes do useful work (R1). Choose workgroup sizes that are multiples of 64 when the code may run on CDNA; multiples of 64 are also multiples of 32.</p>
+<h3 id="F7-08-l2-warpsize">Where the number 64 comes from in your program</h3>
+<p>In HIP 5.7's device headers, <code>warpSize</code> is declared as <code>static constexpr int warpSize = __AMDGCN_WAVEFRONT_SIZE;</code>. <sup class="src"><a href="#F7-08-src-H1">H1</a></sup> The macro <code>__AMDGCN_WAVEFRONT_SIZE</code> is set by the compiler for each target. The <code>targets</code> step of the lab asked the compiler for four targets: gfx90a and gfx942 get 64, gfx1030 and gfx1100 get 32, and the kernel metadata (<code>.wavefront_size</code>) agrees each time (R2). So a single source file compiled for two targets contains two different values of <code>warpSize</code>, one in each code object.</p>
+<p>On the host side, the number comes from the device: <code>hipGetDeviceProperties</code> fills <code>hipDeviceProp_t::warpSize</code>, documented in the header as "Warp size." <sup class="src"><a href="#F7-08-src-H1">H1</a></sup> Host code that sizes buffers per wave (one result per wave, as in F7-12) must use this field, not a literal. Listing 2 does both: the kernel stores <code>warpSize</code>, <code>t / warpSize</code> and <code>__lane_id()</code> for every work-item, and the host prints the device's <code>warpSize</code> and CU count.</p>
+<div class="co note"><span class="lbl">Note</span><p><b>Two meanings of "kernel" and of "thread".</b> In this faculty a kernel is the GPU function every work-item runs, not an operating-system kernel (F3); a GPU work-item ("thread" in CUDA words) is not an operating-system thread (SP203, BR-03).</p></div>
+
+<h2 id="F7-08-layer3">Layer 3 — the engineer's depth</h2>
+<p>In the analogy: the row length is painted on the floor of each building when it is built, and the recipe card is printed separately for each building, with the number already filled in.</p>
+<h3 id="F7-08-l3-isa">What the compiler made of <code>warpSize</code></h3>
+<p>The <code>lane_isa</code> step compiled Listing 2's kernel for gfx90a and for gfx1100 (R3). Three differences tell the story:</p>
+<ul>
+<li><code>out[3*t+0] = warpSize</code> became <code>v_mov_b32_e32 v0, 64</code> on gfx90a and <code>v_mov_b32_e32 v0, 32</code> on gfx1100: a literal in the instruction stream, not a value read at run time.</li>
+<li><code>t / warpSize</code> became a shift: <code>v_lshrrev_b32_e32 v1, 6, v0</code> (divide by 2<sup>6</sup> = 64) on gfx90a, <code>v_lshrrev_b32_e32 v1, 5, v0</code> (by 2<sup>5</sup> = 32) on gfx1100. Because the width is a power of two known at compile time, division costs one instruction.</li>
+<li><code>__lane_id()</code> became two instructions on gfx90a, <code>v_mbcnt_lo_u32_b32</code> and <code>v_mbcnt_hi_u32_b32</code>, and only the first on gfx1100. The HIP 5.7 header defines <code>__lane_id()</code> as <code>__builtin_amdgcn_mbcnt_hi(-1, __builtin_amdgcn_mbcnt_lo(-1, 0))</code>: "mbcnt" counts, for each lane, the set bits of a mask in the lanes below it; with an all-ones mask that count is the lane's own index. <sup class="src"><a href="#F7-08-src-H1">H1</a></sup> <sup class="src"><a href="#F7-08-src-D2">D2</a></sup> The "lo" half handles lanes 0–31 of the mask, the "hi" half lanes 32–63; a wave32 target needs only the low half. <sup class="src"><a href="#F7-08-src-R3">R3</a></sup></li>
+</ul>
+<p>CUDA does it differently. The <code>ptx_warp</code> step shows that in PTX for <code>sm_80</code>, <code>warpSize</code> is the symbolic constant <code>WARP_SZ</code> (<code>mov.u32 %r2, WARP_SZ;</code>), which the PTX-to-SASS assembler resolves. <sup class="src"><a href="#F7-08-src-R4">R4</a></sup> <sup class="src"><a href="#F7-08-src-D11">D11</a></sup> In both ecosystems the value is fixed per target; neither reads it from memory in the kernel.</p>
+<h3 id="F7-08-l3-portable">Rules for portable code</h3>
+<ol>
+<li>Never write 32 or 64 where you mean "lanes per wave": use <code>warpSize</code> in device code and <code>prop.warpSize</code> on the host. <sup class="src"><a href="#F7-08-src-D1">D1</a></sup></li>
+<li>Loops over lanes start from <code>warpSize / 2</code>, not from 16 (the bug of the story hook; Listing 1 part 3).</li>
+<li>Lane masks are 64-bit: HIP 5.7's <code>__ballot</code> returns <code>unsigned long long</code>. <sup class="src"><a href="#F7-08-src-H1">H1</a></sup> F7-12 is about this.</li>
+<li>Workgroup sizes: multiples of 64 run full waves on every target in this chapter.</li>
+<li>Per-wave buffers: size them with the device's <code>warpSize</code> at run time.</li>
+</ol>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Newer HIP versions.</b> This build has HIP 5.7. The authoring guide records that the HIP documentation announced API changes in HIP 7.0 to align more closely with CUDA; whether <code>warpSize</code> is still a <code>constexpr</code> in device code, and whether <code>__lane_id()</code>, <code>__ballot</code> and the <code>__shfl</code> family keep these names and types, must be checked in the HIP documentation (programming guide, warp cross-lane functions; API reference) for the ROCm version in your dossier. Check: D1.</p></div>
+
+<h2 id="F7-08-hardware">How the hardware actually does it</h2>
+<p>When a workgroup is dispatched to a CU, its wavefronts are placed into wave slots of the CU's SIMD units, and they stay there until they finish (they are resident, as in F1-56). <sup class="src"><a href="#F7-08-src-D2">D2</a></sup> <sup class="src"><a href="#F7-08-src-D6">D6</a></sup> Each wavefront has its own program counter, its own execution mask (<code>EXEC</code>, 64 bits on wave64) and its own scalar and vector registers. <sup class="src"><a href="#F7-08-src-D2">D2</a></sup> Each cycle, issue logic picks ready wavefronts and sends their next instruction to an execution unit, as F1-60 modelled; a vector instruction operates on all lanes whose <code>EXEC</code> bit is set. <sup class="src"><a href="#F7-08-src-D2">D2</a></sup> All waves of one workgroup are on the same CU, which is why they can share the LDS and meet at a barrier (<code>s_barrier</code>, F7-11). <sup class="src"><a href="#F7-08-src-D2">D2</a></sup></p>
+<p>Besides the vector units, a wavefront has a <b>scalar unit</b> for values that are the same in every lane (addresses of kernel arguments, loop counters): in R3, the kernel argument is loaded by <code>s_load_dwordx2</code> into scalar registers <code>s[0:1]</code> once per wave. <sup class="src"><a href="#F7-08-src-R3">R3</a></sup> F7-10 is about the two register files.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>How many SIMD units a CU has, how many lanes a SIMD processes per cycle and how many cycles a wave64 vector instruction therefore occupies it, how many wave slots each SIMD has, and how many CUs a named product has: none of these could be read from a product document in this build. The four SIMDs per CU and the eight wave slots per SIMD that F7-10's calculator uses are the values that reproduce this build's compiler's occupancy reports for gfx90a (R5); they are the compiler's model, not a datasheet. Check: the CDNA architecture whitepaper for the named product (D6) and the "AMD Instinct MI200" ISA reference guide, chapter on the program state and wavefronts (D2). Run <code>rocminfo</code> on the lab machine (F7-14) and write the product's numbers into the hardware passport (mini-project).</p></div>
+
+<h2 id="F7-08-worked">Worked example</h2>
+<p><b>Task.</b> A kernel is launched with 1,000 work-items per workgroup (allowed by the default limit of 1,024 that the compiler records as <code>.max_flat_workgroup_size</code>, F7-13). (a) How many wavefronts does a workgroup have on gfx90a and how many warps on an NVIDIA GPU? (b) How many lanes are idle? (c) A reduction inside each wave uses offsets 16, 8, 4, 2, 1 and lane 0 writes the result. With the input value of lane <i>l</i> equal to <i>l</i> + 1, what does lane 0 write for wave 0 on gfx90a, and what was lost?</p>
+<ol>
+<li>(a) Waves = ⌈1000 / 64⌉ = ⌈15.6…⌉ = 16. Warps = ⌈1000 / 32⌉ = ⌈31.25⌉ = 32. Listing 1 prints 16 and 32 (R1).</li>
+<li>(b) 16 × 64 = 1,024 lanes for 1,000 work-items: 24 idle; 32 × 32 = 1,024: also 24 idle. Both use 97.7 % of the lanes (R1). Here the widths agree; at 96 work-items they do not (75.0 % versus 100.0 %).</li>
+<li>(c) With offsets starting at 16, lane 0 only ever adds values from lanes 0–31: the sum is 1 + 2 + … + 32 = 32 × 33 / 2 = 528. The full wave's sum is 64 × 65 / 2 = 2,080. The missing 1,552 = 33 + … + 64 has been collected into lane 32, which nobody reads. Listing 1 prints exactly these three numbers (R1). Starting at <code>warpSize / 2</code> = 32 gives 2,080.</li>
+</ol>
+
+<h2 id="F7-08-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>wave_model.cpp</code>: cutting a workgroup into groups of 32 or 64, and a reduction inside one group (host-only model).</p>
+<pre class="listing" data-src="F7-08/wave_model.cpp"></pre>
+<p><b>Build command</b> (the one actually used): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined wave_model.cpp -o wave_model</code>, then <code>./wave_model</code>.</p>
+<pre class="output" data-run="F7-08/wave_model"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–15</td><td><code>splitWorkgroup</code></td><td>Rounds the number of groups up; counts idle lanes and the share of lanes used.</td><td>The cost of a workgroup size that is not a multiple of the width.</td></tr>
+<tr><td>18–26</td><td><code>shuffleDown</code></td><td>Lane <i>l</i> reads lane <i>l</i> + offset; lanes past the end keep their value.</td><td>Models <code>__shfl_down</code> inside one wave (F7-12 shows the real one).</td></tr>
+<tr><td>29–38</td><td><code>waveReduce</code></td><td>Halving tree: add the value from <code>offset</code> lanes along, then halve the offset.</td><td><code>firstOffset</code> is the only difference between the right and the wrong reduction.</td></tr>
+<tr><td>44–47</td><td>part 1</td><td>Six workgroup sizes, both widths.</td><td>Worked example (a), (b).</td></tr>
+<tr><td>49–53</td><td>part 2</td><td>Prints (warp, lane) and (wavefront, lane) for chosen work-items.</td><td>Figure 1's work-item 100.</td></tr>
+<tr><td>55–72</td><td>part 3</td><td>Sums 1..W with offsets from 16 and from W / 2; reports lane 0 and lane 32.</td><td>The story hook's bug, measured.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>wave_info.hip</code>: every work-item records <code>warpSize</code>, its wave and its lane (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-08/wave_info.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a wave_info.hip -o wave_info</code>, then <code>./wave_info</code>.</p>
+<pre class="output" data-run="F7-08/wave_info"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 2 was built for real; its run stopped at the first runtime call with the runtime's own error, because the build container has no AMD GPU. On a gfx90a GPU the expected lines are: <code>warpSize 64</code> for every work-item, wave = <code>t / 64</code>, lane = <code>t % 64</code>; this expectation follows from the compiled code (R3), not from a run. Needed: an AMD GPU from the ROCm compatibility matrix (D8).</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–14</td><td><code>waveInfo</code></td><td>Stores three numbers per work-item.</td><td>The three facts this chapter is about, observed from inside the kernel.</td></tr>
+<tr><td>16–22</td><td><code>check</code></td><td>Prints the error name and string and exits on failure.</td><td>Every HIP call is checked (guide 13.4); the recorded output is this function's message.</td></tr>
+<tr><td>26–29</td><td><code>hipGetDeviceProperties</code></td><td>Host-side <code>warpSize</code>, CU count and architecture name.</td><td>The host must ask the device; the kernel already knows.</td></tr>
+<tr><td>34–36</td><td>launch, <code>hipGetLastError</code></td><td>One workgroup of 256.</td><td>4 waves on gfx90a, 8 on gfx1100.</td></tr>
+</tbody></table></div>
+
+<p>The <code>targets</code> step: the wave width the compiler assigns to four targets (macro and kernel metadata).</p>
+<pre class="output" data-run="F7-08/targets"></pre>
+<p>The <code>lane_isa</code> step: Listing 2's kernel for gfx90a (wave64) and gfx1100 (wave32), comments removed.</p>
+<pre class="output" data-run="F7-08/lane_isa"></pre>
+<div class="tw"><table>
+<thead><tr><th>Instruction (gfx90a)</th><th>What it does</th><th>gfx1100 difference</th></tr></thead>
+<tbody>
+<tr><td><code>s_load_dwordx2 s[0:1], s[4:5], 0x0</code></td><td>Loads the 64-bit pointer <code>out</code> from the kernel arguments into two scalar registers, once per wave.</td><td><code>s_load_b64</code>: the RDNA3 assembler spells sizes in bits.</td></tr>
+<tr><td><code>v_mul_u32_u24_e32 v1, 3, v0</code></td><td><code>3 * t</code>; <code>v0</code> holds <code>threadIdx.x</code> on entry.</td><td>same</td></tr>
+<tr><td><code>v_lshrrev_b32_e32 v1, 6, v0</code></td><td><code>t / 64</code> as a right shift by 6.</td><td>shift by 5</td></tr>
+<tr><td><code>v_mbcnt_lo_u32_b32</code>, <code>v_mbcnt_hi_u32_b32</code></td><td><code>__lane_id()</code>: count of mask bits below this lane, low and high halves.</td><td>only the low half</td></tr>
+<tr><td><code>v_mov_b32_e32 v0, 64</code></td><td><code>warpSize</code>, a literal.</td><td>32</td></tr>
+<tr><td><code>s_waitcnt lgkmcnt(0)</code></td><td>Waits for the scalar load of <code>out</code> (F1-60).</td><td>same</td></tr>
+<tr><td><code>global_store_dwordx3 v3, v[0:2], s[0:1]</code></td><td>One 12-byte store of the three values per lane.</td><td><code>global_store_b96</code></td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>wave_info_cuda.cu</code>: the same kernel in CUDA, built for comparison (untested on hardware: no NVIDIA GPU).</p>
+<pre class="listing" data-src="F7-08/wave_info_cuda.cu"></pre>
+<pre class="output" data-run="F7-08/wave_info_cuda"></pre>
+<p>The <code>ptx_warp</code> step: how <code>warpSize</code> appears in the PTX for <code>sm_80</code>.</p>
+<pre class="output" data-run="F7-08/ptx_warp"></pre>
+
+<h2 id="F7-08-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A row is not a fixed group of people.</b> A wavefront exists only while its work-items run; when it finishes, its slot takes a wave of any other workgroup. There is no permanent "helper 37". <sup class="src"><a href="#F7-08-src-D2">D2</a></sup></li>
+<li><b>Idle helpers still occupy their places.</b> In a kitchen, missing helpers leave room for others; in a wave, a masked lane still occupies its slot in every instruction (75.0 % lane use for a 96-item workgroup, R1).</li>
+<li><b>The row length is not painted once per building.</b> On RDNA the same hardware runs both wave32 and wave64 (F7-09); the length is chosen per compiled kernel, not per building.</li>
+</ul>
+
+<h2 id="F7-08-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Reduction result about half the expected value on AMD, correct on NVIDIA</td><td>Shuffle offsets start at 16</td><td>Print each wave's partial sums per lane; lane 32 holds the missing half (R1)</td><td>Start at <code>warpSize / 2</code></td></tr>
+<tr><td>Per-wave results overwrite each other or leave gaps</td><td>Host buffer sized for 32 lanes per wave</td><td>Compare <code>prop.warpSize</code> with the constant in the host code</td><td>Size from <code>prop.warpSize</code></td></tr>
+<tr><td>Low efficiency with an unusual workgroup size</td><td>Size not a multiple of 64</td><td>Listing 1's arithmetic</td><td>Multiples of 64</td></tr>
+<tr><td>Code works for gfx90a but not for gfx1100</td><td>A literal 64 or a 64-lane loop</td><td>Compile both targets and compare the assembly (<code>lane_isa</code> step)</td><td><code>warpSize</code> everywhere</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F7-08-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#HP301">HP301</a> ported CUDA programs to HIP, and <a href="#F1-57">F1-57</a> explained warps, lanes and the execution mask on both vendors; <a href="#BR-03">BR-03</a> introduced warps and wavefronts as groups scheduled by hardware. <b>What carries over:</b> the grid–workgroup–work-item hierarchy, the index formula, lock-step execution, masks for divergence, and latency hiding by switching groups (F1-60). <sup class="src"><a href="#F7-08-src-D1">D1</a></sup> <b>What changes:</b> the group is 64 lanes on CDNA (32 or 64 on RDNA), so every lane-level algorithm, every lane mask and every per-wave buffer size must follow <code>warpSize</code>; the SM becomes a CU with SIMD units; and <code>warpSize</code> is a per-target compile-time constant (R2, R3). <sup class="src"><a href="#F7-08-src-R2">R2</a></sup> <sup class="src"><a href="#F7-08-src-R3">R3</a></sup> <b>What comes next:</b> <a href="#F7-09">F7-09</a> looks at RDNA, where one GPU can run both wave32 and wave64, and what the choice changes in the machine code.</p></div>
+
+<h2 id="F7-08-check">Check yourself</h2>
+<ol>
+<li>Which AMD term corresponds to NVIDIA's SM, and which to NVIDIA's warp?</li>
+<li>A workgroup has 160 work-items. How many wavefronts on gfx90a, how many warps on NVIDIA, and what share of lanes is used in each case?</li>
+<li>Work-item 200 of a one-dimensional workgroup: which wave and lane on gfx90a, and which on gfx1100?</li>
+<li>Why does <code>t / warpSize</code> compile to one shift instruction on AMD? What would change if the width were not known at compile time?</li>
+<li>Which statement is true for HIP 5.7? (a) <code>warpSize</code> is read from device memory in every kernel. (b) <code>warpSize</code> is a <code>constexpr</code> set from <code>__AMDGCN_WAVEFRONT_SIZE</code> for each target. (c) <code>warpSize</code> is always 64 on AMD GPUs. (d) <code>warpSize</code> exists only in host code.</li>
+<li>Explain in your own words why the reduction with offsets 16, 8, 4, 2, 1 gives 528 instead of 2,080 on a 64-lane wave.</li>
+<li>Apply: a CUDA kernel launched with 256 threads per block keeps one partial result per warp in shared memory: <code>__shared__ float part[256 / 32];</code>, written by the thread with <code>threadIdx.x % 32 == 0</code> into <code>part[threadIdx.x / 32]</code> after a warp-level reduction, and then summed over 8 slots. It was hipified unchanged and its wave reduction was fixed to start at <code>warpSize / 2</code>. What goes wrong on gfx90a, and what is the portable form?</li>
+<li>Predict, then run: change Listing 1 part 3 to use width 128 (not a real wave width; a test of the code). What does the hard-coded version put in lane 0? Check with the program.</li>
+</ol>
+
+<h2 id="F7-08-lab">Lab</h2>
+<p><b>Goal.</b> Survey wave widths across targets, prove from machine code where <code>warpSize</code> comes from, and fix a hard-coded lane count. This is the first step of curriculum milestone E10 (AMD part): reading the machine code of your own kernels.</p>
+<p><b>Hardware and software needed.</b> g++ 13.3, hipcc (HIP 5.7, clang 17.0.6), nvcc 12.0 as recorded in the run logs; folder <code>university/labs/F7-08</code>. No GPU for steps 1–5; an AMD GPU (ROCm compatibility matrix, D8) for step 6.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F7-08</code>. You should see the outputs shown above; every log ends with an exit code.</li>
+<li>Open <code>targets.out</code>. Add <code>gfx908</code> and <code>gfx1101</code> to the loop in <code>run.sh</code> and re-run. Record each width; do not guess.</li>
+<li>Open <code>lane_isa.out</code>. For each instruction, write in your notebook which source expression produced it.</li>
+<li>Change Listing 2's kernel so that it also stores <code>t % warpSize</code>. Predict the instruction the compiler will use (hint: a power of two), re-run, and check.</li>
+<li>Do the forensic lab below.</li>
+<li>On an AMD GPU: run <code>wave_info</code> and compare its printed lanes with your prediction from step 3. Record <code>gcnArchName</code>, <code>warpSize</code> and the CU count in your hardware passport.</li>
+</ol>
+<p><b>Expected observations.</b> 64 for the CDNA targets, 32 for the RDNA targets; literals and shifts in the code instead of run-time reads; one <code>mbcnt</code> instruction more on wave64.</p>
+<p><b>Verification.</b> Milestone E10's acceptance test, verbatim: "For each listing you identify: global loads and their width, shared/LDS accesses, synchronization, the FMA or matrix instructions, any register spills; and you predict one change, make it, and confirm the predicted effect in the profiler." For this chapter's small kernel: identify the store and its width (<code>global_store_dwordx3</code>, 12 bytes), and confirm step 4's prediction in the assembly (the profiler part comes in F7-14).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>hipcc</code> prints "argument unused during compilation" warnings → harmless driver notes in this toolchain; the steps filter them.</li>
+<li>An added target is rejected → the compiler of this build does not know it; record that, it is evidence about your toolchain version.</li>
+<li><code>wave_info</code> prints <code>hipErrorInvalidDevice</code> → no AMD GPU or no driver; on a GPU machine run <code>rocminfo</code> first (F7-14).</li>
+</ul>
+<p><b>Extension.</b> Write a template <code>waveReduce&lt;W&gt;</code> in Listing 1 and a <code>static_assert</code> that W is a power of two; instantiate it for 32 and 64.</p>
+
+<h2 id="F7-08-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A team ported a histogram post-processing kernel from CUDA with hipify. On their NVIDIA development machine the checksum is right. On the AMD test machine (a CDNA GPU) the total count is too small, but never zero, and always by the same amount for the same input. They suspect a race in the atomics.</p>
+<p><b>Evidence pack.</b> The team reduced the problem to one wave with values 1 to 64 and ran the university's model of their reduction (Listing 1, part 3, R1):</p>
+<pre class="output" data-run="F7-08/wave_model"></pre>
+<p>Their kernel's reduction loop, from the ported source: <code>for (int offset = 16; offset &gt; 0; offset /= 2) v += __shfl_down(v, offset);</code> followed by <code>if (__lane_id() == 0) atomicAdd(total, v);</code>.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what does lane 0 hold for width 32 and for width 64, and where is the rest?</li>
+<li>Hypotheses: (a) a race in <code>atomicAdd</code>; (b) a hard-coded lane count; (c) a wrong <code>warpSize</code> on the device. Which line of the evidence rules out each?</li>
+<li>Root cause: which literal, and why is the error always the same for the same input?</li>
+<li>Fix and verify: give the corrected loop and the expected output line of the model.</li>
+<li>Prevention: what review rule and what automatic test would have caught it before it reached the AMD machine?</li>
+</ol>
+<p><b>Method hints.</b> A race gives varying results; a deterministic shortfall points to code that systematically skips data. Compare the shortfall with sums over lane ranges.</p>
+
+<h2 id="F7-08-project">Mini-project</h2>
+<p><b>Start the AMD hardware passport</b> (the course project, extended in every chapter of HP302). Copy the passport table of F1-63 and add an "AMD" section with these fields, each tagged DOC (document and section), TOOL (tool output with its run record) or MEAS, or left TBD: architecture name (<code>gcnArchName</code>), wavefront size (TOOL: <code>.wavefront_size</code> from the compiler for your target, and <code>warpSize</code> from the device), CU count, SIMDs per CU, wave slots per SIMD. Fill what this chapter's runs give you; leave the rest TBD with the document to check.</p>
+<p><b>Rubric.</b> Every value has a tag and a record (4). No value without evidence (3). The TBD list names the document and section to read (2). The passport passes F1-63's checker (1).</p>
+
+<h2 id="F7-08-summary">Summary</h2>
+<ul>
+<li>AMD's compute unit (CU) plays the role of NVIDIA's SM; its wavefront plays the role of the warp.</li>
+<li>Wavefronts are 64 lanes on CDNA targets (gfx90a, gfx942) and 32 by default on RDNA targets (gfx1030, gfx1100) in this build's compiler.</li>
+<li>In HIP 5.7, <code>warpSize</code> is a per-target <code>constexpr</code>; the compiler turns it into literals and shifts.</li>
+<li><code>__lane_id()</code> is built from <code>mbcnt</code>: two instructions on wave64, one on wave32.</li>
+<li>Workgroup sizes should be multiples of 64; lane loops start at <code>warpSize / 2</code>; masks are 64-bit.</li>
+<li>A hard-coded 32 fails silently and deterministically on wave64: 528 instead of 2,080.</li>
+</ul>
+
+<h2 id="F7-08-sources">Sources</h2>
+<ol>
+<li id="F7-08-src-D1">D1 — AMD, HIP documentation: HIP Programming Guide (including "Porting CUDA code to HIP" and the warp cross-lane functions) and HIP API reference (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F7-08-src-D2">D2 — AMD, "AMD Instinct MI200" Instruction Set Architecture reference guide (CDNA2) (tier 1): program state, wavefronts, EXEC, scalar and vector instructions, <code>v_mbcnt</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-08-src-D4">D4 — AMD, RDNA2 and RDNA3 Instruction Set Architecture reference guides (tier 1): wave32 and wave64. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-08-src-D6">D6 — AMD, CDNA architecture whitepapers (tier 1): compute-unit organisation for the named product. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-08-src-D8">D8 — AMD, ROCm documentation: installation, compatibility matrix, tools (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-08-src-D10">D10 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): SIMT architecture, the built-in variable <code>warpSize</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-08-src-D11">D11 — NVIDIA, "Parallel Thread Execution ISA" (tier 1): the constant <code>WARP_SZ</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-08-src-H1">H1 — HIP 5.7 headers installed in the build container, read in this build (tier 4: source of the reference implementation): <code>hip/amd_detail/amd_warp_functions.h</code> (<code>warpSize</code>), <code>hip/amd_detail/amd_device_functions.h</code> (<code>__lane_id</code>, <code>__ballot</code>), <code>hip/hip_runtime_api.h</code> (<code>hipDeviceProp_t</code>). What these headers do is a fact about HIP 5.7 only.</li>
+<li id="F7-08-src-R1">R1 — run of Listing 1 (<code>university/labs/F7-08/wave_model.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0.</li>
+<li id="F7-08-src-R2">R2 — <code>targets</code> step (<code>targets.log</code>), Ubuntu clang 17.0.6 via hipcc (HIP 5.7), compiled only.</li>
+<li id="F7-08-src-R3">R3 — <code>lane_isa</code> step (<code>lane_isa.log</code>), same toolchain, compiled only.</li>
+<li id="F7-08-src-R4">R4 — <code>ptx_warp</code> step (<code>ptx_warp.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>, compiled only.</li>
+<li id="F7-08-src-R5">R5 — F7-10's <code>occ_check</code> and F7-11's <code>lds_occupancy</code> steps: the calculator's model (4 SIMDs per CU, 8 wave slots per SIMD) matched every occupancy figure the compiler reported for gfx90a.</li>
+</ol>
+
+<h2 id="F7-08-glossary">Glossary links</h2>
+<p><a href="#gl-compute-unit-cu">Compute Unit (CU)</a> · <a href="#gl-warp-wavefront">Warp / wavefront</a> · <a href="#gl-wave64-and-wave32">Wave64 and wave32</a> · <a href="#gl-lane">Lane</a> · <a href="#gl-warpsize-hip">warpSize (HIP)</a> · <a href="#gl-simd-unit-amd-compute-unit">SIMD unit (AMD compute unit)</a> · <a href="#gl-active-mask-exec">Active mask / EXEC</a> · <a href="#gl-cdna-rdna">CDNA / RDNA</a></p>
+
+<h2 id="F7-08-next">Next chapter</h2>
+<p>Next: <a href="#F7-09">F7-09 Wave32 and wave64 on RDNA</a>. Previous course: <a href="#HP301">HP301</a> (last chapter <a href="#F7-07">F7-07</a>). Back to the course: <a href="#HP302">HP302</a>.</p>
+
+<h2 id="F7-08-answers">Answers to Check yourself</h2>
+<ol>
+<li>Compute unit (CU) ↔ SM; wavefront ↔ warp.</li>
+<li>gfx90a: ⌈160 / 64⌉ = 3 waves, 192 lanes, 160 / 192 = 83.3 % used. NVIDIA: 160 / 32 = 5 warps, 100 %.</li>
+<li>gfx90a: wave 200 / 64 = 3, lane 200 − 192 = 8. gfx1100 (wave32): wave 200 / 32 = 6, lane 200 − 192 = 8. (Same lane by coincidence: 192 is a multiple of both.)</li>
+<li>The width is a power of two fixed at compile time, so division is a right shift (R3). With a width known only at run time the compiler would have to emit a general integer division sequence, as the SASS of an <code>int</code> division by a non-constant does.</li>
+<li>(b). (a) is wrong: R3 shows a literal. (c) is wrong: gfx1030 and gfx1100 compile with 32 (R2). (d) is wrong: device code uses it; the host has <code>prop.warpSize</code>.</li>
+<li>The offsets add up to 31, so lane 0 only ever receives data from lanes 1–31; lanes 32–63 are summed among themselves into lane 32, which is never read.</li>
+<li>On gfx90a the 256 work-items form 4 waves, not 8 groups of 32. The writer test <code>threadIdx.x % 32 == 0</code> is true for lanes 0 and 32 of each wave. After a wave reduction that starts at <code>warpSize / 2</code>, only lane 0 holds the wave's total; lane 32 holds some other intermediate value. So slots 0, 2, 4, 6 receive correct wave totals and slots 1, 3, 5, 7 receive values that are not totals of anything the algorithm intends: the final sum over 8 slots is wrong. Portable form: choose the writer with <code>__lane_id() == 0</code>, index with <code>threadIdx.x / warpSize</code>, size the array with <code>256 / warpSize</code> (a constant in HIP 5.7 device code, H1) or with the largest count over your targets, and sum <code>blockDim.x / warpSize</code> slots.</li>
+<li>Lane 0 sums lanes 0–31 only: 528 (the offsets still add up to 31). The model prints the same number for any width above 32; the expected value for 128 would be 8,256. (Lab Engineer's check; not in the recorded output.)</li>
+</ol>
+<h3 id="F7-08-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Width 32: lane 0 holds 528, the expected value. Width 64: lane 0 holds 528 against an expected 2,080; lane 32 holds 1,552, and 528 + 1,552 = 2,080 (R1).</p>
+<p><b>Hypotheses ruled out.</b> (a) A race would give varying shortfalls; the shortfall is exact and repeatable, and it appears in a model with no atomics at all. (c) A wrong <code>warpSize</code> is excluded because the portable version in the same evidence (offset <code>warpSize / 2</code>) gives 2,080.</p>
+<p><b>Root cause.</b> The literal 16 in the loop's starting offset, copied from 32-lane code. On a 64-lane wave the first step must fold lanes 32–63 onto 0–31 (offset 32); without it, half the wave is summed into lane 32 and discarded. The error is deterministic because it depends only on the data in lanes 32–63.</p>
+<p><b>Fix and verification.</b> <code>for (int offset = warpSize / 2; offset &gt; 0; offset /= 2)</code>. The model's line "warpSize/2: lane 0 holds 2080" is the verification; on hardware, compare against a CPU sum.</p>
+<p><b>Prevention.</b> Review rule: no literal 32 or 16 near shuffles, ballots or lane ids (a grep in CI). Test: run every kernel's unit tests compiled for a wave64 target; a CPU model such as Listing 1 can run in CI without a GPU. <b>How the evidence was produced:</b> the Lab Engineer ran Listing 1; the team and the histogram are a scenario.</p>
