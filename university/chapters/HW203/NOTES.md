@@ -132,3 +132,61 @@ the owner may want one image for both (they are related structures) or two disti
 5. **Analogy proposals** above, especially the two outbox trays.
 6. **Prerequisites.** F1-36 and F1-37 list SP201 as "may run in parallel" (atomics are used in the labs
    and explained locally); confirm with the SP faculty or move the atomics material.
+
+## Owner rulings applied
+
+Verification pass 2026-10-10 (Source Researcher / Fact-Checker / Editor / Accessibility agent). The
+decisions listed above were closed as follows:
+
+1. **CS:APP Cache Lab.** Ruling C1/C3. The authors' labs page and the Cache Lab writeup (cachelab.pdf)
+   were opened; F1-34 now quotes the file names, `csim` options, trace format, reference simulator
+   policy, test scripts and Part B parameters from that writeup, tagged "D1 Cache Lab". The lab was
+   not run in this build or in the verification pass; a separate box in F1-34 says so and lists what is
+   needed (the handout tarball, a 64-bit x86-64 Linux machine, Valgrind).
+2. **Counters.** Ruling C3. Cachegrind (simulated) remains the evidence; the Cachegrind manual and
+   perf_event_open(2) were opened and cited. Hardware counters stay "untested on hardware" in F1-34,
+   F1-36 and F1-38 with what a test needs (a PMU-exposing machine, a perf build matching its kernel).
+3. **NUMA lab.** Ruling C3. Stays untested (both containers have one node). The box in F1-39 no longer
+   says the tool names are "from memory": libnuma calls are quoted from numa(3), numactl is named per
+   the kernel "NUMA Memory Policy" document; numactl(8) itself could not be opened.
+4. **Rerun policy.** Ruling A5: recorded runs are kept. All labs were re-run on the verifier's
+   container (a different KVM VM); deterministic outputs were identical, timing outputs differed only
+   by machine/run noise, and the lab folders were restored with `git checkout`. Each chapter's Sources
+   list has a new R-entry recording the re-run figures.
+5. **Analogies.** Ruling A3: all proposals above are approved teaching images. The two outbox trays
+   (F1-35 write buffer, F1-37 store buffer) — decided by verifier: both kept, presented as the same
+   mechanism at two levels (a cache's tray toward the pantry, a cook's tray toward the shared board).
+6. **Prerequisites (SP201).** Decided by verifier: "may run in parallel" is kept for F1-36 and F1-37,
+   because the atomics used in the labs are explained locally in those chapters.
+
+Other rulings: A1 (nothing trimmed; only additions, corrections and sentence splits), AH-18/C2
+(unverified boxes kept where no source could be opened, each now saying what would close it),
+C4 (QA status string "internally checked · hardware steps untested").
+
+## Verification pass
+
+- **Documents opened** (recorded in `university/_dossiers/F1-32..F1-39.dossier.html`): CS:APP3e
+  authors' site (home, code, labs, cachelab.pdf); publisher pages for COD RISC-V 2e, CA:AQA 6e and
+  DDCA RISC-V (edition and chapter titles only); Primer on Memory Consistency and Cache Coherence 2e
+  (title page, table of contents, chapters 1–3 in part, chapters 6 and 8); C++ working draft
+  [time.clock.steady], [intro.races], [basic.align], [vector.overview]; Valgrind manual ch. 5
+  (Cachegrind); kernel docs "Transparent Hugepage Support" and "NUMA Memory Policy"; man-pages
+  madvise(2), proc_pid_smaps(5), numa(3), perf_event_open(2); the stable sysfs CPU ABI file; Dive
+  Into Systems 1.2 §11.1, 11.3, 11.4.x, 11.5, 11.6, 13.3.x, 14.5; OSTEP ch. 18; Micron 8Gb DDR4
+  data sheet Rev. N. New source ids D11 (Dive Into Systems), D12 (OSTEP), D13 (Micron) were added.
+- **Not opened** (shared web-fetch budget exhausted; stated honestly in chapters and dossiers): Intel
+  SDM Vol. 3 (D7), Primer chapters 4, 5, 7, 9, C++ [atomics.order], GCC -fsanitize=thread page (D10),
+  getrusage(2), numactl(8), the testing sysfs cache ABI file, OSTEP TLB chapter. Claims resting on
+  these are tagged at chapter-title level or sit inside unverified boxes.
+- **Corrections:** F1-32 chase.cc line numbers in the code table, lab troubleshooting and forensic key
+  (off by one against the file); F1-34 Cache Lab box replaced by sourced text plus a "not run" box;
+  F1-36 std::vector over-aligned remark marked as not checked; F1-38 x86-64 paging figures moved
+  under the Layer 3 unverified box; F1-39 NUMA box wording. No measured number was changed.
+- **Remaining unverified / untested boxes:** F1-32 (VM's outstanding-miss capacity, prefetchers, L3
+  share); F1-33 (replacement policy, inclusion); F1-34 (perf event names; Cache Lab not run);
+  F1-35 (memcpy non-temporal stores; Intel memory types); F1-36 (protocol variant, interconnect);
+  F1-37 (x86 = TSO per vendor manual, xchg ordering, Arm/RISC-V); F1-38 (TLB sizes, walk cost,
+  paging figures); F1-39 (controller hashing; NUMA).
+- **Labs:** all eight lab folders re-run with `run_lab.sh` on the verifier's container (Intel Xeon
+  @ 2.80 GHz, 4 CPUs, kernel 6.18); every listing exits as recorded; recorded files kept (A5).
+- **QA records:** `university/qa/F1-32.json` … `F1-39.json`.
