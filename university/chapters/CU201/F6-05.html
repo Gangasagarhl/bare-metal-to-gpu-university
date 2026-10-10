@@ -1,0 +1,285 @@
+<!--meta
+id: F6-05
+title: Error checking and debugging: checking every call, Compute Sanitizer
+course: CU201
+level: L2
+prereqs: F6-01; F6-04; SP102 (F2-16 error handling); SP202 (F2-29 sanitizers)
+time: 3–5 hours including the lab
+hardware: Running Listings 2 and 4 and Compute Sanitizer needs an NVIDIA GPU with a CUDA Toolkit and driver (record both), or a cloud GPU; Listing 3 (the CPU model), the header reading, the compile-error listing and the forensic lab need only g++ and nvcc (this build had no GPU and no working sanitizer)
+maps: Curriculum E1 ("Compute Sanitizer (or the ROCm address sanitizer support) reports no errors"); 13.2 topic 1 (programming model, error handling); forensic "The kernel that silently did nothing"
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-05-hook">Story hook</h2>
+<p>Kofi sends an order into the great kitchen hall: "square every number on this list, 65,536 of them". He wants it fast, so he writes on the order slip: "use tables of 2,048 helpers each". The hall has no tables that big. The door-keeper reads the slip, writes "refused: impossible table size" in the hall's logbook, and does not send a single helper to work. Kofi does not read the logbook. He waits a moment, collects the results tray (empty, as it was when he left it) and reports: "every square is zero".</p>
+<p>Nobody lied to Kofi. The hall wrote the reason down in the place where it always writes reasons. Kofi's program never looked. This chapter is about looking every time: after every call, after every launch, and, for the mistakes that happen deep inside the work itself, with an inspector who watches every helper's every step.</p>
+
+<h2 id="F6-05-able">What you will be able to do</h2>
+<ul>
+<li><b>Check</b> every CUDA runtime call and every launch with a small helper that reports the error name, the call text, the file and the line.</li>
+<li><b>Explain</b> the two moments at which a launch can fail (when it is made, and while the kernel runs) and where each error becomes visible.</li>
+<li><b>Distinguish</b> <code>cudaGetLastError</code> from <code>cudaPeekAtLastError</code>, and an ordinary error from one that ruins the whole process.</li>
+<li><b>Run</b> Compute Sanitizer's memcheck tool on a kernel and read what it should report for an out-of-bounds write.</li>
+<li><b>Diagnose</b> "the kernel that silently did nothing" from its evidence.</li>
+</ul>
+
+<div class="co jargon" id="F6-05-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Error code (<code>cudaError_t</code>)</dt><dd><b>Simple words:</b> the number every CUDA runtime function returns to say "it worked" or what went wrong. <b>Analogy:</b> the line the door-keeper writes in the logbook. <b>Precise:</b> an enumeration in <code>driver_types.h</code>; <code>cudaSuccess</code> means no error; each other value has a name (<code>cudaGetErrorName</code>) and a description (<code>cudaGetErrorString</code>). <sup class="src"><a href="#F6-05-src-H1">H1</a></sup></dd>
+<dt>Launch error</dt><dd><b>Simple words:</b> a launch refused before any thread runs, for example because the block is too big. <b>Analogy:</b> the door-keeper refusing an impossible table size. <b>Precise:</b> such as <code>cudaErrorInvalidConfiguration</code>, which the header describes as "a kernel launch is requesting resources that can never be satisfied by the current device"; the launch syntax returns no value, so it is read with <code>cudaGetLastError</code>. <sup class="src"><a href="#F6-05-src-H1">H1</a></sup></dd>
+<dt>Asynchronous error</dt><dd><b>Simple words:</b> an error that happens while the kernel runs and is reported by a later call. <b>Analogy:</b> a helper dropping a jar in the far pantry; you hear about it the next time you talk to the hall. <b>Precise:</b> because a launch returns before the kernel ends, errors inside the kernel (such as <code>cudaErrorIllegalAddress</code>) are returned by a later synchronizing or other runtime call. <sup class="src"><a href="#F6-05-src-D1">D1</a></sup></dd>
+<dt>Sticky error</dt><dd><b>Simple words:</b> an error after which the GPU cannot be used again in this process. <b>Analogy:</b> the hall is closed for the rest of the day; every new order comes back with the same note. <b>Precise:</b> the header for <code>cudaErrorIllegalAddress</code>: "This leaves the process in an inconsistent state and any further CUDA work will return the same error. To continue using CUDA, the process must be terminated and relaunched." <sup class="src"><a href="#F6-05-src-H1">H1</a></sup></dd>
+<dt>Compute Sanitizer</dt><dd><b>Simple words:</b> a tool that runs your program and watches every memory access and synchronisation of every GPU thread. <b>Analogy:</b> an inspector who follows every helper and notes each reach into the wrong shelf. <b>Precise:</b> NVIDIA's correctness tool <code>compute-sanitizer</code> with sub-tools <code>memcheck</code> (memory access checking, the default), <code>racecheck</code>, <code>synccheck</code> and <code>initcheck</code>, as listed by its own help. <sup class="src"><a href="#F6-05-src-R5">R5</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-05-pictures">The idea in pictures</h2>
+<p>Figure 1 is a timeline of one program on the host (top) and the GPU (bottom). It shows the two moments where things go wrong and the calls that report them.</p>
+<figure id="F6-05-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F6-05-f1t F6-05-f1d">
+<title id="F6-05-f1t">Figure 1: where launch errors and kernel errors become visible</title>
+<desc id="F6-05-f1d">Two horizontal lanes, host on top, GPU below, time running left to right. Case A, launch error: the host makes a launch with 2048 threads per block; the launch is refused at once, nothing runs on the GPU, and the error cudaErrorInvalidConfiguration is returned by the next cudaGetLastError. Case B, kernel error: the host launches a kernel that writes past the end of an array; the launch returns success at once and the kernel runs on the GPU; during the run a thread makes an illegal access; the host learns about it only at the next synchronizing call, cudaDeviceSynchronize, which returns cudaErrorIllegalAddress; every later call returns the same error, shown as a hatched band labelled sticky.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="10" y="24">A  launch error (refused at the door)</text>
+<line class="sv-line" x1="80" y1="60" x2="360" y2="60"/><text class="sv-ts" x="10" y="64">host</text>
+<line class="sv-dash" x1="80" y1="110" x2="360" y2="110"/><text class="sv-ts" x="10" y="114">GPU</text>
+<rect class="sv-b6" x="100" y="44" width="92" height="32" rx="4"/><text class="sv-tm" x="106" y="64">&lt;&lt;&lt;32, 2048&gt;&gt;&gt;</text>
+<rect class="sv-b3" x="210" y="44" width="140" height="32" rx="4"/><text class="sv-tm" x="216" y="64">cudaGetLastError</text>
+<text class="sv-ts" x="100" y="100">nothing runs on the GPU</text>
+<text class="sv-ts" x="210" y="92">→ InvalidConfiguration</text>
+<text class="sv-tb" x="400" y="24">B  kernel error (found later)</text>
+<line class="sv-line" x1="400" y1="60" x2="750" y2="60"/>
+<line class="sv-dash" x1="400" y1="110" x2="750" y2="110"/>
+<rect class="sv-b1" x="410" y="44" width="70" height="32" rx="4"/><text class="sv-tm" x="416" y="64">launch</text>
+<text class="sv-ts" x="410" y="92">→ Success</text>
+<rect class="sv-b5" x="470" y="98" width="140" height="24" rx="4"/><text class="sv-tm" x="476" y="115">kernel runs</text>
+<circle class="sv-dot4" cx="580" cy="110" r="6"/><text class="sv-ts" x="520" y="140">illegal write here</text>
+<line class="sv-line" x1="480" y1="76" x2="480" y2="96"/><polygon class="sv-head" points="480,98 476,90 484,90"/>
+<rect class="sv-b3" x="616" y="44" width="134" height="32" rx="4"/><text class="sv-tm" x="620" y="64">cudaDeviceSynchronize</text>
+<text class="sv-ts" x="616" y="92">→ IllegalAddress</text>
+<line class="sv-line2" x1="610" y1="110" x2="636" y2="78"/><polygon class="sv-head" points="638,76 630,80 636,85"/>
+<rect class="sv-box" x="400" y="160" width="350" height="34" rx="4"/><text class="sv-ts" x="410" y="181">sticky: every later call (copy, launch) returns IllegalAddress</text>
+<rect class="sv-box" x="10" y="220" width="740" height="66" rx="6"/>
+<text class="sv-t" x="22" y="242">Check after the launch (cudaGetLastError) to catch A. Synchronize and check to catch B,</text>
+<text class="sv-t" x="22" y="262">in debug builds after every launch (CUDA_CHECK_LAUNCH with CU201_DEBUG_SYNC), and run</text>
+<text class="sv-t" x="22" y="280">Compute Sanitizer to learn which thread and which line.</text>
+</svg></div><figcaption><b>Figure 1.</b> A timeline (not to scale) of the two kinds of failure. The rules come from the CUDA 12.0 header comments (H1); the sequences shown are those printed by Listing 3, a CPU model, because this build had no GPU. <sup class="src"><a href="#F6-05-src-H1">H1</a></sup> <sup class="src"><a href="#F6-05-src-R3">R3</a></sup></figcaption></figure>
+
+<h2 id="F6-05-layer1">Layer 1 — the kid explanation</h2>
+<p>When you ask the hall to do something, the hall always answers with a little note: "done" or "not done, because…". If you never read the notes, you will not know when something went wrong, and you may carry home an empty tray and think it is the answer. So you read the note after every request.</p>
+<p>Some problems happen at the door: you asked for something impossible, and the hall refuses at once. Other problems happen inside, while the helpers are working: one of them reaches for a shelf that does not exist. You do not hear about that straight away, because you were not waiting at the door; you hear about it the next time you ask the hall anything. And some mistakes are so bad that the hall closes for the day: every later request gets the same "closed" note. For the mistakes that leave no note at all (a helper writing on the wrong shelf without being caught), you invite an inspector who follows every helper and writes down each wrong move.</p>
+
+<h2 id="F6-05-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-05-l2-codes">Every call returns an error code</h3>
+<p>Nearly every CUDA runtime function returns a <code>cudaError_t</code>. <code>cudaSuccess</code> means it worked; anything else has a name such as <code>cudaErrorNoDevice</code> and a one-line description you can print with <code>cudaGetErrorName</code> and <code>cudaGetErrorString</code>. <sup class="src"><a href="#F6-05-src-H1">H1</a></sup> Ignoring the returned value is legal C++, and the compiler does not warn, which is exactly why unchecked programs are common. The fix is mechanical: wrap every call. Listing 1 is the helper this course uses from here on. The macro <code>CUDA_CHECK(call)</code> passes the call's result, the call's own text (<code>#call</code>), the file and the line to a function that prints all four and stops the program. A failed run then says precisely where it failed: in this build, Listing 2 printed <code>scale.cu:19: cudaMalloc(&amp;d, n * sizeof(float)) failed: cudaErrorNoDevice (no CUDA-capable device is detected)</code>. <sup class="src"><a href="#F6-05-src-R2">R2</a></sup> Compare that with "the answer is zero".</p>
+<h3 id="F6-05-l2-launch">A launch has no return value</h3>
+<p><code>kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(args)</code> is not a function call that returns an error code. The runtime records a launch failure as the "last error", which you read with <code>cudaGetLastError()</code> immediately after the launch. <sup class="src"><a href="#F6-05-src-H1">H1</a></sup> A launch that asks for more threads per block than the device allows, or more shared memory, fails this way with <code>cudaErrorInvalidConfiguration</code>, and the kernel does not run at all. <sup class="src"><a href="#F6-05-src-H1">H1</a></sup> Kofi's 2,048 threads per block is such a request on every NVIDIA GPU this author knows of, whose limit is 1,024; check <code>maxThreadsPerBlock</code> in your device report (<a href="#F6-07">F6-07</a>). On TG-1, the university's teaching GPU, the limit is 512. <code>cudaGetLastError</code> also <i>resets</i> the last error to success; <code>cudaPeekAtLastError</code> returns it without resetting. <sup class="src"><a href="#F6-05-src-H1">H1</a></sup> Listing 3's part 3 shows the difference on the TG-1 model: peek, peek, get all report the error; the second get reports success. <sup class="src"><a href="#F6-05-src-R3">R3</a></sup></p>
+<h3 id="F6-05-l2-async">Errors inside a kernel arrive later</h3>
+<p>The launch returns as soon as the work is queued (<a href="#F6-01">F6-01</a>). If a thread then writes to an address that does not belong to the program, the GPU detects it while the host is already doing something else. The host learns about it from the next call that waits for the GPU or otherwise talks to it, for example <code>cudaDeviceSynchronize</code> or the next <code>cudaMemcpy</code>, and the error is reported there, not at the launch. <sup class="src"><a href="#F6-05-src-D1">D1</a></sup> The header describes two such errors, <code>cudaErrorIllegalAddress</code> ("The device encountered a load or store instruction on an invalid memory address") and <code>cudaErrorLaunchFailure</code> ("An exception occurred on the device while executing a kernel"), and adds for both: "any further CUDA work will return the same error. To continue using CUDA, the process must be terminated and relaunched." <sup class="src"><a href="#F6-05-src-H1">H1</a></sup> So the line number in the error message points at the call that <i>noticed</i> the error, not at the kernel that caused it. In a debug build, Listing 1's <code>CUDA_CHECK_LAUNCH()</code> with <code>CU201_DEBUG_SYNC</code> defined synchronizes after every launch, so the error is noticed right after the guilty kernel. That costs speed (the host waits every time), which is why it is a debug option and not the default.</p>
+<h3 id="F6-05-l2-san">When no error code appears: Compute Sanitizer</h3>
+<p>Not every bug produces an error code. A thread that writes one element past the end of an array often lands in memory the program owns anyway (another allocation, padding), so nothing is detected and some other value is silently overwritten. Compute Sanitizer runs the program under supervision and checks every access. Its help lists four tools: <code>memcheck</code> ("Memory access checking", the default), <code>racecheck</code> ("Shared memory hazard checking"), <code>synccheck</code> ("Synchronization checking") and <code>initcheck</code> ("Global memory initialization checking"). <sup class="src"><a href="#F6-05-src-R5">R5</a></sup> Listing 4 is a kernel without its bounds check: 1,024 threads write into 1,000 elements. Under <code>compute-sanitizer --tool memcheck</code> the expected report is an invalid write for each of the 24 extra threads, naming the kernel and, because the program was built with <code>-lineinfo</code>, the source line. In this build the tool could not run: it printed <code>Unable to find injection library libsanitizer-collection.so</code> and exited with status 13. <sup class="src"><a href="#F6-05-src-R4">R4</a></sup> E1 requires that the sanitizer "reports no errors" on your E1 programs; that has to be checked on the lab GPU. <sup class="src"><a href="#F6-05-src-C1">C1</a></sup></p>
+<h3 id="F6-05-l2-compile">Errors at compile time</h3>
+<p>Some mistakes never reach the GPU. A kernel may call only functions compiled for the device. Listing 5 calls an ordinary function from a kernel; nvcc refuses with <code>calling a __host__ function("twice(int)") from a __global__ function("useTwice") is not allowed</code>. <sup class="src"><a href="#F6-05-src-R6">R6</a></sup> Marking the function <code>__host__ __device__</code> compiles it for both sides. Compile errors are the cheapest errors; this course compiles with <code>-Werror all-warnings</code> so that warnings are treated the same way.</p>
+
+<h2 id="F6-05-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: the logbook has one "last line" per helper thread of yours, and some entries close the hall for good. The engineering consequences:</p>
+<ul>
+<li><b>Last error is per host thread.</b> The header: <code>cudaGetLastError</code> "Returns the last error that has been produced by any of the runtime calls in the same instance of the CUDA Runtime library in the host thread". A launch error in one host thread is not seen by another thread's check; and a library that links its own copy of the runtime statically has its own last error ("Multiple instances of the CUDA Runtime library can be present"). <sup class="src"><a href="#F6-05-src-H1">H1</a></sup></li>
+<li><b>Sticky errors end the process.</b> After <code>cudaErrorIllegalAddress</code> or <code>cudaErrorLaunchFailure</code>, the only recovery is to restart the process (H1). A test harness that runs many kernels should therefore run each risky test in its own process, or stop at the first sticky error and say so.</li>
+<li><b>Exiting from the check is a choice.</b> Listing 1 calls <code>std::exit</code>. That is right for labs and tools. A library must instead return or throw the error to its caller (<a href="#F2-16">F2-16</a>); the harness of <a href="#F6-06">F6-06</a> keeps the exit for simplicity and says so.</li>
+<li><b>The sanitizer slows the program</b> and changes its timing, so never time under it. It also cannot see bugs on code paths your test does not execute: run it on the same sizes as your correctness tests, including the odd ones.</li>
+<li><b>Debuggers.</b> <code>cuda-gdb</code> lets you stop inside a kernel and inspect one thread's variables. It is outside CU201's labs; this build did not try it.</li>
+<li><b>HIP</b> follows the same pattern with <code>hipError_t</code>, <code>hipGetLastError</code> and <code>hipGetErrorName</code>, declared in the HIP 5.7 header read in this build (H2); <a href="#F6-06">F6-06</a>'s HIP slot uses them.</li>
+</ul>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Two statements in this chapter come from memory, not from a source opened or a run made in this build: (1) the limit of 1,024 threads per block on current NVIDIA GPUs (read <code>maxThreadsPerBlock</code> in your device report); (2) the exact format of Compute Sanitizer's report for an out-of-bounds write (24 errors, kernel name and line with <code>-lineinfo</code>). Check (1) with <a href="#F6-07">F6-07</a>'s device report and (2) by running step 3 of the lab on a GPU with a working Compute Sanitizer.</p></div>
+
+<h2 id="F6-05-hardware">How the hardware actually does it</h2>
+<p>A launch passes through two checks. On the host, the runtime and driver compare the execution configuration with the device's limits (threads per block, shared memory per block, grid size) before anything is sent; a request that "can never be satisfied by the current device" is refused there (H1). This is why a configuration error appears at <code>cudaGetLastError</code> right after the launch. If it passes, the launch is queued for the GPU and the host continues.</p>
+<p>On the GPU, every load and store goes through address translation: device memory, like host memory, is accessed through page tables. An address that maps to nothing raises a fault, which stops the kernel; the driver records it and reports it to the next runtime call that checks the GPU's state. <sup class="src"><a href="#F6-05-src-D3">D3</a></sup> An address that is wrong but still maps to memory the program owns (the next allocation, or padding after an array) raises nothing; only a tool that knows the size of every allocation, like memcheck, can call it an error. That is the reason the sanitizer exists: hardware protection works at page granularity, not at array granularity.</p>
+<div class="co note"><span class="lbl">Note</span><p>The page-table explanation above is a model consistent with the header's description of <code>cudaErrorIllegalAddress</code> and with how host virtual memory works (<a href="#HW203">HW203</a>); this build did not open a source that describes the GPU's memory management unit, and the details differ by GPU generation (D3).</p></div>
+
+<h2 id="F6-05-worked">Worked example</h2>
+<p><b>Task.</b> Using the TG-1 model (Listing 3), predict and then confirm what each call returns in this sequence: a kernel without bounds check is launched with 4 blocks of 256 threads for an array of 1,000 elements; then <code>cudaGetLastError</code>; then <code>cudaDeviceSynchronize</code>; then a copy; then another launch.</p>
+<ol>
+<li><b>Launch.</b> 256 threads per block is within TG-1's 512, and no shared memory is requested, so the configuration is valid: <code>cudaSuccess</code>.</li>
+<li><b>Get last error.</b> The launch was accepted, and the kernel's fault has not been reported yet: <code>cudaSuccess</code>. (A check here is not enough.)</li>
+<li><b>Synchronize.</b> 4 × 256 = 1,024 threads; threads 1,000 to 1,023 write out of range; the fault is reported now: <code>cudaErrorIllegalAddress</code>.</li>
+<li><b>Copy and next launch.</b> The error is sticky: both return <code>cudaErrorIllegalAddress</code>.</li>
+<li><b>Confirm.</b> Listing 3's part 4 prints exactly this sequence. <sup class="src"><a href="#F6-05-src-R3">R3</a></sup> On a real GPU, as the model's comment says, an out-of-range write can also land in memory the program owns and raise nothing; the model always faults, which is the case the header describes.</li>
+</ol>
+
+<h2 id="F6-05-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>cuda_check.h</code>: the checking helpers used by every later CU201 listing.</p>
+<pre class="listing" data-src="F6-05/cuda_check.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>7–14</td><td><code>cudaCheck(err, call, file, line)</code></td><td>Prints file, line, call text, error name and description to <code>stderr</code>; exits.</td><td>One place for the format; <code>stderr</code> is not buffered, so the message appears even if the program dies next (<a href="#F6-07">F6-07</a>).</td></tr>
+<tr><td>17</td><td><code>#define CUDA_CHECK(call)</code></td><td><code>#call</code> turns the call into a string; <code>__FILE__</code>, <code>__LINE__</code> name the place.</td><td>A macro is needed: a function cannot see the caller's line or the text of its argument.</td></tr>
+<tr><td>21–26</td><td><code>CU201_DEBUG_SYNC</code> version</td><td>Checks the last error, then synchronizes and checks again.</td><td>Kernel errors are reported right after the kernel that caused them.</td></tr>
+<tr><td>28</td><td>default version</td><td>Checks the last error only.</td><td>Catches launch errors without making the host wait.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>scale.cu</code>: a small program that checks every call.</p>
+<pre class="listing" data-src="F6-05/scale.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings scale.cu -o scale</code>.</p>
+<pre class="output" data-run="F6-05/scale"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The run above is real; the first call failed because the container has no GPU (R2). On a GPU the expected output is <code>h[0] = 6.0, h[999] = 6.0</code> with exit status 0. Note what the message gives you: file, line and the call's own text.</p></div>
+<p>Lines 19, 20, 23 and 24 wrap each runtime call; line 22 checks the launch of line 21. Line 26 makes the exit status depend on the result, so a script can test it.</p>
+
+<p><b>Listing 3</b> — <code>launch_model.cpp</code>: a CPU model of TG-1's error reporting (not CUDA; it follows the header rules quoted in Layer 2).</p>
+<pre class="listing" data-src="F6-05/launch_model.cpp"></pre>
+<pre class="output" data-run="F6-05/launch_model"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>29–30</td><td>TG-1 limits</td><td>512 threads and 32 KiB shared memory per block.</td><td>Invented teaching values (TG-1); read your GPU's in <a href="#F6-07">F6-07</a>.</td></tr>
+<tr><td>37–41</td><td>refusal</td><td>Sticky error first; then a configuration check; nothing runs if it fails.</td><td>Rule 1: a refused launch does no work.</td></tr>
+<tr><td>42–46</td><td>run, detect, accept</td><td>Out-of-range thread sets a <i>pending</i> fault; the launch still returns success.</td><td>Rule 3: the fault is not visible at launch.</td></tr>
+<tr><td>48–53</td><td><code>synchronize</code>, <code>copy</code></td><td>The pending fault becomes sticky and is returned by every later call.</td><td>"any further CUDA work will return the same error" (H1).</td></tr>
+<tr><td>54–55</td><td>get versus peek</td><td>Get resets the last error; peek does not.</td><td>Rule 2.</td></tr>
+<tr><td>64–79</td><td><code>kofi</code></td><td>The forensic program on the model, with or without a check.</td><td>Same zeros either way; only the check explains them.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>oob.cu</code>: a kernel without its bounds check, for Compute Sanitizer.</p>
+<pre class="listing" data-src="F6-05/oob.cu"></pre>
+<pre class="output" data-run="F6-05/oob"></pre>
+<p><b>Tool run</b> — Compute Sanitizer's memcheck on Listing 4, attempted in this build (exit status 13, recorded as is):</p>
+<pre class="output" data-run="F6-05/sanitizer"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The sanitizer could not start in the build container (no injection library, no GPU; R4). The expected result on a GPU, an "Invalid __global__ write of size 4" report for each out-of-range thread with the kernel name and <code>oob.cu:9</code>, is stated from memory of the tool's output format and must be confirmed in step 3 of the lab.</p></div>
+<p><b>Tool run</b> — the sanitizer's own list of tools and two options used in the lab:</p>
+<pre class="output" data-run="F6-05/sanitizer_help"></pre>
+<p><b>Tool run</b> — the CUDA 12.0 header's own words for the error codes of this chapter:</p>
+<pre class="output" data-run="F6-05/header"></pre>
+
+<p><b>Listing 5</b> — <code>host_call.cu</code>: does not compile, on purpose.</p>
+<pre class="listing" data-src="F6-05/host_call.cu"></pre>
+<pre class="output" data-run="F6-05/host_call"></pre>
+<p>Expected failure: both errors point at line 10. Adding <code>__host__ __device__</code> before <code>int twice(int x)</code> on line 3 fixes it.</p>
+
+<h2 id="F6-05-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A door-keeper would shout; the runtime only writes.</b> Nothing interrupts your program when a launch is refused; the error waits until you ask (<a href="#F6-05-l2-launch">Layer 2</a>).</li>
+<li><b>A real kitchen's "closed for the day" ends at midnight; a sticky CUDA error ends only with the process.</b> No call reopens the hall (H1).</li>
+<li><b>An inspector in a kitchen does not slow the cooks much; Compute Sanitizer slows the program a lot</b> and must never be used while timing.</li>
+<li><b>A wrong shelf in the kitchen is always noticed by someone; on the GPU an out-of-bounds write to memory the program owns is noticed by nobody</b> unless a tool checks every access.</li>
+</ul>
+
+<h2 id="F6-05-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Output all zeros (or unchanged input)</td><td>Launch refused, error not checked</td><td>Add <code>CUDA_CHECK_LAUNCH()</code></td><td>Valid configuration (block size within <code>maxThreadsPerBlock</code>)</td></tr>
+<tr><td>Error reported at a <code>cudaMemcpy</code> that looks correct</td><td>An earlier kernel faulted (asynchronous error)</td><td>Rebuild with <code>-DCU201_DEBUG_SYNC</code></td><td>Fix the kernel the debug build points at</td></tr>
+<tr><td>Every call fails after one error</td><td>Sticky error</td><td>Look for the first error in the log</td><td>Restart the process; fix the first error</td></tr>
+<tr><td>Results slightly wrong at the end of an array, no error</td><td>Out-of-bounds write into owned memory</td><td><code>compute-sanitizer --tool memcheck</code></td><td>Bounds check <code>if (i &lt; n)</code></td></tr>
+<tr><td>Check reports success, kernel still not run</td><td>Checked the wrong thing (for example only <code>cudaDeviceSynchronize</code> of a different stream, or a check before the launch)</td><td>Read the order of calls</td><td>Check immediately after each launch</td></tr>
+<tr><td>Error says the wrong file or line</td><td>Check written as a function, not a macro</td><td>Look at the helper</td><td>Use <code>__FILE__</code>/<code>__LINE__</code> in a macro (Listing 1)</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-05-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F2-16">F2-16</a>: error handling with return codes and exceptions; <a href="#F2-29">F2-29</a>: AddressSanitizer and UndefinedBehaviorSanitizer on the CPU; <a href="#F6-04">F6-04</a>: your first checked kernels. <b>What carries over:</b> a return code must be read to be useful; a sanitizer finds memory bugs that produce no error by themselves; the habit of making the failure point to file and line. <b>What changes:</b> CUDA reports errors with return codes, not exceptions; a launch returns nothing, so its error must be fetched with <code>cudaGetLastError</code>; errors inside a kernel arrive later, at another call; some errors are sticky and end the process (H1); and the CPU sanitizers of <a href="#F2-29">F2-29</a> cannot see device memory: Compute Sanitizer is a separate tool. <b>What comes next:</b> <a href="#F6-06">F6-06</a> uses these checks inside the course's benchmark harness and asks the next question: how long did the kernel take, really?</p></div>
+
+<h2 id="F6-05-check">Check yourself</h2>
+<ol>
+<li>Why must <code>CUDA_CHECK</code> be a macro rather than a function?</li>
+<li>Which call reports a launch configuration error, and which reports an illegal address inside the kernel? Why are they different?</li>
+<li>Which is true? (a) <code>cudaPeekAtLastError</code> resets the last error. (b) After <code>cudaErrorIllegalAddress</code>, a new <code>cudaMalloc</code> may succeed. (c) A refused launch runs no thread. (d) <code>cudaGetLastError</code> waits for the kernel to finish.</li>
+<li>Predict Listing 3's output if line 70 used 512 threads instead of 2,048. Explain.</li>
+<li>Explain why an out-of-bounds write may produce no error code at all, and which tool finds it.</li>
+<li>Apply: a program reports <code>cudaErrorIllegalAddress</code> at a <code>cudaMemcpy</code> on line 80; three different kernels were launched before it. Describe the steps to find the guilty kernel.</li>
+<li>Why should <code>CU201_DEBUG_SYNC</code> not be defined in a benchmark build?</li>
+<li>Listing 5 fails to compile. Give the smallest change that makes it compile, and explain what it changes.</li>
+</ol>
+
+<h2 id="F6-05-lab">Lab</h2>
+<p><b>Goal.</b> Make every E1 program check every call, and pass the third E1 acceptance test: "Compute Sanitizer (or the ROCm address sanitizer support) reports no errors." <sup class="src"><a href="#F6-05-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> An NVIDIA GPU with a CUDA Toolkit, driver and a working <code>compute-sanitizer</code> (record versions; this build: <code>Version 2022.4.1</code>, not usable without a GPU), or a cloud GPU. Steps 1 and 5 need no GPU. Folder <code>university/labs/F6-05</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-05</code>. Read <code>launch_model.out</code>, <code>header.out</code> and <code>host_call.out</code>.</li>
+<li>On a GPU, read <code>scale.out</code> (expected <code>h[0] = 6.0, h[999] = 6.0</code>) and <code>oob.out</code>. Did <code>oob</code> report an error? Write down what happened.</li>
+<li>Run <code>compute-sanitizer --tool memcheck ./oob</code>. Count the reported errors and note the line it names.</li>
+<li>Add <code>if (i &lt; n)</code> to Listing 4 (pass <code>n</code> as an argument) and rerun the sanitizer: it must report no errors.</li>
+<li>Change Listing 2's block size to 2,048, rebuild and rerun; then rebuild with <code>-DCU201_DEBUG_SYNC</code>. Record both messages.</li>
+<li>Run the sanitizer on <a href="#F6-04">F6-04</a>'s Listing 2 (SAXPY) with <code>--leak-check full</code>; it must report no errors.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: <code>oob</code> may well print <code>finished</code> without any error, because the 24 extra writes land inside the allocation's padding (to be observed, not assumed). Step 3: memcheck reports the invalid writes. Step 4: zero errors. Step 5: <code>scale.cu:22: cudaGetLastError() failed: cudaErrorInvalidConfiguration …</code> in both builds. Step 6: zero errors, zero leaks.</p>
+<p><b>Verification.</b> E1's sanitizer test passes on SAXPY (step 6) and on Listing 4 after the fix (step 4).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"Unable to find injection library" → the sanitizer installation is incomplete (as in this build) → install the full CUDA Toolkit for your driver, then retry.</li>
+<li>Sanitizer reports errors in a program you think is correct → read the first report only; later ones are often consequences.</li>
+<li>Program much slower under the sanitizer → expected; reduce the size for this test, keeping odd sizes.</li>
+</ul>
+<p><b>Extension.</b> Write a <code>racecheck</code> test: a kernel in which every thread of a block writes <code>tile[0]</code> in shared memory and then reads it without <code>__syncthreads</code>. Record what racecheck reports.</p>
+
+<h2 id="F6-05-forensic">Forensic lab</h2>
+<p><b>The kernel that silently did nothing.</b> Kofi's program squares 65,536 numbers. After he changed the block size "for speed", every output is 0. His program has no error checks. No GPU is needed: the evidence below comes from this build.</p>
+<p><b>Evidence pack.</b> (1) Kofi's program as he wrote it:</p>
+<pre class="listing" data-src="F6-05/silent.cu"></pre>
+<p>(2) Its real output in this build:</p>
+<pre class="output" data-run="F6-05/silent"></pre>
+<p>(3) The same program on the TG-1 model, without and with one check after the launch (Listing 3, parts 1 and 2, output above). (4) The header comment for <code>cudaErrorInvalidConfiguration</code> (tool run "header" above).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what exactly does the output say, and what does the exit status of the run say (see the run log)?</li>
+<li>Hypotheses: list at least three explanations for all-zero output. Which can you rule out from the source alone?</li>
+<li>Root cause: which line causes the failure, and which error code does the added check report on the model? Why is the output zero and not random?</li>
+<li>Careful: this build's real run printed zeros too. Was that for the same reason? What would Kofi's program have to do so that the two reasons could be told apart?</li>
+<li>Fix and prevention: give the fix, and the rule that would have caught it immediately.</li>
+</ol>
+<p><b>Method hints.</b> All zeros means "nothing was written", not "the computation gave zero": what was the output vector's content before the kernel? Find the first place where the program could have learned something and did not ask.</p>
+
+<h2 id="F6-05-project">Mini-project</h2>
+<p><b>A checked, debuggable back end.</b> Add Listing 1 to your harness (from <a href="#F6-04">F6-04</a>'s mini-project) and give it a command-line switch for "debug synchronize after every launch", plus a script that runs the whole test set under <code>compute-sanitizer</code> and fails if any error is reported.</p>
+<p><b>Rubric.</b> Every runtime call and launch checked; a reviewer finds none unchecked (4). Debug switch works and is off by default; the reason is written in a comment (2). Sanitizer script runs the same sizes as the correctness tests and returns a non-zero status on any report (3). A short note on the sticky-error policy of the harness (1).</p>
+
+<h2 id="F6-05-summary">Summary</h2>
+<ul>
+<li>Every CUDA runtime call returns a <code>cudaError_t</code>; check every one, with file, line and call text (Listing 1).</li>
+<li>A launch returns nothing; read its error with <code>cudaGetLastError</code> right after it. An invalid configuration runs no thread at all.</li>
+<li>Errors inside a kernel arrive at a later call; <code>cudaErrorIllegalAddress</code> and <code>cudaErrorLaunchFailure</code> are sticky and end the process's use of CUDA (H1).</li>
+<li>In debug builds synchronize after every launch to find the guilty kernel; never in benchmarks.</li>
+<li>Out-of-bounds accesses into owned memory raise nothing; Compute Sanitizer's memcheck finds them. E1 requires a clean sanitizer run.</li>
+<li>"All zeros" usually means "nothing ran"; the first missing check is the first suspect.</li>
+</ul>
+
+<h2 id="F6-05-sources">Sources</h2>
+<ol>
+<li id="F6-05-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1; title per the guide's registry: "CUDA Programming Guide", version 13.x): programming interface, error checking; asynchronous execution. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-05-src-D2">D2 — NVIDIA, "CUDA Runtime API" reference (tier 1): Error Handling (<code>cudaGetErrorName</code>, <code>cudaGetErrorString</code>); the same functions' header comments were read instead (H1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-05-src-D3">D3 — NVIDIA, "Compute Sanitizer" documentation (tier 1): memcheck, racecheck, synccheck, initcheck, report format; and NVIDIA's "CUDA-GDB" documentation. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-05-src-H1">H1 — CUDA 12.0 headers as installed (Ubuntu package nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>driver_types.h</code> (comments of <code>cudaErrorInvalidConfiguration</code>, <code>cudaErrorIllegalAddress</code>, <code>cudaErrorLaunchFailure</code>, <code>cudaErrorNoDevice</code>, recorded in <code>university/labs/F6-05/header.log</code>) and <code>cuda_runtime_api.h</code> (comments of <code>cudaGetLastError</code>, which returns the last error "in the host thread and resets it to ::cudaSuccess", and <code>cudaPeekAtLastError</code>, which "does not reset the error"). Tier 1.</li>
+<li id="F6-05-src-H2">H2 — HIP 5.7 header <code>hip_runtime_api.h</code> as installed, read in this build: <code>hipError_t</code>, <code>hipGetLastError</code>, <code>hipGetErrorName</code>. Tier 1.</li>
+<li id="F6-05-src-C1">C1 — Systems Curriculum (this project), milestone E1 (acceptance test quoted verbatim). A map, not a source (AH-4).</li>
+<li id="F6-05-src-R2">R2 — build and run of Listing 2 (<code>scale.log</code>), CUDA 12.0; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+<li id="F6-05-src-R3">R3 — run of Listing 3 (<code>launch_model.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with sanitizers, exit code 0. A model, not a GPU.</li>
+<li id="F6-05-src-R4">R4 — Compute Sanitizer 2022.4.1 on Listing 4 (<code>sanitizer.log</code>); untested on hardware, exit code 13 (injection library missing).</li>
+<li id="F6-05-src-R5">R5 — <code>compute-sanitizer --help</code> excerpt (<code>sanitizer_help.log</code>), version 2022.4.1.</li>
+<li id="F6-05-src-R6">R6 — compile of Listing 5 (<code>host_call.log</code>), CUDA 12.0; failed as expected.</li>
+<li id="F6-05-src-R7">R7 — build and run of the forensic program (<code>silent.log</code>), CUDA 12.0; untested on hardware, exit code 0 (no check, so the missing device went unnoticed).</li>
+</ol>
+
+<h2 id="F6-05-glossary">Glossary links</h2>
+<p><a href="#gl-error-code-cudaerror-t">Error code (cudaError_t)</a> · <a href="#gl-launch-error">Launch error</a> · <a href="#gl-asynchronous-error">Asynchronous error</a> · <a href="#gl-sticky-error">Sticky error</a> · <a href="#gl-compute-sanitizer">Compute Sanitizer</a> · <a href="#gl-sanitizer">Sanitizer</a> · <a href="#gl-launch-execution-configuration">Launch (execution configuration)</a> · <a href="#gl-bounds-check">Bounds check</a></p>
+
+<h2 id="F6-05-next">Next chapter</h2>
+<p>Next: <a href="#F6-06">F6-06 Measuring time correctly: events, warm-up, median of many runs</a>. Previous: <a href="#F6-04">F6-04</a>. Back to the course: <a href="#CU201">CU201</a>.</p>
+
+<h2 id="F6-05-answers">Answers to Check yourself</h2>
+<ol>
+<li>Only a macro is expanded at the place of use, so <code>__FILE__</code> and <code>__LINE__</code> name the caller's file and line, and <code>#call</code> can turn the argument's source text into a string. A function sees only the value.</li>
+<li><code>cudaGetLastError</code> (or <code>cudaPeekAtLastError</code>) right after the launch reports the configuration error; a later synchronizing call such as <code>cudaDeviceSynchronize</code> (or the next copy) reports the illegal address. The configuration is checked before the kernel is sent; the illegal access happens while it runs, after the launch has returned.</li>
+<li>(c). (a) is false: peek does not reset. (b) is false: the error is sticky (H1). (d) is false: it does not wait.</li>
+<li>512 is within TG-1's limit, so the launch runs: out[1] = 0.25, out[2] = 1.00 and the sum is non-zero (the sum of (0.5·i)<sup>2</sup>); with the check, <code>cudaSuccess</code>.</li>
+<li>Hardware protection works on pages, not arrays: a write slightly past an array often lands in memory the program owns, so nothing faults. Compute Sanitizer's memcheck knows each allocation's size and reports it.</li>
+<li>Rebuild with <code>-DCU201_DEBUG_SYNC</code> so each launch is followed by a synchronize and check; the first failing check names the line after the guilty launch. Then run that program under memcheck to find the thread and line inside the kernel.</li>
+<li>It makes the host wait after every launch, which changes what is measured (no overlap of host work and kernels) and adds the synchronization cost to every launch.</li>
+<li>Write <code>__host__ __device__ int twice(int x)</code>: nvcc then compiles the function for both host and device, so the kernel may call it.</li>
+</ol>
+<h3 id="F6-05-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> <code>out[1] = 0.00, out[2] = 0.00, sum of all outputs = 0.00</code>; exit code 0, so a script would count it as a success (R7).</p>
+<p><b>Hypotheses.</b> (a) The kernel computes wrong values: ruled out by reading line 11 (squares are not zero for non-zero inputs). (b) The input was not copied: possible, unchecked. (c) The kernel did not run: possible, unchecked. (d) The result was not copied back: possible, unchecked. Every hypothesis except (a) involves an unchecked call.</p>
+<p><b>Root cause.</b> Line 25: 2,048 threads per block exceeds the device's limit, the launch on line 26 is refused with <code>cudaErrorInvalidConfiguration</code> (shown by the model with the check, R3; meaning from H1), no thread runs, and line 27 copies back <code>dOut</code>'s unwritten content. Zero, not random, is consistent with fresh device memory reading as zero, but CUDA does not promise that: never rely on it.</p>
+<p><b>Careful.</b> No: in this build the first <code>cudaMalloc</code> already failed with <code>cudaErrorNoDevice</code>, every later call failed too, and <code>hOut</code> kept its initial zeros. Two different causes give the same symptom; only checks tell them apart. With <code>CUDA_CHECK</code> on every call, this build would stop at line 22 with <code>cudaErrorNoDevice</code>, and the lab GPU would stop after line 26 with <code>cudaErrorInvalidConfiguration</code>.</p>
+<p><b>Fix and prevention.</b> Use 256 threads per block (or any size within <code>maxThreadsPerBlock</code>); check every call and every launch (Listing 1); make the program verify at least one known output and return a non-zero status otherwise. <b>How the evidence was produced:</b> the real program was compiled and run in this build (no GPU); the launch refusal is reproduced on the TG-1 model; the GPU behaviour is predicted from the header, not measured.</p>

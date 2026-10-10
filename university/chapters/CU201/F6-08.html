@@ -1,0 +1,265 @@
+<!--meta
+id: F6-08
+title: Coalescing: fetching neighbouring jars in one trip
+course: CU201
+level: L2
+prereqs: F6-02; F6-03; F6-06; HW203 (F1-33 caches and cache lines); HW301 in parallel (F1-59)
+time: 4–6 hours including the lab
+hardware: Running Listing 2 and the profiler needs an NVIDIA GPU with toolkit, driver and Nsight Compute (record versions), or a cloud GPU; Listing 1 (the coalescing model), the SASS reading and the forensic lab need only g++ and nvcc (this build had no GPU and no profiler output)
+maps: Curriculum E2 (copy kernels with strided and offset variants; "A chart (in the log) of bandwidth vs stride and vs offset, explained with the profiler's memory-transaction metrics"); 13.2 topic 2 (coalescing); guide 9.2 required diagram "coalesced vs uncoalesced warp access"; forensic "Slow by stride"
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-08-hook">Story hook</h2>
+<p>In the great kitchen hall, a row of 32 helpers needs one jar each from the big far pantry. The pantry has a rule: a runner fetches whole shelf sections, never single jars. One section holds eight jars standing side by side. If the 32 helpers need jars 0, 1, 2, … 31, the runner fetches four sections in four quick grabs and every jar carried is used. Neighbouring jars, one trip.</p>
+<p>Now the recipe changes: helper 0 needs jar 0, helper 1 needs jar 8, helper 2 needs jar 16, and so on. Each helper's jar sits in a different section. The runner must fetch 32 sections, 256 jars, to deliver 32 of them; seven of every eight jars carried are put straight back. The row waits eight times as long for the same work. Nobody in the row did anything wrong; the recipe asked for jars that are far apart. This chapter is about writing recipes whose rows ask for neighbouring jars.</p>
+
+<h2 id="F6-08-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> coalescing: how the addresses of one warp's load become a number of memory segments, and why that number sets the kernel's speed.</li>
+<li><b>Compute</b> with a model the segments and efficiency of strided, offset, array-of-structures and vector accesses.</li>
+<li><b>Write</b> and time strided and offset copy kernels for E2 and predict their bandwidth from the model.</li>
+<li><b>Restructure</b> data (structure of arrays) and index mapping so that consecutive threads read consecutive addresses.</li>
+<li><b>Diagnose</b> "slow by stride" with the profiler's memory metrics.</li>
+</ul>
+
+<div class="co jargon" id="F6-08-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Coalesced access</dt><dd><b>Simple words:</b> the threads of a warp reading neighbouring addresses, so the hardware can serve them with few, full memory transfers. <b>Analogy:</b> the row needs neighbouring jars, fetched in one trip per section. <b>Precise:</b> the device combines the global loads or stores of a warp's threads into as few memory transactions as their addresses allow (paraphrase; the exact rules are in D1); efficiency is the ratio of bytes requested to bytes moved. <sup class="src"><a href="#F6-08-src-D1">D1</a></sup></dd>
+<dt>Memory segment (sector)</dt><dd><b>Simple words:</b> the smallest aligned block of bytes the memory system moves at a time. <b>Analogy:</b> a shelf section of eight jars, always fetched whole. <b>Precise:</b> in this course's TG-1 model, an aligned 32-byte unit; NVIDIA calls 32-byte units "sectors" and caches in 128-byte lines on many generations (from memory; check D1, D2). <sup class="src"><a href="#F6-08-src-D2">D2</a></sup></dd>
+<dt>Stride</dt><dd><b>Simple words:</b> the distance, in elements, between what thread <i>t</i> and thread <i>t</i>+1 read. <b>Analogy:</b> helper 1's jar is 8 jars along from helper 0's. <b>Precise:</b> thread <i>t</i> reads element offset + <i>t</i> × stride; stride 1 is the coalesced case. (Defined in <a href="#HW203">HW203</a>.)</dd>
+<dt>Memory efficiency</dt><dd><b>Simple words:</b> what fraction of the bytes moved were actually wanted. <b>Analogy:</b> jars used ÷ jars carried. <b>Precise:</b> bytes requested by the warp ÷ (segments touched × segment size); Listing 1's last column. A profiler reports related ratios from hardware counters.</dd>
+<dt>Structure of arrays (SoA)</dt><dd><b>Simple words:</b> storing each field in its own array (all x together, all y together) instead of one array of records. <b>Analogy:</b> one shelf of all the salt, one of all the pepper, instead of a box per dish holding one of each. <b>Precise:</b> the layout <code>struct { float x[N], y[N], z[N]; }</code> versus array of structures (AoS) <code>struct { float x, y, z; } p[N]</code>; with SoA, thread <i>t</i> reading <code>x[t]</code> is stride 1. <sup class="src"><a href="#F6-08-src-D3">D3</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-08-pictures">The idea in pictures</h2>
+<p>Figure 1 is the required picture: one warp's addresses, coalesced (top) and uncoalesced (bottom), on TG-1's 32-byte segments.</p>
+<figure id="F6-08-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-08-f1t F6-08-f1d">
+<title id="F6-08-f1t">Figure 1: coalesced versus uncoalesced warp access on 32-byte segments</title>
+<desc id="F6-08-f1d">Top: 32 threads of a warp, numbered 0 to 31, each with an arrow to a 4-byte float in memory. With stride 1 the floats are consecutive and fill exactly four 32-byte segments, shaded, all bytes used: 128 bytes requested, 128 moved, 100 percent. Bottom: the same warp with stride 8; thread t reads float 8t, so each thread's float lies in its own 32-byte segment; 32 segments are moved, 1024 bytes, of which only the first float of each is used: 128 bytes requested, 12.5 percent. Only the first threads are drawn in detail; the rest are indicated by dots.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="10" y="20">Coalesced: stride 1 — thread t reads float t</text>
+<text class="sv-ts" x="10" y="44">warp</text>
+<g><rect class="sv-b1" x="60" y="30" width="20" height="18"/><rect class="sv-b1" x="80" y="30" width="20" height="18"/><rect class="sv-b1" x="100" y="30" width="20" height="18"/><rect class="sv-b1" x="120" y="30" width="20" height="18"/><rect class="sv-b1" x="140" y="30" width="20" height="18"/><rect class="sv-b1" x="160" y="30" width="20" height="18"/><rect class="sv-b1" x="180" y="30" width="20" height="18"/><rect class="sv-b1" x="200" y="30" width="20" height="18"/></g>
+<text class="sv-ts" x="66" y="43">0</text><text class="sv-ts" x="86" y="43">1</text><text class="sv-ts" x="106" y="43">2</text><text class="sv-ts" x="206" y="43">7</text><text class="sv-ts" x="230" y="43">… threads 8–31 likewise</text>
+<line class="sv-line" x1="70" y1="48" x2="70" y2="82"/><line class="sv-line" x1="90" y1="48" x2="90" y2="82"/><line class="sv-line" x1="110" y1="48" x2="110" y2="82"/><line class="sv-line" x1="210" y1="48" x2="210" y2="82"/>
+<text class="sv-ts" x="10" y="100">memory</text>
+<rect class="sv-b5" x="60" y="84" width="160" height="22"/><rect class="sv-b5" x="220" y="84" width="160" height="22"/><rect class="sv-b5" x="380" y="84" width="160" height="22"/><rect class="sv-b5" x="540" y="84" width="160" height="22"/>
+<text class="sv-ts" x="110" y="100">segment 0</text><text class="sv-ts" x="270" y="100">segment 1</text><text class="sv-ts" x="430" y="100">segment 2</text><text class="sv-ts" x="590" y="100">segment 3</text>
+<text class="sv-t" x="60" y="130">4 segments × 32 bytes = 128 bytes moved for 128 requested: 100 % (R1)</text>
+<line class="sv-dash" x1="10" y1="146" x2="750" y2="146"/>
+<text class="sv-tb" x="10" y="168">Uncoalesced: stride 8 — thread t reads float 8t</text>
+<text class="sv-ts" x="10" y="194">warp</text>
+<rect class="sv-b1" x="60" y="180" width="20" height="18"/><rect class="sv-b1" x="80" y="180" width="20" height="18"/><rect class="sv-b1" x="100" y="180" width="20" height="18"/><rect class="sv-b1" x="120" y="180" width="20" height="18"/>
+<text class="sv-ts" x="66" y="193">0</text><text class="sv-ts" x="86" y="193">1</text><text class="sv-ts" x="106" y="193">2</text><text class="sv-ts" x="126" y="193">3</text><text class="sv-ts" x="150" y="193">… 28 more threads</text>
+<line class="sv-line" x1="70" y1="198" x2="70" y2="236"/><line class="sv-line" x1="90" y1="198" x2="230" y2="236"/><line class="sv-line" x1="110" y1="198" x2="390" y2="236"/><line class="sv-line" x1="130" y1="198" x2="550" y2="236"/>
+<text class="sv-ts" x="10" y="254">memory</text>
+<rect class="sv-b8" x="60" y="238" width="160" height="22"/><rect class="sv-b8" x="220" y="238" width="160" height="22"/><rect class="sv-b8" x="380" y="238" width="160" height="22"/><rect class="sv-b8" x="540" y="238" width="160" height="22"/>
+<rect class="sv-b5" x="60" y="238" width="20" height="22"/><rect class="sv-b5" x="220" y="238" width="20" height="22"/><rect class="sv-b5" x="380" y="238" width="20" height="22"/><rect class="sv-b5" x="540" y="238" width="20" height="22"/>
+<text class="sv-ts" x="710" y="254">… ×32</text>
+<text class="sv-ts" x="90" y="276">used: 4 of 32 bytes in each segment; the rest is moved and wasted</text>
+<text class="sv-t" x="60" y="304">32 segments × 32 bytes = 1,024 bytes moved for 128 requested: 12.5 % (R1)</text>
+<text class="sv-ts" x="60" y="322">Each grey block is one 32-byte segment = 8 floats; the darker part is the float a thread asked for.</text>
+</svg></div><figcaption><b>Figure 1.</b> Coalesced versus uncoalesced warp access in the TG-1 model (32-byte segments, aligned array). Widths are to scale within each row: one float is one eighth of a segment. Numbers from Listing 1 (R1). The real segment and cache-line sizes of a given NVIDIA generation must be checked in D1/D2. <sup class="src"><a href="#F6-08-src-R1">R1</a></sup> <sup class="src"><a href="#F6-08-src-D1">D1</a></sup></figcaption></figure>
+
+<h2 id="F6-08-layer1">Layer 1 — the kid explanation</h2>
+<p>The pantry never hands out single jars: it hands out whole shelf sections. So the question for a row of helpers is not "how many jars do we need?" but "how many sections do our jars sit in?". If the 32 helpers need 32 jars standing next to each other, that is a few sections and every jar carried is used. If their jars are spread out, every helper's jar needs its own section, and the runner carries many jars nobody wanted.</p>
+<p>So you arrange two things: the shelves (put the things that are used together next to each other) and the recipe (helper number <i>t</i> takes jar number <i>t</i>, not jar number 8<i>t</i>). Then each trip is full.</p>
+
+<h2 id="F6-08-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-08-l2-warp">One instruction, 32 addresses</h3>
+<p>A warp executes a load instruction for its 32 threads together (<a href="#F6-02">F6-02</a>). The SASS of both copy kernels in this chapter contains exactly one global load, <code>LDG.E</code>, and one store, <code>STG.E</code>, per thread, whatever the stride or offset. <sup class="src"><a href="#F6-08-src-R3">R3</a></sup> The instructions are the same; what differs is the 32 addresses they produce. The memory system serves those addresses in units larger than 4 bytes: it moves whole aligned segments. <sup class="src"><a href="#F6-08-src-D1">D1</a></sup> So the cost of one warp load is set by <i>how many distinct segments the 32 addresses fall into</i>, not by how many bytes the threads want.</p>
+<h3 id="F6-08-l2-model">The model</h3>
+<p>Listing 1 is the university's teaching model for TG-1: thread <i>t</i> reads element offset + <i>t</i> × stride of an array that starts at a segment boundary; the model counts the distinct 32-byte segments touched and computes efficiency = requested ÷ moved. <sup class="src"><a href="#F6-08-src-R1">R1</a></sup> Its real output:</p>
+<ul>
+<li><b>Stride.</b> 4-byte floats: stride 1 → 4 segments, 100 %; stride 2 → 8, 50 %; stride 4 → 16, 25 %; stride 8 → 32, 12.5 %; stride 32 → still 32, 12.5 %. Once each thread's element lies in its own segment (stride ≥ 8 here), it cannot get worse in this model: 32 segments per warp load.</li>
+<li><b>Offset.</b> Starting one element late (offset 1) spreads the 128 bytes over 5 segments: 80 %. Offset 8 (exactly one segment) is aligned again: 100 %.</li>
+<li><b>Records.</b> Reading only <code>x</code> from an array of <code>{x, y, z}</code> records (AoS) is stride 3: 12 segments, 33.3 %; the same field from its own array (SoA) is 100 %.</li>
+<li><b>Vectors.</b> Each thread reading a 16-byte <code>float4</code> at stride 1 touches 16 segments for 512 bytes: 100 %, with four times the bytes per instruction (<a href="#F6-09">F6-09</a>).</li>
+<li><b>Bigger units.</b> If the unit moved were 128 bytes instead of 32, stride 1 would still be 100 %, but stride 32 would fall to 3.1 % (4,096 bytes moved for 128). The segment size decides how bad scattered access is.</li>
+</ul>
+<h3 id="F6-08-l2-speed">From efficiency to speed</h3>
+<p>For a kernel limited by memory bandwidth (a copy, SAXPY), time is roughly bytes moved ÷ bandwidth. If the moved bytes grow by 8× for the same useful work, the useful bandwidth falls to about one eighth. The model's prediction for Listing 2: the strided copy's effective bandwidth (counted from requested bytes, as the harness does) falls roughly as 100 %, 50 %, 25 %, 12.5 % of the stride-1 value for strides 1, 2, 4, 8, and stays near 12.5 % beyond; offset 1 costs about 20 % on the reads. Two cautions: the copy also <i>writes</i> 4 bytes per thread with stride 1, which stays at 100 %, so the total falls less than the reads alone; and caches can serve some of the "wasted" bytes later to a neighbouring warp, which the model ignores. Measure (E2) and compare. <sup class="src"><a href="#F6-08-src-C1">C1</a></sup></p>
+<h3 id="F6-08-l2-fix">How to get coalesced access</h3>
+<ul>
+<li>Map consecutive threads to consecutive addresses: <code>threadIdx.x</code> to the fastest-changing index of a row-major array (<a href="#F6-02">F6-02</a>).</li>
+<li>Use structures of arrays for data that kernels read field by field.</li>
+<li>Keep arrays aligned: <code>cudaMalloc</code> returns well-aligned pointers (at least 256 bytes on current GPUs, from memory, D1); offsets you add yourself can break alignment.</li>
+<li>When an algorithm must read columns (transposes, some stencils), read a tile coalesced into shared memory and read the column from there (CU301's tiled transpose).</li>
+</ul>
+
+<h2 id="F6-08-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: the pantry also keeps a small counter near the hall where recently fetched sections wait for a while, so the second row asking for the same section may not need a trip. The engineering consequences:</p>
+<ul>
+<li><b>Caches.</b> Global loads pass through the L2 cache and usually the SM's L1 (<a href="#F6-03">F6-03</a>). A stride-2 warp leaves the other half of each segment in cache, and the neighbouring warp that needs it may hit; that is why measured stride curves are often better than the model at small strides.</li>
+<li><b>Sectors and lines.</b> On many NVIDIA generations the L1 and L2 cache in lines of 128 bytes made of four 32-byte sectors, and DRAM is accessed in sectors. The TG-1 model's 32-byte segment follows that structure in simplified form (unverified box below).</li>
+<li><b>Stores.</b> Writes coalesce the same way; partial writes of a segment can cost extra work in some memory systems. Measure strided stores separately in the extension.</li>
+<li><b>Profiler metrics.</b> Nsight Compute reports, per kernel, how many requests the global loads made and how many sectors they moved, plus the bytes transferred from DRAM; sectors per request near 4 for 4-byte loads means coalesced, near 32 means one sector per thread. These are the "memory-transaction metrics" E2 asks for (C1). Look up the exact metric names for your Nsight Compute version.</li>
+<li><b>Index width.</b> <code>i * stride</code> for large <i>n</i> and stride exceeds <code>int</code>: Listing 2 computes the index in 64 bits (line 11).</li>
+</ul>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not from a source opened or a measurement made in this build: (1) the 32-byte sector and 128-byte line sizes; (2) the alignment of <code>cudaMalloc</code> pointers; (3) the profiler's "sectors per request" and its values for coalesced and scattered loads; (4) the statement that caching makes small strides cheaper than the model predicts. TG-1's 32-byte segment is a teaching proposal recorded in the course notes. Check (1)–(3) in the CUDA C++ Best Practices Guide ("Coalesced Access to Global Memory") and the Nsight Compute documentation (D1, D2, D4); check (4) with the lab's measured chart.</p></div>
+
+<h2 id="F6-08-hardware">How the hardware actually does it</h2>
+<p>When a warp executes <code>LDG.E</code>, the SM's load/store unit has 32 addresses. It groups them by the aligned units of the memory system, looks those units up in L1, sends misses to L2 and from there to DRAM, and waits until all the data for the warp has arrived before the warp can use it. <sup class="src"><a href="#F6-08-src-D2">D2</a></sup> DRAM moves data in bursts: a whole run of consecutive bytes is transferred per access (<a href="#F1-59">F1-59</a>, <a href="#F1-33">F1-33</a>), so a scattered warp keeps the DRAM busy transferring bytes nobody uses. The SASS confirms that nothing in the instruction stream changes with the pattern: <code>copyStrided</code> computes its address with <code>IMAD.WIDE</code> and <code>LEA</code>/<code>LEA.HI.X</code> (a 64-bit index scaled by 4) and issues one <code>LDG.E</code>; <code>copyOffset</code> adds the offset with <code>IADD3</code> and issues one <code>LDG.E</code>. <sup class="src"><a href="#F6-08-src-R3">R3</a></sup> The difference in speed comes entirely from the memory system below the instruction.</p>
+
+<h2 id="F6-08-worked">Worked example</h2>
+<p><b>Task.</b> A kernel reads an array of 3-D points stored as records <code>{float x, y, z}</code> (12 bytes each); thread <i>t</i> reads <code>p[t].x</code>. Compute with the TG-1 model the segments per warp and the efficiency; then do the same if the points are stored as three arrays.</p>
+<ol>
+<li><b>Addresses.</b> <code>p[t].x</code> is at byte 12<i>t</i>: element stride 3 floats.</li>
+<li><b>Span.</b> Thread 31 reads bytes 372–375, so the warp touches bytes 0 to 375.</li>
+<li><b>Segments.</b> Bytes 0–375 lie in segments 0 to ⌊375 ÷ 32⌋ = 11: 12 segments. Is every one touched? Consecutive addresses are 12 bytes apart, less than 32, so yes: 12 segments, 384 bytes moved.</li>
+<li><b>Efficiency.</b> 128 ÷ 384 = 33.3 %, matching Listing 1's <code>aos_x_of_xyz</code> line (R1).</li>
+<li><b>SoA.</b> With <code>x[t]</code> in its own array: stride 1, 4 segments, 100 % (<code>soa_x</code>, R1).</li>
+<li><b>Caveat.</b> If the kernel reads x, y and z of each point, the AoS layout's three loads touch the same 12 segments, so after caching the total may be close to SoA; the model per instruction is the worst case. Measure.</li>
+</ol>
+
+<h2 id="F6-08-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>coalesce_model.cpp</code>: the TG-1 coalescing model. Input lines: label, element bytes, stride, offset, segment bytes.</p>
+<pre class="listing" data-src="F6-08/coalesce_model.cpp"></pre>
+<pre class="output" data-run="F6-08/coalesce_model"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–21</td><td>read and validate a case</td><td>Rejects meaningless inputs.</td><td>Garbage in, explicit message out.</td></tr>
+<tr><td>22–27</td><td>the 32 threads</td><td>First and last byte of each thread's element; every segment between them is inserted into a set.</td><td>A set counts distinct segments; an element can straddle two (line 25).</td></tr>
+<tr><td>28–29</td><td>requested, moved</td><td>32 × element size; segments × segment size.</td><td>The two numbers whose ratio is efficiency.</td></tr>
+<tr><td>30–32</td><td>print</td><td>One row per case.</td><td>Same table format as the forensic evidence.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>copy_kernels.cu</code>: strided and offset copy kernels for E2, timed with the course harness (includes <code>cuda_check.h</code> and <code>bench.h</code>).</p>
+<pre class="listing" data-src="F6-08/copy_kernels.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings copy_kernels.cu -o copy_kernels</code>.</p>
+<pre class="output" data-run="F6-08/copy_kernels"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Built without warnings; the run stopped at the first <code>cudaMalloc</code> (R2). On a GPU the output is a table of 13 rows (strides 1–32, offsets 0–32) with the median time and GB/s. The predicted shape is given in Layer 2; no GPU number is shown in this chapter.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–15</td><td><code>copyStrided</code></td><td>Thread <i>i</i> reads element <i>i</i> × stride, writes element <i>i</i>.</td><td>Reads strided, writes coalesced: isolates the read pattern.</td></tr>
+<tr><td>11</td><td><code>long long j</code></td><td>64-bit index.</td><td>2<sup>22</sup> × 32 = 2<sup>27</sup> fits in <code>int</code>, but larger sizes would not.</td></tr>
+<tr><td>17–23</td><td><code>copyOffset</code></td><td>Reads element <i>i</i> + offset.</td><td>Same pattern shifted: tests alignment.</td></tr>
+<tr><td>27–29</td><td>sizes</td><td>Always 2<sup>22</sup> elements copied; input 32× larger.</td><td>Same useful work for every variant: times are comparable.</td></tr>
+<tr><td>34</td><td><code>cudaMemset</code></td><td>Initializes the input.</td><td>Reading uninitialized memory is what initcheck reports (<a href="#F6-05">F6-05</a>).</td></tr>
+<tr><td>43–54</td><td><code>timeIt</code></td><td>Wraps any launch in the event timing of <a href="#F6-06">F6-06</a>.</td><td>One timing method for every row.</td></tr>
+<tr><td>55–64</td><td>stride and offset loops</td><td>3 warm-up and 21 timed runs each; bytes = read + write of useful elements.</td><td>GB/s counts useful bytes, so waste shows as lower GB/s.</td></tr>
+</tbody></table></div>
+<p><b>Tool run</b> — the machine code of both copy kernels (target sm_80):</p>
+<pre class="output" data-run="F6-08/sass_copies"></pre>
+
+<h2 id="F6-08-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A runner can see which jars are wanted and grab only those; the memory system cannot move less than a segment.</b> The waste is not laziness; it is the unit of transfer.</li>
+<li><b>Jars put back go back to the shelf; wasted bytes may stay in a cache</b> and be used by another warp. The kitchen picture has no counter near the hall unless you add one (Layer 3).</li>
+<li><b>In the kitchen a row of 32 helpers could split up and fetch separately; a warp's load is one instruction</b> and waits for all its segments.</li>
+</ul>
+
+<h2 id="F6-08-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>2-D kernel much slower than its 1-D version</td><td><code>threadIdx.x</code> mapped to the row index (column-wise access)</td><td>Write down the address of threads 0 and 1</td><td>Map <code>x</code> to the column (fastest) index</td></tr>
+<tr><td>Kernel on records slow</td><td>AoS layout, one field read</td><td>Model: stride = record size ÷ field size</td><td>SoA, or read whole records with vector loads</td></tr>
+<tr><td>Slightly slower with an offset</td><td>Misaligned start</td><td>Offset in bytes mod segment size ≠ 0</td><td>Align the start; pad rows (pitch)</td></tr>
+<tr><td>Profiler: many sectors per request</td><td>Scattered addresses</td><td>Compare with 4 (coalesced, 4-byte loads)</td><td>Change the index mapping or the layout</td></tr>
+<tr><td>Wrong results at large strides</td><td><code>int</code> overflow of <code>i * stride</code></td><td>Largest index vs 2<sup>31</sup> − 1</td><td>64-bit index (Listing 2, line 11)</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-08-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F1-33">F1-33</a>: caches and cache lines; <a href="#F2-33">F2-33</a>: profiling; CPU loops that walk arrays in row-major order. <b>What carries over:</b> memory moves in blocks larger than one value; sequential access uses every byte of a block; layout (row-major, AoS versus SoA) decides the pattern. <b>What changes:</b> on the CPU, one thread's <i>successive</i> accesses should be neighbours; on the GPU, the 32 threads' <i>simultaneous</i> accesses should be neighbours: the loop index of the CPU becomes the thread index, and "walk along the row" becomes "spread the threads along the row" (R1). A CPU hides some bad patterns with prefetching; a warp waits for every segment its one instruction touched. <b>What comes next:</b> <a href="#F6-09">F6-09</a> asks how fast the best pattern can go: the memory roof, vector loads, and copies between host and device.</p></div>
+
+<h2 id="F6-08-check">Check yourself</h2>
+<ol>
+<li>In one sentence, what decides the cost of one warp's global load?</li>
+<li>Using the TG-1 model (32-byte segments), how many segments does a warp touch for 4-byte elements at stride 4? At stride 16?</li>
+<li>Which is true in the model? (a) Offset 8 floats is misaligned. (b) Stride 32 is worse than stride 8 with 32-byte segments. (c) With 128-byte segments, stride 32 has 3.1 % efficiency. (d) A <code>float4</code> load at stride 1 is less efficient than a <code>float</code> load.</li>
+<li>Explain why Listing 2 writes <code>out[i]</code> (stride 1) even in the strided kernel.</li>
+<li>Predict the model's result for 8-byte <code>double</code> elements at stride 1 and offset 1, with 32-byte segments; then check by adding a line to <code>coalesce_model.in</code>.</li>
+<li>Apply: a 2-D kernel on a 1024 × 1024 row-major float matrix uses <code>row = threadIdx.x + …</code>, <code>col = threadIdx.y + …</code>. What stride does a warp see? What is the fix?</li>
+<li>Why can a measured stride-2 copy be faster than the model's 50 % predicts?</li>
+<li>The two copy kernels have the same number of SASS instructions per thread. Why does that not mean they run at the same speed?</li>
+</ol>
+
+<h2 id="F6-08-lab">Lab</h2>
+<p><b>Goal.</b> The coalescing part of milestone E2: "Copy kernels with scalar and vector loads, strided and offset variants" and "A chart (in the log) of bandwidth vs stride and vs offset, explained with the profiler's memory-transaction metrics." <sup class="src"><a href="#F6-08-src-C1">C1</a></sup> (Vector loads and host copies: <a href="#F6-09">F6-09</a>.)</p>
+<p><b>Hardware and software needed.</b> An NVIDIA GPU with toolkit, driver and Nsight Compute (<code>ncu</code>), or a cloud GPU that allows profiling (this build: none). Step 1 needs no GPU. Folder <code>university/labs/F6-08</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use. Some systems restrict GPU performance counters to administrators; do not change system settings on shared machines without permission.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-08</code>. From <code>coalesce_model.out</code>, write your predicted GB/s for every row of Listing 2 as a fraction of the stride-1 value.</li>
+<li>On the GPU, read <code>copy_kernels.out</code>. Draw two charts in your log: GB/s versus stride and GB/s versus offset, with your predictions on the same axes.</li>
+<li>Profile two rows with Nsight Compute, stride 1 and stride 8, and record the global-load requests, the sectors moved and the DRAM bytes for each.</li>
+<li>Explain every chart point that differs from the prediction by more than 20 %, using the profiler numbers.</li>
+<li>Add an AoS-versus-SoA pair of kernels reading only <code>x</code> of 3-D points and measure both.</li>
+</ol>
+<p><b>Expected observations.</b> GB/s falls with stride and levels off; offset costs much less than stride; sectors per request grow with stride; SoA beats AoS for single-field reads. Shapes predicted by the model; not observed in this build.</p>
+<p><b>Verification.</b> Both charts are in the log with the GPU named (device report, <a href="#F6-07">F6-07</a>), and each is explained with the profiler's memory-transaction metrics (E2's second acceptance test, C1).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Profiler reports a permission error for counters → the system restricts them → ask the administrator or use a cloud GPU that allows profiling; record it.</li>
+<li>All strides equally fast → check that the stride actually reaches the kernel (print it) and that the input is large enough not to fit in L2.</li>
+<li>Out-of-memory at start → the input is 32 × 2<sup>22</sup> floats = 512 MiB; reduce <i>n</i>.</li>
+</ul>
+<p><b>Extension.</b> Write a strided <i>store</i> kernel (<code>out[i * stride] = in[i]</code>) and compare its chart with the strided load chart.</p>
+
+<h2 id="F6-08-forensic">Forensic lab</h2>
+<p><b>Slow by stride.</b> Tomás wrote a kernel that sums each column of a 1024 × 1024 row-major matrix: thread <i>t</i> handles column <i>t</i> and loops over the rows. A colleague's version sums rows: thread <i>t</i> handles row <i>t</i> and loops over the columns. Tomás expected his version to be slower ("columns are bad"), but it is his colleague's that is several times slower. No GPU is needed: the evidence below is the model's real output and an invented profiler summary.</p>
+<p><b>Evidence pack.</b> (1) The model, run on the two access patterns at one step of the loop: in Tomás's kernel, at loop step <i>r</i>, thread <i>t</i> reads element <i>r</i> × 1024 + <i>t</i> (stride 1 across the warp: <code>row_read</code>); in the colleague's, thread <i>t</i> reads element <i>t</i> × 1024 + <i>c</i> (stride 1,024 across the warp: <code>column_read_w1024</code>):</p>
+<pre class="output" data-run="F6-08/forensic"></pre>
+<p>(2) A profiler summary of the two kernels (<i>invented values for this scenario, in the shape Nsight Compute reports; not measured</i>): Tomás's kernel: about 4 sectors per global-load request, DRAM bytes read ≈ 4 MiB (the matrix once). Colleague's kernel: about 32 sectors per request, DRAM bytes read several times the matrix size. (3) The SASS of a load in a loop is one <code>LDG.E</code> in both (as in the tool run of this chapter).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which kernel's warp reads consecutive addresses at each loop step?</li>
+<li>Hypotheses: (a) more instructions in the slow kernel; (b) uncoalesced loads; (c) a cache effect. Which evidence item speaks to each?</li>
+<li>Root cause: explain with the model's numbers why "summing rows" is the slow one here, although each thread walks along a row.</li>
+<li>Why can DRAM bytes exceed the matrix size for the slow kernel, if every element is read only once?</li>
+<li>Fix: give an index mapping that makes the row sums coalesced.</li>
+</ol>
+<p><b>Method hints.</b> What matters is not the direction each thread walks in, but which addresses the 32 threads touch <i>at the same moment</i>. Write the addresses of threads 0, 1 and 2 at one loop step.</p>
+
+<h2 id="F6-08-project">Mini-project</h2>
+<p><b>The course project, part 3: a pattern sweep.</b> Add to the harness a sweep mode that runs Listing 2's kernels for a list of strides and offsets given on the command line, writes CSV, and prints next to each measured row the model's predicted efficiency from Listing 1 (link the model as a function). Produce the two E2 charts from the CSV.</p>
+<p><b>Rubric.</b> Sweep works for any list of strides and offsets; CSV has units (3). Model prediction printed per row from the same code as Listing 1 (2). Charts with GPU, driver and toolkit in the caption (3). One paragraph on where the model fails and why, backed by profiler numbers (2).</p>
+
+<h2 id="F6-08-summary">Summary</h2>
+<ul>
+<li>A warp's load is one instruction with 32 addresses; its cost is the number of distinct segments those addresses touch.</li>
+<li>TG-1 model (32-byte segments, 4-byte floats): stride 1 → 100 %, 2 → 50 %, 4 → 25 %, ≥ 8 → 12.5 %; offset 1 → 80 %; AoS field → 33.3 %; SoA → 100 % (R1).</li>
+<li>The instruction does not change with the pattern (R3); the memory system does the extra work.</li>
+<li>Map consecutive threads to consecutive addresses; use SoA; keep arrays aligned; use shared memory for unavoidable column access (CU301).</li>
+<li>E2: chart bandwidth versus stride and offset and explain it with the profiler's memory-transaction metrics.</li>
+</ul>
+
+<h2 id="F6-08-sources">Sources</h2>
+<ol>
+<li id="F6-08-src-D1">D1 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): memory optimizations, "Coalesced Access to Global Memory" (simple access pattern, sequential but misaligned, strided accesses). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section and the quoted wording (dossier gate G1 open).</i></li>
+<li id="F6-08-src-D2">D2 — NVIDIA, "CUDA C++ Programming Guide" (tier 1; title per the guide's registry: "CUDA Programming Guide", version 13.x): device memory accesses, global memory, per-compute-capability memory notes. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-08-src-D3">D3 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): memory coalescing. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-08-src-D4">D4 — NVIDIA, "Nsight Compute" documentation (tier 1): memory workload analysis, metrics for global load requests and sectors. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-08-src-C1">C1 — Systems Curriculum (this project), milestone E2 (build and acceptance tests quoted verbatim). A map, not a source (AH-4).</li>
+<li id="F6-08-src-R1">R1 — run of Listing 1 on <code>coalesce_model.in</code> (<code>coalesce_model.log</code>) and on <code>forensic.in</code> (<code>forensic.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0. A model of the invented TG-1, not a GPU.</li>
+<li id="F6-08-src-R2">R2 — build and run of Listing 2 (<code>copy_kernels.log</code>), CUDA 12.0; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+<li id="F6-08-src-R3">R3 — SASS of <code>copyStrided</code> and <code>copyOffset</code> for target sm_80 (<code>sass_copies.log</code>), CUDA 12.0, compiled only.</li>
+</ol>
+
+<h2 id="F6-08-glossary">Glossary links</h2>
+<p><a href="#gl-coalesced-access">Coalesced access</a> · <a href="#gl-memory-segment-sector">Memory segment (sector)</a> · <a href="#gl-stride">Stride</a> · <a href="#gl-memory-efficiency">Memory efficiency</a> · <a href="#gl-structure-of-arrays-soa">Structure of arrays (SoA)</a> · <a href="#gl-alignment">Alignment</a> · <a href="#gl-l1-l2-cache">L1 / L2 cache</a> · <a href="#gl-row-major-order">Row-major order</a></p>
+
+<h2 id="F6-08-next">Next chapter</h2>
+<p>Next: <a href="#F6-09">F6-09 Bandwidth and the memory roof; pinned and pageable host memory</a>. Previous: <a href="#F6-07">F6-07</a>. Back to the course: <a href="#CU201">CU201</a>.</p>
+
+<h2 id="F6-08-answers">Answers to Check yourself</h2>
+<ol>
+<li>The number of distinct memory segments (aligned units) its 32 addresses fall into.</li>
+<li>Stride 4: 16 segments (25 %, R1). Stride 16: 32 segments (each thread's 4 bytes in its own 32-byte segment; 12.5 %), like stride 8 and 32.</li>
+<li>(c) (R1). (a) is false: 8 floats = 32 bytes, aligned (100 %). (b) is false: both touch 32 segments. (d) is false: both are 100 %.</li>
+<li>To isolate the read pattern: the write is coalesced in every variant, so differences between rows come from the reads.</li>
+<li>Bytes 8 to 263: segments 0 to 8, so 9 segments, 288 bytes moved for 256 requested: 88.9 %. (Line <code>double_offset1 8 1 1 32</code>.)</li>
+<li>Consecutive threads (consecutive <code>threadIdx.x</code>) differ in <code>row</code>, so their addresses are 1,024 floats apart: stride 1,024, one segment per thread. Fix: <code>col = threadIdx.x + …</code>, <code>row = threadIdx.y + …</code>.</li>
+<li>The unused half of each segment may stay in the L1 or L2 cache and be used by the neighbouring warp, so not every wasted byte costs a DRAM transfer.</li>
+<li>Speed is set by the memory system's work below the instruction: the same <code>LDG.E</code> can need 4 or 32 segments depending on the addresses (R3, R1).</li>
+</ol>
+<h3 id="F6-08-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Tomás's "column sums": at each step the 32 threads read row <i>r</i>, columns <i>t</i> = 0…31: consecutive addresses, 4 segments, 100 % (<code>row_read</code>). The colleague's "row sums": the 32 threads read column <i>c</i> of 32 different rows: addresses 1,024 floats apart, 32 segments, 12.5 % (<code>column_read_w1024</code>; 3.1 % with 128-byte units) (R1).</p>
+<p><b>Hypotheses.</b> (a) Instructions: ruled out by the SASS, one <code>LDG.E</code> per load in both. (b) Uncoalesced loads: supported by the model and by the invented profiler summary (about 32 sectors per request instead of about 4). (c) Cache effects: part of the story for (d) below.</p>
+<p><b>Root cause.</b> Coalescing is about the 32 threads' simultaneous addresses. The colleague's threads each walk along their own row, but at any moment they are 4 KiB apart, so every warp load touches 32 segments.</p>
+<p><b>DRAM bytes.</b> Each segment fetched for one element also contains the next 7 elements of that row, which the same thread needs in its next 7 loop steps; if the segment has been evicted from the caches by then (the warp's working set is 32 rows), it is fetched again. Repeated fetches make DRAM traffic exceed the matrix size.</p>
+<p><b>Fix.</b> Assign a warp (or block) to each row and let the threads take consecutive columns (thread <i>t</i> reads columns <i>t</i>, <i>t</i> + 32, …), then combine the partial sums (a reduction, CU301); or keep one thread per row but stage tiles through shared memory. <b>How the evidence was produced:</b> the model output and SASS are real runs in this build; the profiler summary is invented for the scenario and labelled so.</p>
