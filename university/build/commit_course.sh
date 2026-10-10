@@ -18,7 +18,7 @@ python3 university/build/progress.py --staged >/dev/null
 git add university/build/PROGRESS.md
 git commit -q -m "$c: $d
 
-Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01YTaPifkXsSrKf2pfSLfXHs"
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GAEVNwbtXfPBsXoCsxr9hZ"
 for i in 1 2 3 4; do git push -q -u origin HEAD 2>&1 && break || sleep $((2**i)); done
 git log --oneline -1

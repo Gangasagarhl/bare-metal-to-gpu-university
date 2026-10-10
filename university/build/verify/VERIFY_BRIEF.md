@@ -1,7 +1,7 @@
 # Verification pass brief (one unit: a course, a bridge or a mega project)
 
 You are the Source Researcher, Fact-Checker, Diagram reviewer, Editor and Accessibility reviewer
-for ONE unit of the university in the git repo at /home/claude/bare-metal-to-gpu-university.
+for ONE unit of the university in the git repo at /home/user/bare-metal-to-gpu-university.
 Work only in that checkout. Do not commit or push. Never call any mcp__hearthbot__ tool.
 Touch only: your unit's chapter folder `university/chapters/<UNIT>/`, the lab folders of your
 unit's chapters `university/labs/<CHAPTER>/`, `university/_dossiers/<CHAPTER>.dossier.html` and
@@ -19,10 +19,30 @@ unit's chapters `university/labs/<CHAPTER>/`, `university/_dossiers/<CHAPTER>.do
 5. Your unit's `NOTES.md` (it lists the unverified claims and the open owner decisions).
 
 ## Web access
-The bash shell has NO internet. Use the WebSearch tool (mode "standard") and the WebFetch tool to
-find and open official documents (load them with ToolSearch "select:WebSearch,WebFetch" first).
+The bash shell has NO general internet (only package indexes and GitHub). Load the web tools with
+ToolSearch "select:WebSearch,WebFetch" first.
+- **WebSearch** (mode "standard"; "extended" when the standard result is thin) works for every
+  topic. Its result quotes and summarises the pages it found, with their URLs. Use it to locate the
+  official document and to confirm what it says.
+- **WebFetch** reaches ONLY `github.com` and `raw.githubusercontent.com` in this session; the
+  environment's network policy denies every other host (the call fails with ENOTFOUND or 403).
+  Many standards and manuals have their source on GitHub (RISC-V ISA manual, the C++ draft
+  `cplusplus/draft`, Linux `Documentation/` via `torvalds/linux`, VIRTIO `oasis-tcs/virtio-spec`,
+  LLVM `llvm/llvm-project` docs, Zephyr, PX4, ArduPilot, ROS 2, Gazebo, CUDA samples, QEMU docs
+  source). Open those there and record the GitHub URL and the commit/tag you read.
+- Do not retry a denied host; do not pretend a document was opened.
 Prefer tier-1 sources: the vendor's or project's own documentation, the standard's official page,
-the paper itself, the book publisher's page. Record the URL you actually opened.
+the paper itself, the book publisher's page.
+
+**Honest recording (build-lead ruling for this pass, under owner ruling C1):**
+- A document you opened with WebFetch: "how accessed" = the URL opened; tier as usual.
+- A document you could not open but whose official page a WebSearch result quoted: "how accessed"
+  = "search excerpt of <URL> (WebSearch; document not opened: network policy)". A claim that the
+  quoted official text confirms counts as confirmed; cite the section the excerpt names. Say in
+  the claim's dossier F-row that the evidence is a search excerpt.
+- A claim confirmed only by secondary pages (blogs, forums, vendor summaries) stays in an
+  "unverified" box with the reason "official text not opened in this pass".
+- Record every URL you actually opened or quoted; never invent a section number.
 
 ## For each chapter of the unit
 1. **Dossier (G1).** Write `university/_dossiers/<CHAPTER>.dossier.html` as an HTML fragment

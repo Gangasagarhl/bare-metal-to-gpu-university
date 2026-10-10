@@ -1,7 +1,7 @@
 # Exam pass brief (one course)
 
 You are the Exam Writer and Lab Engineer for ONE course of the university in the git repo at
-/home/claude/bare-metal-to-gpu-university. Work only in that checkout. Do not commit or push.
+/home/user/bare-metal-to-gpu-university. Work only in that checkout. Do not commit or push.
 Never call any mcp__hearthbot__ tool. Touch only `university/chapters/<COURSE>/EXAMS.html`,
 `university/_keys/<COURSE>.keys.html` and `university/labs/<COURSE>-P/` (the practical's
 reference solution). Another agent may be verifying the course's chapters at the same time: do
