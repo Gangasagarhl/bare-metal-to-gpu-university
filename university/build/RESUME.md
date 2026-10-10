@@ -31,3 +31,17 @@ complete courses. `PROGRESS.md` (regenerated on every course commit) shows what 
    commit `university/UNIVERSITY.html`, and mark the pull request ready.
 
 Owner decisions are collected in each course's `university/chapters/<COURSE>/NOTES.md`.
+
+## Verification pass (owner delegated, 2026-10-10)
+
+Rulings: `university/OWNER_RULINGS.md`. Briefs: `build/verify/VERIFY_BRIEF.md` (one unit per
+agent: dossiers in `university/_dossiers/`, QA in `university/qa/`) and `build/verify/EXAM_BRIEF.md`
+(one course per agent, after the course is verified: `chapters/<C>/EXAMS.html`,
+`_keys/<C>.keys.html`, `labs/<C>-P/`). Queue status: `python3 university/build/verify/vqueue.py`;
+next units: `vqueue.py verify N` / `vqueue.py exam N`. Agent prompt:
+"Your unit is <U> (chapters …) … Read university/build/verify/VERIFY_BRIEF.md (or EXAM_BRIEF.md
+with <COURSE>) and follow it exactly …". Commit each finished unit with `commit_course.sh <U> "…"`
+(it now also adds dossiers, QA records, keys and practical labs). Reference kit:
+`build/KIT.md` + `build/KIT.fragment.html`. Last step: an agent compiles
+`chapters/ANALOGY_ADDITIONS.html` from the NOTES.md analogy proposals; then `build.py --check`,
+commit UNIVERSITY.html, copy to /mnt/project-files/university/.
