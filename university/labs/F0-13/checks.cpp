@@ -1,5 +1,6 @@
 // Number check for F0-13: recomputes every number used in the chapter text.
 #include <iostream>
+#include <limits>
 
 int main()
 {
@@ -30,5 +31,7 @@ int main()
               << "; 80 / 4 = " << 80 / 4 << "\n";
     std::cout << "1000 / 8 = " << 1000 / 8 << "; 3 x 125 = " << 3 * 125 << "; 375 / 1000 = " << 375.0 / 1000 << "\n";
     std::cout << "2/4 + 1/4 = " << 2.0 / 4 + 1.0 / 4 << "; 1/4 = 2/8: " << 2.0 / 8 << "\n";
+    std::cout << "base used for double on this machine (std::numeric_limits<double>::radix) = "
+              << std::numeric_limits<double>::radix << "\n";
     return 0;
 }
