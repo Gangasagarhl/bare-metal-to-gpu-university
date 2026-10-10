@@ -1,0 +1,352 @@
+<!--meta
+id: F6-33
+title: Profiling one kernel with Nsight Compute; the roofline
+course: CU303
+level: L4
+prereqs: F6-32 (whole-program profiling); F2-56 (the roofline model on a CPU); F6-21 (arithmetic intensity); F1-57 (warps and SIMT); F1-58 (registers and spills); MA302 (floating point)
+time: 12–16 hours including the lab
+hardware: Lab steps 1–3: an NVIDIA GPU with a CUDA Toolkit, a driver and Nsight Compute (record all three versions), or a cloud GPU instance with them; profiling may need permission to access the GPU's performance counters on your system. The SASS counting, the roofline model, the rounding check and the forensic lab need no GPU (this build had none and no Nsight Compute: GPU runs below show the runtime's real "no device" error)
+maps: Track E 13.2 topic 10 (profiling and the roofline model: arithmetic intensity, memory-bound versus compute-bound, reading speed-of-light and memory charts); curriculum "Explain the gap" rule; prepares E10
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-33-hook">Story hook</h2>
+<p>The wall chart of the last chapter told Zainab that on Fridays the cooks' station is busy all evening. Nobody waits for porters any more. Still, the soup takes too long. Is the station slow because the cooks cannot chop faster, or because they keep walking to the pantry for one onion at a time?</p>
+<p>Zainab invites an inspector, Dr. Okafor, who studies one station only. She brings two numbers from the hall's plans: the most vegetables the cooks could possibly chop in an hour if they never stopped, and the most crates the pantry door can let through in an hour. Then she watches one batch of soup closely and counts: how much chopping per crate does this recipe need?</p>
+<p>"Your soup needs very little chopping per crate," she says. "So the door is your limit, not the knives. Sharpening the knives will change nothing. Bring the crates in faster, or find a recipe that does more with each crate."</p>
+<p>The two limits are the <b>roofs</b>, the chopping per crate is <b>arithmetic intensity</b>, and the inspector is Nsight Compute. This chapter teaches you to place a kernel under its roofs, from counts you can read yourself in the machine code, before any profiler confirms it.</p>
+
+<h2 id="F6-33-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the roofline model for a GPU kernel: the two roofs, arithmetic intensity, the ridge point, and what "memory-bound" and "compute-bound" do and do not mean.</li>
+<li><b>Count</b> a kernel's floating-point operations and global-memory bytes per element from its real SASS, and see where the compiler's code differs from the source's arithmetic.</li>
+<li><b>Predict</b> each kernel's attainable performance and time on a stated machine (the course's invented TG-1, then your own GPU from its datasheet).</li>
+<li><b>Use</b> a kernel profiler's view of one kernel (throughput relative to peak, memory traffic, instruction mix) to test the prediction, and explain the remaining gap.</li>
+<li><b>Diagnose</b> a kernel that became compute-heavy because a division compiles to a reciprocal, a refinement and a slow path, and choose a fix with its numerical cost stated.</li>
+</ul>
+
+<div class="co jargon" id="F6-33-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Kernel profiler</dt><dd><b>Simple words:</b> a tool that looks inside one GPU kernel and reports how busy each part of the GPU was while it ran. <b>Analogy:</b> the inspector who studies one station. <b>Precise:</b> a profiler that collects hardware performance counters for individual kernel launches and derives metrics such as achieved memory throughput and compute throughput relative to the device's peak; NVIDIA's tool for this is Nsight Compute. <sup class="src"><a href="#F6-33-src-D1">D1</a></sup> Not the whole-program view of <a href="#F6-32">F6-32</a>.</dd>
+<dt>Roofline model</dt><dd><b>Simple words:</b> a picture that says the fastest a kernel can possibly go, given how much arithmetic it does per byte it moves. <b>Analogy:</b> the inspector's two limits, knives and pantry door. <b>Precise:</b> attainable performance = min(peak FLOP/s, arithmetic intensity × peak memory bandwidth), drawn on log–log axes as a slanted memory roof meeting a flat compute roof. <sup class="src"><a href="#F6-33-src-D3">D3</a></sup> Already defined for CPUs in <a href="#F2-56">F2-56</a>.</dd>
+<dt>Arithmetic intensity (AI)</dt><dd><b>Simple words:</b> how much calculating a kernel does for each byte it reads or writes. <b>Analogy:</b> chopping per crate. <b>Precise:</b> floating-point operations divided by bytes of memory traffic, in FLOP/byte; the chapter counts DRAM-level traffic as the bytes the kernel's global loads and stores request (a lower bound when caches help, an upper bound when accesses are uncoalesced). <sup class="src"><a href="#F6-33-src-D3">D3</a></sup> Defined for GEMM in <a href="#F6-21">F6-21</a>.</dd>
+<dt>Ridge point</dt><dd><b>Simple words:</b> the intensity at which a kernel stops being limited by memory and starts being limited by arithmetic. <b>Analogy:</b> the recipe at which the knives and the door are equally busy. <b>Precise:</b> peak FLOP/s divided by peak bandwidth, in FLOP/byte. <sup class="src"><a href="#F6-33-src-D3">D3</a></sup></dd>
+<dt>Speed of light (SOL) throughput</dt><dd><b>Simple words:</b> how close a kernel came to the hardware's maximum for one kind of work. <b>Analogy:</b> "the door was in use 85 % of the evening". <b>Precise:</b> a kernel profiler's summary metric of achieved throughput as a percentage of the theoretical peak, reported separately for compute and memory units; the curriculum's topic list names "speed-of-light and memory charts" as what to read. <sup class="src"><a href="#F6-33-src-C1">C1</a></sup> <sup class="src"><a href="#F6-33-src-D1">D1</a></sup> Exact metric names: unverified box in Layer 2.</dd>
+<dt>Kernel replay</dt><dd><b>Simple words:</b> running the same kernel several times so that a profiler can collect more counters than it can read at once. <b>Analogy:</b> the inspector asking for the same batch of soup three times, counting different things each time. <b>Precise:</b> a kernel profiler technique in which the kernel launch is repeated, with memory saved and restored between passes, to collect metric groups that do not fit in one pass; it makes profiled durations differ from unprofiled ones. <sup class="src"><a href="#F6-33-src-D1">D1</a></sup></dd>
+<dt>Slow path (of an instruction sequence)</dt><dd><b>Simple words:</b> a longer piece of code that runs only for rare, difficult inputs. <b>Analogy:</b> the special procedure for a frozen crate. <b>Precise:</b> in the SASS of an IEEE-rounded single-precision division in this build, a check instruction (<code>FCHK</code>) decides whether the fast reciprocal-based result can be used; otherwise the code calls a subroutine (<code>CALL.REL.NOINC</code>) (R5).</dd>
+</dl></div>
+
+<h2 id="F6-33-pictures">The idea in pictures</h2>
+<p>Figure 1 is the roofline of TG-1, the course's invented teaching GPU, with the six kernels of Listing 1 placed at the arithmetic intensities counted in their real SASS (R3, R4). TG-1's memory roof comes from its invented memory system (256-bit at 8 GT/s, 256 GB/s); its compute roof is an extension proposed in this chapter: 4 SMs × 32 lanes × 1 FMA per cycle × 2 FLOP × 1 GHz = 256 GFLOP/s. No real GPU is described.</p>
+<figure id="F6-33-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 360" role="img" aria-labelledby="F6-33-f1t F6-33-f1d">
+<title id="F6-33-f1t">Figure 1: the TG-1 roofline with six kernels</title>
+<desc id="F6-33-f1d">A log-log chart. Horizontal axis: arithmetic intensity in FLOP per byte, from 1/8 to 64, doubling every 60 pixels. Vertical axis: attainable GFLOP per second, from 16 to 512, doubling every 50 pixels. The memory roof is a slanted line rising from 32 GFLOP/s at 1/8 FLOP/B to 256 GFLOP/s at 1 FLOP/B, the ridge point. The compute roof is a flat line at 256 GFLOP/s from 1 to 64 FLOP/B. Six points sit on the roofs: poly 1 at 0.125 and 32; saxpy at 0.167 and 42.7; poly 4 at 0.875 and 224, just left of the ridge; poly 16 at 3.875, poly 64 at 15.875 and poly 256 at 63.875, all at 256 on the flat roof. The region left of the ridge is labelled memory-bound and the region right of it compute-bound.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="360"/>
+<line class="sv-line" x1="100" y1="300" x2="660" y2="300"/><line class="sv-line" x1="100" y1="300" x2="100" y2="30"/>
+<text class="sv-ts" x="92" y="318">1/8</text><text class="sv-ts" x="214" y="318">1/2</text><text class="sv-ts" x="276" y="318">1</text><text class="sv-ts" x="396" y="318">4</text><text class="sv-ts" x="512" y="318">16</text><text class="sv-ts" x="632" y="318">64</text>
+<text class="sv-ts" x="300" y="340">arithmetic intensity (FLOP/byte, log scale)</text>
+<text class="sv-ts" x="62" y="44">512</text><text class="sv-ts" x="62" y="94">256</text><text class="sv-ts" x="62" y="144">128</text><text class="sv-ts" x="68" y="194">64</text><text class="sv-ts" x="68" y="244">32</text><text class="sv-ts" x="68" y="294">16</text>
+<text class="sv-ts" x="10" y="24">GFLOP/s (log)</text>
+<line class="sv-line2" x1="100" y1="240" x2="280" y2="90"/>
+<line class="sv-line2" x1="280" y1="90" x2="650" y2="90"/>
+<line class="sv-dash" x1="280" y1="90" x2="280" y2="300"/>
+<text class="sv-ts" x="120" y="170">memory roof 256 GB/s</text><text class="sv-ts" x="420" y="80">compute roof 256 GFLOP/s</text>
+<text class="sv-ts" x="286" y="286">ridge 1 FLOP/B</text>
+<text class="sv-ts" x="120" y="286">memory-bound</text><text class="sv-ts" x="440" y="286">compute-bound</text>
+<circle class="sv-dot1" cx="100" cy="240" r="5"/><text class="sv-ts" x="108" y="256">poly&lt;1&gt;</text>
+<circle class="sv-dot2" cx="125" cy="219" r="5"/><text class="sv-ts" x="134" y="222">saxpy</text>
+<circle class="sv-dot3" cx="268" cy="100" r="5"/><text class="sv-ts" x="196" y="114">poly&lt;4&gt;</text>
+<circle class="sv-dot4" cx="397" cy="90" r="5"/><text class="sv-ts" x="380" y="110">poly&lt;16&gt;</text>
+<circle class="sv-dot1" cx="519" cy="90" r="5"/><text class="sv-ts" x="500" y="110">poly&lt;64&gt;</text>
+<circle class="sv-dot2" cx="640" cy="90" r="5"/><text class="sv-ts" x="600" y="110">poly&lt;256&gt;</text>
+<text class="sv-ts" x="440" y="200">Points are predictions: each kernel</text>
+<text class="sv-ts" x="440" y="216">placed ON its roof. A measured point</text>
+<text class="sv-ts" x="440" y="232">sits at or below it; the distance is</text>
+<text class="sv-ts" x="440" y="248">the gap to explain.</text>
+</svg></div><figcaption><b>Figure 1.</b> Roofline of the invented TG-1 with the kernels of Listing 1 at their SASS-counted intensities (R4). Points mark the attainable performance (min of the two roofs), not measurements. The roofline definition follows the roofline paper (D3) and <a href="#F2-56">F2-56</a>. <sup class="src"><a href="#F6-33-src-D3">D3</a></sup> <sup class="src"><a href="#F6-33-src-R4">R4</a></sup></figcaption></figure>
+
+<p>Figure 2 shows what the compiler did with one line of the forensic program, <code>y[i] = x[i] / s;</code>, read directly from this build's SASS for sm_80 (R5). A division is not one instruction.</p>
+<figure id="F6-33-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F6-33-f2t F6-33-f2d">
+<title id="F6-33-f2t">Figure 2: the SASS of one single-precision division</title>
+<desc id="F6-33-f2d">A flow of boxes from left to right. Box 1: LDG load x. Box 2: MUFU.RCP, an approximate reciprocal of s. Box 3: two FFMA instructions refining the reciprocal. Box 4: FCHK, a check of whether the fast result is valid for these operands, setting predicate P0. Box 5: three FFMA instructions computing and correcting the quotient. A diamond: if P0 is set, branch to a CALL of a slow-path subroutine; otherwise continue. Box 6: STG store y. Labels count the fast path: 5 FFMA, 1 MUFU, 1 FCHK for one division, against a single FMUL for multiplying by a precomputed inverse.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<rect class="sv-b3" x="10" y="40" width="80" height="44" rx="5"/><text class="sv-ts" x="18" y="60">LDG</text><text class="sv-ts" x="18" y="76">load x</text>
+<rect class="sv-b6" x="104" y="40" width="96" height="44" rx="5"/><text class="sv-ts" x="110" y="60">MUFU.RCP</text><text class="sv-ts" x="110" y="76">approx 1/s</text>
+<rect class="sv-b5" x="214" y="40" width="100" height="44" rx="5"/><text class="sv-ts" x="220" y="60">FFMA × 2</text><text class="sv-ts" x="220" y="76">refine 1/s</text>
+<rect class="sv-b7" x="328" y="40" width="90" height="44" rx="5"/><text class="sv-ts" x="334" y="60">FCHK</text><text class="sv-ts" x="334" y="76">sets P0</text>
+<rect class="sv-b5" x="432" y="40" width="110" height="44" rx="5"/><text class="sv-ts" x="438" y="60">FFMA × 3</text><text class="sv-ts" x="438" y="76">quotient, fix</text>
+<polygon class="sv-b8" points="600,40 640,62 600,84 560,62"/><text class="sv-ts" x="584" y="66">P0?</text>
+<rect class="sv-b4" x="666" y="40" width="80" height="44" rx="5"/><text class="sv-ts" x="672" y="60">STG</text><text class="sv-ts" x="672" y="76">store y</text>
+<line class="sv-line" x1="90" y1="62" x2="102" y2="62"/><line class="sv-line" x1="200" y1="62" x2="212" y2="62"/><line class="sv-line" x1="314" y1="62" x2="326" y2="62"/><line class="sv-line" x1="418" y1="62" x2="430" y2="62"/><line class="sv-line" x1="542" y1="62" x2="558" y2="62"/><line class="sv-line" x1="640" y1="62" x2="664" y2="62"/>
+<polygon class="sv-head" points="664,62 656,58 656,66"/>
+<text class="sv-ts" x="644" y="56">no</text>
+<line class="sv-dash" x1="600" y1="84" x2="600" y2="130"/><polygon class="sv-head" points="600,130 596,122 604,122"/>
+<rect class="sv-b2" x="530" y="132" width="140" height="40" rx="5"/><text class="sv-ts" x="538" y="150">CALL slow-path</text><text class="sv-ts" x="538" y="166">subroutine, then back</text>
+<text class="sv-ts" x="606" y="110">yes</text>
+<text class="sv-ts" x="10" y="200">Fast path of one division: 5 FFMA + 1 MUFU + 1 FCHK + branch. Multiplying by a precomputed inverse: 1 FMUL.</text>
+<text class="sv-ts" x="10" y="220">Read from the real SASS of divideEach and multiplyInverse for sm_80 in this build (R5); NOPs and address arithmetic omitted.</text>
+<text class="sv-ts" x="10" y="240">With --prec-div=false the same line compiles to MUFU.RCP and FMUL with range scaling, and no FCHK (R8).</text>
+</svg></div><figcaption><b>Figure 2.</b> An IEEE round-to-nearest single-precision division, as nvcc emits it by default (<code>--prec-div</code> default value true, R7), compared with a multiplication. The instruction names are copied from <code>cuobjdump -sass</code> output; their meaning is inferred from the code's structure and should be confirmed in the CUDA Binary Utilities instruction set reference (D2). <sup class="src"><a href="#F6-33-src-R5">R5</a></sup> <sup class="src"><a href="#F6-33-src-R7">R7</a></sup> <sup class="src"><a href="#F6-33-src-D2">D2</a></sup></figcaption></figure>
+
+<h2 id="F6-33-layer1">Layer 1 — the kid explanation</h2>
+<p>Every kernel has two possible limits. It can be limited by how fast the GPU can calculate. Or it can be limited by how fast the GPU can bring data from memory. A kernel cannot beat either limit.</p>
+<p>Which limit matters depends on the kernel. Count how many calculations it does for each byte it moves. Few calculations per byte means memory is the limit. Many calculations per byte means the calculators are the limit.</p>
+<p>The roofline picture shows both limits as a roof. You put a dot for your kernel under the roof. If the dot is far below the roof, something is wasting time, and you go looking for it.</p>
+<p>To count calculations honestly, read the machine code. The compiler sometimes removes work you wrote, and sometimes adds work you did not see. One division, for example, becomes many instructions.</p>
+
+<h2 id="F6-33-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-33-l2-roofline">The roofline for a GPU kernel</h3>
+<p>Analogy first: knives and the pantry door. The roofline model bounds a kernel's performance <i>P</i> (FLOP/s) by two ceilings: the peak floating-point rate π of the processor, and the product of the kernel's arithmetic intensity <i>I</i> (FLOP/byte) and the peak memory bandwidth β (byte/s): <i>P</i> ≤ min(π, <i>I</i> · β). <sup class="src"><a href="#F6-33-src-D3">D3</a></sup> On log–log axes, <i>I</i> · β is a straight line of slope 1, the memory roof; π is horizontal, the compute roof; they meet at the ridge point <i>I</i> = π / β. You met the model on a CPU in <a href="#F2-56">F2-56</a>; nothing in the model changes for a GPU, but three things in its use do:</p>
+<ul>
+<li><b>π depends on the instruction and the number format.</b> A GPU's FP32 FMA rate, its FP64 rate and its tensor-core rates are different roofs. Use the roof of the instructions your kernel actually executes; read them from your GPU's datasheet or architecture whitepaper (D4), never from memory (AH-21).</li>
+<li><b>β depends on the level you count.</b> DRAM, L2 and shared memory each have their own roof. The chapter counts global-memory bytes requested by the kernel's loads and stores; a kernel profiler measures the bytes actually moved at each level.</li>
+<li><b>The prediction is a ceiling.</b> "Memory-bound" means the memory roof is the lower one at this intensity. It does not mean the kernel reaches it; the distance to the roof is what you must explain. The curriculum's rule for every performance milestone is to end with "a profiler-backed explanation of the remaining gap (memory throughput, issue stalls, occupancy, instruction mix)". <sup class="src"><a href="#F6-33-src-C1">C1</a></sup></li>
+</ul>
+<h3 id="F6-33-l2-count">Counting FLOPs and bytes from SASS</h3>
+<p>The source suggests counts; the machine code decides them. Listing 2 walks the SASS of every kernel in a cubin and counts, per thread, fused multiply-adds (<code>FFMA</code>, 2 FLOP), adds and multiplies (<code>FADD</code>, <code>FMUL</code>, 1 FLOP each), special-function instructions (<code>MUFU</code>, counted separately and not as FLOPs), and bytes loaded and stored by <code>LDG</code> and <code>STG</code> (4 bytes, or 8 or 16 for <code>.64</code> and <code>.128</code> forms). It is valid only for straight-line kernels where every instruction runs once per thread, which is why Listing 1's loops are fully unrolled. The real counts for sm_80 (R3):</p>
+<pre class="output" data-run="F6-33/sass_counts"></pre>
+<p>Compare with the source's arithmetic: <code>poly&lt;D&gt;</code> was written as <i>D</i> multiply-adds, 2<i>D</i> FLOPs. The SASS has <i>D</i> − 1 <code>FFMA</code> and one <code>FADD</code>: 2<i>D</i> − 1 FLOPs, because the first step is <code>1.0f * v + 0.5f</code> and the compiler turned it into <code>v + 0.5f</code>. For <code>poly&lt;1&gt;</code> that halves the FLOP count. The SASS of <code>poly&lt;4&gt;</code> shows it directly (R6):</p>
+<pre class="output" data-run="F6-33/sass_poly4"></pre>
+<p>Read it from the top: the block and thread index (<code>S2R</code>, <code>IMAD</code>), the bounds check (<code>ISETP</code>, <code>@P0 EXIT</code>), the address of <code>x[i]</code> (<code>IMAD.WIDE</code> with 4, the size of a float), one load (<code>LDG.E.CONSTANT</code>), then <code>FADD</code> and three <code>FFMA</code> with the constant 0.5 as an immediate, the address of <code>y[i]</code>, one store. <a href="#F6-34">F6-34</a> teaches this reading in depth.</p>
+<h3 id="F6-33-l2-ncu">What a kernel profiler adds</h3>
+<p>The counts above are what the kernel <i>asks</i> for. A kernel profiler measures what the hardware <i>did</i>: achieved DRAM throughput and bytes, cache hit rates, how busy the arithmetic pipelines were, how many instructions of each kind were issued, and why warps were stalled. Nsight Compute's documentation describes collecting such metrics per kernel launch, grouping them into sections, comparing a kernel against a baseline, and plotting it on a roofline chart built from the device's peaks. <sup class="src"><a href="#F6-33-src-D1">D1</a></sup> Two of its properties change how you read its numbers: metrics that need several passes are collected by replaying the kernel, and kernels are usually serialised while being profiled, so the durations it reports are not those of a normal run. <sup class="src"><a href="#F6-33-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Nsight Compute was not installed in this build. The names of its sections and metrics (for example the speed-of-light and memory workload sections, the metric names for DRAM bytes and FP32 instruction counts), its command-line options, the replay modes and the permission needed to read GPU performance counters on Linux could not be checked. Read the Nsight Compute documentation (Kernel Profiling Guide and CLI reference) for your version, copy the exact section and metric names into your lab notes, and record the version the tool prints.</p></div>
+<h3 id="F6-33-l2-resources">The compiler's own resource report</h3>
+<p>One piece of per-kernel evidence needs no GPU: <code>ptxas</code>'s verbose report, enabled with <code>-Xptxas -v</code>, prints for each kernel the registers used and any stack frame and spill traffic (R2). All six kernels use 10 or 12 registers and spill nothing:</p>
+<pre class="output" data-run="F6-33/resources"></pre>
+<p>Register count feeds the occupancy calculation of <a href="#F6-20">F6-20</a>; spill bytes would add local-memory traffic that the roofline's byte count must include (<a href="#F1-58">F1-58</a>).</p>
+
+<h2 id="F6-33-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: the inspector's verdict is only as good as her count of chopping per crate and her knowledge of the door's real width.</p>
+<h3 id="F6-33-l3-predict">From counts to a predicted time</h3>
+<p>For <i>n</i> elements with <i>F</i> FLOPs and <i>B</i> bytes each, the roofline time is <i>t</i> = max(<i>nF</i>/π, <i>nB</i>/β). Listing 3 computes it for TG-1 and prints which term wins. With the SASS counts (R4):</p>
+<pre class="output" data-run="F6-33/roofline_points"></pre>
+<p>Three engineering consequences. First, <code>poly&lt;1&gt;</code>, <code>poly&lt;4&gt;</code> and <code>saxpy</code> are memory-bound on TG-1: below the ridge, adding arithmetic is free, which is the whole idea of kernel fusion (<a href="#CU401">CU401</a>): <code>poly&lt;4&gt;</code> does seven times the FLOPs of <code>poly&lt;1&gt;</code> in the same predicted time. Second, past the ridge, time grows with FLOPs: <code>poly&lt;256&gt;</code> is predicted 64 times slower than <code>poly&lt;4&gt;</code>. Third, the prediction depends on correct counts: the source-level counts give a slightly different picture (Worked example).</p>
+<h3 id="F6-33-l3-gap">Explaining the gap</h3>
+<p>A measured kernel sits below its roof. The reasons, roughly in the order to check them, each with the evidence that shows it:</p>
+<div class="tw"><table>
+<thead><tr><th>Reason the kernel is below its roof</th><th>Evidence</th><th>Where taught</th></tr></thead>
+<tbody>
+<tr><td>More bytes moved than requested (uncoalesced access, poor cache reuse)</td><td>Profiler DRAM bytes against your <i>nB</i>; sectors per request</td><td><a href="#F6-08">F6-08</a></td></tr>
+<tr><td>Not enough warps or independent instructions to hide latency</td><td>Achieved occupancy, stall reasons, ptxas registers</td><td><a href="#F6-20">F6-20</a>, <a href="#F1-60">F1-60</a></td></tr>
+<tr><td>Instructions other than the counted FLOPs dominate issue (address arithmetic, conversions, special functions)</td><td>Instruction mix; the SASS</td><td>this chapter, <a href="#F6-34">F6-34</a></td></tr>
+<tr><td>The kernel is too short or too small to fill the GPU</td><td>Grid size against SM count; duration against launch overhead</td><td><a href="#F6-30">F6-30</a></td></tr>
+<tr><td>Wrong roof: FP64, special-function or tensor-core instructions have other peaks</td><td>Instruction mix against the datasheet</td><td><a href="#F6-25">F6-25</a>, <a href="#F6-26">F6-26</a>, D4</td></tr>
+<tr><td>Spills add hidden traffic</td><td><code>-Xptxas -v</code>, <code>STL</code>/<code>LDL</code> in SASS</td><td><a href="#F1-58">F1-58</a></td></tr>
+</tbody></table></div>
+<h3 id="F6-33-l3-division">Special functions and what they cost</h3>
+<p>The roofline counts FLOPs as if every arithmetic instruction were an FMA on the FP32 pipeline. Some source operations are not: the forensic program's single division becomes, on sm_80, a special-function reciprocal (<code>MUFU.RCP</code>), two <code>FFMA</code> that refine it, a check (<code>FCHK</code>), three more <code>FFMA</code> for the quotient and its correction, and a conditional call into a slow-path subroutine (R5). That sequence implements IEEE round-to-nearest division, which is what nvcc's default <code>--prec-div=true</code> promises; nvcc's own help text says <code>--prec-div=false</code> "enables the fast approximation mode" and that <code>--use_fast_math</code> implies it (R7). Built that way, the same source line becomes range checks, <code>MUFU.RCP</code> and one <code>FMUL</code>, with no <code>FCHK</code> and no call (R8):</p>
+<pre class="output" data-run="F6-33/sass_fastdiv"></pre>
+<p>Precision is the price: <code>x / 3</code> and <code>x * (1/3)</code> are different floating-point computations. Listing 4 checks the forensic program's 1000 input values on the host: about a third of them give a result one unit in the last place different (R9). Whether that matters is a numerical decision (<a href="#MA302">MA302</a>), not a performance one, and it must be written down.</p>
+<pre class="output" data-run="F6-33/rounding"></pre>
+
+<h2 id="F6-33-hardware">How the hardware actually does it</h2>
+<p>An SM issues warp instructions to several kinds of execution units: FP32 pipelines that execute <code>FFMA</code>, <code>FADD</code> and <code>FMUL</code>, integer pipelines for address arithmetic, special-function units for <code>MUFU</code> operations such as reciprocals, and load/store units that send memory requests through the L1 and L2 caches to DRAM (<a href="#F1-57">F1-57</a>, <a href="#F1-58">F1-58</a>, <a href="#F1-59">F1-59</a>). <sup class="src"><a href="#F6-33-src-D4">D4</a></sup> <sup class="src"><a href="#F6-33-src-D5">D5</a></sup> Each unit type has its own peak rate per SM per clock; the "compute roof" of a roofline is the peak of one of them, usually the FP32 FMA rate. Performance counters in the SM and the memory system count issued instructions, active cycles and bytes per level; a kernel profiler reads them per launch and divides by the elapsed cycles to get throughput percentages. <sup class="src"><a href="#F6-33-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The number and throughput of FP32, integer and special-function units per SM, and therefore the cost of <code>MUFU.RCP</code> relative to <code>FFMA</code>, differ between GPU generations and are not stated in any document opened in this build. TG-1's compute roof (4 SMs × 32 lanes × 1 FMA per cycle × 2 FLOP × 1 GHz) is invented for this chapter and proposed for registration in the course NOTES. For your GPU, take the peaks from its datasheet or architecture whitepaper (D4) and the per-instruction throughput table of the CUDA Programming Guide (D5) for its compute capability.</p></div>
+
+<h2 id="F6-33-worked">Worked example</h2>
+<p>Place <code>poly&lt;4&gt;</code> on TG-1's roofline, first from the source, then from the SASS, for <i>n</i> = 2<sup>24</sup> = 16,777,216 elements.</p>
+<ol>
+<li><b>TG-1's roofs.</b> Memory: 256 bit × 8 GT/s / 8 bit per byte = 256 GB/s. Compute: 4 × 32 × 2 × 1 GHz = 256 GFLOP/s. Ridge: 256 / 256 = 1 FLOP/byte.</li>
+<li><b>Source counts.</b> Four multiply-adds: 8 FLOP; one float read and one written: 8 bytes. <i>I</i> = 1.0 FLOP/byte, exactly at the ridge. Attainable: 256 GFLOP/s; time max(8<i>n</i>/π, 8<i>n</i>/β) = 8 × 16,777,216 / 256 × 10<sup>9</sup> s = 524.3 µs, with both roofs equal.</li>
+<li><b>SASS counts.</b> 3 <code>FFMA</code> + 1 <code>FADD</code> = 7 FLOP; bytes unchanged. <i>I</i> = 0.875: just left of the ridge, memory-bound. Attainable 0.875 × 256 = 224 GFLOP/s; time still 524.3 µs (the memory term).</li>
+<li><b>What a measurement would mean.</b> On a real GPU you would compute the achieved FLOP/s as 7<i>n</i> / measured time and the achieved bandwidth as 8<i>n</i> / measured time, and compare each with its roof. For a memory-bound kernel the bandwidth percentage is the one that matters.</li>
+<li><b>The other kernels.</b> Listing 3's output for the source counts (R10) next to the SASS-count output above shows the same pattern: <code>poly&lt;1&gt;</code>'s intensity halves (2 to 1 FLOP), <code>poly&lt;16&gt;</code> loses 1 FLOP of 32; all predicted times of memory-bound kernels are unchanged.</li>
+</ol>
+<pre class="output" data-run="F6-33/roofline_model"></pre>
+<p>The lesson: an error in the FLOP count moves a kernel left or right, and near the ridge it can change the verdict "memory-bound" or "compute-bound". Count from the machine code.</p>
+
+<h2 id="F6-33-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>roofline.cu</code>: a family of kernels with rising arithmetic intensity, each timed with events, printing the two coordinates of a measured roofline point.</p>
+<pre class="listing" data-src="F6-33/roofline.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings roofline.cu -o roofline</code>, then <code>./roofline</code>. <sup class="src"><a href="#F6-33-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F6-33/roofline"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> This build has no GPU; the program compiled without warnings and its first runtime call returned <code>cudaErrorNoDevice</code>. On a GPU it prints six lines with AI, time, GFLOP/s and GB/s. Note that it uses the <i>source</i> FLOP counts (2 per multiply-add), so its GFLOP/s overstate the executed FLOPs slightly for <code>poly</code> (Layer 2); correct them with Listing 2's counts. No time or rate has been observed in this build.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–15</td><td><code>saxpy</code></td><td>Two loads, one multiply-add, one store per element.</td><td>The classic memory-bound reference (12 bytes, 2 FLOP).</td></tr>
+<tr><td>17–30</td><td><code>poly&lt;D&gt;</code></td><td>One load, <i>D</i> multiply-adds in registers, one store.</td><td>The template parameter moves the kernel along the intensity axis without changing its memory traffic.</td></tr>
+<tr><td>24</td><td><code>#pragma unroll</code></td><td>Fully unrolls the constant-trip loop.</td><td>Straight-line SASS: Listing 2's per-thread counts are exact.</td></tr>
+<tr><td>32–48</td><td><code>timeMs</code></td><td>Warm-up, then 21 back-to-back launches between two events; returns the mean.</td><td>A mean of back-to-back runs; for publication use the median protocol of <a href="#F6-06">F6-06</a>.</td></tr>
+<tr><td>50–56</td><td><code>report</code></td><td>Converts counts and time to AI, GFLOP/s and GB/s.</td><td>The two coordinates of a measured point.</td></tr>
+<tr><td>68–69</td><td><code>cudaMemset</code> to 0</td><td>Defined input values.</td><td>Reading uninitialised memory would be a bug even in a benchmark; zero inputs do not change the instruction count.</td></tr>
+<tr><td>78–83</td><td>six <code>run</code> calls</td><td>Source counts per element: FLOP and bytes.</td><td>Compare with the SASS counts of R3.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>count_sass.sh</code>: counts FLOP-carrying instructions and global-memory bytes per thread in the real SASS of a cubin.</p>
+<pre class="listing" data-src="F6-33/count_sass.sh"></pre>
+<p><b>Run</b> (from <code>run.sh</code>): <code>nvcc -arch=sm_80 -cubin roofline.cu -o roofline.cubin &amp;&amp; ./count_sass.sh roofline.cubin</code>. <sup class="src"><a href="#F6-33-src-R3">R3</a></sup> No GPU is needed: the compiler produces sm_80 machine code whether or not such a GPU is present.</p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8</td><td><code>cuobjdump -sass "$1" | awk</code></td><td>Disassembles every kernel and pipes the text into a small awk program.</td><td>The disassembler is the evidence; the script only counts.</td></tr>
+<tr><td>9</td><td><code>/Function :/</code></td><td>Starts a new kernel; prints the previous one's counts.</td><td>One result line per kernel.</td></tr>
+<tr><td>10–12</td><td>instruction lines; predicate skipped; trailing <code>;</code> removed</td><td>Finds the opcode, also after a predicate such as <code>@P0</code>.</td><td>A first version counted <code>NOP;</code> as instructions because of the attached semicolon; line 12 is the fix, found by comparing the count with the listing (R6).</td></tr>
+<tr><td>15</td><td>width from <code>.64</code>/<code>.128</code></td><td>Bytes per load or store.</td><td>Vector loads (<a href="#F6-23">F6-23</a>) move more bytes per instruction.</td></tr>
+<tr><td>16–21</td><td>opcode classes</td><td>FFMA, FADD, FMUL, MUFU, LDG, STG.</td><td>MUFU is counted but not as FLOPs: its cost is on a different unit.</td></tr>
+<tr><td>23–26</td><td><code>out()</code></td><td>Prints counts, FLOPs (2 per FFMA) and bytes.</td><td>The format Listing 3 reads.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>roofline_model.cpp</code>: places counted kernels on TG-1's roofline and predicts their time.</p>
+<pre class="listing" data-src="F6-33/roofline_model.cpp"></pre>
+<p><b>Build and run</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined roofline_model.cpp -o roofline_model</code>, then <code>./roofline_model &lt; sass_counts.out</code> (R4) or <code>&lt; roofline_model.in</code> (R10).</p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>16–17</td><td><code>peakFlops</code>, <code>peakBytes</code></td><td>TG-1's invented roofs.</td><td>Replace them with your GPU's datasheet values for the lab, with the document named.</td></tr>
+<tr><td>25–34</td><td>parse loop</td><td>Finds <code>kernel</code>, <code>flops</code> and <code>bytes</code> in any line.</td><td>Reads Listing 2's output and hand-written inputs alike.</td></tr>
+<tr><td>35–36</td><td><code>ai</code>, <code>attain</code></td><td>Intensity and min of the two roofs.</td><td>The roofline formula.</td></tr>
+<tr><td>37–39</td><td><code>tCompute</code>, <code>tMemory</code>, <code>t</code></td><td>Both times and the larger one.</td><td>The bound is the term that wins; equal terms (at the ridge) print "memory".</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>rounding.cpp</code>: division versus multiplication by a rounded inverse, on the host. Output in Layer 3 (R9).</p>
+<pre class="listing" data-src="F6-33/rounding.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8</td><td><code>inv = 1.0f / s</code></td><td>The reciprocal, rounded once to float.</td><td>Exactly what the forensic program computes on the host.</td></tr>
+<tr><td>11–21</td><td>loop over 0..999</td><td>Compares <code>x / s</code> with <code>x * inv</code> bit for bit.</td><td>The same inputs as <code>normalize.cu</code>; the result is a fact about IEEE float, not about a GPU.</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-33-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The kitchen has one kind of knife.</b> A GPU has several roofs: FP32, FP64, special functions, tensor cores, and one bandwidth roof per memory level. A kernel can be under the wrong roof in the picture and still be "correctly" placed by the formula.</li>
+<li><b>The inspector counts what the cooks did.</b> Intensity counted from source or SASS is what the kernel asks for; the memory system may move more (wasted sectors) or less (cache hits). Only a profiler measures what was moved.</li>
+<li><b>The inspector does not change the soup.</b> A kernel profiler replays and serialises kernels; durations under the profiler are not those of a normal run (D1).</li>
+<li><b>Walking to the pantry is the only waiting in the story.</b> On a GPU, warps also wait for arithmetic results and for each other (<a href="#F1-60">F1-60</a>); a kernel can be below both roofs with neither unit busy, which the two-limit story cannot express.</li>
+</ul>
+
+<h2 id="F6-33-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Measured GFLOP/s above the compute roof</td><td>FLOPs counted from the source, not executed; or the wrong roof (FP16, tensor cores)</td><td>Count the SASS (Listing 2)</td><td>Use executed counts and the roof of the executed instructions</td></tr>
+<tr><td>Measured GB/s above the memory roof</td><td>Caches served part of the traffic; bytes counted as requested</td><td>Profiler DRAM bytes against <i>nB</i></td><td>Place the kernel on the cache-level roof, or use DRAM bytes</td></tr>
+<tr><td>Profiled duration much longer than the event-timed one</td><td>Replay and serialisation under the profiler</td><td>Compare with an unprofiled run</td><td>Times from events (<a href="#F6-06">F6-06</a>); ratios and counters from the profiler</td></tr>
+<tr><td>A "simple" kernel is compute-bound</td><td>Special functions, divisions, conversions or address arithmetic</td><td>Read the SASS; instruction mix</td><td>Precompute, use multiplications, change precision flags with the numerical cost stated</td></tr>
+<tr><td>SASS instruction count looks inflated</td><td>Padding <code>NOP</code>s and the final self-branch counted</td><td>Compare count and listing (Listing 2, line 12)</td><td>Filter padding; count only executed paths</td></tr>
+<tr><td><code>cudaErrorNoDevice</code> (this build's real output)</td><td>No GPU visible</td><td>Device query (<a href="#F6-07">F6-07</a>)</td><td>Run on a GPU machine</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-33-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F2-56">F2-56</a>, where you drew a roofline for a CPU from a datasheet and a measured loop; <a href="#F6-32">F6-32</a>, where the timeline told you which kernels deserve attention; <a href="#F6-21">F6-21</a>, where arithmetic intensity explained GEMM tiling. <b>What carries over:</b> the formula min(π, <i>I</i>β), the ridge point, the rule that the label "memory-bound" describes the roof and not the achievement, and the measurement discipline. <sup class="src"><a href="#F6-33-src-D3">D3</a></sup> <b>What changes:</b> most dangerous first: FLOP counts from source can be wrong in both directions, because the compiler removes and adds work (R3, R5); a GPU has several compute roofs and several memory levels; the kernel profiler perturbs timing through replay (D1); and the hardware numbers must come from your GPU's own documents (AH-21). <b>What comes next:</b> <a href="#F6-34">F6-34</a> reads PTX and SASS line by line, so that you can find loads, stores, FMAs and spills in any kernel and predict the effect of a change before you make it.</p></div>
+
+<h2 id="F6-33-check">Check yourself</h2>
+<ol>
+<li>Write the roofline formula and define each symbol. What is the ridge point of a machine with π = 512 GFLOP/s and β = 128 GB/s?</li>
+<li>Which statement is true? (a) A memory-bound kernel always reaches the memory roof. (b) Adding arithmetic to a kernel left of the ridge leaves its predicted time unchanged until it reaches the ridge. (c) A kernel profiler's durations equal those of a normal run. (d) <code>MUFU</code> instructions run on the FP32 FMA pipeline.</li>
+<li>Predict, then check with Listing 3: a kernel that reads two floats, writes one and does 6 <code>FFMA</code> per element. AI, bound and time on TG-1 for 2<sup>24</sup> elements?</li>
+<li>Why does the SASS of <code>poly&lt;D&gt;</code> have one <code>FADD</code> and <i>D</i> − 1 <code>FFMA</code>, and what does that do to <code>poly&lt;1&gt;</code>'s intensity?</li>
+<li>Explain in your own words why near the ridge an error in the FLOP count matters more than far from it.</li>
+<li>Apply to a new case: Hannah's kernel converts 8-bit integers to float, scales them and writes floats: per element, one 1-byte load, one 4-byte store, one conversion and one <code>FMUL</code>. Where is it on TG-1's roofline, and which "instruction other than FLOPs" might matter on a real GPU?</li>
+<li>Name three reasons a kernel can sit far below its roof and the evidence for each.</li>
+<li>What does <code>--prec-div=false</code> change in the SASS of a division, and what does it cost?</li>
+</ol>
+
+<h2 id="F6-33-lab">Lab</h2>
+<p><b>Goal.</b> Place the six kernels of Listing 1 on your GPU's roofline from SASS counts and datasheet roofs, measure them, and explain the gap for each with profiler evidence (curriculum rule "Explain the gap"). <sup class="src"><a href="#F6-33-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> For steps 1–3: an NVIDIA GPU, CUDA Toolkit, driver and Nsight Compute (record each version), or a cloud GPU instance with them; your GPU's datasheet or architecture whitepaper for its FP32 peak and memory bandwidth (D4). This build used <code>Cuda compilation tools, release 12.0, V12.0.140</code> and <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> (from the run logs), had no GPU and no Nsight Compute. Steps 4–6 need no GPU. Folder <code>university/labs/F6-33</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use. Do not change system-wide profiling permissions on a shared machine without its administrator.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p><b>GPU and Nsight Compute required for steps 1–3.</b> Before step 1, write down the two roofs of your GPU with the document and section they come from. A roof from memory is not allowed (AH-21).</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Compile for your GPU's architecture (replace <code>sm_80</code> in <code>run.sh</code> with yours, from <a href="#F6-07">F6-07</a>), run <code>run_lab.sh</code>, and read <code>sass_counts.out</code>: are the counts the same as for sm_80?</li>
+<li>Put your GPU's roofs into Listing 3 and predict each kernel's time. Then run <code>./roofline</code> on the GPU (median of 5 runs) and compute each kernel's achieved GFLOP/s with the SASS counts and its achieved GB/s.</li>
+<li>Profile each kernel with Nsight Compute (exact command from its documentation) and record: DRAM bytes read and written, achieved memory and compute throughput percentages, FP32 instructions executed. Compare DRAM bytes with <i>nB</i> and FP32 FLOPs with <i>nF</i>.</li>
+<li>Without a GPU: open <code>sass_poly4.out</code> and label every line with its role (index, bounds check, address, load, arithmetic, store).</li>
+<li>Without a GPU: add a kernel <code>poly2&lt;D&gt;</code> that loads two floats and writes one, recount with Listing 2 and place it with Listing 3.</li>
+<li>Without a GPU: read <code>sass_normalize.out</code>, <code>sass_fastdiv.out</code> and <code>rounding.out</code> for the forensic lab.</li>
+</ol>
+<p><b>Expected observations.</b> On a GPU: memory-bound kernels near the same time, compute-bound kernels growing with FLOPs, each below its roof by an amount you explain. In this build: <code>roofline.cu:66: cudaMalloc(&amp;dX, bytes) failed: cudaErrorNoDevice (no CUDA-capable device is detected)</code> (R1) and the compile-time evidence R2–R10.</p>
+<p><b>Verification.</b> For each kernel, your table has: SASS FLOPs and bytes, predicted time, measured time, percentage of the relevant roof, profiler DRAM bytes against prediction, and one sentence explaining the gap with the evidence named (memory throughput, issue stalls, occupancy or instruction mix, C1).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The profiler reports that it cannot access performance counters → a system permission → follow the Nsight Compute documentation for your operating system, or ask the administrator.</li>
+<li>Counts differ from sm_80 → another architecture or toolkit generates other code → use your own counts; that is the point of counting.</li>
+<li>Achieved GB/s above the datasheet value → caches served traffic, or wrong byte count → use the profiler's DRAM bytes.</li>
+<li><code>count_sass.sh</code> prints nothing → wrong file (not a cubin) → build with <code>-cubin</code> as in <code>run.sh</code>.</li>
+</ul>
+<p><b>Extension.</b> Make <code>poly&lt;D&gt;</code> process four elements per thread with a <code>float4</code> load and store (<a href="#F6-23">F6-23</a>); check in the SASS that the loads become <code>.128</code>, recount, and measure whether the memory-bound kernels move closer to their roof.</p>
+
+<h2 id="F6-33-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Leila maintains a normalisation step that multiplied every element by <code>1.0f / s</code>, computed on the host. A reviewer asked for "exact division", so she changed the kernel to <code>x[i] / s</code> (<code>divideEach</code> in <code>normalize.cu</code>). On the team's development board, a GPU with modest arithmetic throughput, the kernel is now clearly slower, while on the big server GPU nobody sees a difference. The evidence below was produced in this build without a GPU; the "development board" is modelled by TG-1.</p>
+<p><b>Evidence pack.</b> (1) The program, with both kernels:</p>
+<pre class="listing" data-src="F6-33/normalize.cu"></pre>
+<p>(2) Its run in this build (R11):</p>
+<pre class="output" data-run="F6-33/normalize"></pre>
+<p>(3) The real SASS of both kernels for sm_80, fast paths (R5):</p>
+<pre class="output" data-run="F6-33/sass_normalize"></pre>
+<p>(4) The fast-path counts, read from (3), placed on TG-1's roofline (R12):</p>
+<pre class="output" data-run="F6-33/forensic"></pre>
+<p>(5) nvcc's description of <code>--prec-div</code> (R7), the SASS with <code>--prec-div=false</code> (R8) and the rounding check (R9), all shown in Layer 3.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: list the arithmetic instructions in each kernel's fast path. What does the <code>divideEach</code> code do when <code>P0</code> is set?</li>
+<li>Hypotheses: give at least two explanations for "slower on the board, same on the server" (for example: the division made the kernel compute-bound on a machine with a low ridge; a memory effect; a different compiler).</li>
+<li>Using (4), explain the difference between the two GPUs with the roofline, without inventing any real GPU's numbers.</li>
+<li>Propose at least two fixes, with the numerical consequence of each (use R9).</li>
+<li>How would you verify your explanation on the real board with a kernel profiler, and how would you prevent a silent change like this in future?</li>
+</ol>
+<p><b>Method hints.</b> Count FLOP-carrying instructions per element in each fast path and place both kernels on TG-1's roofline. Ask where the ridge point of each machine might be, as a variable. Hypothesis → evidence → conclusion.</p>
+
+<h2 id="F6-33-project">Mini-project</h2>
+<p><b>Your GPU's roofline, from documents and from you.</b> Build the roofline of your lab GPU from its datasheet (FP32 and FP64 compute roofs, DRAM bandwidth), then measure your own "practical" roofs: the best bandwidth of a copy kernel (<a href="#F6-09">F6-09</a>) and the best FP32 rate of <code>poly&lt;256&gt;</code> with enough threads. Plot both rooflines (by hand or with numpy and a plotting tool of your choice) with the six kernels on them, and write one paragraph on the difference between the datasheet and the measured roofs.</p>
+<p><b>Rubric.</b> Roofs sourced to named documents, measured roofs with machine, versions and dates (4). Correct placement of all kernels with SASS-based counts (3). An honest discussion of the gaps (3).</p>
+
+<h2 id="F6-33-summary">Summary</h2>
+<ul>
+<li>The roofline bounds a kernel by min(π, <i>I</i>β); the ridge π/β separates memory-bound from compute-bound kernels.</li>
+<li>Count FLOPs and bytes from the SASS: the compiler removed a multiply in <code>poly</code> and turned one division into seven arithmetic and check instructions plus a slow path.</li>
+<li>Below the ridge, extra arithmetic is free in time; past it, time grows with FLOPs.</li>
+<li>A kernel profiler measures what the hardware did (bytes per level, throughput percentages, instruction mix, stalls) and explains the gap to the roof; it replays and serialises kernels, so take times from normal runs.</li>
+<li>Machines with different ridge points can disagree about whether a change matters; never generalise a speed-up from one GPU to another without the roofs.</li>
+<li>Precision flags (<code>--prec-div</code>) and algebraic rewrites change both speed and results; state the numerical cost of every such change.</li>
+</ul>
+
+<h2 id="F6-33-sources">Sources</h2>
+<ol>
+<li id="F6-33-src-D1">D1 — NVIDIA, "Nsight Compute" documentation (Kernel Profiling Guide; Nsight Compute CLI) (tier 1): sections, metrics, replay, roofline charts, baselines. <i>Title only — not opened during this build, and the tool was not installed; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-33-src-D2">D2 — NVIDIA, "CUDA Binary Utilities" (tier 1): cuobjdump, nvdisasm, and the instruction set reference for SASS by architecture. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-33-src-D3">D3 — Samuel Williams, Andrew Waterman, David Patterson, "Roofline: An Insightful Visual Performance Model for Multicore Architectures" (tier 5, peer-reviewed paper; listed among the curriculum's reading items 75–85). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-33-src-D4">D4 — NVIDIA datasheet or architecture whitepaper for the GPU used in your lab (tier 1; product and version to be recorded): SM structure, FP32 and FP64 peak rates, memory bandwidth. <i>Title only — no product chosen in this build (dossier gate G1 open).</i></li>
+<li id="F6-33-src-D5">D5 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): arithmetic instructions throughput table; floating-point standard and precision of division. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-33-src-C1">C1 — Systems Curriculum (this project), section 13.2 topic "Profiling and the roofline model" and the rule "Explain the gap" (quoted). A map, not a source (AH-4).</li>
+<li id="F6-33-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-33/roofline.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+<li id="F6-33-src-R2">R2 — <code>nvcc -arch=sm_80 -cubin -Xptxas -v roofline.cu</code>, ptxas resource report (<code>resources.log</code>), CUDA 12.0, exit code 0. Compile only.</li>
+<li id="F6-33-src-R3">R3 — Listing 2 on the sm_80 cubin of Listing 1 (<code>sass_counts.log</code>), CUDA 12.0 <code>cuobjdump</code>, exit code 0.</li>
+<li id="F6-33-src-R4">R4 — Listing 3 on R3's output (<code>roofline_points.log</code>), g++ 13.3 with sanitizers, exit code 0. TG-1 is invented.</li>
+<li id="F6-33-src-R5">R5 — SASS of <code>multiplyInverse</code> and <code>divideEach</code> for sm_80, padding removed (<code>sass_normalize.log</code>), CUDA 12.0, exit code 0.</li>
+<li id="F6-33-src-R6">R6 — SASS of <code>poly&lt;4&gt;</code> for sm_80, padding removed (<code>sass_poly4.log</code>), CUDA 12.0, exit code 0.</li>
+<li id="F6-33-src-R7">R7 — <code>nvcc --help</code>, the <code>--prec-div</code> entry (<code>prec_div_help.log</code>), CUDA 12.0, exit code 0.</li>
+<li id="F6-33-src-R8">R8 — SASS of <code>divideEach</code> built with <code>--prec-div=false</code> (<code>sass_fastdiv.log</code>), CUDA 12.0, exit code 0.</li>
+<li id="F6-33-src-R9">R9 — build and run of Listing 4 (<code>rounding.log</code>), g++ 13.3 with sanitizers, exit code 0.</li>
+<li id="F6-33-src-R10">R10 — Listing 3 on <code>roofline_model.in</code>, the source-level counts (<code>roofline_model.log</code>), exit code 0.</li>
+<li id="F6-33-src-R11">R11 — build and run of the forensic program (<code>normalize.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F6-33-src-R12">R12 — Listing 3 on <code>forensic.in</code> (<code>forensic.log</code>), exit code 0.</li>
+</ol>
+
+<h2 id="F6-33-glossary">Glossary links</h2>
+<p><a href="#gl-kernel-profiler">Kernel profiler</a> · <a href="#gl-roofline-model">Roofline model</a> · <a href="#gl-arithmetic-intensity">Arithmetic intensity</a> · <a href="#gl-ridge-point">Ridge point</a> · <a href="#gl-speed-of-light-sol-throughput">Speed of light (SOL) throughput</a> · <a href="#gl-kernel-replay">Kernel replay</a> · <a href="#gl-slow-path-of-an-instruction-sequence">Slow path</a> · <a href="#gl-memory-bound-and-compute-bound">Memory-bound and compute-bound</a> · <a href="#gl-ptx-sass">PTX / SASS</a> · <a href="#gl-tg-1-teaching-gpu">TG-1 (teaching GPU)</a></p>
+
+<h2 id="F6-33-next">Next chapter</h2>
+<p>Next: <a href="#F6-34">F6-34 Reading PTX and SASS</a>. Previous: <a href="#F6-32">F6-32</a>. Back to the course: <a href="#CU303">CU303</a>.</p>
+
+<h2 id="F6-33-answers">Answers to Check yourself</h2>
+<ol>
+<li><i>P</i> ≤ min(π, <i>I</i>β): <i>P</i> attainable FLOP/s, π peak FLOP/s, <i>I</i> arithmetic intensity in FLOP/byte, β peak bandwidth in byte/s (D3). Ridge = 512 / 128 = 4 FLOP/byte.</li>
+<li>(b). Left of the ridge the time is set by bytes, which do not change. (a) is false: the label names the lower roof, not the achievement. (c) is false: replay and serialisation change durations (D1). (d) is not what this chapter teaches: <code>MUFU</code> is a special-function instruction, counted separately from FP32 arithmetic; which units execute it on a given GPU is left open in the unverified box of "How the hardware actually does it", so the statement cannot be accepted.</li>
+<li>12 FLOP, 12 bytes: AI = 1.0, at the ridge; attainable 256 GFLOP/s; time = 12 × 16,777,216 / 256 × 10<sup>9</sup> = 786.4 µs, both terms equal (Listing 3 prints "memory" for a tie). Run it with the line <code>kernel q3 flops 12 bytes 12</code>.</li>
+<li>The first step is <code>1.0f * v + 0.5f</code>; multiplying by 1.0 is exact, so the compiler emits <code>v + 0.5f</code> as <code>FADD</code>. <code>poly&lt;1&gt;</code> then executes 1 FLOP instead of the source's 2, and its intensity halves from 0.25 to 0.125 FLOP/byte (R3, R4, R10).</li>
+<li>Near the ridge the two roofs are close, so a small shift in intensity can move the kernel across the ridge and change which resource limits it, and therefore which optimisation helps. Far from the ridge, the same shift changes the predicted performance a little but not the verdict.</li>
+<li>5 bytes per element and 1 FLOP (the <code>FMUL</code>): AI = 0.2, memory-bound on TG-1, attainable 51.2 GFLOP/s. The conversion from integer to float is an instruction that carries no FLOP in this counting; on a real GPU its throughput may be lower than the FMA rate (check the throughput table, D5), and narrow 1-byte loads may use memory less efficiently than wider ones.</li>
+<li>For example: more DRAM bytes than requested (profiler bytes against <i>nB</i>); low occupancy or long stalls (achieved occupancy, stall reasons, ptxas registers); a non-FLOP instruction mix (SASS and instruction counts); a grid too small to fill the GPU; spills (ptxas report, STL/LDL).</li>
+<li>It replaces the IEEE-rounded division sequence (reciprocal, refinement, <code>FCHK</code>, correction, slow-path call) by an approximate reciprocal and one multiplication with range scaling (R8, R5). Cost: results are no longer the correctly rounded quotient; nvcc calls it "the fast approximation mode" (R7).</li>
+</ol>
+<h3 id="F6-33-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> <code>multiplyInverse</code>: one <code>FMUL</code> between load and store (R5). <code>divideEach</code>: <code>MUFU.RCP</code>, five <code>FFMA</code> and <code>FCHK</code> on the fast path; if <code>FCHK</code> sets <code>P0</code>, the code does not take the branch at 0x130 and instead executes <code>CALL.REL.NOINC</code> to a subroutine (the slow path), then rejoins at <code>BSYNC</code>.</p>
+<p><b>Hypotheses.</b> (a) More arithmetic per element moved the kernel past the ridge of a machine with low arithmetic throughput; (b) a memory effect (different access pattern); (c) a compiler difference between machines; (d) the slow path being taken often. (b) is ruled out: both kernels have the same load and store (one <code>LDG.E.CONSTANT</code>, one <code>STG.E</code>, same addresses). (c) is not supported: the evidence comes from one compiler for one target. (d) is unlikely for these inputs (moderate values, divisor 3), but must be checked on the board with the profiler's branch or instruction counts.</p>
+<p><b>Evidence-based conclusion.</b> Counted per element, the fast path moves from 1 FLOP to 10 FLOP-equivalents plus a special-function instruction, with the same 8 bytes: intensity from 0.125 to 1.25 FLOP/byte (R12). On TG-1, whose ridge is 1 FLOP/byte, that crosses the ridge: <code>multiplyInverse</code> is memory-bound at 524.3 µs, <code>divideEach</code> compute-bound at 655.4 µs. A GPU with a much higher ridge (much more arithmetic per byte of bandwidth) keeps both kernels memory-bound and shows no difference. The explanation needs only the two ridges as variables, not any real product's numbers.</p>
+<p><b>Fixes.</b> (1) Go back to multiplication by a host-computed inverse: fastest, but about a third of the results differ by one unit in the last place from the correctly rounded quotient (R9); acceptable only if the reviewer's "exact" requirement is relaxed in writing. (2) <code>--prec-div=false</code> or <code>__fdividef</code>-style fast division: similar speed, approximate results, and the flag affects every division in the file (R7, R8). (3) Keep exact division and accept the cost on the board, documenting it. (4) Fuse the normalisation into a neighbouring kernel so that the extra arithmetic hides under that kernel's memory traffic (<a href="#CU401">CU401</a>).</p>
+<p><b>Verification and prevention.</b> On the board, profile both kernels: compute-pipeline throughput high and memory throughput below its peak for <code>divideEach</code>, the reverse for <code>multiplyInverse</code>; executed instruction counts consistent with R5. Prevent: a performance test on the slowest supported GPU; review rule "every change to arithmetic in a kernel is reviewed with its SASS and its numerical effect". <b>How the evidence was produced:</b> real compiles and SASS dumps in this build, real host rounding check, and the TG-1 model with counts read from the SASS; the "development board" is TG-1 and the server GPU is described only by its ridge being higher.</p>

@@ -1,0 +1,366 @@
+<!--meta
+id: F6-30
+title: CUDA Graphs
+course: CU303
+level: L4
+prereqs: F6-28 (streams and events); F6-29 (overlap and pinned memory); F6-06 (timing with events); F6-05 (error checking)
+time: 10–14 hours including the lab
+hardware: Lab steps 1–4: an NVIDIA GPU with a CUDA Toolkit and driver (record both versions), or a cloud GPU instance. The launch model, the capture model of the forensic lab and the compiler checks need no GPU (this build had none: every GPU run below shows the runtime's real "no device" error)
+maps: Curriculum E8 (streams, overlap and graphs: the graph part and its second acceptance test); Track E 13.2 topic 8 (streams, events and graphs)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-30-hook">Story hook</h2>
+<p>Every evening the great kitchen hall serves the same tasting menu: one hundred small courses, each a tiny step that takes the cooks only a moment. Amara, the head chef, has been writing one order slip per course and carrying it to the pass herself. Writing a slip takes her longer than the cooks need to cook the course. So the cooks finish, look up, and wait for the next slip. The hall is quick; the head chef is the bottleneck.</p>
+<p>Joseph, who runs the pass, has an idea. "Write the whole menu once, on one laminated card. Draw arrows where a course must wait for another. Hand me the card, and every evening you only say <i>serve the card</i>." The first evening costs Amara some extra time to prepare the card. After that, one word starts all hundred courses, and the cooks go from one to the next without waiting for her.</p>
+<p>Two weeks later a guest asks for less salt, and nothing changes: the card still says "two pinches". Joseph shrugs. "The card is laminated. If you want something different, you have to update the card."</p>
+<p>In CUDA, the laminated card is a <b>graph</b>, preparing it is <b>instantiation</b>, "serve the card" is a <b>graph launch</b>, and the guest's salt is the lesson of this chapter's forensic lab.</p>
+
+<h2 id="F6-30-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what a CUDA graph is (nodes, dependency edges, the graph and its executable form) and why replaying an executable graph can cost less host time than issuing the same operations one by one.</li>
+<li><b>Write</b> a graph by stream capture, including a fork and a join across two streams, instantiate it once, launch it many times, and check every call.</li>
+<li><b>Predict</b> with the course's launch model when a graph helps (many short kernels, host-bound issue) and when it hardly helps (long kernels), before measuring.</li>
+<li><b>Measure</b> the per-launch saving of a 100-kernel sequence as curriculum milestone E8 asks, and state what the measured interval contains.</li>
+<li><b>Diagnose</b> a graph that keeps using stale argument values, and fix it with an executable-graph update or with arguments read through device memory.</li>
+</ul>
+
+<div class="co jargon" id="F6-30-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>CUDA graph</dt><dd><b>Simple words:</b> a recorded plan of GPU work, with arrows that say what must wait for what. <b>Analogy:</b> the laminated menu card with arrows between courses. <b>Precise:</b> an object of type <code>cudaGraph_t</code> made of nodes (kernel launches, copies, memsets, event operations, host functions, child graphs) and dependency edges; it describes work but does not run it. <sup class="src"><a href="#F6-30-src-D1">D1</a></sup> <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></dd>
+<dt>Node and edge (graph)</dt><dd><b>Simple words:</b> a node is one job; an edge is a "wait for" arrow between two jobs. <b>Analogy:</b> one course on the card; an arrow from the sauce to the dessert. <b>Precise:</b> a node is created with a call such as <code>cudaGraphAddKernelNode</code> (with a list of dependencies) or by stream capture; an edge from node A to node B means B may start only after A completes. <sup class="src"><a href="#F6-30-src-H1">H1</a></sup> Not the edges of a road map in <a href="#MA102">MA102</a>, although the mathematics (a directed acyclic graph) is the same.</dd>
+<dt>Executable graph (instantiation)</dt><dd><b>Simple words:</b> the ready-to-run version of a graph, checked and prepared once. <b>Analogy:</b> the card after Joseph has laminated it. <b>Precise:</b> a <code>cudaGraphExec_t</code> made by <code>cudaGraphInstantiate</code>, which validates "any structural constraints or intra-node constraints which were not previously validated"; it is launched with <code>cudaGraphLaunch</code> and destroyed with <code>cudaGraphExecDestroy</code>. <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></dd>
+<dt>Stream capture</dt><dd><b>Simple words:</b> recording the jobs you put into a stream instead of running them. <b>Analogy:</b> Joseph copies each slip onto the card instead of sending it to the cooks. <b>Precise:</b> between <code>cudaStreamBeginCapture(s, mode)</code> and <code>cudaStreamEndCapture(s, &amp;graph)</code>, "all operations pushed into the stream will not be executed, but will instead be captured into a graph". <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></dd>
+<dt>Graph launch</dt><dd><b>Simple words:</b> one call that starts all the jobs of an executable graph. <b>Analogy:</b> "serve the card". <b>Precise:</b> <code>cudaGraphLaunch(exec, stream)</code> executes the graph in a stream; "each launch is ordered behind both any previous work in <i>stream</i> and any previous launches of <i>graphExec</i>", and only one instance of an executable graph may execute at a time. <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></dd>
+<dt>Launch overhead</dt><dd><b>Simple words:</b> the time spent starting a kernel, not running it. <b>Analogy:</b> the time Amara spends writing and carrying a slip. <b>Precise:</b> the host time of a launch call plus any gap on the GPU between the end of one kernel and the start of the next; this course's launch model (Listing 3) treats both as parameters, because no values could be measured in this build (AH-23).</dd>
+<dt>Executable-graph update</dt><dd><b>Simple words:</b> changing the values inside a prepared graph without preparing it again. <b>Analogy:</b> updating the card's salt line without writing a new card. <b>Precise:</b> <code>cudaGraphExecKernelNodeSetParams</code> changes one kernel node's parameters for future launches; <code>cudaGraphExecUpdate</code> copies the node parameters of a "topologically identical graph" into the executable graph, or fails with a reason. <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-30-pictures">The idea in pictures</h2>
+<p>Figure 1 compares two ways of running the same short kernels. Above, the host issues each launch; when a launch call takes longer on the host than the kernel takes on the GPU, the GPU idles between kernels. Below, the host issues one graph launch and the GPU walks the nodes. The bars come from the launch model's assumptions (Listing 3), not from a GPU.</p>
+<figure id="F6-30-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F6-30-f1t F6-30-f1d">
+<title id="F6-30-f1t">Figure 1: individual launches versus one graph launch</title>
+<desc id="F6-30-f1d">Two timelines, each with a host lane and a GPU lane. Top, individual launches: the host lane shows four launch calls one after the other, each 8 model units long; the GPU lane shows four short kernels of 3 units, each starting only when the host has finished the matching launch call, so there are gaps of idle GPU time between the kernels. Total about 35 units. Bottom, one graph: the host lane shows one graph launch call of 6 units and is then free; the GPU lane shows the same four kernels close together, separated by 1-unit gaps, ending at about 21 units. A note says the units are invented model parameters: host 8 per launch, kernel 3, graph launch 6, gap between graph nodes 1.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="20" y="22">Individual launches (host-bound case): the GPU waits for the host</text>
+<text class="sv-ts" x="20" y="52">host</text><text class="sv-ts" x="20" y="82">GPU</text>
+<rect class="sv-b2" x="100" y="40" width="128" height="18"/><text class="sv-ts" x="106" y="53">launch 1</text>
+<rect class="sv-b2" x="228" y="40" width="128" height="18"/><text class="sv-ts" x="234" y="53">launch 2</text>
+<rect class="sv-b2" x="356" y="40" width="128" height="18"/><text class="sv-ts" x="362" y="53">launch 3</text>
+<rect class="sv-b2" x="484" y="40" width="128" height="18"/><text class="sv-ts" x="490" y="53">launch 4</text>
+<rect class="sv-b5" x="228" y="70" width="48" height="18"/><text class="sv-ts" x="232" y="83">k1</text>
+<rect class="sv-b5" x="356" y="70" width="48" height="18"/><text class="sv-ts" x="360" y="83">k2</text>
+<rect class="sv-b5" x="484" y="70" width="48" height="18"/><text class="sv-ts" x="488" y="83">k3</text>
+<rect class="sv-b5" x="612" y="70" width="48" height="18"/><text class="sv-ts" x="616" y="83">k4</text>
+<text class="sv-ts" x="282" y="108">idle</text><text class="sv-ts" x="410" y="108">idle</text><text class="sv-ts" x="538" y="108">idle</text>
+<line class="sv-dash" x1="660" y1="34" x2="660" y2="96"/><text class="sv-ts" x="666" y="83">end 35</text>
+<text class="sv-tb" x="20" y="146">One graph launch: the host issues once, the GPU walks the nodes</text>
+<text class="sv-ts" x="20" y="176">host</text><text class="sv-ts" x="20" y="206">GPU</text>
+<rect class="sv-b2" x="100" y="164" width="96" height="18"/><text class="sv-ts" x="104" y="177">graph launch</text>
+<text class="sv-ts" x="206" y="177">host free for other work</text>
+<rect class="sv-b5" x="196" y="194" width="48" height="18"/><text class="sv-ts" x="200" y="207">k1</text>
+<rect class="sv-b5" x="260" y="194" width="48" height="18"/><text class="sv-ts" x="264" y="207">k2</text>
+<rect class="sv-b5" x="324" y="194" width="48" height="18"/><text class="sv-ts" x="328" y="207">k3</text>
+<rect class="sv-b5" x="388" y="194" width="48" height="18"/><text class="sv-ts" x="392" y="207">k4</text>
+<line class="sv-dash" x1="436" y1="158" x2="436" y2="220"/><text class="sv-ts" x="442" y="207">end 21</text>
+<line class="sv-line" x1="100" y1="240" x2="740" y2="240"/><polygon class="sv-head" points="740,240 732,236 732,244"/>
+<text class="sv-ts" x="96" y="256">0</text><text class="sv-ts" x="700" y="256">time</text>
+<text class="sv-ts" x="20" y="276">Invented model units (Listing 3 parameters): host 8 per launch, kernel 3, graph launch 6, gap between graph nodes 1.</text>
+<text class="sv-ts" x="20" y="292">Not a measurement of any GPU. Bars in one lane never overlap.</text>
+</svg></div><figcaption><b>Figure 1.</b> Why a graph can help: the host's cost per launch is paid once per graph instead of once per kernel. The shape follows the <code>host-bound</code> case of Listing 3 with four kernels instead of a hundred (R3). Whether the GPU-side gaps also shrink on a real GPU is an assumption of the model, marked unverified in "How the hardware actually does it". <sup class="src"><a href="#F6-30-src-D1">D1</a></sup> <sup class="src"><a href="#F6-30-src-R3">R3</a></sup></figcaption></figure>
+
+<p>Figure 2 shows the graph that Listing 2 captures: a fork into two branches and a join before the sum. The arrows are the edges of the graph. They come from the event record and event wait calls made during capture, exactly the pattern of <a href="#F6-28">F6-28</a>'s Figure 2.</p>
+<figure id="F6-30-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 240" role="img" aria-labelledby="F6-30-f2t F6-30-f2d">
+<title id="F6-30-f2t">Figure 2: the fork-and-join graph captured by Listing 2</title>
+<desc id="F6-30-f2d">Left, the capture code as two stream lanes: main stream with record forkEv, setTo A, wait joinEv, addInto C; side stream with wait forkEv, setTo B, record joinEv. Dashed arrows show forkEv from main to side and joinEv from side to main. Right, the resulting graph: three kernel nodes. Node setTo A and node setTo B have no dependencies; both have an arrow to node addInto C. A note says the events themselves do not become nodes in this pattern; they become the two edges into addInto.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="240"/>
+<text class="sv-tb" x="20" y="22">During capture (two streams)</text>
+<text class="sv-ts" x="20" y="56">main</text><text class="sv-ts" x="20" y="136">side</text>
+<rect class="sv-b6" x="70" y="40" width="70" height="26" rx="4"/><text class="sv-ts" x="74" y="57">rec fork</text>
+<rect class="sv-b5" x="150" y="40" width="70" height="26" rx="4"/><text class="sv-ts" x="154" y="57">setTo A</text>
+<rect class="sv-b7" x="230" y="40" width="76" height="26" rx="4"/><text class="sv-ts" x="234" y="57">wait join</text>
+<rect class="sv-b5" x="316" y="40" width="70" height="26" rx="4"/><text class="sv-ts" x="320" y="57">addInto</text>
+<rect class="sv-b7" x="70" y="120" width="76" height="26" rx="4"/><text class="sv-ts" x="74" y="137">wait fork</text>
+<rect class="sv-b5" x="156" y="120" width="70" height="26" rx="4"/><text class="sv-ts" x="160" y="137">setTo B</text>
+<rect class="sv-b6" x="236" y="120" width="70" height="26" rx="4"/><text class="sv-ts" x="240" y="137">rec join</text>
+<line class="sv-dash" x1="105" y1="66" x2="105" y2="118"/><polygon class="sv-head" points="105,118 101,110 109,110"/>
+<line class="sv-dash" x1="271" y1="120" x2="271" y2="68"/><polygon class="sv-head" points="271,68 267,76 275,76"/>
+<text class="sv-ts" x="20" y="180">Dashed: event dependencies made by cudaEventRecord / cudaStreamWaitEvent.</text>
+<text class="sv-tb" x="470" y="22">Captured graph</text>
+<rect class="sv-b5" x="450" y="44" width="100" height="30" rx="5"/><text class="sv-ts" x="458" y="63">setTo A</text>
+<rect class="sv-b5" x="610" y="44" width="100" height="30" rx="5"/><text class="sv-ts" x="618" y="63">setTo B</text>
+<rect class="sv-b4" x="530" y="130" width="110" height="30" rx="5"/><text class="sv-ts" x="538" y="149">addInto C</text>
+<line class="sv-line" x1="500" y1="74" x2="570" y2="128"/><polygon class="sv-head" points="570,128 561,125 566,119"/>
+<line class="sv-line" x1="660" y1="74" x2="600" y2="128"/><polygon class="sv-head" points="600,128 604,119 609,125"/>
+<text class="sv-ts" x="450" y="196">Two root nodes, one edge each into the sum.</text>
+<text class="sv-ts" x="450" y="214">The run on a GPU prints the counts (Listing 2).</text>
+</svg></div><figcaption><b>Figure 2.</b> Stream capture turns cross-stream event dependencies into graph edges. The side stream joins the capture by waiting on an event recorded in the capturing stream, and must be joined back before <code>cudaStreamEndCapture</code>; otherwise the runtime reports <code>cudaErrorStreamCaptureUnjoined</code>, "the capture sequence contains a fork that was not joined to the primary stream". <sup class="src"><a href="#F6-30-src-H1">H1</a></sup> <sup class="src"><a href="#F6-30-src-D1">D1</a></sup> The node and edge counts on the right are the expected shape, not an observed output (no GPU in this build).</figcaption></figure>
+
+<h2 id="F6-30-layer1">Layer 1 — the kid explanation</h2>
+<p>Starting a GPU job costs a little time on the CPU. For a big job, nobody notices. For a tiny job, starting it can take longer than doing it. Then the GPU spends its evening waiting for the CPU.</p>
+<p>A CUDA graph is a recorded plan. You write down all the jobs once, with arrows for "this one waits for that one". The computer checks the plan and prepares it. After that, one short call starts the whole plan.</p>
+<p>The easiest way to write the plan is to record it. You tell a stream "record, don't run". Then you issue your jobs as usual. When you stop recording, you get the plan.</p>
+<p>A recorded plan remembers the numbers you gave it. If a number must change every time, you have to update the plan, or let the jobs read the number from GPU memory.</p>
+
+<h2 id="F6-30-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-30-l2-three">Three steps: define, instantiate, launch</h3>
+<p>Analogy first: write the card, laminate it, serve it many times. The CUDA Programming Guide describes work submission with graphs as three separate stages: definition, where the program creates the description of the operations and their dependencies; instantiation, which validates the graph and does much of the setup work once; and execution, where the executable graph is launched into a stream as often as needed. <sup class="src"><a href="#F6-30-src-D1">D1</a></sup> The installed runtime header gives the calls for each stage:</p>
+<div class="tw"><table>
+<thead><tr><th>Stage</th><th>Calls (declarations in this build's header, R4)</th><th>What the header says</th></tr></thead>
+<tbody>
+<tr><td>Define by capture</td><td><code>cudaStreamBeginCapture</code>, <code>cudaStreamEndCapture</code></td><td>Captured operations "will not be executed"; capture "may not be initiated if <i>stream</i> is cudaStreamLegacy" and "must be ended on the same stream in which it was initiated". <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></td></tr>
+<tr><td>Define by hand</td><td><code>cudaGraphCreate</code>, <code>cudaGraphAddKernelNode</code> and the other <code>cudaGraphAdd…Node</code> calls</td><td>For a kernel node, "the <i>kernelParams</i> or <i>extra</i> array, as well as the argument values it points to, are copied during this call". <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></td></tr>
+<tr><td>Instantiate</td><td><code>cudaGraphInstantiate</code></td><td>"The graph is validated for any structural constraints or intra-node constraints which were not previously validated." <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></td></tr>
+<tr><td>Launch</td><td><code>cudaGraphLaunch</code></td><td>"Only one instance of <i>graphExec</i> may be executing at a time"; to run a graph concurrently it "must be instantiated multiple times". <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></td></tr>
+<tr><td>Change</td><td><code>cudaGraphExecKernelNodeSetParams</code>, <code>cudaGraphExecUpdate</code></td><td>"The modifications only affect future launches"; update needs a "topologically identical graph". <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F6-30/graph_api_help"></pre>
+<h3 id="F6-30-l2-capture">Stream capture is the easy road</h3>
+<p>Capture lets you reuse code you already have. In Listing 1, the function <code>issueSequence</code> launches 100 kernels into a stream. Called normally, it runs them. Called between <code>cudaStreamBeginCapture</code> and <code>cudaStreamEndCapture</code>, the same function records 100 kernel nodes, each depending on the previous one because in-stream order becomes a chain of edges. <sup class="src"><a href="#F6-30-src-D1">D1</a></sup> <sup class="src"><a href="#F6-30-src-H1">H1</a></sup> Nothing runs during capture: if your code reads a result back between two captured kernels, the result is not there.</p>
+<p>The <code>mode</code> argument decides which other API calls are allowed while a capture is in progress. The header explains why such a rule is needed: some calls, such as <code>cudaMalloc</code>, are "not enqueued asynchronously to a stream" and are "not observed by stream capture", so a captured sequence that depended on them would be invalid when replayed. With <code>cudaStreamCaptureModeGlobal</code>, the default, a thread is "prohibited from potentially unsafe API calls" while it, or any other thread in global mode, is capturing; <code>cudaStreamCaptureModeThreadLocal</code> only looks at the thread's own capture; <code>cudaStreamCaptureModeRelaxed</code> lifts the prohibition. <sup class="src"><a href="#F6-30-src-H1">H1</a></sup> Use global mode unless you know why not. Allocate everything before capturing.</p>
+<h3 id="F6-30-l2-fork">Forks and joins: events become edges</h3>
+<p>Capture can follow work into other streams. In Listing 2, the main stream records <code>forkEv</code>; the side stream waits on it, and from that moment the side stream is part of the same capture. Work issued to both streams is recorded; the event wait at the end (<code>joinEv</code>) brings the side branch back. The result is the graph of Figure 2: two kernels with no dependency between them, and a sum that depends on both. <sup class="src"><a href="#F6-30-src-D1">D1</a></sup> If the side stream is not joined back, the header's error list has the name for it: <code>cudaErrorStreamCaptureUnjoined</code>. Other capture errors are just as specific: <code>cudaErrorStreamCaptureImplicit</code> ("a disallowed implicit dependency on a current capture sequence from cudaStreamLegacy"), <code>cudaErrorStreamCaptureIsolation</code>, <code>cudaErrorStreamCaptureInvalidated</code>. <sup class="src"><a href="#F6-30-src-H2">H2</a></sup> The legacy default stream of <a href="#F6-28">F6-28</a> causes trouble here too: the header says that while a blocking stream is capturing, "the legacy stream is in an unusable state until the blocking stream capture is terminated". <sup class="src"><a href="#F6-30-src-H1">H1</a></sup> One more reason for non-blocking streams.</p>
+<h3 id="F6-30-l2-values">What a graph remembers</h3>
+<p>A graph records the work <i>as it was issued</i>. For a node added by hand, the header states that the kernel's argument values are copied when the node is created. <sup class="src"><a href="#F6-30-src-H1">H1</a></sup> A pointer argument is an address, so the graph will read whatever is stored at that address when it runs; a value argument such as a <code>float gain</code> is frozen. That difference is the whole story of the forensic lab.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The installed header documents the copying of argument values for <code>cudaGraphAddKernelNode</code>. That a kernel launch recorded by <b>stream capture</b> keeps the argument values given at capture time in the same way is how this chapter, its listings and its forensic lab treat capture, but the statement for capture was not found in the header. Check the CUDA Programming Guide's section on CUDA Graphs, stream capture (D1), for the toolkit version you use, and confirm it with Lab step 4 on a GPU.</p></div>
+
+<h2 id="F6-30-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: the card saves Amara's writing time, not the cooks' cooking time, so the card pays off only when the writing was the slow part.</p>
+<h3 id="F6-30-l3-model">When does a graph pay off? A model</h3>
+<p>Listing 3 models one sequence of <i>K</i> kernels, each taking <i>k</i> µs on the GPU. Issued one by one, the host needs <i>h</i> µs per launch call, and the GPU needs a gap of <i>g</i> µs between one kernel's end and the next one's start. Issued as a graph, the host needs <i>G</i> µs once, and the GPU needs a gap of <i>g</i>′ between nodes. All five numbers are inputs; this build measured none of them. With individual launches, kernel <i>i</i> starts at max((<i>i</i> + 1)·<i>h</i>, end of kernel <i>i</i> − 1 + <i>g</i>). For large <i>K</i> the total tends to <i>K</i> · max(<i>h</i>, <i>k</i> + <i>g</i>): either the host is the bottleneck or the GPU is. With a graph, the total is <i>G</i> + <i>K</i>·<i>k</i> + (<i>K</i> − 1)·<i>g</i>′.</p>
+<p>Two conclusions follow from the algebra, whatever the real values are. First, the saving per kernel is bounded by max(<i>h</i>, <i>k</i> + <i>g</i>) − (<i>k</i> + <i>g</i>′): when kernels are long, <i>k</i> dominates both terms and the relative gain goes to zero. Second, when the host is the bottleneck (<i>h</i> &gt; <i>k</i> + <i>g</i>), the graph removes the host term from the critical path entirely, which is the largest gain the model can show. The real output (Worked example) shows both. <sup class="src"><a href="#F6-30-src-R3">R3</a></sup></p>
+<h3 id="F6-30-l3-instantiate">The cost of instantiation, and amortisation</h3>
+<p>Instantiation does validation and setup once (H1, D1); it is not free. A graph launched once has paid for instantiation and saved nothing, as the model's <code>short-1</code> line shows with its invented numbers (a speed-up below 1). The engineering rule: build and instantiate the graph outside the loop, launch it inside the loop, and measure the break-even count on your machine. Milestone E8 asks for exactly the per-launch saving: "Graph version of a 100-kernel sequence reduces total time versus individual launches; the measured per-launch saving is logged." <sup class="src"><a href="#F6-30-src-C1">C1</a></sup> Listing 1 logs that number on a GPU; it excludes instantiation from the timed interval and says so.</p>
+<h3 id="F6-30-l3-update">Changing a graph without rebuilding it</h3>
+<p>Real programs rarely replay exactly the same work: a frame number, a pointer to the next buffer or a gain changes every time. There are three honest options, from cheapest to most general:</p>
+<ol>
+<li><b>Indirection.</b> Pass a pointer to device memory and update the value there with an ordinary copy before each launch. The graph never changes; the kernel reads the current value. (Version 3 of the forensic model.)</li>
+<li><b>Set one node's parameters.</b> <code>cudaGraphExecKernelNodeSetParams</code> changes a kernel node in the executable graph; "the modifications only affect future launches", and "already enqueued or running launches … are not affected". You need the node handle, which you get from a graph you built by hand, or by querying the captured graph's nodes. <sup class="src"><a href="#F6-30-src-H1">H1</a></sup></li>
+<li><b>Capture again, then update.</b> Capture the new work into a new graph and call <code>cudaGraphExecUpdate(exec, newGraph, &amp;info)</code>. It succeeds when the new graph is "topologically identical" and the changes are within its documented limits; otherwise it returns <code>cudaErrorGraphExecUpdateFailure</code> and <code>info.result</code> names the reason, for example <code>cudaGraphExecUpdateErrorTopologyChanged</code>. The header adds: "The API may add further restrictions in future releases. The return code should always be checked." <sup class="src"><a href="#F6-30-src-H1">H1</a></sup> Listing 4 does this and falls back to a fresh instantiation.</li>
+</ol>
+<h3 id="F6-30-l3-more">Other node types, and what this chapter leaves out</h3>
+<p>The header documents graph instantiation flags for graphs with memory allocation nodes (<code>cudaGraphInstantiateFlagAutoFreeOnLaunch</code>), for graphs launched from the device (<code>cudaGraphInstantiateFlagDeviceLaunch</code>) and for per-node priorities (<code>cudaGraphInstantiateFlagUseNodePriority</code>), and a call <code>cudaGraphUpload</code> that uploads an executable graph "to the device in <i>hStream</i> without executing it". <sup class="src"><a href="#F6-30-src-H1">H1</a></sup> <code>cudaGraphDebugDotPrint</code> writes "a DOT formatted description of the graph" (Listing 2 uses it). <sup class="src"><a href="#F6-30-src-H1">H1</a></sup> Device-side launch, conditional nodes and memory nodes are beyond this course; read the Programming Guide's graphs section (D1) for the toolkit you use before using them. HIP offers graphs with <code>hip</code> names (<a href="#HP301">HP301</a>); check the HIP API reference before assuming any one-to-one mapping.</p>
+
+<h2 id="F6-30-hardware">How the hardware actually does it</h2>
+<p>A kernel launch is a message from the host to the GPU: the driver writes a command describing the kernel, its launch configuration and its argument values into memory that the GPU reads, and tells the GPU there is new work, in the way a host hands work to any device that reads its commands from memory (<a href="#F1-44">F1-44</a>). <sup class="src"><a href="#F6-30-src-D3">D3</a></sup> The host side of that (checking arguments, building the command, writing it) is what a graph launch can do once for many nodes instead of once per kernel; that is the gain the Programming Guide attributes to graphs, by moving work from launch time to instantiation time. <sup class="src"><a href="#F6-30-src-D1">D1</a></sup> On the GPU side, a kernel still occupies the streaming multiprocessors in exactly the same way; a graph does not make any kernel itself faster.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>How a graph launch is represented in the GPU's command stream, whether the GPU-side gap between consecutive kernels (<i>g</i> versus <i>g</i>′ in the model) really shrinks with graphs on a given GPU, and the size of the host cost per launch and per graph launch are not stated in any document opened in this build. The model's numbers are invented (TG-1-class teaching values). Read the CUDA Programming Guide's CUDA Graphs section (D1) and the Best Practices Guide (D2) for your toolkit, then <b>measure</b> both effects with Listing 1 and an Nsight Systems timeline (<a href="#F6-32">F6-32</a>).</p></div>
+
+<h2 id="F6-30-worked">Worked example</h2>
+<p>Use the launch model with invented parameters: host time per launch call <i>h</i> = 4 µs, GPU gap between individually launched kernels <i>g</i> = 2 µs, one graph launch <i>G</i> = 6 µs, gap between graph nodes <i>g</i>′ = 1 µs. These are teaching numbers, not properties of any GPU.</p>
+<ol>
+<li><b>100 kernels of 3 µs, individually.</b> The GPU needs <i>k</i> + <i>g</i> = 5 µs per kernel, the host 4 µs per launch, so the GPU is the bottleneck after the first kernel. Kernel 0 starts when the first launch call is done, at 4, and ends at 7. Each further kernel adds 5: 7 + 99 × 5 = 502 µs.</li>
+<li><b>The same as a graph.</b> First node starts at <i>G</i> = 6, ends at 9; each further node adds <i>g</i>′ + <i>k</i> = 4: 9 + 99 × 4 = 405 µs. Speed-up 502 / 405 ≈ 1.24; saving per kernel (502 − 405) / 100 = 0.97 µs.</li>
+<li><b>One kernel.</b> Individually: 4 + 3 = 7 µs. As a graph: 6 + 3 = 9 µs. The graph is slower (0.78×) because nothing is amortised.</li>
+<li><b>100 kernels of 500 µs.</b> Both totals are about 50 ms; the saving is still about 1 µs per kernel, but the speed-up is 1.00×: invisible.</li>
+<li><b>Host-bound: <i>h</i> = 8 µs.</b> Individually the host is the bottleneck: kernel 99 ends at 100 × 8 + 3 = 803 µs. The graph does not depend on <i>h</i>: 405 µs again. Speed-up 1.98×, saving 3.98 µs per kernel.</li>
+</ol>
+<p>Listing 3 computes the same six cases; its real output (R3):</p>
+<pre class="output" data-run="F6-30/launch_model"></pre>
+<p>The lesson for your plan: measure <i>h</i> (host time per launch) and the kernel time first. If kernels are long compared with the launch cost, a graph will not be worth its complexity.</p>
+
+<h2 id="F6-30-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>graph.cu</code>: 100 small kernels launched one by one and as one captured graph, each version timed over 20 repetitions; the results must be bit-identical. This is the measurement for milestone E8's second acceptance test.</p>
+<pre class="listing" data-src="F6-30/graph.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings graph.cu -o graph</code>, then <code>./graph</code>. <sup class="src"><a href="#F6-30-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F6-30/graph"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> This build has no GPU. The program compiled without warnings; the run stopped at its first runtime call with <code>cudaErrorNoDevice</code>. On an NVIDIA GPU the expected output is four lines: <code>graph nodes: 100</code>, two timing lines and <code>results identical</code>, with exit status 0. None of these values, and no time, has been observed in this build. Record your own run with the GPU name, driver and toolkit versions.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–14</td><td><code>step</code></td><td>A tiny element-wise kernel: <code>x = x * a + 1</code>.</td><td>Short on purpose: launch cost must be visible next to the kernel's own time.</td></tr>
+<tr><td>17–25</td><td><code>issueSequence</code></td><td>Launches 100 kernels into one stream, each with its own multiplier, each launch checked.</td><td>The same function is used for direct launches and for capture: capture reuses existing code.</td></tr>
+<tr><td>29–31</td><td><code>n = 1 &lt;&lt; 12</code>, 100 kernels, 20 repeats</td><td>4096 elements, 2000 kernels per timed run.</td><td>Small data so that each kernel is short; repeats so the event resolution is not the limit.</td></tr>
+<tr><td>39</td><td><code>cudaStreamNonBlocking</code></td><td>A stream that does not synchronise with the legacy stream.</td><td>Capture is not allowed on the legacy stream, and a blocking capture disturbs it (H1).</td></tr>
+<tr><td>46–47</td><td>copy, warm-up sequence</td><td>One untimed run of the sequence.</td><td>First-use costs stay out of the measurement (<a href="#F6-06">F6-06</a>).</td></tr>
+<tr><td>48–56</td><td>reset, record, 20 × sequence, record, elapsed</td><td>Times 2000 individual launches with events in the same stream.</td><td>Both events are in one stream, so the interval is "from the first launch's start to the last kernel's end" in that stream.</td></tr>
+<tr><td>63–65</td><td><code>cudaStreamBeginCapture</code> … <code>cudaStreamEndCapture</code></td><td>Records the 100 launches as a graph; nothing runs.</td><td>The graph is defined once, outside any loop.</td></tr>
+<tr><td>66–67</td><td><code>cudaGraphGetNodes(graph, nullptr, &amp;nodes)</code></td><td>Asks only for the node count.</td><td>A check that capture saw all 100 launches.</td></tr>
+<tr><td>68</td><td><code>cudaGraphInstantiate(&amp;graphExec, graph, 0)</code></td><td>Validates and prepares the executable graph.</td><td>Done once, outside the timed interval; report its cost separately if you measure it.</td></tr>
+<tr><td>69</td><td><code>cudaGraphLaunch</code> (warm-up)</td><td>One untimed launch.</td><td>Same warm-up rule as for direct launches.</td></tr>
+<tr><td>70–78</td><td>reset, record, 20 × <code>cudaGraphLaunch</code>, record, elapsed</td><td>Times 20 graph launches.</td><td>Each launch is ordered behind the previous one (H1), so the work is the same as in part A.</td></tr>
+<tr><td>82</td><td><code>std::memcmp</code></td><td>Compares the two results byte for byte.</td><td>Same operations in the same order must give the same bits; any difference is a bug, not rounding.</td></tr>
+<tr><td>84–91</td><td>prints</td><td>Node count, both times, per-kernel times and the saving per kernel.</td><td>The logged per-launch saving that E8 requires (C1).</td></tr>
+<tr><td>93–98</td><td>destroy and free</td><td>Executable graph, graph, events, stream, memory.</td><td>Every handle released, every call checked (AH-27).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>graph_forkjoin.cu</code>: capture across two streams, the fork-and-join graph of Figure 2.</p>
+<pre class="listing" data-src="F6-30/graph_forkjoin.cu"></pre>
+<p><b>Build command</b>: <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings graph_forkjoin.cu -o graph_forkjoin</code>. <sup class="src"><a href="#F6-30-src-R2">R2</a></sup></p>
+<pre class="output" data-run="F6-30/graph_forkjoin"></pre>
+<p><b>Untested on hardware</b> in the same way as Listing 1: the expected output on a GPU is a line with the node and edge counts and <code>C[0] = 3.0 (expected 3.0)</code>; for the graph of Figure 2 the expected counts are 3 nodes and 2 edges, which is a prediction, not an observation.</p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>37–42</td><td>two non-blocking streams, two marker events</td><td>Prepares the fork and the join.</td><td>Marker events use <code>cudaEventDisableTiming</code> (<a href="#F6-28">F6-28</a>).</td></tr>
+<tr><td>45</td><td><code>cudaStreamBeginCapture(mainStream, …Global)</code></td><td>Starts capture on the main stream.</td><td>The capture must end on this stream (H1).</td></tr>
+<tr><td>46–47</td><td>record <code>forkEv</code>; side waits on it</td><td>The side stream joins the capture.</td><td>Without this wait, work issued to <code>side</code> would simply run, uncaptured.</td></tr>
+<tr><td>48–51</td><td>two <code>setTo</code> launches in two streams</td><td>Two independent nodes.</td><td>No edge between them: the graph lets them run concurrently.</td></tr>
+<tr><td>52–53</td><td>record <code>joinEv</code> in side; main waits</td><td>Joins the branch back.</td><td>Required before ending capture (<code>cudaErrorStreamCaptureUnjoined</code>, H2).</td></tr>
+<tr><td>54</td><td><code>addInto</code></td><td>The node with two incoming edges.</td><td>Reads both branches' results safely.</td></tr>
+<tr><td>58–63</td><td>count nodes and edges; <code>cudaGraphDebugDotPrint</code></td><td>Checks the shape and writes a DOT file.</td><td>Look at the graph before trusting it; <code>run.sh</code> deletes the file afterwards to keep the folder clean.</td></tr>
+<tr><td>65–71</td><td>instantiate, launch, copy one value back, synchronise</td><td>Runs the graph once and checks one element.</td><td>The host reads <code>c0</code> only after <code>cudaStreamSynchronize</code>.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>launch_model.cpp</code>: the launch model of Layer 3. Ordinary C++; its output in the Worked example is real.</p>
+<pre class="listing" data-src="F6-30/launch_model.cpp"></pre>
+<p><b>Build and run</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined launch_model.cpp -o launch_model</code>, then <code>./launch_model &lt; launch_model.in</code>. <sup class="src"><a href="#F6-30-src-R3">R3</a></sup></p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>7</td><td>input format comment</td><td>One case per line: label, <i>K</i>, <i>k</i>, <i>h</i>, <i>g</i>, <i>G</i>, <i>g</i>′.</td><td>Every parameter is visible in <code>launch_model.in</code>; nothing is hidden in the code.</td></tr>
+<tr><td>21–26</td><td>individual-launch loop</td><td>Kernel <i>i</i> starts at the later of "host finished launch call <i>i</i>" and "previous kernel ended plus gap".</td><td>Exactly the max formula of Layer 3; the host and the GPU are the two possible bottlenecks.</td></tr>
+<tr><td>28–32</td><td>graph loop</td><td>First node after <i>G</i>, then gap <i>g</i>′ between nodes.</td><td>The host cost appears once.</td></tr>
+<tr><td>34–35</td><td><code>printf</code></td><td>Both totals, the speed-up and the saving per kernel.</td><td>The same quantities Listing 1 prints on a GPU, so model and measurement can be compared line by line.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>graph_update.cu</code>: a graph whose kernel argument changes each frame, kept correct by re-capturing and updating the executable graph. It is the fix for the forensic lab.</p>
+<pre class="listing" data-src="F6-30/graph_update.cu"></pre>
+<p><b>Build command</b>: <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings graph_update.cu -o graph_update</code>. <sup class="src"><a href="#F6-30-src-R5">R5</a></sup></p>
+<pre class="output" data-run="F6-30/graph_update"></pre>
+<p><b>Untested on hardware.</b> On a GPU the expected output is four lines with pixel values 10.0, 20.0, 40.0 and 5.0 and a last line saying how often the graph was instantiated and updated. Whether <code>cudaGraphExecUpdate</code> succeeds for this change (only a kernel's value argument differs) is a prediction from the header's list of update limits, not an observation; the listing is correct either way because it falls back to instantiation.</p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–26</td><td><code>captureFrame</code></td><td>Captures one copy and one kernel with this frame's gain.</td><td>The new gain is part of the new graph's kernel node.</td></tr>
+<tr><td>33–39</td><td><code>cudaMallocHost</code>, fill</td><td>Pinned source buffer.</td><td>The captured asynchronous copy reads it when the graph runs, so it must stay valid and unchanged until then.</td></tr>
+<tr><td>43, 49</td><td><code>graphs</code> vector</td><td>Keeps every captured graph until the end.</td><td>The header documented here does not say whether the executable graph still needs the graph it was made from; keeping them is the safe choice.</td></tr>
+<tr><td>50–52</td><td>first frame: instantiate</td><td>Creates the executable graph.</td><td>Paid once.</td></tr>
+<tr><td>54–56</td><td><code>cudaGraphExecUpdate(exec, graph, &amp;info)</code></td><td>Copies the new node parameters into the executable graph.</td><td>Cheaper than instantiating when the shape is the same (D1); the return code must be checked (H1).</td></tr>
+<tr><td>57–61</td><td>fallback</td><td>Clears the error, destroys and re-instantiates.</td><td>Correct even if a future toolkit refuses the update.</td></tr>
+<tr><td>64–69</td><td>launch, copy one pixel, synchronise, print</td><td>Runs the frame and checks it.</td><td>The printed "expected" value makes a stale graph visible at once.</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-30-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The card does not make the cooking faster.</b> A graph removes launch work; each kernel's own time is unchanged. If the kernels are the slow part, the card helps nothing (Worked example step 4).</li>
+<li><b>A laminated card is truly fixed; a graph is fixed only in what it copied.</b> Value arguments are frozen at definition, but pointer arguments are addresses: the graph reads whatever memory holds when it runs. The "salt" can change through a pointer without any update (version 3 of the forensic model).</li>
+<li><b>Only one card can be served at a time.</b> In the kitchen, two copies of a card can be served in parallel by two teams. An executable graph cannot execute twice at the same time; a second launch waits behind the first. To run two at once, instantiate twice (H1).</li>
+<li><b>Joseph reads the card; there is no Joseph on the GPU.</b> The analogy suggests a person walking the card. The real mechanism of graph execution is not documented in the sources read for this chapter (unverified box above).</li>
+</ul>
+
+<h2 id="F6-30-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Results never change although inputs do</td><td>A value argument frozen in the graph (forensic lab)</td><td>Print the value the graph used next to the value the host meant; inspect the graph with <code>cudaGraphDebugDotPrint</code> with detailed flags</td><td>Update the executable graph, or read the value through device memory</td></tr>
+<tr><td><code>cudaStreamEndCapture</code> fails or returns a NULL graph</td><td>A rule of capture was broken during the sequence; the header says capture is then invalidated and "a NULL graph will be returned"</td><td>Check every call inside the capture; query <code>cudaStreamIsCapturing</code></td><td>Remove the offending call (often a synchronous call or an allocation) from the captured region</td></tr>
+<tr><td><code>cudaErrorStreamCaptureUnjoined</code></td><td>A forked stream was not joined back (H2)</td><td>Follow every event wait that brought a stream into the capture</td><td>Record an event at the end of each side branch and wait on it in the capturing stream</td></tr>
+<tr><td><code>cudaErrorStreamCaptureImplicit</code> or <code>…Unsupported</code></td><td>A legacy-stream operation or an unsafe call during capture (H2, H1)</td><td>Compile with <code>-Wdefault-stream-launch</code> (<a href="#F6-28">F6-28</a>)</td><td>Non-blocking streams; allocate before capturing</td></tr>
+<tr><td>The graph version is slower</td><td>Instantiation inside the loop, or long kernels (nothing to save)</td><td>Time instantiation separately; compare with the model</td><td>Instantiate once; use graphs where launch cost matters</td></tr>
+<tr><td>Code reads results "inside" the captured region and finds garbage</td><td>Captured operations are not executed (H1)</td><td>Look for host reads between begin and end of capture</td><td>Read results after the graph launch and a wait</td></tr>
+<tr><td><code>cudaErrorNoDevice</code> at the first call (this build's real output)</td><td>No GPU visible</td><td>Device query (<a href="#F6-07">F6-07</a>)</td><td>Run on a GPU machine</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-30-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-28">F6-28</a> and <a href="#F6-29">F6-29</a>, where the host issued every copy and kernel into streams one call at a time and events ordered streams against each other. <b>What carries over:</b> in-stream order and event dependencies, which capture turns into graph edges; error checks on every call; warm-up and event timing from <a href="#F6-06">F6-06</a>. <sup class="src"><a href="#F6-30-src-D1">D1</a></sup> <sup class="src"><a href="#F6-30-src-H1">H1</a></sup> <b>What changes:</b> most dangerous first: a captured graph freezes argument values, so code that changes a value between launches silently computes with the old one; captured work does not run during capture, so reads in the middle see nothing; some calls are forbidden during capture and invalidate it; and the work is paid for in two places, instantiation and launch (H1). <b>What comes next:</b> <a href="#F6-31">F6-31</a> drops explicit copies altogether with managed memory, and asks what the page faults cost; <a href="#F6-32">F6-32</a> shows how to see launch gaps and graph launches on a real timeline.</p></div>
+
+<h2 id="F6-30-check">Check yourself</h2>
+<ol>
+<li>Name the three stages of graph work submission and say which one you should do inside a loop.</li>
+<li>Which statement is true? (a) During stream capture, the captured kernels run and are also recorded. (b) <code>cudaGraphLaunch</code> on the same executable graph twice in two different streams runs both copies at the same time. (c) <code>cudaGraphExecKernelNodeSetParams</code> changes future launches only. (d) Capture can be started on the legacy default stream.</li>
+<li>Predict, then run Listing 3: 1000 kernels of 3 µs, host 4 µs per launch, gap 2 µs, graph launch 6 µs, node gap 1 µs. What are the two totals? Then change the host cost to 2 µs and predict again.</li>
+<li>Why does Listing 1 compare the two results with <code>memcmp</code> rather than with a tolerance?</li>
+<li>Explain in your own words why a graph helps a sequence of short kernels much more than a sequence of long ones.</li>
+<li>In Listing 2, what would happen if line 53 (<code>cudaStreamWaitEvent(mainStream, joinEv, 0)</code>) were removed?</li>
+<li>Apply to a new case: Lucas runs a simulation step of 40 small kernels every time step, for 10,000 time steps; the only thing that changes between steps is a pointer swap between two state buffers (even and odd steps). Design a graph solution that needs no update at all.</li>
+<li>What does <code>cudaGraphExecUpdate</code> require of the new graph, and what must your code do if it fails?</li>
+<li>Your measured per-kernel saving is negative. Give two possible reasons.</li>
+</ol>
+
+<h2 id="F6-30-lab">Lab</h2>
+<p><b>Goal.</b> Measure the per-launch saving of a 100-kernel sequence as a graph, compare it with your plan from the launch model, and show that a frozen argument is fixed by an update. This completes the graph part of curriculum milestone E8, whose goal is "Overlap copies with compute; reduce launch overhead with graphs." <sup class="src"><a href="#F6-30-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> An NVIDIA GPU with a CUDA Toolkit and driver, or a cloud GPU instance, for steps 1–4. This build used <code>Cuda compilation tools, release 12.0, V12.0.140</code> and <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> (from the run logs) and had no GPU. Steps 5–6 need no GPU. Folder <code>university/labs/F6-30</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p><b>GPU required for steps 1–4.</b> In this build they produced only the "no device" error. Your measurements are the lab's result; record the GPU name, driver and toolkit versions and the date next to every number, and present them as "measured on &lt;machine&gt;" (AH-23).</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li><b>Plan first.</b> Before running anything, write in your notes the expected per-kernel saving from Listing 3 for your own guesses of <i>h</i>, <i>g</i>, <i>G</i>, <i>g</i>′. You will correct the guesses in step 3.</li>
+<li>From the repository root run <code>university/labs/run_lab.sh university/labs/F6-30</code>. Open <code>graph.out</code>: four lines, ending with <code>results identical</code>.</li>
+<li>Run <code>./graph</code> 20 times (build it with the command above) and take the median of each time (<a href="#F6-06">F6-06</a>). Then measure the host cost of one launch call: time a loop of 1000 launch calls with <code>std::chrono::steady_clock</code> on the host, without waiting for the GPU, and divide. Put the measured values into a new line of <code>launch_model.in</code> and compare the model's saving with the measured one.</li>
+<li>Run <code>graph_forkjoin</code> and <code>graph_update</code>. Convert <code>forkjoin.dot</code> to a picture with a graph-drawing tool of your choice (comment out the <code>rm</code> in <code>run.sh</code> first) and compare with Figure 2.</li>
+<li>Open <code>launch_model.out</code> and check the Worked example's numbers line by line.</li>
+<li>Open <code>capture_model.out</code> and keep it for the forensic lab.</li>
+</ol>
+<p><b>Expected observations.</b> On a GPU: identical results; a positive saving per kernel for the 100-kernel sequence (E8); pixel values 10, 20, 40, 5 from <code>graph_update</code>. In this build: <code>graph.cu:37: cudaMalloc(&amp;dX, bytes) failed: cudaErrorNoDevice (no CUDA-capable device is detected)</code> (R1) and the model outputs shown above (R3, R6).</p>
+<p><b>Verification.</b> The E8 acceptance test, verbatim: "Graph version of a 100-kernel sequence reduces total time versus individual launches; the measured per-launch saving is logged." <sup class="src"><a href="#F6-30-src-C1">C1</a></sup> Your log contains the median times of both versions, the saving per kernel, the toolkit and driver versions and the GPU name. Correctness: <code>results identical</code> in every run; <code>compute-sanitizer ./graph</code> reports no errors (<a href="#F6-05">F6-05</a>).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>cudaErrorNoDevice</code> → no GPU visible → device query (<a href="#F6-07">F6-07</a>).</li>
+<li><code>results DIFFERENT</code> → the two versions did not run the same work → check that both start from the same reset copy (lines 48 and 70) and that the warm-up graph launch happened before the reset.</li>
+<li>The saving varies wildly between runs → other work on the GPU or a busy host → take the median of 20 runs and close other GPU programs; report the spread.</li>
+<li>The model prints nothing for your new line → a missing number in <code>launch_model.in</code>; each line needs seven fields.</li>
+</ul>
+<p><b>Extension.</b> Build the 100-kernel sequence by hand with <code>cudaGraphAddKernelNode</code> instead of capture, using the header's description of <code>cudaKernelNodeParams</code>; then change the multiplier of node 50 with <code>cudaGraphExecKernelNodeSetParams</code> and show that only later launches use it.</p>
+
+<h2 id="F6-30-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Kenji's camera-processing program applies an exposure gain to each frame. To save launch time, he captured the frame's work into a graph once, before the loop, and launches the graph for every frame. Since then, the operators complain that "the exposure control does nothing": every frame looks the same, whatever gain they choose. The host log shows the gain changing correctly. The evidence was produced in this build with a host-only model of capture (no GPU needed).</p>
+<p><b>Evidence pack.</b> (1) The model program, whose <code>Node</code> keeps the argument values it was given when it was recorded, as a captured kernel node does:</p>
+<pre class="listing" data-src="F6-30/capture_model.cpp"></pre>
+<p>(2) Its real output (R6): version 1 is Kenji's program; versions 2 and 3 are two candidate fixes.</p>
+<pre class="output" data-run="F6-30/capture_model"></pre>
+<p>(3) The header's statements on kernel nodes and on updates (Layer 2 and Layer 3 of this chapter, H1).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: in version 1, which gain does the node use in each frame, and which gain did the host want? From which frame on are the results wrong?</li>
+<li>Hypotheses: give at least two explanations that would fit "the exposure control does nothing" (for example: the gain never reaches the GPU; the graph uses a frozen value; the output buffer is not copied back; the operator interface is broken).</li>
+<li>Which evidence rules each hypothesis in or out?</li>
+<li>Compare versions 2 and 3. Which real CUDA mechanisms do they model, and what does each cost per frame?</li>
+<li>Propose the fix you would ship, how you would verify it on a GPU, and how you would prevent the bug from coming back.</li>
+</ol>
+<p><b>Method hints.</b> Separate value arguments from pointer arguments in the node. Read the header's sentence on what is copied when a kernel node is created (Layer 2), and the unverified box about capture. Hypothesis → evidence → conclusion.</p>
+
+<h2 id="F6-30-project">Mini-project</h2>
+<p><b>A graph for the pipeline.</b> Take your chunked pipeline from <a href="#F6-29">F6-29</a> (copy in, kernel, copy out over several streams) and capture one whole pass, with all its streams, into a single graph. Launch it many times on new data that you place in the same pinned buffers, and compare total time and host time per pass with the stream version. Write down beforehand, with Listing 3 or your own extension of it, what you expect: will the graph help a pipeline whose chunks are large?</p>
+<p><b>Rubric.</b> Correct capture with fork and join for every stream, results identical to the stream version (4). A prediction written before measuring, and the comparison with the measurement (3). An honest explanation of the difference, including what the graph cannot save (3).</p>
+
+<h2 id="F6-30-summary">Summary</h2>
+<ul>
+<li>A CUDA graph describes work as nodes and dependency edges; it is defined, instantiated once and launched many times.</li>
+<li>Stream capture records the operations issued to a stream (and to streams that join it through events) without running them; it must end on the stream where it began, and forked streams must be joined back.</li>
+<li>A graph saves launch work, not kernel time: it helps most when kernels are short or the host is the bottleneck, and can lose when launched only once.</li>
+<li>Instantiation has a cost; keep it out of loops and measure it separately.</li>
+<li>Value arguments are frozen in a graph; pointer arguments are read at run time. Change values with <code>cudaGraphExecKernelNodeSetParams</code>, <code>cudaGraphExecUpdate</code> (always check its result), or indirection through device memory.</li>
+<li>Milestone E8 asks for the measured per-launch saving of a 100-kernel sequence; plan it with the model, measure it on a GPU, log it with the machine and versions.</li>
+</ul>
+
+<h2 id="F6-30-sources">Sources</h2>
+<ol>
+<li id="F6-30-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1). The guide's source registry (section 4.6) records that the page at the long-standing address was titled "CUDA Programming Guide", version 13.x, when opened. Sections used: CUDA Graphs (graph structure, creating a graph using stream capture, cross-stream dependencies, updating instantiated graphs). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-30-src-D2">D2 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): sections on launch overhead and asynchronous execution. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-30-src-D3">D3 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3; edition to be recorded): how the host launches work on the device. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-30-src-H1">H1 — CUDA 12.0 headers as installed in the build container (Ubuntu package nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>cuda_runtime_api.h</code>, documentation comments of <code>cudaStreamBeginCapture</code>, <code>cudaStreamEndCapture</code>, <code>cudaStreamIsCapturing</code>, <code>cudaThreadExchangeStreamCaptureMode</code>, <code>cudaGraphAddKernelNode</code>, <code>cudaGraphInstantiate</code>, <code>cudaGraphLaunch</code>, <code>cudaGraphUpload</code>, <code>cudaGraphExecKernelNodeSetParams</code>, <code>cudaGraphExecUpdate</code>, <code>cudaGraphDebugDotPrint</code>, <code>cudaGraphDestroy</code>; and <code>driver_types.h</code>: <code>cudaStreamCaptureMode</code>, <code>cudaStreamCaptureStatus</code>, <code>cudaGraphExecUpdateResultInfo</code>. Tier 1 (vendor files).</li>
+<li id="F6-30-src-H2">H2 — the same <code>driver_types.h</code>, the comments of the error codes <code>cudaErrorStreamCaptureUnsupported</code> through <code>cudaErrorCapturedEvent</code> (values 900–907). Tier 1 (vendor file).</li>
+<li id="F6-30-src-C1">C1 — Systems Curriculum (this project), section 13.2 topic "Streams, events and graphs" and milestone E8 (goal and acceptance tests quoted verbatim). A map, not a source (AH-4).</li>
+<li id="F6-30-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-30/graph.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+<li id="F6-30-src-R2">R2 — build and run of Listing 2 (<code>graph_forkjoin.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F6-30-src-R3">R3 — run of Listing 3 on <code>launch_model.in</code> (<code>launch_model.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with AddressSanitizer and UndefinedBehaviorSanitizer, exit code 0. A model with invented parameters, not a measurement.</li>
+<li id="F6-30-src-R4">R4 — the declarations of the graph calls in this build's <code>cuda_runtime_api.h</code>, extracted by <code>run.sh</code> (<code>graph_api_help.log</code>), exit code 0.</li>
+<li id="F6-30-src-R5">R5 — build and run of Listing 4 (<code>graph_update.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F6-30-src-R6">R6 — run of the forensic model (<code>capture_model.log</code>), same g++ toolchain and sanitizers, exit code 0.</li>
+</ol>
+
+<h2 id="F6-30-glossary">Glossary links</h2>
+<p><a href="#gl-cuda-graph">CUDA graph</a> · <a href="#gl-node-and-edge-graph">Node and edge (graph)</a> · <a href="#gl-executable-graph-instantiation">Executable graph (instantiation)</a> · <a href="#gl-stream-capture">Stream capture</a> · <a href="#gl-graph-launch">Graph launch</a> · <a href="#gl-launch-overhead">Launch overhead</a> · <a href="#gl-executable-graph-update">Executable-graph update</a> · <a href="#gl-stream-cuda">Stream (CUDA)</a> · <a href="#gl-event-cuda">Event (CUDA)</a></p>
+
+<h2 id="F6-30-next">Next chapter</h2>
+<p>Next: <a href="#F6-31">F6-31 Unified (managed) memory, page migration and prefetching</a>. Previous: <a href="#F6-29">F6-29</a>. Back to the course: <a href="#CU303">CU303</a>.</p>
+
+<h2 id="F6-30-answers">Answers to Check yourself</h2>
+<ol>
+<li>Definition, instantiation, execution (launch) (D1). Only the launch belongs inside the loop; define and instantiate once, outside it.</li>
+<li>(c), quoted from the header: "The modifications only affect future launches" (H1). (a) is false: captured operations "will not be executed" (H1). (b) is false: "only one instance of <i>graphExec</i> may be executing at a time"; each launch is ordered behind previous launches of the same executable graph (H1). (d) is false: capture "may not be initiated if <i>stream</i> is cudaStreamLegacy" (H1).</li>
+<li>Individually: the GPU needs 5 µs per kernel and the host 4, so 7 + 999 × 5 = 5002 µs; as a graph 9 + 999 × 4 = 4005 µs (the <code>short-1000</code> line of R3). With <i>h</i> = 2 µs the GPU is still the bottleneck (5 &gt; 2), so the individual total is unchanged except for the first kernel: it starts at 2 and ends at 5, giving 5 + 999 × 5 = 5000 µs. Add the line <code>h2 1000 3 2 2 6 1</code> to the input and run the model to check.</li>
+<li>Both versions run the same kernels with the same arguments in the same order on the same data, so the floating-point operations are identical and the bits must be identical. A tolerance would hide a real bug such as a missing kernel or a stale argument.</li>
+<li>A graph removes host work and possibly gaps per launch, a roughly constant amount per kernel. For short kernels that amount is a large share of the total, so removing it matters; for long kernels it is a tiny share (Layer 3's bound; Worked example steps 2 and 4).</li>
+<li>The side branch would not be joined back into the capturing stream. <code>cudaStreamEndCapture</code> would fail with <code>cudaErrorStreamCaptureUnjoined</code> (H2), and even without capture <code>addInto</code> could read <code>dB</code> before <code>setTo</code> wrote it.</li>
+<li>Capture two graphs once: one for even steps (reading buffer A, writing B) and one for odd steps (reading B, writing A), instantiate both, and launch them alternately. The pointers are frozen correctly in each graph, so no update is needed. Alternatively, one graph whose kernels read the two pointers from device memory, swapped by a tiny kernel at the end of the graph.</li>
+<li>A topologically identical graph (same nodes, same dependencies) whose changes stay within the documented limits (for example, the function of a kernel node cannot move to another context). On failure it returns <code>cudaErrorGraphExecUpdateFailure</code> and sets <code>info.result</code>; the code must check the return value and fall back to a new instantiation, as Listing 4 does (H1).</li>
+<li>Instantiation or the first launch inside the timed interval; kernels so long that the saving is lost in run-to-run variation; a host-side difference such as an extra synchronisation in the graph loop; or simply measurement noise when the median is not used.</li>
+</ol>
+<h3 id="F6-30-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> In version 1 (R6) the node gain is 1.0 in every frame while the host gain is 1.0, 2.0, 4.0, 0.5; the pixel is always 10.0. Frame 0 is correct by coincidence (the gain at capture time was 1.0); frames 1–3 are wrong.</p>
+<p><b>Hypotheses.</b> (a) The gain never reaches the GPU because the value was frozen when the graph was recorded; (b) the result is not copied back; (c) the operator interface does not pass the gain; (d) the kernel ignores the gain. The host log rules out (c). Frame 0 is correct and every frame has a fresh result of 10.0, which rules out (b) and (d) (the kernel computes, with gain 1.0). The node's stored gain of 1.0 against the host's changing value proves (a).</p>
+<p><b>Evidence-based conclusion.</b> The graph was defined once with <code>gain</code> passed by value; a recorded kernel node holds a copy of its argument values (H1 for hand-built nodes; the unverified box for capture), so every launch reuses 1.0. Kenji's change of the host variable cannot reach a node that holds its own copy.</p>
+<p><b>The two fixes.</b> Version 2 models <code>cudaGraphExecKernelNodeSetParams</code> or capture-and-<code>cudaGraphExecUpdate</code> (Listing 4): one update call per frame, cheaper than instantiating again when the update succeeds. Version 3 models indirection: the kernel reads the gain through a pointer to device memory, and the host copies the new gain there before each launch (one small copy per frame, which can itself be part of the graph as a copy node from a pinned slot). Both give correct pixels in R6.</p>
+<p><b>Fix, verification, prevention.</b> Ship version 3 if the gain is the only thing that changes (the graph never changes), or Listing 4's update if several values change. Verify on a GPU with a test that sets four different gains and checks four different pixel values (Listing 4's output), under Compute Sanitizer. Prevent: a code-review rule that every argument of a captured kernel is listed as "fixed" or "changes per launch", and a test that changes every "per launch" argument. <b>How the evidence was produced:</b> a real run in this build of a host-only model; no fault was injected beyond writing Kenji's version as described; the model's node behaviour follows the header's statement for kernel nodes, and its application to capture is the chapter's unverified assumption.</p>

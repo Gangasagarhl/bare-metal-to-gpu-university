@@ -1,0 +1,339 @@
+<!--meta
+id: F6-28
+title: Streams and events: separate order queues
+course: CU303
+level: L4
+prereqs: CU302; F6-06 (events and timing); F6-09 (pinned and pageable memory); F1-62 (interconnects and copy engines); F2-34 (CPU threads)
+time: 10–14 hours including the lab
+hardware: Lab steps 1–3: an NVIDIA GPU with a CUDA Toolkit and driver (record both versions), or a cloud GPU instance. The timeline model, the forensic lab and the compiler checks need no GPU (this build had none: every GPU run below shows the runtime's real "no device" error)
+maps: Curriculum E8 (streams, overlap and graphs: first part); Track E 13.2 topic 8 (streams, events and graphs)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-28-hook">Story hook</h2>
+<p>It is the busiest evening of the year in the great kitchen hall. At the pass, the counter where orders come in, Priya has been putting every order slip on one single spike. The rule of the spike is simple: the helpers take the slips from the bottom, one at a time, and a slip is started only when the one below it is completely finished, plated and carried out. Nobody ever gets confused. But the porters who carry crates in from the store stand idle while the cooks cook, and the cooks stand idle while the porters carry.</p>
+<p>Tunde, the hall manager, puts up three more spikes. "Orders on the same spike still go in order," he says. "Orders on different spikes don't wait for each other. While table four's food is cooking, the porters can already bring in the crates for table seven." The hall gets faster at once.</p>
+<p>Then one order needs another: the dessert for table seven may only start when table four's sauce is ready, because they share the pot. Tunde gives Priya a small brass token. "Drop this on spike one right after the sauce slip. Pin a note on spike two: <i>wait until the token is reached</i>." And one last warning: "There is also the old spike by the door. Anything you put on it makes every other spike stop and wait. Use it for nothing that should run alongside."</p>
+<p>In CUDA, the spikes are <b>streams</b>, the token is an <b>event</b>, and the old spike by the door is the legacy <b>default stream</b>. This chapter is about all three.</p>
+
+<h2 id="F6-28-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the ordering rules of CUDA streams: what is guaranteed inside one stream, what is allowed between streams, and what the legacy default stream does to both.</li>
+<li><b>Write</b> host code that creates non-blocking streams, issues copies and kernels into them, records events and makes one stream wait for another with <code>cudaStreamWaitEvent</code>, with every call checked.</li>
+<li><b>Predict</b> the timeline of a set of streams on a GPU with a given number of copy engines, using the course's timeline model, before running anything.</li>
+<li><b>Measure</b> elapsed time across two streams with events and state what the measured interval really contains.</li>
+<li><b>Diagnose</b> a program whose streams do not overlap because one launch went to the legacy default stream, from the timeline and the source, and fix it without introducing a race.</li>
+</ul>
+
+<div class="co jargon" id="F6-28-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Stream (CUDA)</dt><dd><b>Simple words:</b> a queue of GPU jobs that are done in the order you put them in. <b>Analogy:</b> one order spike at the pass. <b>Precise:</b> a sequence of operations (copies, kernels, event records, waits) that execute in issue order; operations in different streams may run concurrently. The runtime creates one with <code>cudaStreamCreate</code> or <code>cudaStreamCreateWithFlags</code>. <sup class="src"><a href="#F6-28-src-D1">D1</a></sup> <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> Not a C++ I/O stream (<code>std::ostream</code>) and not the HD Audio stream of <a href="#DR302">DR302</a>.</dd>
+<dt>Legacy default stream (stream 0, the NULL stream)</dt><dd><b>Simple words:</b> the queue your work goes to when you name no stream. <b>Analogy:</b> the old spike by the door that makes every other spike wait. <b>Precise:</b> the per-context implicit stream used when no stream argument is given; nvcc's help text describes it as "per context, implicitly synchronizes with other streams", and nvcc uses it by default. <sup class="src"><a href="#F6-28-src-R4">R4</a></sup> <sup class="src"><a href="#F6-28-src-D1">D1</a></sup></dd>
+<dt>Non-blocking stream</dt><dd><b>Simple words:</b> a queue that never waits for the old default queue. <b>Analogy:</b> a spike that ignores the old spike by the door. <b>Precise:</b> a stream created with the flag <code>cudaStreamNonBlocking</code>, which the header documents as: work in it "may run concurrently with work in stream 0 (the NULL stream)" and the stream "should perform no implicit synchronization with stream 0". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></dd>
+<dt>Per-thread default stream</dt><dd><b>Simple words:</b> each CPU thread gets its own ordinary default queue. <b>Analogy:</b> each waiter gets a private spike instead of sharing the old one. <b>Precise:</b> selected with nvcc's <code>--default-stream per-thread</code>; nvcc describes it as "a normal CUDA stream (per thread, does not implicitly synchronize with other streams)". <sup class="src"><a href="#F6-28-src-R4">R4</a></sup> The handle <code>cudaStreamPerThread</code> names it explicitly. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></dd>
+<dt>Event (CUDA)</dt><dd><b>Simple words:</b> a marker you drop into a queue to know when the queue gets that far. <b>Analogy:</b> the brass token dropped on a spike. <b>Precise:</b> an object that <code>cudaEventRecord</code> fills with "the contents of <i>stream</i> at the time of this call"; <code>cudaEventQuery</code>, <code>cudaEventSynchronize</code> and <code>cudaStreamWaitEvent</code> then examine or wait for completion of that captured work, and two completed events give an elapsed time. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> Not the same as a probability event (<a href="#MA202">MA202</a>) or a Windows event object (<a href="#OS304">OS304</a>).</dd>
+<dt>Cross-stream dependency</dt><dd><b>Simple words:</b> a rule that one queue must wait for a point in another queue. <b>Analogy:</b> the note "wait until the token is reached" pinned on spike two. <b>Precise:</b> <code>cudaStreamWaitEvent(stream, event, 0)</code> "makes all future work submitted to <i>stream</i> wait for all work captured in <i>event</i>"; the wait is performed on the device when applicable, so the host does not block. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></dd>
+<dt>Asynchronous (with respect to the host)</dt><dd><b>Simple words:</b> the call returns before the GPU has done the job. <b>Analogy:</b> Priya pins the slip and walks away; she does not stand and watch it cook. <b>Precise:</b> a call that may return before the operation completes, for example kernel launches and <code>cudaMemcpyAsync</code> in most directions; the header's section "API synchronization behavior" lists the exceptions. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></dd>
+<dt>Timeline</dt><dd><b>Simple words:</b> a picture of what each worker did over time. <b>Analogy:</b> a wall chart with one row per station and a bar for every job. <b>Precise:</b> a time axis with one lane per execution resource (copy engine, compute, host thread) and one bar per operation; profilers such as Nsight Systems record them (<a href="#F6-32">F6-32</a>), and this chapter's model computes them.</dd>
+</dl></div>
+
+<h2 id="F6-28-pictures">The idea in pictures</h2>
+<p>Figure 1 is the picture that every stream program should be checked against. Two independent jobs, A and B, each copy data in, run a kernel and copy the result out. In one stream, everything waits for everything. In two streams, B's copy in runs while A's kernel runs, and A's copy out runs while B's kernel runs. The bars are taken from the real output of this chapter's timeline model (Listing 2), not from a GPU.</p>
+<figure id="F6-28-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-28-f1t F6-28-f1d">
+<title id="F6-28-f1t">Figure 1: two jobs in one stream versus two streams</title>
+<desc id="F6-28-f1d">Two timelines on the same time axis from 0 to 200 model units. Each timeline has three lanes: copy in, compute, copy out. Top, one stream: A-in from 0 to 30 on copy in, A-kernel from 30 to 70 on compute, A-out from 70 to 100 on copy out, then B-in 100 to 130, B-kernel 130 to 170, B-out 170 to 200; total 200 and no bars overlap in time. Bottom, two streams: A-in 0 to 30, B-in 30 to 60 on the copy-in lane; A-kernel 30 to 70 and B-kernel 70 to 110 on the compute lane; A-out 70 to 100 and B-out 110 to 140 on the copy-out lane; total 140. Dashed vertical lines mark the totals. A note says the model assumes two copy engines and one kernel at a time.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="22">One stream (all work on one spike): total 200 units</text>
+<text class="sv-ts" x="20" y="50">copy in</text><text class="sv-ts" x="20" y="74">compute</text><text class="sv-ts" x="20" y="98">copy out</text>
+<rect class="sv-b3" x="110" y="38" width="96" height="18"/><text class="sv-ts" x="116" y="51">A-in</text>
+<rect class="sv-b5" x="206" y="62" width="128" height="18"/><text class="sv-ts" x="212" y="75">A-kernel</text>
+<rect class="sv-b4" x="334" y="86" width="96" height="18"/><text class="sv-ts" x="340" y="99">A-out</text>
+<rect class="sv-b3" x="430" y="38" width="96" height="18"/><text class="sv-ts" x="436" y="51">B-in</text>
+<rect class="sv-b5" x="526" y="62" width="128" height="18"/><text class="sv-ts" x="532" y="75">B-kernel</text>
+<rect class="sv-b4" x="654" y="86" width="96" height="18"/><text class="sv-ts" x="660" y="99">B-out</text>
+<line class="sv-dash" x1="750" y1="32" x2="750" y2="112"/>
+<text class="sv-tb" x="20" y="150">Two streams (A on stream 1, B on stream 2): total 140 units</text>
+<text class="sv-ts" x="20" y="178">copy in</text><text class="sv-ts" x="20" y="202">compute</text><text class="sv-ts" x="20" y="226">copy out</text>
+<rect class="sv-b3" x="110" y="166" width="96" height="18"/><text class="sv-ts" x="116" y="179">A-in</text>
+<rect class="sv-b3" x="206" y="166" width="96" height="18" /><text class="sv-ts" x="212" y="179">B-in</text>
+<rect class="sv-b5" x="206" y="190" width="128" height="18"/><text class="sv-ts" x="212" y="203">A-kernel</text>
+<rect class="sv-b5" x="334" y="190" width="128" height="18"/><text class="sv-ts" x="340" y="203">B-kernel</text>
+<rect class="sv-b4" x="334" y="214" width="96" height="18"/><text class="sv-ts" x="340" y="227">A-out</text>
+<rect class="sv-b4" x="462" y="214" width="96" height="18"/><text class="sv-ts" x="468" y="227">B-out</text>
+<line class="sv-dash" x1="558" y1="160" x2="558" y2="240"/>
+<line class="sv-line" x1="110" y1="258" x2="750" y2="258"/><polygon class="sv-head" points="750,258 742,254 742,262"/>
+<text class="sv-ts" x="104" y="276">0</text><text class="sv-ts" x="196" y="276">30</text><text class="sv-ts" x="326" y="276">70</text><text class="sv-ts" x="420" y="276">100</text><text class="sv-ts" x="550" y="276">140</text><text class="sv-ts" x="700" y="276">200 time</text>
+<text class="sv-ts" x="20" y="300">Model units, not milliseconds. Model assumptions: two copy engines (one per direction), one kernel at a time.</text>
+<text class="sv-ts" x="20" y="318">Bars in one lane never overlap: a lane is one engine. Overlap happens between lanes.</text>
+</svg></div><figcaption><b>Figure 1.</b> The required "streams" diagram (guide 9.2): the timeline of copy and kernel overlap for scenarios <code>one-stream</code> and <code>two-streams</code> of Listing 2's real output (R2). Inside a stream, operations run in order; operations of different streams may overlap. <sup class="src"><a href="#F6-28-src-D1">D1</a></sup> <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> <sup class="src"><a href="#F6-28-src-R2">R2</a></sup></figcaption></figure>
+
+<p>Figure 2 shows the event: a marker recorded in stream A, waited on by stream B. The arrow is a dependency, not a data copy.</p>
+<figure id="F6-28-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 210" role="img" aria-labelledby="F6-28-f2t F6-28-f2d">
+<title id="F6-28-f2t">Figure 2: an event joins two streams</title>
+<desc id="F6-28-f2d">Two horizontal rows of boxes. Row 1, stream A: copy x in, then scale kernel, then a diamond labelled record xReady. Row 2, stream B: fill kernel, then a box labelled wait xReady, then combine kernel, then copy result out, then a diamond labelled record stop. A dashed arrow goes from the xReady diamond in stream A down to the wait box in stream B. Text explains that fill does not wait for anything, and that combine starts only after both scale and fill are complete.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="210"/>
+<text class="sv-tb" x="10" y="44">stream A</text>
+<rect class="sv-b3" x="90" y="24" width="120" height="34" rx="5"/><text class="sv-ts" x="98" y="45">copy x in (H2D)</text>
+<line class="sv-line" x1="210" y1="41" x2="228" y2="41"/><polygon class="sv-head" points="228,41 220,37 220,45"/>
+<rect class="sv-b5" x="230" y="24" width="110" height="34" rx="5"/><text class="sv-ts" x="238" y="45">scale kernel</text>
+<line class="sv-line" x1="340" y1="41" x2="358" y2="41"/><polygon class="sv-head" points="358,41 350,37 350,45"/>
+<polygon class="sv-b6" points="410,21 460,41 410,61 360,41"/><text class="sv-ts" x="381" y="45">xReady</text>
+<text class="sv-tb" x="10" y="134">stream B</text>
+<rect class="sv-b5" x="90" y="114" width="100" height="34" rx="5"/><text class="sv-ts" x="98" y="135">fill kernel</text>
+<line class="sv-line" x1="190" y1="131" x2="358" y2="131"/><polygon class="sv-head" points="358,131 350,127 350,135"/>
+<rect class="sv-b7" x="360" y="114" width="100" height="34" rx="5"/><text class="sv-ts" x="368" y="135">wait xReady</text>
+<line class="sv-line" x1="460" y1="131" x2="478" y2="131"/><polygon class="sv-head" points="478,131 470,127 470,135"/>
+<rect class="sv-b5" x="480" y="114" width="100" height="34" rx="5"/><text class="sv-ts" x="488" y="135">combine</text>
+<line class="sv-line" x1="580" y1="131" x2="598" y2="131"/><polygon class="sv-head" points="598,131 590,127 590,135"/>
+<rect class="sv-b4" x="600" y="114" width="90" height="34" rx="5"/><text class="sv-ts" x="606" y="135">copy out</text>
+<line class="sv-dash" x1="410" y1="61" x2="410" y2="112"/><polygon class="sv-head" points="410,112 406,104 414,104"/>
+<text class="sv-ts" x="420" y="88">dependency (no data moves)</text>
+<text class="sv-ts" x="10" y="180">fill waits for nothing; combine starts only after fill (same stream) and after everything xReady captured (copy in, scale).</text>
+<text class="sv-ts" x="10" y="198">Solid arrows: order inside a stream. Dashed arrow: the event dependency between streams. Not to scale.</text>
+</svg></div><figcaption><b>Figure 2.</b> The event pattern of Listing 1. <code>cudaEventRecord(xReady, streamA)</code> captures the work issued to stream A so far; <code>cudaStreamWaitEvent(streamB, xReady, 0)</code> makes later work in stream B wait for it. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></figcaption></figure>
+
+<h2 id="F6-28-layer1">Layer 1 — the kid explanation</h2>
+<p>A GPU has more than one kind of worker. Some workers carry data in. Some carry data out. Many workers compute. If you put every job in one line, each kind of worker waits for the others. That wastes time.</p>
+<p>A stream is a line of jobs. Jobs in the same line go in order. Jobs in different lines may happen at the same time. So you give each independent job its own line. Then the carriers can carry for one job while the cooks cook for another.</p>
+<p>Sometimes a job in one line needs a result from another line. Then you drop a marker, an event, in the first line, and tell the second line to wait for it. Only that one point waits; everything else keeps moving.</p>
+<p>Be careful with the oldest line, the default stream. Work you send without naming a line goes there. In its old mode it makes every ordinary line wait. One small job sent there by accident can make all your lines take turns again.</p>
+
+<h2 id="F6-28-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-28-l2-order">The two rules</h3>
+<p>Analogy first: one spike keeps its slips in order; different spikes do not wait for each other. The CUDA Programming Guide states the stream model in these terms: a stream is a sequence of commands that execute in order, and different streams may execute their commands out of order with respect to one another or concurrently. <sup class="src"><a href="#F6-28-src-D1">D1</a></sup> The installed runtime header says the same thing about copies at the level of a single call: <code>cudaMemcpyAsync</code> "is asynchronous with respect to the host", and "if <i>kind</i> is cudaMemcpyHostToDevice or cudaMemcpyDeviceToHost and the <i>stream</i> is non-zero, the copy may overlap with operations in other streams". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> Notice the word <i>may</i>. Streams give the GPU permission to overlap; whether it does depends on the hardware's engines (Layer 3), on the kind of host memory (<a href="#F6-29">F6-29</a>), and on what else you issued.</p>
+<p>So the first rule is a guarantee and the second is only a possibility:</p>
+<ol>
+<li><b>Inside one stream, order is guaranteed.</b> A kernel issued after a copy in the same stream sees the copied data. You need no extra synchronisation for that.</li>
+<li><b>Between streams, nothing is ordered unless you order it.</b> If stream 2 reads what stream 1 writes, you must add a dependency (an event wait) or a host synchronisation. Without one, the program has a race, and it may pass a test today and fail on another GPU.</li>
+</ol>
+<h3 id="F6-28-l2-create">Creating streams and issuing work into them</h3>
+<p>A stream is created with <code>cudaStreamCreate(&amp;s)</code> or with <code>cudaStreamCreateWithFlags(&amp;s, flags)</code>, where the flags are <code>cudaStreamDefault</code> or <code>cudaStreamNonBlocking</code>. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> Work goes into a stream through the stream argument: the fourth value of the launch configuration (<code>kernel&lt;&lt;&lt;blocks, threads, sharedBytes, s&gt;&gt;&gt;(...)</code>) and the last argument of <code>cudaMemcpyAsync</code>, <code>cudaMemsetAsync</code> and <code>cudaEventRecord</code>. <sup class="src"><a href="#F6-28-src-D1">D1</a></sup> <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> A stream is destroyed with <code>cudaStreamDestroy</code>; if the device is still working on it, the header says the call "will return immediately and the resources associated with <i>stream</i> will be released automatically once the device has completed all work in <i>stream</i>". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></p>
+<h3 id="F6-28-l2-default">The default stream: the old spike by the door</h3>
+<p>Every launch and copy without an explicit stream goes to the default stream. Its behaviour depends on a compiler choice. nvcc's own help text, recorded in this build, lists the choices: <code>legacy</code>, "the CUDA legacy stream (per context, implicitly synchronizes with other streams)", which is the default value, and <code>per-thread</code>, "a normal CUDA stream (per thread, does not implicitly synchronize with other streams)". <sup class="src"><a href="#F6-28-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F6-28/default_stream_help"></pre>
+<p>"Implicitly synchronizes with other streams" is the dangerous part. The Programming Guide describes it as follows: work issued to the legacy default stream waits until previously issued work in all blocking streams of the context has finished, and work issued afterwards to blocking streams waits until the default-stream work has finished. <sup class="src"><a href="#F6-28-src-D1">D1</a></sup> A "blocking" stream here simply means one created without <code>cudaStreamNonBlocking</code>. The non-blocking flag removes that implicit synchronisation for the stream that carries it. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> The CU201 programs you wrote put everything in the default stream; that was correct then, because everything was meant to run in order.</p>
+<h3 id="F6-28-l2-events">Events: record, wait, query, time</h3>
+<p>The header's documentation of <code>cudaEventRecord</code> is precise enough to quote: it "captures in <i>event</i> the contents of <i>stream</i> at the time of this call", "uses of <i>stream</i> after this call do not modify <i>event</i>", it "can be called multiple times on the same event and will overwrite the previously captured state", and "before the first call to cudaEventRecord(), an event represents an empty set of work, so for example cudaEventQuery() would return cudaSuccess". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> Four operations use what an event captured:</p>
+<div class="tw"><table>
+<thead><tr><th>Call</th><th>Who waits</th><th>What the installed header says</th></tr></thead>
+<tbody>
+<tr><td><code>cudaStreamWaitEvent(s, e, 0)</code></td><td>later work in stream <code>s</code> (on the device)</td><td>"Makes all future work submitted to <i>stream</i> wait for all work captured in <i>event</i>." The event "may be from a different device than <i>stream</i>". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></td></tr>
+<tr><td><code>cudaEventSynchronize(e)</code></td><td>the host thread</td><td>"Waits until the completion of all work currently captured in <i>event</i>"; without <code>cudaEventBlockingSync</code> the CPU thread "will busy-wait". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></td></tr>
+<tr><td><code>cudaEventQuery(e)</code></td><td>nobody (a question)</td><td>Returns <code>cudaSuccess</code> if all captured work has completed, or <code>cudaErrorNotReady</code>. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></td></tr>
+<tr><td><code>cudaEventElapsedTime(&amp;ms, a, b)</code></td><td>nobody; both events must be complete</td><td>Milliseconds "with a resolution of around 0.5 microseconds"; returns <code>cudaErrorNotReady</code> if an event is not complete; fails for events created with <code>cudaEventDisableTiming</code>. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></td></tr>
+</tbody></table></div>
+<p>An event used only as a dependency marker should be created with <code>cudaEventDisableTiming</code>; the header says such events "will provide the best performance when used with cudaStreamWaitEvent() and cudaEventQuery()". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> Listing 1 does exactly that for <code>xReady</code> and keeps two ordinary events for timing.</p>
+<h3 id="F6-28-l2-sync">The ways the host can wait</h3>
+<p>From the widest to the narrowest: <code>cudaDeviceSynchronize()</code> waits for all work on the device; <code>cudaStreamSynchronize(s)</code> "blocks until <i>stream</i> has completed all operations"; <code>cudaEventSynchronize(e)</code> waits only for the work the event captured; <code>cudaStreamQuery</code> and <code>cudaEventQuery</code> ask without waiting. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> Use the narrowest wait that is correct. A <code>cudaDeviceSynchronize</code> inside a loop of streamed work turns every iteration into "everything waits for everything", the single spike again.</p>
+
+<h2 id="F6-28-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: the spikes are a promise about order, not a promise about speed; how many porters and cooks the hall has decides what can really happen at once.</p>
+<h3 id="F6-28-l3-may">What the API promises, and what it does not</h3>
+<p>The runtime documentation is careful to promise ordering and to describe concurrency only as possible. Three statements from the installed header define the limits:</p>
+<ul>
+<li>Copies between host and device in non-zero streams "may overlap with operations in other streams" (<code>cudaMemcpyAsync</code>). <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></li>
+<li><code>concurrentKernels</code> "is 1 if the device supports executing multiple kernels within the same context simultaneously", but "it is not guaranteed that multiple kernels will be resident on the device concurrently so this feature should not be relied upon for correctness". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> A program whose kernels must run at the same moment to make progress (one spinning until another writes a flag) is wrong, even if it passes on your GPU.</li>
+<li><code>asyncEngineCount</code> "is 1 when the device can concurrently copy memory between host and device while executing a kernel. It is 2 when the device can concurrently copy memory between host and device in both directions and execute a kernel at the same time. It is 0 if neither of these is supported." <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> Your device report from <a href="#F6-07">F6-07</a> prints it. Plan with that number, not with a picture from a slide.</li>
+</ul>
+<h3 id="F6-28-l3-model">A model you can check by hand</h3>
+<p>Because the guarantees are about order and the speed depends on engines, a small model is enough to predict a timeline. Listing 2 implements one. Its rules come from the documents: in-stream order (D1), event waits (H1), legacy default-stream synchronisation with blocking streams (D1, R4), the absence of that synchronisation for non-blocking streams (H1), and host blocking for calls documented as synchronous (H1). Two rules are assumptions of the model and are labelled as such in the source: each engine runs one operation at a time in the order the host issued work to it, and only one kernel runs at a time. The second is pessimistic when kernels are small (<code>concurrentKernels</code> above); the first is a simplification of hardware whose real queue structure this build could not verify (see the unverified box in "How the hardware actually does it").</p>
+<h3 id="F6-28-l3-timing">Timing across streams</h3>
+<p>Listing 1 records <code>start</code> in stream A and <code>stop</code> in stream B. That is legal, and it measures something meaningful only because stream B waits for an event recorded in stream A after <code>start</code>, so <code>stop</code> cannot complete before <code>start</code>. The header warns about the general case: "If either event was last recorded in a non-NULL stream, the resulting time may be greater than expected (even if both used the same stream handle)", because "any number of other different stream operations could execute in between the two measured events". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> State in your lab notes what the interval contains: here, from the moment stream A reaches <code>start</code> until stream B has copied the result out, including the time B spent waiting for A.</p>
+<h3 id="F6-28-l3-more">Priorities, host functions and per-thread streams</h3>
+<p><code>cudaStreamCreateWithPriority</code> creates a stream whose kernels may preempt work in lower-priority streams; lower numbers mean higher priority, the meaningful range comes from <code>cudaDeviceGetStreamPriorityRange</code>, and the header adds that "only compute kernels launched in priority streams are affected by the stream's priority. Stream priorities have no effect on host-to-device and device-to-host memory operations." <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> <code>cudaLaunchHostFunc</code> enqueues a CPU function into a stream; it "will be called after currently enqueued work and will block work added after it", and it "must not make any CUDA API calls". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> Finally, multi-threaded host programs should know about <code>--default-stream per-thread</code> (R4): with it, two CPU threads that both launch "without a stream" no longer share, and no longer serialise on, one legacy stream. Prefer explicit streams anyway; nvcc can warn about every launch without a stream argument (<code>-Wdefault-stream-launch</code>, recorded in the forensic lab, R5).</p>
+<h3 id="F6-28-l3-ahead">Where this leads</h3>
+<p>Streams order work and expose overlap; <a href="#F6-29">F6-29</a> uses them to overlap copies with compute and shows why host memory must be pinned for that; <a href="#F6-30">F6-30</a> records a stream's work once as a graph (stream capture) and replays it; <a href="#F6-32">F6-32</a> checks a real timeline against your prediction. HIP has the same stream and event model with <code>hip</code> names (<a href="#HP301">HP301</a> and BR-02); the mapping must be checked in the HIP API reference, not assumed.</p>
+
+<h2 id="F6-28-hardware">How the hardware actually does it</h2>
+<p>A discrete GPU moves data between host memory and its own memory with direct-memory-access engines, the copy engines of <a href="#F1-44">F1-44</a> and <a href="#F1-62">F1-62</a>, while its streaming multiprocessors run kernels. That is why a copy and a kernel can happen at the same time at all, and why <code>asyncEngineCount</code> counts them (H1). The copies themselves are bus transactions on PCIe or another link (<a href="#F1-45">F1-45</a>); a copy engine reads host memory directly, which is only possible when the host pages cannot move: the reason pinned memory appears in every overlap recipe (<a href="#F6-29">F6-29</a>). <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> <sup class="src"><a href="#F6-28-src-D4">D4</a></sup> Kernels from different streams can share the SMs when resources allow (the occupancy rules of <a href="#F6-20">F6-20</a>), which is what <code>concurrentKernels</code> reports.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>How streams are mapped onto hardware work queues (how many independent queues a given GPU generation has, what happens when there are more streams than queues, and whether work issued in a certain order can create "false" dependencies between unrelated streams) is described in NVIDIA documents and talks that were not opened in this build. The model of Listing 2 assumes in-order engines. Before relying on any of this for a named GPU, read the CUDA Programming Guide's section on asynchronous concurrent execution (D1) and the CUDA C++ Best Practices Guide (D2) for the toolkit version you use, and confirm with an Nsight Systems timeline (<a href="#F6-32">F6-32</a>).</p></div>
+
+<h2 id="F6-28-worked">Worked example</h2>
+<p>Two independent jobs, A and B. Each copies its input in (30 units), runs a kernel (40 units) and copies its result out (30 units). Units are model time units, invented for the arithmetic. The GPU has two copy engines (<code>asyncEngineCount</code> = 2 in the model) and runs one kernel at a time.</p>
+<ol>
+<li><b>One stream.</b> Everything is in order: 30 + 40 + 30 + 30 + 40 + 30 = 200 units.</li>
+<li><b>Two streams, by hand.</b> A-in occupies the copy-in engine from 0 to 30. B-in can use the same engine only after A-in: 30 to 60. A-kernel starts when A-in is done: 30 to 70. B-kernel needs both B-in (done at 60) and the compute engine (free at 70): 70 to 110. A-out: 70 to 100 on the copy-out engine. B-out: after B-kernel, 110 to 140. Total: 140 units.</li>
+<li><b>Speed-up.</b> 200 / 140 ≈ 1.43. It is not 2, because the second job's kernel still waits for the first job's kernel, and the first copy in and the last copy out overlap with nothing.</li>
+<li><b>A dependency.</b> Now job C writes its result into A's output buffer, so C's kernel must not start before A's result has been copied out (event recorded after A-out, at 100). C-in can still run from 30 to 60, but C-kernel waits until 100: 100 to 140, then C-out 140 to 170. The event costs 30 units here, and it is the price of correctness.</li>
+<li><b>The legacy stream.</b> Add a 5-unit kernel to stream 0 between the two jobs. It must wait for everything A issued (until 100), and B's work must wait for it: B-in 105–135, B-kernel 135–175, B-out 175–205. Total 205 units: slower than one stream.</li>
+</ol>
+<p>Listing 2 is the model. Its real output reproduces steps 1, 2 and 4 (R2); the forensic lab shows step 5 (R3).</p>
+<pre class="output" data-run="F6-28/stream_model"></pre>
+
+<h2 id="F6-28-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>streams_events.cu</code>: two non-blocking streams, an event that joins them, and event timing across streams. It uses the checking helpers <code>CUDA_CHECK</code> and <code>CUDA_CHECK_LAUNCH</code> from <a href="#F6-05">F6-05</a>.</p>
+<pre class="listing" data-src="F6-28/streams_events.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings streams_events.cu -o streams_events</code>, then <code>./streams_events</code>. <sup class="src"><a href="#F6-28-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F6-28/streams_events"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> This build has no GPU. The program compiled without warnings; the run above stopped at its first runtime call with <code>cudaErrorNoDevice</code>. On an NVIDIA GPU the expected output is one line, <code>checked 4194304 elements, 0 errors, start-&gt;stop</code> followed by a time, and exit status 0. Neither the line nor any time has been observed in this build. Record your own run (GPU name, driver and toolkit versions).</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>6</td><td><code>#include "../F6-05/cuda_check.h"</code></td><td>The checking helpers of the CU201 harness.</td><td>Every call is checked (AH-27); a failure names the call and line, as the real output shows.</td></tr>
+<tr><td>8–30</td><td><code>scale</code>, <code>fill</code>, <code>combine</code></td><td>Three element-wise kernels with bounds checks.</td><td>Simple on purpose: the subject is the order of work, not the kernels.</td></tr>
+<tr><td>39–42</td><td><code>cudaMallocHost</code></td><td>Allocates page-locked host buffers.</td><td>Asynchronous copies that overlap need pinned memory (<a href="#F6-29">F6-29</a>); the header says such memory "can be read or written with much higher bandwidth than pageable memory". <sup class="src"><a href="#F6-28-src-H1">H1</a></sup></td></tr>
+<tr><td>53–54</td><td><code>cudaStreamCreateWithFlags(&amp;streamA, cudaStreamNonBlocking)</code></td><td>Creates two streams that do not synchronise with stream 0.</td><td>A library or a colleague's launch into stream 0 cannot serialise them (forensic lab).</td></tr>
+<tr><td>58</td><td><code>cudaEventCreateWithFlags(&amp;xReady, cudaEventDisableTiming)</code></td><td>An event used only as a marker.</td><td>Best performance for waits and queries (H1); it cannot be used for timing.</td></tr>
+<tr><td>62–66</td><td>record <code>start</code>, copy, <code>scale</code>, record <code>xReady</code></td><td>Stream A's work. <code>xReady</code> captures the copy and the kernel.</td><td>Work after line 66 in stream A (there is none) would not be part of <code>xReady</code> (H1).</td></tr>
+<tr><td>68</td><td><code>fill&lt;&lt;&lt;blocks, threads, 0, streamB&gt;&gt;&gt;</code></td><td>Stream B starts at once; it does not depend on A.</td><td>Independent work goes before the wait, so it can overlap with A.</td></tr>
+<tr><td>70</td><td><code>cudaStreamWaitEvent(streamB, xReady, 0)</code></td><td>Later work in B waits for what <code>xReady</code> captured.</td><td>Without it, <code>combine</code> could read <code>dX</code> before <code>scale</code> wrote it: a race.</td></tr>
+<tr><td>71–74</td><td><code>combine</code>, copy out, record <code>stop</code></td><td>Uses both inputs, copies the result into pinned memory, marks the end.</td><td>All in stream B, so their order is guaranteed.</td></tr>
+<tr><td>76</td><td><code>cudaEventSynchronize(stop)</code></td><td>The host waits for the work <code>stop</code> captured.</td><td>Stream B's last operation is the copy out, so <code>hOut</code> is ready after this line; no device-wide wait is needed.</td></tr>
+<tr><td>78</td><td><code>cudaEventElapsedTime(&amp;ms, start, stop)</code></td><td>Time between the two events.</td><td>Meaningful because of the dependency (Layer 3); report what the interval contains.</td></tr>
+<tr><td>80–87</td><td>check loop</td><td>Compares every element with 2x + 1.</td><td>Small integers are exact in <code>float</code>, so equality is the right test here.</td></tr>
+<tr><td>89–97</td><td>destroy and free</td><td>Releases events, streams and memory, each call checked.</td><td>Pinned memory is freed with <code>cudaFreeHost</code>, not <code>cudaFree</code> (H1).</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>stream_model.cpp</code>: the timeline model. It is ordinary C++ and runs anywhere; its output above (Worked example) is real.</p>
+<pre class="listing" data-src="F6-28/stream_model.cpp"></pre>
+<p><b>Build and run</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined stream_model.cpp -o stream_model</code>, then <code>./stream_model &lt; stream_model.in</code>. <sup class="src"><a href="#F6-28-src-R2">R2</a></sup></p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>28–35</td><td><code>struct Op</code></td><td>One bar of the timeline: lane, label, stream, start, end.</td><td>The same fields a profiler export has (<a href="#F6-32">F6-32</a>).</td></tr>
+<tr><td>37–51</td><td><code>struct Scenario</code></td><td>The state: per-stream tails, pending event waits, event times, per-lane free times, host clock, and the two tails used for legacy-stream rules.</td><td>Every rule below reads or updates one of these.</td></tr>
+<tr><td>53–58</td><td><code>laneFor</code></td><td>Kernels go to <code>compute</code>; copies to one shared <code>copy</code> lane or to <code>copy-in</code>/<code>copy-out</code>.</td><td>This is where <code>asyncEngineCount</code> enters the model.</td></tr>
+<tr><td>65</td><td><code>ready = max(hostClock, streamTail)</code></td><td>Not before the host issued it; not before the previous op of its stream ended.</td><td>Rule 1, in-stream order (D1).</td></tr>
+<tr><td>66</td><td><code>streamWaitUntil</code></td><td>Applies pending event waits.</td><td><code>cudaStreamWaitEvent</code> (H1).</td></tr>
+<tr><td>67–68</td><td>legacy rules</td><td>Stream-0 work waits for all blocking streams; blocking streams wait for earlier stream-0 work.</td><td>The implicit synchronisation of R4 and D1; non-blocking streams skip line 68 (H1).</td></tr>
+<tr><td>70–72</td><td><code>start = max(ready, laneFree)</code></td><td>The op also waits for its engine; then occupies it.</td><td>Model assumption: one op per engine, in issue order.</td></tr>
+<tr><td>76</td><td><code>if (hostSync) hostClock = end</code></td><td>A blocking call holds the host until the op ends.</td><td>Used in <a href="#F6-32">F6-32</a> for copies into pageable memory.</td></tr>
+<tr><td>184–193</td><td><code>record</code>, <code>wait</code></td><td>An event stores the time its stream's captured work ends; a wait raises the stream's earliest start.</td><td>Exactly the "captures the contents of stream" rule (H1).</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-28-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A spike is a physical queue; a stream is a promise about order.</b> Two slips on different spikes are not guaranteed to be worked on at the same time, and the hall may even serve them in any order. The GPU "may" overlap streams; it never must (H1). Correctness must not depend on overlap.</li>
+<li><b>The token is not passed to the other spike.</b> An event does not move any data and does not copy anything; it only orders. Data written by stream A is visible to stream B after the wait because both use the same device memory, not because the event carried it.</li>
+<li><b>More spikes do not mean more porters.</b> Creating eight streams does not create eight copy engines. With <code>asyncEngineCount</code> = 1, copies in both directions share one engine whatever the number of streams (H1); <a href="#F6-29">F6-29</a>'s forensic lab is about exactly that.</li>
+<li><b>The old spike by the door is not always old.</b> With <code>--default-stream per-thread</code> the default stream of each host thread is an ordinary stream (R4). The analogy describes the legacy mode only.</li>
+</ul>
+
+<h2 id="F6-28-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Streams do not overlap; the timeline looks like one stream</td><td>One launch or copy without a stream argument (legacy stream 0) between them</td><td>Compile with <code>-Wdefault-stream-launch</code> (real warning in the forensic lab, R5); look for operations on stream 0 in the timeline</td><td>Explicit streams everywhere; non-blocking streams; or <code>--default-stream per-thread</code></td></tr>
+<tr><td>Wrong results "sometimes", only with several streams</td><td>A reader in one stream and a writer in another, with no dependency</td><td>Run under Compute Sanitizer's race checking where it applies (<a href="#F6-05">F6-05</a>); list every buffer and which streams touch it</td><td><code>cudaEventRecord</code> after the writer, <code>cudaStreamWaitEvent</code> before the reader</td></tr>
+<tr><td><code>cudaEventElapsedTime</code> returns <code>cudaErrorNotReady</code></td><td>The events have not completed yet</td><td>The header documents this return value (H1)</td><td><code>cudaEventSynchronize(stop)</code> first</td></tr>
+<tr><td><code>cudaEventElapsedTime</code> returns <code>cudaErrorInvalidResourceHandle</code></td><td>An event created with <code>cudaEventDisableTiming</code>, or never recorded (H1)</td><td>Check how each event was created</td><td>Separate marker events from timing events, as Listing 1 does</td></tr>
+<tr><td>The host reads a pinned buffer and sees old data</td><td>It read before the stream's copy finished; <code>cudaMemcpyAsync</code> returned early (H1)</td><td>Find the wait between the copy and the read</td><td>Synchronise the event or stream that contains the copy</td></tr>
+<tr><td>Everything is correct but slower than one stream</td><td><code>cudaDeviceSynchronize</code> inside the issuing loop, or tiny chunks</td><td>Timeline (<a href="#F6-32">F6-32</a>): gaps after each wait</td><td>Narrowest wait; fewer, larger operations (<a href="#F6-29">F6-29</a>)</td></tr>
+<tr><td><code>cudaErrorNoDevice</code> at the first call (this build's real output)</td><td>No GPU visible</td><td>Device query (<a href="#F6-07">F6-07</a>)</td><td>Run on a GPU machine</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-28-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#CU201">CU201</a>–<a href="#CU302">CU302</a>, where every copy and kernel went into the default stream and ran in order, and <a href="#F2-34">F2-34</a>, where CPU threads ran concurrently and needed locks. <b>What carries over:</b> the error checks after every call and launch; event timing from <a href="#F6-06">F6-06</a>; the data-race thinking of <a href="#F2-35">F2-35</a>: two writers, or a writer and a reader, without an ordering are a bug. <sup class="src"><a href="#F6-28-src-H1">H1</a></sup> <b>What changes:</b> most dangerous first: work in different streams is unordered unless you order it, so a missing event wait is a race that may stay hidden; the legacy default stream silently serialises blocking streams (R4, D1); calls return before the work is done, so every host read needs a matching wait (H1); and overlap is a possibility the hardware may not deliver (<code>asyncEngineCount</code>, <code>concurrentKernels</code>, H1). <b>What comes next:</b> <a href="#F6-29">F6-29</a> splits one large job into chunks across streams so that copies and compute overlap, and shows why the host memory must be pinned.</p></div>
+
+<h2 id="F6-28-check">Check yourself</h2>
+<ol>
+<li>State the two ordering rules of streams. Which one is a guarantee and which one only a possibility?</li>
+<li>Which statement is true? (a) Work in two different streams always runs at the same time. (b) <code>cudaEventRecord(e, s)</code> captures the work issued to <code>s</code> so far, and later work in <code>s</code> does not change <code>e</code>. (c) <code>cudaStreamWaitEvent</code> blocks the host thread until the event completes. (d) An event created with <code>cudaEventDisableTiming</code> can still be used for <code>cudaEventElapsedTime</code>.</li>
+<li>In Listing 1, why is <code>fill</code> issued <i>before</i> <code>cudaStreamWaitEvent</code> and <code>combine</code> after it? What would change if you swapped lines 68–69 and 70?</li>
+<li>Predict, then check with Listing 2: jobs A and B as in the Worked example, but the GPU has one copy engine (<code>copyengines 1</code>). Write the six start and end times, then run the model.</li>
+<li>A program launches all its kernels with an explicit stream, but calls <code>cudaMemset(dCounter, 0, 4)</code> (no stream) between two jobs. Can that serialise the streams? Explain with the legacy default stream rule.</li>
+<li>Explain in your own words why the elapsed time between <code>start</code> (stream A) and <code>stop</code> (stream B) in Listing 1 is meaningful, and what it includes.</li>
+<li>Apply to a new case: Kofi processes camera frames. For each frame he copies the frame in, runs a denoise kernel, then a detect kernel, and copies a small result out. Frames are independent. Design the streams and events (how many streams, what goes where, any events) and say what you expect to overlap.</li>
+<li>Which header-documented device property tells you whether copies in both directions can overlap with a kernel, and what are its three possible values?</li>
+<li>Why should a program never rely on two kernels in different streams running at the same time for its correctness? Quote the document.</li>
+</ol>
+
+<h2 id="F6-28-lab">Lab</h2>
+<p><b>Goal.</b> Build and run Listing 1 on a GPU, prove its result correct, and compare one predicted timeline (Listing 2) with what your GPU does. This is the first part of curriculum milestone E8, whose goal is "Overlap copies with compute; reduce launch overhead with graphs." <sup class="src"><a href="#F6-28-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> An NVIDIA GPU with a CUDA Toolkit and driver, or a cloud GPU instance, for steps 1–3. This build used <code>Cuda compilation tools, release 12.0, V12.0.140</code> and <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> (from the run logs) and had no GPU. Steps 4–6 need no GPU. Folder <code>university/labs/F6-28</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p><b>GPU required for steps 1–3.</b> In this build they produced only the "no device" error. Your outputs on real hardware are the lab's result: write them down with the GPU name, driver and toolkit versions, and the value of <code>asyncEngineCount</code> printed by your <a href="#F6-07">F6-07</a> device report.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>From the repository root run <code>university/labs/run_lab.sh university/labs/F6-28</code>. Open <code>streams_events.out</code>: you should see <code>checked 4194304 elements, 0 errors</code> and a time.</li>
+<li>Move the line <code>cudaStreamWaitEvent(streamB, xReady, 0)</code> to after <code>combine</code>. Run several times, then under Compute Sanitizer (<a href="#F6-05">F6-05</a>). Record whether the error count changes. Restore the line.</li>
+<li>Change both streams to <code>cudaStreamCreate</code> (blocking) and add <code>fill&lt;&lt;&lt;1, 1&gt;&gt;&gt;(dY, 1.0f, 1);</code> (no stream) right after line 66. Is the result still correct? Use the elapsed time, then an Nsight Systems timeline (<a href="#F6-32">F6-32</a>), to decide whether the streams still overlap.</li>
+<li>Open <code>stream_model.out</code> and check the Worked example's numbers line by line.</li>
+<li>Write a scenario of your own in a new input file: three jobs, three streams, one copy engine. Predict the total by hand, then run <code>./stream_model &lt; yours.in</code> after building it with the command above.</li>
+<li>Open <code>forensic.out</code> and <code>default_stream_warning.out</code> and keep them for the forensic lab.</li>
+</ol>
+<p><b>Expected observations.</b> On a GPU: 0 errors in step 1; in step 2, results that are correct or wrong depending on timing, which is the point. In this build: <code>streams_events.cu:41: cudaMallocHost(&amp;hX, bytes) failed: cudaErrorNoDevice (no CUDA-capable device is detected)</code> (R1), and the model outputs shown above (R2, R3).</p>
+<p><b>Verification.</b> Listing 1 exits with status 0 and reports 0 errors; your model scenario's total matches your hand calculation exactly; your notes state what the measured interval contains. The E8 acceptance test on overlap ("Timeline (Nsight Systems or ROCm Systems Profiler) shows overlapping copies and kernels; end-to-end time improves over the single-stream version by the amount predicted in your plan, within 20 %") is completed in <a href="#F6-29">F6-29</a> and <a href="#F6-32">F6-32</a>. <sup class="src"><a href="#F6-28-src-C1">C1</a></sup></p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>cudaErrorNoDevice</code> → no GPU visible → device query (<a href="#F6-07">F6-07</a>).</li>
+<li>The time is much larger than the sum of the work → the interval contains waiting (Layer 3) or first-use costs → add a warm-up run and record events in the same stream for a single operation.</li>
+<li>Model prints <code>unknown command</code> → a typo in your input file; the model stops with exit status 1 so the mistake cannot be missed.</li>
+</ul>
+<p><b>Extension.</b> Add a third stream with <code>cudaStreamCreateWithPriority</code> at the greatest priority from <code>cudaDeviceGetStreamPriorityRange</code>, put a short kernel in it, and observe in a timeline whether it starts before a long kernel of another stream finishes. Read the header's notes first (Layer 3).</p>
+
+<h2 id="F6-28-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Rosa's two-stream program (<code>counter_reset.cu</code>) was supposed to process two batches at the same time. Her measured time is no better than one stream, and, she says, "sometimes a bit worse". The evidence below was produced in this build: the program itself, the compiler's warnings for it, and the timeline model of the program's sequence of operations. No GPU is needed.</p>
+<p><b>Evidence pack.</b> (1) The program:</p>
+<pre class="listing" data-src="F6-28/counter_reset.cu"></pre>
+<p>(2) Its real run in this build (no GPU, R6):</p>
+<pre class="output" data-run="F6-28/counter_reset"></pre>
+<p>(3) nvcc with <code>-Wdefault-stream-launch</code> on the same file (R5):</p>
+<pre class="output" data-run="F6-28/default_stream_warning"></pre>
+<p>(4) The model's timelines (R3): Rosa's order of operations; the counter reset moved into stream 2; both streams non-blocking.</p>
+<pre class="output" data-run="F6-28/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: in timeline 1, at what time does each operation of stream 2 start, and what is stream 2 waiting for? Compare the total with the <code>two-streams</code> scenario of the Worked example.</li>
+<li>Hypotheses: give at least two explanations that would fit "no faster than one stream" (for example: one copy engine; pageable memory; a default-stream operation; kernels too long to overlap).</li>
+<li>Which line of the source and which piece of evidence decides between them?</li>
+<li>Timeline 2 moves the reset into stream 2. Is that fix correct? Think about who else increments <code>dCounter</code> and when.</li>
+<li>Propose a fix that is both correct and overlapped, and say how you would verify it on a GPU and how you would prevent the bug from coming back.</li>
+</ol>
+<p><b>Method hints.</b> Read the legacy default stream rule (Layer 2) and nvcc's description of <code>legacy</code> (R4). For question 4, list every kernel that touches <code>dCounter</code>, its stream, and what orders it against the reset. Hypothesis → evidence → conclusion.</p>
+
+<h2 id="F6-28-project">Mini-project</h2>
+<p><b>A stream-plan checker.</b> Extend Listing 2 so that it reads, for every operation, the buffers it reads and writes (for example <code>kernel 2 40 B-kernel reads=dB writes=dB,dCounter</code>), and reports every pair of operations in different streams that touch the same buffer, at least one of them writing, with no ordering between them (neither the same stream nor an event chain, nor a legacy-stream rule). Run it on the three forensic scenarios and explain each report.</p>
+<p><b>Rubric.</b> Correct ordering relation (same stream, events, legacy rules) (4). Correct conflict detection on the forensic scenarios, including the race of timeline 2 (3). A short note on what the checker cannot see (host reads, pointer aliasing) (3).</p>
+
+<h2 id="F6-28-summary">Summary</h2>
+<ul>
+<li>A stream is a queue: operations in one stream run in issue order; operations in different streams may overlap but are not ordered.</li>
+<li>Overlap is a permission, not a promise; <code>asyncEngineCount</code> and <code>concurrentKernels</code> say what the device can do, and correctness must never depend on it.</li>
+<li>Events capture a stream's work at the moment of recording; <code>cudaStreamWaitEvent</code> orders another stream behind it on the device; <code>cudaEventSynchronize</code> makes the host wait.</li>
+<li>Marker events use <code>cudaEventDisableTiming</code>; timing events must be complete before <code>cudaEventElapsedTime</code>, and you must state what the interval contains.</li>
+<li>The legacy default stream, nvcc's default, synchronises with blocking streams; one launch without a stream can serialise everything. Use explicit, non-blocking streams; let nvcc warn about launches without a stream.</li>
+<li>A small timeline model built from the documented rules predicts what to expect; the profiler (<a href="#F6-32">F6-32</a>) tells you what really happened.</li>
+</ul>
+
+<h2 id="F6-28-sources">Sources</h2>
+<ol>
+<li id="F6-28-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1). The guide's source registry (section 4.6) records that the page at the long-standing address was titled "CUDA Programming Guide", version 13.x, when opened. Sections used: asynchronous concurrent execution; streams (creation, the default stream, explicit and implicit synchronisation); events. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-28-src-D2">D2 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): asynchronous and overlapping transfers with computation. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-28-src-D3">D3 — NVIDIA, "CUDA Runtime API" reference (tier 1): stream management, event management. <i>Title only — not opened during this build (dossier gate G1 open).</i> The installed header H1 carries the same function documentation as comments and was read instead.</li>
+<li id="F6-28-src-D4">D4 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3; edition to be recorded): the chapter on streams and data transfer overlap. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-28-src-H1">H1 — CUDA 12.0 headers as installed in the build container (Ubuntu package nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>cuda_runtime_api.h</code> (section "API synchronization behavior"; documentation of <code>cudaStreamCreateWithFlags</code>, <code>cudaStreamCreateWithPriority</code>, <code>cudaDeviceGetStreamPriorityRange</code>, <code>cudaStreamSynchronize</code>, <code>cudaStreamQuery</code>, <code>cudaStreamDestroy</code>, <code>cudaStreamWaitEvent</code>, <code>cudaEventCreateWithFlags</code>, <code>cudaEventRecord</code>, <code>cudaEventQuery</code>, <code>cudaEventSynchronize</code>, <code>cudaEventElapsedTime</code>, <code>cudaMemcpyAsync</code>, <code>cudaMallocHost</code>, <code>cudaLaunchHostFunc</code>; the <code>cudaDeviceProp</code> field descriptions of <code>concurrentKernels</code> and <code>asyncEngineCount</code>) and <code>driver_types.h</code> (<code>cudaStreamNonBlocking</code>, <code>cudaStreamLegacy</code>, <code>cudaStreamPerThread</code>). Tier 1 (vendor files).</li>
+<li id="F6-28-src-C1">C1 — Systems Curriculum (this project), section 13.2 topic "Streams, events and graphs" and milestone E8 (goal and acceptance tests quoted verbatim). A map, not a source (AH-4).</li>
+<li id="F6-28-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-28/streams_events.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+<li id="F6-28-src-R2">R2 — run of Listing 2 on <code>stream_model.in</code> (<code>stream_model.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with AddressSanitizer and UndefinedBehaviorSanitizer, exit code 0. A model, not a measurement.</li>
+<li id="F6-28-src-R3">R3 — run of Listing 2 on <code>forensic.in</code> (<code>forensic.log</code>), same toolchain, exit code 0.</li>
+<li id="F6-28-src-R4">R4 — <code>nvcc --help</code>, the <code>--default-stream</code> entry, recorded in this build (<code>default_stream_help.log</code>), CUDA 12.0.</li>
+<li id="F6-28-src-R5">R5 — <code>nvcc -Wdefault-stream-launch</code> on the forensic program (<code>default_stream_warning.log</code>), CUDA 12.0, compile only, exit code 0.</li>
+<li id="F6-28-src-R6">R6 — build and run of the forensic program (<code>counter_reset.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+</ol>
+
+<h2 id="F6-28-glossary">Glossary links</h2>
+<p><a href="#gl-stream-cuda">Stream (CUDA)</a> · <a href="#gl-legacy-default-stream-stream-0-the-null-stream">Legacy default stream</a> · <a href="#gl-non-blocking-stream">Non-blocking stream</a> · <a href="#gl-per-thread-default-stream">Per-thread default stream</a> · <a href="#gl-event-cuda">Event (CUDA)</a> · <a href="#gl-cross-stream-dependency">Cross-stream dependency</a> · <a href="#gl-asynchronous-with-respect-to-the-host">Asynchronous (with respect to the host)</a> · <a href="#gl-timeline">Timeline</a> · <a href="#gl-copy-engine-dma">Copy engine / DMA</a> · <a href="#gl-pinned-page-locked-memory">Pinned (page-locked) memory</a></p>
+
+<h2 id="F6-28-next">Next chapter</h2>
+<p>Next: <a href="#F6-29">F6-29 Overlapping copies with compute; pinned memory</a>. Back to the course: <a href="#CU303">CU303</a>.</p>
+
+<h2 id="F6-28-answers">Answers to Check yourself</h2>
+<ol>
+<li>Inside one stream, operations run in issue order: a guarantee. Operations in different streams may run concurrently: a possibility, which depends on engines, memory and other work (D1, H1).</li>
+<li>(b), quoted from the header (H1). (a) is false: different streams "may" overlap. (c) is false: the wait is on the device; the host continues. (d) is false: <code>cudaEventElapsedTime</code> returns <code>cudaErrorInvalidResourceHandle</code> for such events (H1).</li>
+<li><code>fill</code> does not depend on stream A, so it should be free to run while A copies and scales. If the wait came first, <code>fill</code> would also wait for <code>xReady</code> and the two streams would barely overlap; the result would still be correct.</li>
+<li>With one shared copy engine and the issue order of the input (A-in, A-kernel, A-out, B-in, B-kernel, B-out), the engine runs copies in issue order, so B-in must wait behind A-out, which itself waits for A-kernel: A-in 0–30, A-kernel 30–70, A-out 70–100, B-in 100–130, B-kernel 130–170, B-out 170–200; total 200, no better than one stream. If the host issues breadth-first (A-in, B-in, A-kernel, B-kernel, A-out, B-out), B-in runs 30–60, B-kernel 70–110, A-out 70–100, B-out 110–140: total 140 again. The model gives both results (run it). With one copy engine, issue order matters; <a href="#F6-29">F6-29</a> develops this.</li>
+<li>Yes. <code>cudaMemset</code> without a stream argument is issued to the default stream; in legacy mode it waits for earlier work in blocking streams and later blocking-stream work waits for it (D1, R4). Non-blocking streams are not affected (H1).</li>
+<li>Stream B waits for <code>xReady</code>, which was recorded in stream A after <code>start</code>; so <code>stop</code> completes after <code>start</code>. The interval includes stream A's copy and kernel, stream B's fill (overlapping), the wait, <code>combine</code> and the copy out; it is "time to result" for this small graph of work, not the time of any single operation (H1's warning).</li>
+<li>One possible design: N streams (for example 3), frame k in stream k mod N; in each stream copy in, denoise, detect, copy out, all in order, so no events are needed inside a frame. Expected overlap: frame k+1's copy in with frame k's kernels, and frame k's small copy out with frame k+1's kernels, subject to <code>asyncEngineCount</code>. An event is needed only if frames share a buffer (for example a reused pinned staging buffer: the host must wait for the copy that last used it before refilling it).</li>
+<li><code>asyncEngineCount</code>: 0 (no concurrent copy and kernel), 1 (copy in one direction while a kernel runs), 2 (copies in both directions and a kernel at the same time) (H1).</li>
+<li>The header says of <code>concurrentKernels</code>: "it is not guaranteed that multiple kernels will be resident on the device concurrently so this feature should not be relied upon for correctness" (H1). A kernel that waits for another to make progress may wait forever if they are not co-resident.</li>
+</ol>
+<h3 id="F6-28-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> In timeline 1 (R3), <code>resetCounter</code> on stream 0 starts at 100.0, when stream 1's copy out ends; stream 2's copy in starts at 105.0, when the reset ends. Nothing of stream 2 overlaps stream 1. Total 205.0, against 200.0 for one stream and 140.0 for two streams without the reset (R2): "no faster, sometimes a bit worse" is exactly what Rosa saw.</p>
+<p><b>Hypotheses.</b> One copy engine; pageable host memory; a default-stream operation; kernels long enough that overlap gains little. The source rules out pageable memory (lines 30–31 use <code>cudaMallocHost</code>) and shows one launch without a stream argument at line 52, which nvcc flags with <code>-Wdefault-stream-launch</code> (R5). The streams are created with <code>cudaStreamCreate</code>, so they are blocking streams.</p>
+<p><b>Evidence-based conclusion.</b> The legacy default stream "implicitly synchronizes with other streams" (R4): the reset waits for all of stream 1's earlier work, and stream 2's later work waits for the reset (D1). The model with only that rule reproduces the serialisation (timeline 1); making the streams non-blocking removes it (timeline 3, total 145.0). One copy engine is not needed to explain the evidence, and the model with two engines already shows the effect.</p>
+<p><b>Is timeline 2 a correct fix?</b> No. Moving the reset into stream 2 restores some overlap (175.0), but now nothing orders the reset after stream 1's <code>work</code> kernel, which also increments <code>dCounter</code> (line 11). On a GPU that runs the two kernels concurrently, the reset can happen in the middle of stream 1's increments, or stream 2's increments can be added to stream 1's count: a race. Rosa's program was "correct by accident" because the legacy stream ordered it. Timeline 3 has the same race.</p>
+<p><b>Correct fix.</b> Give each job its own counter (two allocations, each reset with <code>cudaMemsetAsync</code> in its own stream before its kernel), and use non-blocking streams. Then the two jobs share nothing and the plan is the <code>two-streams</code> scenario (140.0). If one counter is truly needed, record an event after stream 1's kernel, make stream 2 wait for it, and only then reset in stream 2, accepting less overlap.</p>
+<p><b>Verification and prevention.</b> On a GPU: both counts correct over many runs and under Compute Sanitizer; a timeline showing stream 2's copy in during stream 1's kernel (<a href="#F6-32">F6-32</a>). Prevention: build with <code>-Wdefault-stream-launch</code> as an error (nvcc's help lists <code>default-stream-launch</code> among the allowed values of its <code>-Werror</code> option, R4); review rule "one shared buffer, one documented ordering". <b>How the evidence was produced:</b> real compile and run of the program in this build (no GPU); real nvcc warning; the model of Listing 2 on <code>forensic.in</code>, whose operation order is copied from the source. Nothing was injected; the fault is in the source as written.</p>

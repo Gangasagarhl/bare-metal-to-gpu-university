@@ -1,0 +1,311 @@
+<!--meta
+id: F6-29
+title: Overlapping copies with compute; pinned memory
+course: CU303
+level: L4
+prereqs: F6-28; F6-09 (bandwidth, pinned and pageable memory); F1-38 (virtual memory); F1-44 (DMA); F1-62 (interconnects and the alpha–beta copy model)
+time: 12–16 hours including the lab
+hardware: Lab steps 1–4: an NVIDIA GPU with a CUDA Toolkit and driver (record both versions, and the device's asyncEngineCount), or a cloud GPU instance. The pipeline model, the worked example and the forensic lab need no GPU (this build had none: every GPU run below shows the runtime's real "no device" error)
+maps: Curriculum E8 (streams, overlap and graphs: the chunked pipeline and its first acceptance test); Track E 13.2 topic 8; course project of CU303
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-29-hook">Story hook</h2>
+<p>The great kitchen hall has to turn two hundred crates of vegetables into soup. The first plan is simple: the porters carry all two hundred crates in, the cooks chop and boil everything, then the porters carry all the pots out. The porters wait while the cooks cook, and the cooks wait while the porters carry. Most of the evening, half the hall stands still.</p>
+<p>Mei Ling, the shift leader, splits the job into batches of twenty-five crates. While the cooks work on batch one, the porters bring in batch two; while the cooks work on batch two, another porter carries batch one's pots out. After the first batch, everybody is busy at the same time.</p>
+<p>There is one catch. The porters may only take crates from the loading dock, where crates stay put. The crates in the big storeroom get moved around all evening by the storeroom staff, so before a porter can take one, somebody has to carry it to the dock first, and while that happens the porter just waits. Mei Ling's batches only flow if the crates are on the dock to begin with.</p>
+<p>In CUDA, the batches are <b>chunks</b>, the porters are <b>copy engines</b>, the loading dock is <b>pinned memory</b>, and the storeroom is ordinary <b>pageable memory</b>. This chapter plans, builds and checks Mei Ling's pipeline.</p>
+
+<h2 id="F6-29-able">What you will be able to do</h2>
+<ul>
+<li><b>Derive</b> the time of a chunked copy-in / compute / copy-out pipeline from the three stage times and the number of chunks, and say when the formula stops being true.</li>
+<li><b>Plan</b> a pipeline with the course's model: chunk count, number of copy engines, fixed cost per copy and the order in which the host issues work.</li>
+<li><b>Explain</b>, from the runtime's own documentation, why overlapping copies need page-locked host memory, and what pinning costs.</li>
+<li><b>Write</b> a chunked pipeline over several streams that is correct by construction (checked bit for bit against a one-stream run) and that measures its own prediction error (milestone E8).</li>
+<li><b>Diagnose</b> a pipeline that misses its plan because the machine has one copy engine and the work is issued depth-first.</li>
+</ul>
+
+<div class="co jargon" id="F6-29-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Pageable memory</dt><dd><b>Simple words:</b> ordinary memory from <code>new</code>, <code>malloc</code> or <code>std::vector</code>, which the operating system may move or swap. <b>Analogy:</b> crates in the storeroom, which the storeroom staff rearrange. <b>Precise:</b> host memory whose pages the operating system may relocate or page out (<a href="#F1-38">F1-38</a>); for copies from it the CUDA driver first copies the data into "staging memory for DMA transfer". <sup class="src"><a href="#F6-29-src-H1">H1</a></sup></dd>
+<dt>Pinned (page-locked) memory</dt><dd><b>Simple words:</b> host memory the operating system promises not to move, so the GPU can read it directly. <b>Analogy:</b> crates on the loading dock. <b>Precise:</b> host memory allocated with <code>cudaMallocHost</code> or <code>cudaHostAlloc</code>, or registered with <code>cudaHostRegister</code>, that is "page-locked and accessible to the device" and "can be read or written with much higher bandwidth than pageable memory". <sup class="src"><a href="#F6-29-src-H1">H1</a></sup> Already defined in <a href="#F1-62">F1-62</a>; this chapter adds its role in overlap.</dd>
+<dt>Chunk (pipeline chunk)</dt><dd><b>Simple words:</b> one piece of a big job, copied and processed on its own. <b>Analogy:</b> one batch of twenty-five crates. <b>Precise:</b> a contiguous slice of the input whose copy in, kernel and copy out form one in-order sequence in one stream, so that different slices can be in different stages at the same time.</dd>
+<dt>Software pipeline (copy–compute pipeline)</dt><dd><b>Simple words:</b> doing different steps for different pieces at the same time. <b>Analogy:</b> porters carrying batch two in while cooks cook batch one and another porter carries batch zero out. <b>Precise:</b> a schedule in which chunk k+1's copy in, chunk k's kernel and chunk k−1's copy out run concurrently on different engines; with C equal chunks its time is about serial / C + (C − 1) / C × (slowest stage), plus per-chunk costs (this chapter's derivation).</dd>
+<dt>Issue order (depth-first, breadth-first)</dt><dd><b>Simple words:</b> the order in which the CPU hands the GPU its jobs. <b>Analogy:</b> pinning all of batch one's slips, then batch two's (depth-first), or all "carry in" slips first, then all "cook" slips (breadth-first). <b>Precise:</b> depth-first issues copy in, kernel, copy out per chunk; breadth-first issues all copies in, then all kernels, then all copies out. Results are the same; on hardware whose engines take work in issue order, the timelines can differ (Listing 2's model).</dd>
+<dt>Overlap efficiency</dt><dd><b>Simple words:</b> how close the real pipeline came to the plan. <b>Analogy:</b> the evening's actual finish time against the shift plan. <b>Precise:</b> measured pipeline time divided by predicted time, the quantity milestone E8 bounds ("within 20 %"). <sup class="src"><a href="#F6-29-src-C1">C1</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-29-pictures">The idea in pictures</h2>
+<p>Figure 1 shows Mei Ling's plan as a timeline: one job split into four chunks, three engines (copy in, compute, copy out). The first chunk's copy in and the last chunk's copy out overlap with nothing; in between, all three engines are busy. That shape gives the formula of the Worked example.</p>
+<figure id="F6-29-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F6-29-f1t F6-29-f1d">
+<title id="F6-29-f1t">Figure 1: a four-chunk copy–compute pipeline</title>
+<desc id="F6-29-f1d">Top: one lane each for copy in, compute and copy out, with one long bar per lane one after another: the serial plan, total time a plus k plus b. Bottom: the same three lanes with four short bars each. Copy in bars 1, 2, 3, 4 are back to back from the start. Compute bar 1 starts when copy-in bar 1 ends, and compute bars follow back to back. Copy-out bar 1 starts when compute bar 1 ends. Brackets mark the fill (the first chunk passing through all three stages, length serial divided by four) and the steady part (three more chunks at the rate of the slowest stage). The total is serial over four plus three quarters of the slowest stage. Equal stage times are drawn; not to scale.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="20" y="22">Serial: one stream, whole array (time a + k + b)</text>
+<text class="sv-ts" x="20" y="48">copy in</text><text class="sv-ts" x="20" y="70">compute</text><text class="sv-ts" x="20" y="92">copy out</text>
+<rect class="sv-b3" x="100" y="36" width="200" height="16"/><text class="sv-ts" x="106" y="48">a: all of the input</text>
+<rect class="sv-b5" x="300" y="58" width="200" height="16"/><text class="sv-ts" x="306" y="70">k: all of the kernel</text>
+<rect class="sv-b4" x="500" y="80" width="200" height="16"/><text class="sv-ts" x="506" y="92">b: all of the output</text>
+<text class="sv-tb" x="20" y="134">Pipelined: 4 chunks over several streams</text>
+<text class="sv-ts" x="20" y="160">copy in</text><text class="sv-ts" x="20" y="182">compute</text><text class="sv-ts" x="20" y="204">copy out</text>
+<rect class="sv-b3" x="100" y="148" width="50" height="16"/><text class="sv-ts" x="120" y="160">1</text>
+<rect class="sv-b3" x="150" y="148" width="50" height="16"/><text class="sv-ts" x="170" y="160">2</text>
+<rect class="sv-b3" x="200" y="148" width="50" height="16"/><text class="sv-ts" x="220" y="160">3</text>
+<rect class="sv-b3" x="250" y="148" width="50" height="16"/><text class="sv-ts" x="270" y="160">4</text>
+<rect class="sv-b5" x="150" y="170" width="50" height="16"/><text class="sv-ts" x="170" y="182">1</text>
+<rect class="sv-b5" x="200" y="170" width="50" height="16"/><text class="sv-ts" x="220" y="182">2</text>
+<rect class="sv-b5" x="250" y="170" width="50" height="16"/><text class="sv-ts" x="270" y="182">3</text>
+<rect class="sv-b5" x="300" y="170" width="50" height="16"/><text class="sv-ts" x="320" y="182">4</text>
+<rect class="sv-b4" x="200" y="192" width="50" height="16"/><text class="sv-ts" x="220" y="204">1</text>
+<rect class="sv-b4" x="250" y="192" width="50" height="16"/><text class="sv-ts" x="270" y="204">2</text>
+<rect class="sv-b4" x="300" y="192" width="50" height="16"/><text class="sv-ts" x="320" y="204">3</text>
+<rect class="sv-b4" x="350" y="192" width="50" height="16"/><text class="sv-ts" x="370" y="204">4</text>
+<line class="sv-line2" x1="100" y1="224" x2="250" y2="224"/><text class="sv-ts" x="100" y="240">fill: serial / 4</text>
+<line class="sv-line2" x1="250" y1="250" x2="400" y2="250"/><text class="sv-ts" x="250" y="266">steady: 3 × slowest stage / 4</text>
+<line class="sv-dash" x1="400" y1="140" x2="400" y2="270"/><text class="sv-ts" x="408" y="210">pipelined total</text>
+<line class="sv-dash" x1="700" y1="28" x2="700" y2="104"/><text class="sv-ts" x="606" y="118">serial total</text>
+<text class="sv-ts" x="20" y="290">Equal stage times drawn; per-copy fixed costs ignored; two copy engines assumed (asyncEngineCount = 2). Not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> The copy–compute pipeline that milestone E8 asks for: "a pipeline that processes a large data set in chunks with copy-in, compute and copy-out in several streams". <sup class="src"><a href="#F6-29-src-C1">C1</a></sup> Overlap of copies in both directions with a kernel requires a device with <code>asyncEngineCount</code> = 2. <sup class="src"><a href="#F6-29-src-H1">H1</a></sup></figcaption></figure>
+
+<p>Figure 2 is the reason for the loading dock. A copy engine reads host memory by direct memory access; from pageable memory the driver must first copy the data into a pinned staging buffer, and only then can the engine move it.</p>
+<figure id="F6-29-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 220" role="img" aria-labelledby="F6-29-f2t F6-29-f2d">
+<title id="F6-29-f2t">Figure 2: copying from pageable and from pinned host memory</title>
+<desc id="F6-29-f2d">Top row, pageable: a box labelled pageable buffer (std::vector) with an arrow labelled CPU copy by the driver to a box labelled pinned staging buffer, then an arrow labelled DMA by the copy engine to a box labelled GPU memory. Bottom row, pinned: a box labelled pinned buffer (cudaMallocHost) with a single arrow labelled DMA by the copy engine to GPU memory. A note says the staging step is documented in the CUDA runtime header; the size and number of staging buffers are not.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="220"/>
+<text class="sv-tb" x="20" y="24">Pageable source (the storeroom)</text>
+<rect class="sv-b1" x="20" y="36" width="170" height="44" rx="5"/><text class="sv-t" x="30" y="56">pageable buffer</text><text class="sv-ts" x="30" y="72">std::vector, new, malloc</text>
+<line class="sv-line" x1="190" y1="58" x2="278" y2="58"/><polygon class="sv-head" points="278,58 270,54 270,62"/><text class="sv-ts" x="194" y="50">CPU copy (driver)</text>
+<rect class="sv-b6" x="280" y="36" width="170" height="44" rx="5"/><text class="sv-t" x="290" y="56">pinned staging</text><text class="sv-ts" x="290" y="72">buffer (driver's)</text>
+<line class="sv-line" x1="450" y1="58" x2="568" y2="58"/><polygon class="sv-head" points="568,58 560,54 560,62"/><text class="sv-ts" x="456" y="50">DMA (copy engine)</text>
+<rect class="sv-b4" x="570" y="36" width="170" height="44" rx="5"/><text class="sv-t" x="580" y="62">GPU memory</text>
+<text class="sv-tb" x="20" y="124">Pinned source (the loading dock)</text>
+<rect class="sv-b6" x="20" y="136" width="170" height="44" rx="5"/><text class="sv-t" x="30" y="156">pinned buffer</text><text class="sv-ts" x="30" y="172">cudaMallocHost</text>
+<line class="sv-line" x1="190" y1="158" x2="568" y2="158"/><polygon class="sv-head" points="568,158 560,154 560,162"/><text class="sv-ts" x="300" y="150">DMA (copy engine), no CPU copy</text>
+<rect class="sv-b4" x="570" y="136" width="170" height="44" rx="5"/><text class="sv-t" x="580" y="162">GPU memory</text>
+<text class="sv-ts" x="20" y="206">Arrows show data flow. The staging step is documented in cuda_runtime_api.h; the size and number of staging buffers are not.</text>
+</svg></div><figcaption><b>Figure 2.</b> Host-to-device copies from pageable and from pinned memory. For pageable memory the header documents a copy into "staging memory for DMA transfer"; for <code>cudaMemcpyAsync</code> "if pageable memory must first be staged to pinned memory, this will be handled asynchronously with a worker thread". <sup class="src"><a href="#F6-29-src-H1">H1</a></sup></figcaption></figure>
+
+<h2 id="F6-29-layer1">Layer 1 — the kid explanation</h2>
+<p>A big job has three steps: carry in, cook, carry out. If you do all of one step before the next, two kinds of workers always wait. Cut the job into pieces. Then, while piece two is carried in, piece one is cooked. While piece two is cooked, piece one is carried out. After a short start, every worker is busy.</p>
+<p>How long does it take? The first piece has to go through all three steps. After that, one piece comes out every time the slowest step finishes a piece. More pieces make the start shorter. But every piece also has a small fixed cost, like a porter walking to the dock. Too many tiny pieces and those walks add up.</p>
+<p>The carriers can only take data that stays put. Normal memory may be moved around by the operating system. So the computer first copies it to a safe place, and the carriers wait. Memory that is "pinned" never moves. The carriers can take from it straight away.</p>
+
+<h2 id="F6-29-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-29-l2-pipeline">The pipeline in code</h3>
+<p>The analogy first: one batch, one spike; batches on different spikes. In code, chunk <i>c</i> goes to stream <code>c % nStreams</code>, and in that stream it is copied in with <code>cudaMemcpyAsync</code>, processed by a kernel, and copied out with <code>cudaMemcpyAsync</code>. Within the chunk the stream orders the three steps; across chunks the streams allow overlap (<a href="#F6-28">F6-28</a>). <sup class="src"><a href="#F6-29-src-D1">D1</a></sup> <sup class="src"><a href="#F6-29-src-H1">H1</a></sup> Each chunk uses its own slice of the device buffers, so no two streams write the same bytes: the pipeline is race-free by construction, and Listing 1 checks it bit for bit against a one-stream run.</p>
+<h3 id="F6-29-l2-pinned">Why the host memory must be pinned</h3>
+<p>The installed CUDA 12.0 header contains a section titled "API synchronization behavior". For the synchronous <code>cudaMemcpy</code> it says: "For transfers from pageable host memory to device memory, a stream sync is performed before the copy is initiated. The function will return once the pageable buffer has been copied to the staging memory for DMA transfer to device memory, but the DMA to final destination may not have completed." And: "For transfers from device to either pageable or pinned host memory, the function returns only once the copy has completed." <sup class="src"><a href="#F6-29-src-H1">H1</a></sup></p>
+<p>For the asynchronous forms (the "Async" suffix, which the header itself calls "a misnomer as each function may exhibit synchronous or asynchronous behavior depending on the arguments") it lists: "For transfers from device memory to pageable host memory, the function will return only once the copy has completed", and "for all other transfers, the function is fully asynchronous. If pageable memory must first be staged to pinned memory, this will be handled asynchronously with a worker thread." <sup class="src"><a href="#F6-29-src-H1">H1</a></sup></p>
+<p>Three consequences follow, each from those sentences:</p>
+<ol>
+<li><b>A device-to-host <code>cudaMemcpyAsync</code> into pageable memory blocks the host thread</b> until the copy is done. While it is blocked, the host cannot issue the next chunk's work into any stream. A pipeline whose results go to a <code>std::vector</code> therefore issues one chunk at a time; <a href="#F6-32">F6-32</a>'s forensic lab shows the resulting timeline.</li>
+<li><b>Pageable data passes through a staging copy</b> made by the CPU (or a driver worker thread) before the DMA. That costs CPU time and memory bandwidth, and it is a step the copy engine waits for.</li>
+<li><b>Pinned memory is what the copy engine reads directly.</b> The header says pinned memory "can be read or written with much higher bandwidth than pageable memory obtained with functions such as malloc()". <sup class="src"><a href="#F6-29-src-H1">H1</a></sup> The Programming Guide makes page-locked host memory a condition for overlapping copies with kernel execution. <sup class="src"><a href="#F6-29-src-D1">D1</a></sup></li>
+</ol>
+<p>Measure the bandwidth difference on your machine: <a href="#F6-09">F6-09</a>'s lab prints the pinned/pageable ratio. No number for it is given here (AH-22).</p>
+<h3 id="F6-29-l2-alloc">Three ways to get pinned memory</h3>
+<div class="tw"><table>
+<thead><tr><th>Call</th><th>What the header says</th><th>Free with</th></tr></thead>
+<tbody>
+<tr><td><code>cudaMallocHost(&amp;p, size)</code></td><td>"Allocates size bytes of host memory that is page-locked and accessible to the device." <sup class="src"><a href="#F6-29-src-H1">H1</a></sup></td><td><code>cudaFreeHost</code></td></tr>
+<tr><td><code>cudaHostAlloc(&amp;p, size, flags)</code></td><td>The same, with flags: <code>cudaHostAllocDefault</code> (emulates <code>cudaMallocHost</code>), <code>cudaHostAllocPortable</code> (pinned for all contexts), <code>cudaHostAllocMapped</code> (mapped into the device address space), <code>cudaHostAllocWriteCombined</code> (written by the CPU and read by the device; "cannot be read efficiently by most CPUs"). <sup class="src"><a href="#F6-29-src-H1">H1</a></sup></td><td><code>cudaFreeHost</code> ("must be freed with cudaFreeHost()")</td></tr>
+<tr><td><code>cudaHostRegister(p, size, flags)</code></td><td>"Page-locks the memory range specified by ptr and size" of an existing allocation; "supported only on I/O coherent devices that have a non-zero value for the device attribute cudaDevAttrHostRegisterSupported". <sup class="src"><a href="#F6-29-src-H1">H1</a></sup></td><td><code>cudaHostUnregister</code>, then the original deallocation</td></tr>
+</tbody></table></div>
+<p>All three come with the same warning in the header: "Allocating excessive amounts of pinned memory may degrade system performance, since it reduces the amount of memory available to the system for paging. As a result, this function is best used sparingly to allocate staging areas for data exchange between host and device." <sup class="src"><a href="#F6-29-src-H1">H1</a></sup> The engineering consequence: pin a few staging buffers and reuse them, rather than pinning everything. That reuse needs care (Layer 3).</p>
+<h3 id="F6-29-l2-formula">Predicting the time</h3>
+<p>Let <i>a</i>, <i>k</i> and <i>b</i> be the times of copy in, kernel and copy out for the <i>whole</i> array, measured alone. Split into <i>C</i> equal chunks, each stage of each chunk takes a third of that per chunk: <i>a/C</i>, <i>k/C</i>, <i>b/C</i>. With an engine per stage (two copy engines and the compute engine), the first chunk needs (<i>a</i> + <i>k</i> + <i>b</i>)/<i>C</i> to pass through all three stages, and after it one chunk finishes every max(<i>a</i>, <i>k</i>, <i>b</i>)/<i>C</i>. So</p>
+<p><i>T</i>(<i>C</i>) = (<i>a</i> + <i>k</i> + <i>b</i>) / <i>C</i> + (<i>C</i> − 1) / <i>C</i> × max(<i>a</i>, <i>k</i>, <i>b</i>).</p>
+<p>As <i>C</i> grows, <i>T</i> approaches max(<i>a</i>, <i>k</i>, <i>b</i>): the pipeline can never beat its slowest stage. This is the classic pipeline argument of <a href="#F1-24">F1-24</a> (stages and throughput), applied to copies; it is arithmetic, and Listing 2 checks it against a simulation. The formula ignores two things that the model adds: a fixed cost per copy (the α of <a href="#F1-62">F1-62</a>'s α–β model) and the number of copy engines.</p>
+
+<h2 id="F6-29-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: a good shift plan counts the porters, the walk to the dock for every batch, and the order in which slips are pinned, not only the cooking time.</p>
+<h3 id="F6-29-l3-chunks">How many chunks</h3>
+<p>Each copy has a fixed cost (TG-1, the course's invented teaching GPU: 10 µs per copy, <a href="#F1-62">F1-62</a>) besides its size-proportional part. With <i>C</i> chunks there are 2<i>C</i> copies, so the fixed part grows linearly with <i>C</i> while the fill time shrinks as 1/<i>C</i>. The model output in the Worked example shows the consequence on TG-1: the speed-up rises from 1.00× (1 chunk) to its best value around 16–64 chunks and then falls, below 1× at 1024 chunks. The real optimum on your GPU depends on its fixed costs, which you measure (<a href="#F6-09">F6-09</a> measures copy time against size). A kernel launch per chunk also costs time; <a href="#F6-30">F6-30</a> discusses how graphs reduce it.</p>
+<h3 id="F6-29-l3-engines">Copy engines and issue order</h3>
+<p>The header defines <code>asyncEngineCount</code> = 1 as "can concurrently copy memory between host and device while executing a kernel" and 2 as "can concurrently copy memory between host and device in both directions and execute a kernel at the same time". <sup class="src"><a href="#F6-29-src-H1">H1</a></sup> With one engine, copies in and copies out share it, and the best possible time is bounded by <i>a</i> + <i>b</i> instead of max(<i>a</i>, <i>k</i>, <i>b</i>). The model also shows a second effect: if that engine takes copies in the order the host issued them, a depth-first issue order puts chunk 0's copy out (which must wait for chunk 0's kernel) in front of chunk 1's copy in, and the engine idles. Issuing breadth-first avoids that. Whether a given GPU behaves like the model's in-order engine is not documented in the sources read for this build; the forensic lab treats it as a hypothesis to test on your hardware.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The claim that issue order (depth-first versus breadth-first) changes the achieved overlap on GPUs with one copy engine comes from this course's model and from NVIDIA material on overlapping transfers that was <i>not</i> opened in this build (CUDA C++ Best Practices Guide, D2; NVIDIA technical blog articles on overlapping data transfers, tier 5). Whether and how it applies to your GPU generation must be checked in those documents for your toolkit version and confirmed with an Nsight Systems timeline (<a href="#F6-32">F6-32</a>).</p></div>
+<h3 id="F6-29-l3-reuse">Reusing pinned staging buffers safely</h3>
+<p>Because pinning is costly, real pipelines copy data from pageable application memory into a small ring of pinned staging buffers and stream from those. The hazard: the host must not refill staging buffer <i>j</i> while the asynchronous copy that last read it is still running, because <code>cudaMemcpyAsync</code> "may return before the copy is complete". <sup class="src"><a href="#F6-29-src-H1">H1</a></sup> Record an event after each copy that reads a staging buffer and call <code>cudaEventSynchronize</code> on it before the host writes into that buffer again. The same rule applies on the way out: the host may read a pinned result buffer only after the event recorded after its copy out has completed. These are host–device races; Compute Sanitizer cannot see host writes, so they must be prevented by design.</p>
+<h3 id="F6-29-l3-mapped">Zero-copy, briefly</h3>
+<p><code>cudaHostAllocMapped</code> maps pinned host memory into the device's address space; a kernel can then read host memory directly through the pointer from <code>cudaHostGetDevicePointer</code>, without an explicit copy. <sup class="src"><a href="#F6-29-src-H1">H1</a></sup> Every access then crosses the link, so this suits data that is touched once and sparsely; for the streaming pipeline of this chapter, explicit chunked copies keep the kernel reading device memory at device bandwidth. Unified memory (<a href="#F6-31">F6-31</a>) is a third option with its own costs.</p>
+<h3 id="F6-29-l3-e8">The acceptance test and its honest use</h3>
+<p>Milestone E8's first acceptance test reads: "Timeline (Nsight Systems or ROCm Systems Profiler) shows overlapping copies and kernels; end-to-end time improves over the single-stream version by the amount predicted in your plan, within 20 %." <sup class="src"><a href="#F6-29-src-C1">C1</a></sup> Listing 1 prints the ratio measured/predicted for exactly this purpose. The curriculum's measurement rules apply (13.4): write the prediction before you run, use the median of at least 20 runs, and never change the plan after seeing the measurement without a log entry. <sup class="src"><a href="#F6-29-src-C1">C1</a></sup> Listing 1 prints a single run so that its structure stays readable; the course project wraps it in the CU201 harness (<a href="#F6-06">F6-06</a>) to obtain the median.</p>
+
+<h2 id="F6-29-hardware">How the hardware actually does it</h2>
+<p>The copy engines are DMA engines on the GPU: they issue memory read or write transactions over PCIe (or another link) to host physical addresses, without the CPU moving the bytes (<a href="#F1-44">F1-44</a>, <a href="#F1-45">F1-45</a>). <sup class="src"><a href="#F6-29-src-D4">D4</a></sup> A DMA engine works with physical pages; if the operating system could move or page out a page during the transfer, the engine would read the wrong memory. Page-locking removes that possibility, which is why a direct DMA needs pinned memory and why pageable data is first staged into a pinned buffer by the driver (H1). <sup class="src"><a href="#F6-29-src-H1">H1</a></sup> On the device side the kernels run on the SMs and read device memory at device bandwidth (<a href="#F1-59">F1-59</a>), so a well-overlapped pipeline is limited by whichever is slower: the link or the kernel. The link's speed comes from the PCIe generation and width of your slot and is measured in <a href="#F6-09">F6-09</a>; this chapter quotes none.</p>
+
+<h2 id="F6-29-worked">Worked example</h2>
+<p>TG-1 (invented, <a href="#gl-tg-1-teaching-gpu">glossary</a>): host link 16 GB/s with 10 µs fixed cost per copy, two copy engines. The job copies 64 MiB in and 64 MiB out; the kernel takes 4.0 ms on the whole array (an invented value chosen to make the stages nearly equal).</p>
+<ol>
+<li><b>Stage times.</b> 64 MiB = 64 × 1,048,576 = 67,108,864 bytes. At 16 × 10<sup>9</sup> bytes/s that is 67,108,864 / 16,000,000,000 s = 4.194 ms, plus 0.010 ms fixed: <i>a</i> = <i>b</i> = 4.204 ms. Serial: 4.204 + 4.000 + 4.204 = 12.409 ms (rounded).</li>
+<li><b>Formula for C = 8.</b> 12.409 / 8 + 7/8 × 4.204 = 1.551 + 3.679 = 5.230 ms.</li>
+<li><b>Model for C = 8.</b> Each of the 16 copies now carries its own 10 µs, and the first chunk's three stages cannot overlap: 5.309 ms, speed-up 12.409 / 5.309 = 2.34×. The formula was 1.5 % optimistic.</li>
+<li><b>Too many chunks.</b> At C = 1024, each copy moves only 64 KiB, about 4.1 µs of transfer, and still pays 10 µs fixed: the model gives 14.452 ms, slower than serial.</li>
+<li><b>Kernel-bound job.</b> With a 20 ms kernel, the best the pipeline can do is approach 20 ms: 1.41× at 64 chunks. Overlap hides copies; it cannot shorten the kernel.</li>
+</ol>
+<p>Listing 2 computes all of these; its real output (R2):</p>
+<pre class="output" data-run="F6-29/pipeline_model"></pre>
+
+<h2 id="F6-29-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>overlap.cu</code>: the E8 pipeline. It measures the three stages alone, predicts the pipelined time with the formula, runs the pipeline from pinned and from pageable memory, and checks both results bit for bit.</p>
+<pre class="listing" data-src="F6-29/overlap.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings overlap.cu -o overlap</code>, then <code>./overlap</code>. <sup class="src"><a href="#F6-29-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F6-29/overlap"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> This build has no GPU. The program compiled without warnings; the run stopped at the first runtime call with <code>cudaErrorNoDevice</code>. On an NVIDIA GPU the expected output is four lines: the three stage times and the serial sum, the prediction, and two measured lines ending in <code>result identical</code>. No time has been observed in this build, and whether "pinned" lands within 20 % of the prediction on your GPU is exactly what your lab must find out.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–23</td><td><code>process</code></td><td>A kernel with a loop of <code>reps</code> multiply-adds per element.</td><td><code>reps</code> sets the kernel time against the copy time; change it to move the bottleneck.</td></tr>
+<tr><td>25–46</td><td><code>struct Timer</code></td><td>Two events; <code>ms()</code> waits for <code>stop</code> and returns the elapsed time.</td><td>Event timing from <a href="#F6-06">F6-06</a>, wrapped so each measurement is one line; the destructor does not exit on error, because destructors must not throw or abort halfway.</td></tr>
+<tr><td>56–67</td><td><code>Timer t</code>, <code>fork</code></td><td>Records <code>start</code> and a <code>fork</code> event in stream 0; every other stream waits for <code>fork</code>.</td><td>Without the fork, other streams could start before <code>start</code> is recorded and the measured interval would miss work.</td></tr>
+<tr><td>68–82</td><td>chunk loop</td><td>Chunk <i>c</i>: copy in, kernel, copy out, all in stream <code>c % nStreams</code>, on its own slice.</td><td>Depth-first issue order; disjoint slices make the pipeline race-free.</td></tr>
+<tr><td>83–87</td><td><code>done</code> events, record <code>stop</code></td><td>Stream 0 waits for every other stream's end, then records <code>stop</code>.</td><td>The join: <code>stop</code> completes only when all chunks are done.</td></tr>
+<tr><td>107–109</td><td><code>cudaMallocHost</code></td><td>Pinned input, output and reference buffers.</td><td>The copy engine reads and writes them directly (H1).</td></tr>
+<tr><td>113–114</td><td><code>pageIn</code>, <code>pageOut</code></td><td>Pageable copies of the same data.</td><td>Same program, same kernel; only the memory kind differs, so the comparison is fair.</td></tr>
+<tr><td>121</td><td><code>cudaStreamNonBlocking</code></td><td>Streams that ignore the legacy stream.</td><td>The lesson of <a href="#F6-28">F6-28</a>'s forensic lab.</td></tr>
+<tr><td>129–145</td><td>stage timing</td><td>Warm-up, then copy in, kernel and copy out of the whole array in one stream, each between two events.</td><td>The three numbers <i>a</i>, <i>k</i>, <i>b</i> of the formula, measured on your GPU; also the reference result <code>hRef</code>.</td></tr>
+<tr><td>148–149</td><td><code>predicted</code></td><td>The formula of Layer 2.</td><td>Written before the pipeline runs: the plan.</td></tr>
+<tr><td>152–154</td><td>two <code>pipeline</code> calls</td><td>Pinned, then pageable.</td><td>The pageable run shows what the header's synchronous cases do to the plan.</td></tr>
+<tr><td>157–158</td><td><code>std::memcmp</code></td><td>Bit-for-bit comparison with the one-stream result.</td><td>Same kernel, same inputs, same GPU: any difference is a bug in the pipeline (overlapping slices, missing wait), not rounding.</td></tr>
+<tr><td>160–167</td><td>report</td><td>Stage times, prediction, both measurements and their ratio to the prediction.</td><td>The ratio is the E8 check ("within 20 %").</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>pipeline_model.cpp</code>: formula and simulation side by side, on TG-1's invented link.</p>
+<pre class="listing" data-src="F6-29/pipeline_model.cpp"></pre>
+<p><b>Build and run</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined pipeline_model.cpp -o pipeline_model</code>, then <code>./pipeline_model &lt; pipeline_model.in</code> (output in the Worked example). <sup class="src"><a href="#F6-29-src-R2">R2</a></sup></p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>16–19</td><td><code>linkBytesPerMs</code>, <code>fixedMs</code>, <code>copyMs</code></td><td>TG-1's α–β copy cost: 10 µs + bytes / 16 GB/s.</td><td>The fixed part is what punishes tiny chunks.</td></tr>
+<tr><td>29–40</td><td>issue order</td><td>Builds the list of work depth-first or breadth-first.</td><td>Same work, two orders; only the timeline differs.</td></tr>
+<tr><td>46–50</td><td>copy in</td><td>Starts when the copy-in engine is free; with one engine, also occupies the copy-out side.</td><td>One shared engine = one lane for both directions.</td></tr>
+<tr><td>51–54</td><td>kernel</td><td>Starts when its chunk is in and the compute engine is free.</td><td>Model assumption: one kernel at a time.</td></tr>
+<tr><td>55–60</td><td>copy out</td><td>Starts when its kernel is done and the copy-out engine is free.</td><td>With one engine and depth-first order, the next copy in waits behind this one.</td></tr>
+<tr><td>83–85</td><td>formula, model, speed-up</td><td>Prints both predictions and serial / model.</td><td>The gap between the two columns is what the formula leaves out.</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-29-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The storeroom is not slower to walk to; it is unsafe to grab from.</b> Pageable memory is the same DRAM as pinned memory. The difference is that its virtual-to-physical mapping may change, so a DMA engine cannot be pointed at it; the cost is the extra staging copy and the host blocking, not distance (H1, <a href="#F1-38">F1-38</a>).</li>
+<li><b>A bigger loading dock is not free.</b> Pinning takes physical memory away from the operating system's paging, and the header warns it "may degrade system performance". The analogy's dock costs nothing; real pinned memory does (H1).</li>
+<li><b>Porters are not interchangeable.</b> With <code>asyncEngineCount</code> = 2 the two copy engines serve different directions in the model; you cannot use both for copies in (H1 defines the property only in terms of directions).</li>
+<li><b>Batches do not cost the same as crates.</b> In the story, smaller batches only help; real chunks each pay a fixed cost per copy and per launch, so there is an optimum chunk count (Worked example, step 4).</li>
+</ul>
+
+<h2 id="F6-29-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Pipelined time equals serial time</td><td>Host buffers are pageable; device-to-host copies block the host (H1)</td><td>Timeline: chunks issued one after another (<a href="#F6-32">F6-32</a>); check how the buffer was allocated</td><td><code>cudaMallocHost</code> or <code>cudaHostRegister</code> for the buffers that are copied</td></tr>
+<tr><td>Speed-up far below the plan, copies in and out never overlap each other</td><td><code>asyncEngineCount</code> = 1</td><td>Device report (<a href="#F6-07">F6-07</a>)</td><td>Plan with one engine; issue breadth-first (forensic lab)</td></tr>
+<tr><td>Speed-up falls as chunks increase</td><td>Fixed per-copy and per-launch costs dominate</td><td>Measure copy time against size (<a href="#F6-09">F6-09</a>); model it (Listing 2)</td><td>Fewer, larger chunks</td></tr>
+<tr><td>Wrong results only with several streams</td><td>Overlapping slices, or a staging buffer refilled before its copy finished</td><td>Bit-for-bit check against one stream (Listing 1); review every buffer's last user</td><td>Disjoint slices; an event per staging buffer, synchronised before reuse</td></tr>
+<tr><td>Wrong results only for the last chunk</td><td>Size not a multiple of the chunk count</td><td>Test odd sizes (curriculum 13.4)</td><td><code>count = min(chunk, n - first)</code>, as in Listing 1</td></tr>
+<tr><td>The system becomes sluggish after allocating pinned buffers</td><td>Too much pinned memory (H1's warning)</td><td>Compare pinned total with physical memory</td><td>A small ring of reused staging buffers</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-29-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-28">F6-28</a> (streams and events), <a href="#F6-09">F6-09</a> (pinned versus pageable bandwidth) and <a href="#F1-62">F1-62</a> (the α–β model of copies over the link). <b>What carries over:</b> in-stream order and cross-stream freedom; event timing; the α–β cost of a copy; the CU201 rule that every call is checked. <sup class="src"><a href="#F6-29-src-H1">H1</a></sup> <b>What changes:</b> most dangerous first: the memory <i>kind</i> of a host buffer now changes behaviour, not only speed: an asynchronous copy into pageable memory blocks the host (H1); buffers that are reused across chunks need events before the host touches them; the best chunk count is a trade-off you must measure; and the hardware's engine count limits what overlap can achieve. <b>What comes next:</b> <a href="#F6-30">F6-30</a> attacks the other fixed cost of a pipeline, the launch overhead of many small operations, with CUDA Graphs.</p></div>
+
+<h2 id="F6-29-check">Check yourself</h2>
+<ol>
+<li>Write the pipeline formula for <i>C</i> equal chunks and explain each term with Figure 1.</li>
+<li>Which statement is true, according to the installed header? (a) <code>cudaMemcpyAsync</code> is always asynchronous. (b) A device-to-host <code>cudaMemcpyAsync</code> into pageable memory returns only once the copy has completed. (c) Pinned memory should be used for all host allocations. (d) <code>cudaHostAlloc</code> memory is freed with <code>free</code>.</li>
+<li>With <i>a</i> = 6 ms, <i>k</i> = 2 ms, <i>b</i> = 6 ms and two copy engines, what is the best time any number of chunks can achieve (ignoring fixed costs)? What does that tell you about where to optimise?</li>
+<li>Predict, then run Listing 2: with the <code>balanced</code> job and one copy engine, breadth-first, at 8 chunks. Then try 16 chunks.</li>
+<li>Explain in your own words why a DMA engine needs page-locked memory.</li>
+<li>Listing 1 runs the pipeline from pageable memory too. Using the header sentences, predict what its timeline looks like.</li>
+<li>Apply to a new case: Ana's pipeline copies 1 GiB in, runs a 2 ms kernel, and copies 4 KiB out. Does chunking help? What would you change instead?</li>
+<li>A pipeline uses two pinned staging buffers, alternating. Write the order of host operations for chunk <i>c</i> (fill staging buffer, copy, kernel, copy out, read result), including the event waits that make it correct.</li>
+<li>Why does Listing 1 compare results with <code>memcmp</code> instead of a tolerance?</li>
+</ol>
+
+<h2 id="F6-29-lab">Lab</h2>
+<p><b>Goal.</b> Plan a chunked pipeline, build it, and verify that its measured time is within 20 % of your prediction (milestone E8: "A pipeline that processes a large data set in chunks with copy-in, compute and copy-out in several streams"). <sup class="src"><a href="#F6-29-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> An NVIDIA GPU with a CUDA Toolkit and driver, or a cloud GPU instance, for steps 1–4. This build used <code>Cuda compilation tools, release 12.0, V12.0.140</code> and <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> and had no GPU. Step 5 needs no GPU. Folder <code>university/labs/F6-29</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use. Do not pin more host memory than a small fraction of your machine's memory (H1's warning).</p>
+<div class="co warning"><span class="lbl">Watch out</span><p><b>GPU required for steps 1–4.</b> In this build they produced only the "no device" error. Write down your GPU, driver, toolkit, <code>asyncEngineCount</code>, and the PCIe generation and width your device report shows.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li><b>Plan first.</b> From <a href="#F6-07">F6-07</a>'s report write <code>asyncEngineCount</code> in your notes. Run <code>university/labs/run_lab.sh university/labs/F6-29</code> and copy the three stage times from <code>overlap.out</code>. Compute the prediction for 8 chunks by hand and compare with the program's.</li>
+<li>Change <code>reps</code> (line 98) until the kernel time is close to the copy-in time. Rerun. Record predicted, measured pinned, measured pageable.</li>
+<li>Repeat for <code>nChunks</code> = 2, 4, 8, 16, 32, 64 (and <code>nStreams</code> = min(nChunks, 4)). Plot measured time against chunks next to Listing 2's curve with your <i>a</i>, <i>k</i>, <i>b</i> and your measured fixed cost.</li>
+<li>Wrap the pipeline in the CU201 harness (<a href="#F6-06">F6-06</a>): warm-up, median of 21 runs. Record the final ratio measured/predicted for your chosen configuration.</li>
+<li>Without a GPU: run <code>./pipeline_model</code> with your own measured stage times and fixed cost, for both issue orders and your engine count.</li>
+</ol>
+<p><b>Expected observations.</b> On a GPU: identical results for both memory kinds; the pageable pipeline close to the serial time; the pinned pipeline approaching the slowest stage as chunks increase, then getting worse. In this build: <code>overlap.cu:107: cudaMallocHost(&amp;hIn, bytes) failed: cudaErrorNoDevice (no CUDA-capable device is detected)</code> (R1) and the model output of the Worked example (R2).</p>
+<p><b>Verification.</b> Milestone E8 acceptance test, verbatim: "Timeline (Nsight Systems or ROCm Systems Profiler) shows overlapping copies and kernels; end-to-end time improves over the single-stream version by the amount predicted in your plan, within 20 %." <sup class="src"><a href="#F6-29-src-C1">C1</a></sup> The timeline part is done in <a href="#F6-32">F6-32</a>'s lab; here, the median ratio measured/predicted must lie between 0.8 and 1.2, and both results must print <code>identical</code>.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Ratio well above 1.2 with pinned memory → check <code>asyncEngineCount</code>; with 1, recompute the plan with the model's one-engine mode; try breadth-first issue order.</li>
+<li><code>result DIFFERENT</code> → a slice bug (overlapping offsets) or a missing join; print <code>first</code> and <code>count</code> for every chunk.</li>
+<li>Stage times vary a lot between runs → GPU clocks change with load and temperature; fix clocks if your driver allows it and record the setting (curriculum 13.4).</li>
+</ul>
+<p><b>Extension.</b> Rewrite the pipeline with a ring of two pinned staging buffers and a pageable application buffer (Layer 3), and measure how close it comes to the all-pinned version.</p>
+
+<h2 id="F6-29-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Jonas planned his pipeline on paper for "the lab machine", TG-1-class hardware (invented), with 8 chunks and two copy engines, and predicted 2.34×. On the actual lab machine his timeline shows almost no improvement. The machine's device report, which he did not read before planning, says <code>asyncEngineCount</code> = 1. His code issues work depth-first, like Listing 1. No GPU is needed: the evidence is the course model run on Jonas's plan and on the machine as it really is. (The machine is invented, like TG-1; the model's engine rule is its documented assumption, see Layer 3.)</p>
+<p><b>Evidence pack.</b> (1) The model input <code>forensic.in</code> (plan, then the machine with depth-first and with breadth-first issue order); (2) its real output (R3):</p>
+<pre class="listing" data-src="F6-29/forensic.in"></pre>
+<pre class="output" data-run="F6-29/forensic"></pre>
+<p>(3) The header's definition of <code>asyncEngineCount</code> (quoted in Layer 3).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare the three 8-chunk results. Which differences does the formula column show, and which does it miss?</li>
+<li>Hypotheses: list at least two causes that could make a planned 2.34× become about 1×.</li>
+<li>Which evidence identifies the cause, and why does depth-first issue order make it so much worse with one engine?</li>
+<li>What is the best the one-engine machine can do for this job, whatever the chunk count? Compute it from <i>a</i> and <i>b</i>.</li>
+<li>Fix and prevention: what should Jonas change in his code and in his planning procedure?</li>
+</ol>
+<p><b>Method hints.</b> Draw the first two chunks of the one-engine, depth-first timeline by hand: where is the engine idle? Then read <code>simulate</code> in Listing 2 for <code>engines == 1</code>.</p>
+
+<h2 id="F6-29-project">Mini-project</h2>
+<p><b>The course project, first half: a planned pipeline.</b> Turn Listing 1 into a reusable function <code>runPipeline(config)</code> (chunk count, stream count, issue order, memory kind) driven by the CU201 harness, and a plan file in which you write, before any run, the stage times, engine count, fixed cost and predicted time. The project of CU303 ("a chunked processing pipeline with measured overlap close to the planned prediction") is completed in <a href="#F6-32">F6-32</a> with the timeline evidence.</p>
+<p><b>Rubric.</b> Plan written before measurement and kept unchanged (or changed with a logged reason) (3). Correct results for odd sizes and every configuration (3). Median-based measurement with the ratio to the plan (2). One-paragraph explanation of the remaining gap (2).</p>
+
+<h2 id="F6-29-summary">Summary</h2>
+<ul>
+<li>A chunked pipeline overlaps chunk k+1's copy in, chunk k's kernel and chunk k−1's copy out; with C equal chunks its time is about serial/C + (C−1)/C × slowest stage.</li>
+<li>The pipeline cannot beat its slowest stage; fixed per-copy and per-launch costs make too many chunks slower.</li>
+<li>Overlap needs pinned host memory: copies from pageable memory are staged by the driver, and a device-to-host copy into pageable memory blocks the host (installed header).</li>
+<li><code>cudaMallocHost</code>, <code>cudaHostAlloc</code> and <code>cudaHostRegister</code> give pinned memory; pin sparingly and reuse staging buffers with an event per buffer.</li>
+<li><code>asyncEngineCount</code> decides whether copies in both directions can overlap a kernel; with one engine, issue order matters in the course's model.</li>
+<li>Plan before you measure; E8 accepts the pipeline when the measurement is within 20 % of the plan and the timeline shows overlap.</li>
+</ul>
+
+<h2 id="F6-29-sources">Sources</h2>
+<ol>
+<li id="F6-29-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1; the guide's registry records the page title "CUDA Programming Guide", version 13.x, when opened). Sections used: asynchronous concurrent execution (overlap of data transfer and kernel execution; page-locked host memory). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-29-src-D2">D2 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): asynchronous and overlapping transfers with computation; pinned memory. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-29-src-D4">D4 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3; edition to be recorded): chapter on streams, data transfer and DMA with pinned memory. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-29-src-H1">H1 — CUDA 12.0 headers as installed (Ubuntu package nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>cuda_runtime_api.h</code> section "API synchronization behavior" (Memcpy, synchronous and asynchronous cases); documentation of <code>cudaMemcpyAsync</code>, <code>cudaMallocHost</code>, <code>cudaHostAlloc</code> and its flags, <code>cudaHostRegister</code>; the <code>cudaDeviceProp</code> description of <code>asyncEngineCount</code>. Tier 1 (vendor files).</li>
+<li id="F6-29-src-C1">C1 — Systems Curriculum (this project), milestone E8 (goal, build, acceptance tests, quoted verbatim) and section 13.4 (measurement protocol). A map, not a source (AH-4).</li>
+<li id="F6-29-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-29/overlap.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>; untested on hardware, exit code 1.</li>
+<li id="F6-29-src-R2">R2 — run of Listing 2 on <code>pipeline_model.in</code> (<code>pipeline_model.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with sanitizers, exit code 0. A model with TG-1's invented numbers.</li>
+<li id="F6-29-src-R3">R3 — run of Listing 2 on <code>forensic.in</code> (<code>forensic.log</code>), same toolchain, exit code 0.</li>
+</ol>
+
+<h2 id="F6-29-glossary">Glossary links</h2>
+<p><a href="#gl-pageable-memory">Pageable memory</a> · <a href="#gl-pinned-page-locked-memory">Pinned (page-locked) memory</a> · <a href="#gl-chunk-pipeline-chunk">Chunk</a> · <a href="#gl-software-pipeline-copy-compute-pipeline">Software pipeline</a> · <a href="#gl-issue-order-depth-first-breadth-first">Issue order</a> · <a href="#gl-overlap-efficiency">Overlap efficiency</a> · <a href="#gl-copy-engine-dma">Copy engine / DMA</a> · <a href="#gl-stream-cuda">Stream (CUDA)</a> · <a href="#gl-tg-1-teaching-gpu">TG-1 (teaching GPU)</a></p>
+
+<h2 id="F6-29-next">Next chapter</h2>
+<p>Next: <a href="#F6-30">F6-30 CUDA Graphs</a>. Previous: <a href="#F6-28">F6-28</a>. Back to the course: <a href="#CU303">CU303</a>.</p>
+
+<h2 id="F6-29-answers">Answers to Check yourself</h2>
+<ol>
+<li><i>T</i>(<i>C</i>) = (<i>a</i> + <i>k</i> + <i>b</i>)/<i>C</i> + (<i>C</i> − 1)/<i>C</i> × max(<i>a</i>, <i>k</i>, <i>b</i>). The first term is the fill: chunk 1 passes through all three stages. The second term is the steady part: the remaining <i>C</i> − 1 chunks leave at the rate of the slowest stage.</li>
+<li>(b) (H1). (a) is false: the header calls the "Async" suffix "a misnomer" and lists synchronous cases. (c) is false: the header advises using pinned memory "sparingly". (d) is false: <code>cudaFreeHost</code>.</li>
+<li>max(6, 2, 6) = 6 ms as <i>C</i> grows (from 14 ms serial). The copies are the bottleneck: optimise the data volume (keep data on the GPU, compress, fuse steps) rather than the kernel.</li>
+<li>The model gives the same 8.549 ms at 8 chunks as in the forensic evidence (R3); at 16 chunks the shared engine still has to carry both directions, so the time stays above <i>a</i> + <i>b</i> ≈ 8.4 ms. Run it to see the exact value; the bound is the point.</li>
+<li>A DMA engine transfers to and from physical addresses without the CPU. If the operating system could move or page out the page during the transfer, the engine would read or write the wrong memory. Pinning promises the page stays put; for pageable memory the driver therefore copies through a pinned staging buffer (H1).</li>
+<li>Each device-to-host copy into <code>pageOut</code> returns only when complete (H1), so the host cannot issue chunk <i>c</i>+1 until chunk <i>c</i>'s copy out is done: chunks run one after another, with at most the copy in of one chunk overlapping nothing useful; the timeline looks like the serial one cut into pieces. <a href="#F6-32">F6-32</a> shows it.</li>
+<li>Barely: the output is tiny, so the only overlap available is copy in with the kernel; the bound is max(a, k) instead of a + k. With 1 GiB in and a 2 ms kernel, the copy dominates; reduce the bytes copied (keep data resident, copy only what changed) before tuning chunks.</li>
+<li>For chunk <i>c</i> using staging buffer <i>j</i> = <i>c</i> mod 2: <code>cudaEventSynchronize(inDone[j])</code> (the previous copy from buffer <i>j</i> finished); host fills buffer <i>j</i>; <code>cudaMemcpyAsync</code> in; <code>cudaEventRecord(inDone[j])</code>; kernel; <code>cudaMemcpyAsync</code> out into result buffer <i>j</i>; <code>cudaEventRecord(outDone[j])</code>; later, before reading or reusing result buffer <i>j</i>, <code>cudaEventSynchronize(outDone[j])</code>.</li>
+<li>The reference is the same kernel on the same GPU with the same inputs, so the pipelined result must be identical bit for bit. A tolerance would hide a chunking bug that changes a few elements.</li>
+</ol>
+<h3 id="F6-29-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> At 8 chunks the formula column is the same, 5.230 ms, for all three configurations: it knows nothing about engines or issue order. The model gives 5.309 ms (plan, two engines), 12.549 ms (one engine, depth-first: speed-up 0.99×) and 8.549 ms (one engine, breadth-first: 1.45×) (R3).</p>
+<p><b>Hypotheses.</b> Pageable memory; one copy engine; fixed costs from too many chunks; a kernel much longer than planned; a default-stream operation (<a href="#F6-28">F6-28</a>). Jonas's code uses pinned memory, 8 chunks are few, and his stage times match the plan, which leaves the engine count, supported by the device report.</p>
+<p><b>Evidence-based conclusion.</b> With <code>asyncEngineCount</code> = 1 the device can copy in only one direction while a kernel runs (H1): copies in and copies out share one engine. In depth-first order, chunk 0's copy out is queued on that engine before chunk 1's copy in; in the model's in-order engine, chunk 1 cannot be copied in until chunk 0's kernel and copy out are done, so the pipeline degenerates to serial (12.549 ms against 12.409 ms serial: slightly worse, because of the extra fixed costs). Breadth-first order lets all copies in go first, so the kernels overlap them: 8.549 ms.</p>
+<p><b>Best possible on this machine.</b> All bytes must cross the single engine: <i>a</i> + <i>b</i> = 4.204 + 4.204 = 8.408 ms, plus fixed costs. Breadth-first at 8 chunks (8.549 ms) is within 2 % of that bound. The plan's 2.34× was never possible.</p>
+<p><b>Fix and prevention.</b> Code: issue breadth-first (all copies in, then kernels, then copies out), or interleave so that no copy out sits in front of a needed copy in; verify with a timeline. Planning: read <code>asyncEngineCount</code> before planning and plan with the model for that engine count; add the device report to the plan file. Treat the issue-order effect as a hypothesis to confirm on the real GPU (unverified box in Layer 3). <b>How the evidence was produced:</b> real runs of Listing 2 on <code>forensic.in</code> in this build; the machine and its numbers are invented (TG-1-class), and the one-engine behaviour is the model's documented assumption.</p>

@@ -1,0 +1,356 @@
+<!--meta
+id: F6-32
+title: Profiling the whole program with Nsight Systems
+course: CU303
+level: L4
+prereqs: F6-28 (streams and the timeline model); F6-29 (overlap and pinned memory); F6-30 (graphs); F6-31 (managed memory); SP302 (benchmarking and profilers on the CPU)
+time: 10–14 hours including the lab
+hardware: Lab steps 1–4: an NVIDIA GPU with a CUDA Toolkit, a driver and Nsight Systems (record all three versions), or a cloud GPU instance with them. The NVTX host program, the timeline summariser and the whole forensic lab need no GPU (this build had none, and Nsight Systems was not installed in it: every GPU run below shows the runtime's real "no device" error)
+maps: Curriculum E8 (acceptance test: "Timeline (Nsight Systems or ROCm Systems Profiler) shows overlapping copies and kernels"); Track E 13.2 topic 10 (profiling); the CU303 forensic lab "No overlap"
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-32-hook">Story hook</h2>
+<p>The great kitchen hall is slow on Fridays, and everyone has a theory. The cooks blame the porters. The porters blame the head chef's order slips. The head chef blames the oven. Each theory sounds right, and each person is sure.</p>
+<p>Zainab, the new hall manager, stops the arguments. She hangs a long sheet of paper on the wall with one row for each station: the head chef's desk, the pass, the porters coming in, the porters going out, the cooks. Every few seconds an assistant marks on each row what that station is doing. After one Friday, the sheet tells the story. The cooks' row is mostly empty. The porters' rows have long bars, but never at the same time as the cooks. And on the head chef's row there is a pattern: every time a pot goes out, she stands at the door and waits until the porter is back, before she writes the next slip.</p>
+<p>"Nobody was lazy," Zainab says. "The order of things was wrong, and the chart shows exactly where."</p>
+<p>In CUDA, Zainab's wall chart is a <b>timeline profile</b>, the rows are the host threads, the API calls, the copy engines and the kernels, and Nsight Systems is the tool that draws it. This chapter teaches you to read one, to make your own program's phases show up on it, and to reduce it to numbers you can compare with your plan.</p>
+
+<h2 id="F6-32-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what a whole-program (system-level) timeline shows, which rows it has, and which questions it answers that a kernel profiler cannot.</li>
+<li><b>Instrument</b> a program with NVTX ranges so that its own phases appear on the timeline, at close to zero cost when no tool is attached.</li>
+<li><b>Reduce</b> a timeline export to three numbers (lane busy fractions, compute idle time, copy–kernel overlap) with a small program, and compare them with the plan of <a href="#F6-29">F6-29</a>.</li>
+<li><b>Verify</b> milestone E8's overlap acceptance test from a timeline: overlap is visible, and the end-to-end gain is within 20 % of the prediction.</li>
+<li><b>Diagnose</b> "no overlap" from an exported timeline: pageable host memory turning every device-to-host copy into a host wait.</li>
+</ul>
+
+<div class="co jargon" id="F6-32-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>System-level profiler (timeline profiler)</dt><dd><b>Simple words:</b> a tool that records what every part of the program did over time and draws it as rows. <b>Analogy:</b> Zainab's wall chart with one row per station. <b>Precise:</b> a profiler that traces host threads, runtime and driver API calls, memory copies and kernel executions (and optionally operating-system and library activity) with timestamps on a common time axis; NVIDIA's tool for this is Nsight Systems. <sup class="src"><a href="#F6-32-src-D1">D1</a></sup> Contrast with a kernel profiler (<a href="#F6-33">F6-33</a>), which looks inside one kernel.</dd>
+<dt>Trace and sampling</dt><dd><b>Simple words:</b> a trace writes down every event; sampling looks every so often. <b>Analogy:</b> writing down every slip the chef writes, versus glancing at each station every few seconds. <b>Precise:</b> tracing records each instrumented event (an API call, a copy, a kernel) with start and end times; sampling records the state (for example the CPU's program counter) at intervals and estimates where time goes. Timelines of GPU work are traces. <sup class="src"><a href="#F6-32-src-D1">D1</a></sup> <sup class="src"><a href="#F6-32-src-D5">D5</a></sup></dd>
+<dt>NVTX range and marker</dt><dd><b>Simple words:</b> labels your program puts on the timeline: "from here to here I was doing X", or "X happened now". <b>Analogy:</b> the head chef writing "Friday specials" on her own row of the chart. <b>Precise:</b> calls of the NVIDIA Tools Extension library such as <code>nvtxRangePushA</code>/<code>nvtxRangePop</code> (a nested range on the calling thread) and <code>nvtxMarkA</code> (an instantaneous marker); the installed header says the library "introduces close to zero overhead if no tool is attached". <sup class="src"><a href="#F6-32-src-H2">H2</a></sup></dd>
+<dt>Lane (timeline row)</dt><dd><b>Simple words:</b> one row of the chart, for one thing that can be busy. <b>Analogy:</b> the porters-in row. <b>Precise:</b> a horizontal track for one execution resource or source of events: a host thread, the CUDA API calls of that thread, a stream, a copy direction, kernels on a device. Bars in one lane of an engine do not overlap; overlap appears between lanes (<a href="#F6-28">F6-28</a>).</dd>
+<dt>Busy fraction and idle gap</dt><dd><b>Simple words:</b> how much of the time a row is doing something, and the empty stretches in between. <b>Analogy:</b> how much of the evening the cooks were actually cooking. <b>Precise:</b> the sum of bar lengths in a lane divided by the timeline's total time; an idle gap is an interval with no bar in that lane. Listing 3 computes both from an export.</dd>
+<dt>Copy–kernel overlap</dt><dd><b>Simple words:</b> the time during which a copy and a kernel ran at the same moment. <b>Analogy:</b> the time when porters and cooks were both busy. <b>Precise:</b> the measure of the union of intervals where at least one copy-lane bar and at least one compute-lane bar are active; zero overlap with streams in the code means something serialised them.</dd>
+<dt>Host synchronisation point</dt><dd><b>Simple words:</b> a call where the CPU stops and waits for the GPU. <b>Analogy:</b> the head chef standing at the door until the porter is back. <b>Precise:</b> a runtime call that returns only after GPU work completes, for example <code>cudaStreamSynchronize</code>, <code>cudaEventSynchronize</code>, and copies documented as synchronous, such as any device-to-host copy into pageable memory, which "will return only once the copy has completed". <sup class="src"><a href="#F6-32-src-H1">H1</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-32-pictures">The idea in pictures</h2>
+<p>Figure 1 is a schematic of what a whole-program timeline contains for the pipeline of Listing 1. It is drawn by hand from the program's structure to show the kinds of rows and how they relate; it is not a screenshot, and the row names are this chapter's, not the tool's.</p>
+<figure id="F6-32-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F6-32-f1t F6-32-f1d">
+<title id="F6-32-f1t">Figure 1: the rows of a whole-program timeline</title>
+<desc id="F6-32-f1d">Six horizontal rows on a common time axis. Row 1, NVTX ranges on the main thread: allocate, fill input, pipeline, check. Row 2, CUDA API calls on the main thread: short bars for cudaMemcpyAsync and kernel launches during the pipeline range, then a long bar for cudaDeviceSynchronize. Row 3, copy in (host to device): eight bars. Row 4, kernels: eight bars, each starting after its chunk's copy in. Row 5, copy out (device to host): eight bars. Dotted vertical lines connect one launch call in row 2 to the kernel bar in row 4 that it caused, showing that the GPU work happens later than the call. A note says the drawing is schematic.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-ts" x="10" y="40">NVTX ranges</text>
+<rect class="sv-b1" x="150" y="28" width="60" height="18"/><text class="sv-ts" x="154" y="41">allocate</text>
+<rect class="sv-b1" x="212" y="28" width="70" height="18"/><text class="sv-ts" x="216" y="41">fill input</text>
+<rect class="sv-b1" x="284" y="28" width="330" height="18"/><text class="sv-ts" x="290" y="41">pipeline (pinned)</text>
+<rect class="sv-b1" x="616" y="28" width="70" height="18"/><text class="sv-ts" x="622" y="41">check</text>
+<text class="sv-ts" x="10" y="80">CUDA API (host)</text>
+<rect class="sv-b2" x="284" y="68" width="6" height="18"/><rect class="sv-b2" x="292" y="68" width="6" height="18"/><rect class="sv-b2" x="300" y="68" width="6" height="18"/>
+<rect class="sv-b2" x="308" y="68" width="6" height="18"/><rect class="sv-b2" x="316" y="68" width="6" height="18"/><rect class="sv-b2" x="324" y="68" width="6" height="18"/>
+<text class="sv-ts" x="334" y="81">launch and copy calls</text>
+<rect class="sv-b7" x="470" y="68" width="144" height="18"/><text class="sv-ts" x="474" y="81">cudaDeviceSynchronize</text>
+<text class="sv-ts" x="10" y="120">copy in (H2D)</text>
+<rect class="sv-b3" x="290" y="108" width="36" height="18"/><rect class="sv-b3" x="326" y="108" width="36" height="18"/><rect class="sv-b3" x="362" y="108" width="36" height="18"/><rect class="sv-b3" x="398" y="108" width="36" height="18"/>
+<rect class="sv-b3" x="434" y="108" width="36" height="18"/><rect class="sv-b3" x="470" y="108" width="36" height="18"/><rect class="sv-b3" x="506" y="108" width="36" height="18"/><rect class="sv-b3" x="542" y="108" width="36" height="18"/>
+<text class="sv-ts" x="10" y="160">kernels</text>
+<rect class="sv-b5" x="326" y="148" width="36" height="18"/><rect class="sv-b5" x="362" y="148" width="36" height="18"/><rect class="sv-b5" x="398" y="148" width="36" height="18"/><rect class="sv-b5" x="434" y="148" width="36" height="18"/>
+<rect class="sv-b5" x="470" y="148" width="36" height="18"/><rect class="sv-b5" x="506" y="148" width="36" height="18"/><rect class="sv-b5" x="542" y="148" width="36" height="18"/><rect class="sv-b5" x="578" y="148" width="36" height="18"/>
+<text class="sv-ts" x="10" y="200">copy out (D2H)</text>
+<rect class="sv-b4" x="362" y="188" width="36" height="18"/><rect class="sv-b4" x="398" y="188" width="36" height="18"/><rect class="sv-b4" x="434" y="188" width="36" height="18"/><rect class="sv-b4" x="470" y="188" width="36" height="18"/>
+<rect class="sv-b4" x="506" y="188" width="36" height="18"/><rect class="sv-b4" x="542" y="188" width="36" height="18"/><rect class="sv-b4" x="578" y="188" width="36" height="18"/><rect class="sv-b4" x="614" y="188" width="36" height="18"/>
+<line class="sv-dash" x1="295" y1="86" x2="330" y2="148"/><text class="sv-ts" x="150" y="140">a call, then its work later</text>
+<line class="sv-line" x1="150" y1="228" x2="740" y2="228"/><polygon class="sv-head" points="740,228 732,224 732,232"/><text class="sv-ts" x="700" y="246">time</text>
+<text class="sv-ts" x="10" y="270">Schematic, not a screenshot and not to scale. Row names are this chapter's own; the tool's names may differ.</text>
+<text class="sv-ts" x="10" y="288">Three questions: is the compute row full? do copies sit under kernels? where does the host wait?</text>
+</svg></div><figcaption><b>Figure 1.</b> A whole-program timeline puts the program's own phases (NVTX), the host's API calls and the GPU's work on one time axis, so that cause (a call) and effect (a copy or a kernel) can be matched. NVTX ranges per D1 and H2; asynchronous calls returning before their work completes per H1. <sup class="src"><a href="#F6-32-src-D1">D1</a></sup> <sup class="src"><a href="#F6-32-src-H1">H1</a></sup> <sup class="src"><a href="#F6-32-src-H2">H2</a></sup></figcaption></figure>
+
+<p>Figure 2 is the forensic lab in one picture: the same 8-chunk, 4-stream program as two exported timelines, one with pinned and one with pageable host buffers. The bars are taken from the real output of the course's timeline model (R5, R6), not from a GPU.</p>
+<figure id="F6-32-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 280" role="img" aria-labelledby="F6-32-f2t F6-32-f2d">
+<title id="F6-32-f2t">Figure 2: pinned versus pageable, the same pipeline</title>
+<desc id="F6-32-f2d">Two timelines with three lanes each (copy in, compute, copy out), time axis 0 to 240 model units. Top, pinned: copies in run back to back from 0 to 80; kernels from 10 to 90; copies out from 20 to 100; the three lanes overlap almost everywhere; total 100. Bottom, pageable: each chunk's copy in, kernel and copy out run one after the other, 10 units each, and the next chunk's copy in starts only after the previous chunk's copy out ends; nothing overlaps; total 240. Labels give the summary: pinned compute busy 80 percent, overlap 80; pageable compute busy 33.3 percent, overlap 0.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="280"/>
+<text class="sv-tb" x="20" y="20">Timeline A, pinned buffers: total 100, compute busy 80 %, copy–kernel overlap 80</text>
+<text class="sv-ts" x="20" y="44">copy in</text><text class="sv-ts" x="20" y="64">compute</text><text class="sv-ts" x="20" y="84">copy out</text>
+<rect class="sv-b3" x="100" y="32" width="200" height="14"/>
+<rect class="sv-b5" x="125" y="52" width="200" height="14"/>
+<rect class="sv-b4" x="150" y="72" width="200" height="14"/>
+<text class="sv-ts" x="360" y="64">8 chunks back to back in every lane</text>
+<line class="sv-dash" x1="350" y1="28" x2="350" y2="92"/>
+<text class="sv-tb" x="20" y="126">Timeline B, pageable buffers: total 240, compute busy 33.3 %, overlap 0</text>
+<text class="sv-ts" x="20" y="150">copy in</text><text class="sv-ts" x="20" y="170">compute</text><text class="sv-ts" x="20" y="190">copy out</text>
+<rect class="sv-b3" x="100" y="138" width="25" height="14"/><rect class="sv-b5" x="125" y="158" width="25" height="14"/><rect class="sv-b4" x="150" y="178" width="25" height="14"/>
+<rect class="sv-b3" x="175" y="138" width="25" height="14"/><rect class="sv-b5" x="200" y="158" width="25" height="14"/><rect class="sv-b4" x="225" y="178" width="25" height="14"/>
+<rect class="sv-b3" x="250" y="138" width="25" height="14"/><rect class="sv-b5" x="275" y="158" width="25" height="14"/><rect class="sv-b4" x="300" y="178" width="25" height="14"/>
+<rect class="sv-b3" x="325" y="138" width="25" height="14"/><rect class="sv-b5" x="350" y="158" width="25" height="14"/><rect class="sv-b4" x="375" y="178" width="25" height="14"/>
+<rect class="sv-b3" x="400" y="138" width="25" height="14"/><rect class="sv-b5" x="425" y="158" width="25" height="14"/><rect class="sv-b4" x="450" y="178" width="25" height="14"/>
+<rect class="sv-b3" x="475" y="138" width="25" height="14"/><rect class="sv-b5" x="500" y="158" width="25" height="14"/><rect class="sv-b4" x="525" y="178" width="25" height="14"/>
+<rect class="sv-b3" x="550" y="138" width="25" height="14"/><rect class="sv-b5" x="575" y="158" width="25" height="14"/><rect class="sv-b4" x="600" y="178" width="25" height="14"/>
+<rect class="sv-b3" x="625" y="138" width="25" height="14"/><rect class="sv-b5" x="650" y="158" width="25" height="14"/><rect class="sv-b4" x="675" y="178" width="25" height="14"/>
+<line class="sv-dash" x1="700" y1="134" x2="700" y2="198"/>
+<text class="sv-ts" x="20" y="218">Each copy out into pageable memory holds the host until it completes, so the next chunk is issued late (H1).</text>
+<line class="sv-line" x1="100" y1="236" x2="740" y2="236"/><polygon class="sv-head" points="740,236 732,232 732,240"/>
+<text class="sv-ts" x="96" y="252">0</text><text class="sv-ts" x="340" y="252">100</text><text class="sv-ts" x="690" y="252">240 model units</text>
+<text class="sv-ts" x="20" y="272">Scale 2.5 px per unit. Model output (two copy engines, one kernel at a time); stream ids omitted.</text>
+</svg></div><figcaption><b>Figure 2.</b> The forensic lab's two timelines, drawn from the CSV export lines of R5 (pinned) and R6 (pageable) and summarised by Listing 3 (R7, R8). The only difference between the two scenarios is the documented host behaviour of a device-to-host copy into pageable memory. <sup class="src"><a href="#F6-32-src-H1">H1</a></sup> <sup class="src"><a href="#F6-32-src-R5">R5</a></sup> <sup class="src"><a href="#F6-32-src-R6">R6</a></sup></figcaption></figure>
+
+<h2 id="F6-32-layer1">Layer 1 — the kid explanation</h2>
+<p>A fast program is a team where everyone is busy at the right time. When it is slow, guessing who is to blame does not work. You need to see what each part did, and when.</p>
+<p>A timeline profiler draws that picture. It gives each part of the computer its own row. The CPU's work is one row. Copies into the GPU are another. The GPU's calculations are another. Each job is a bar.</p>
+<p>Your program can write its own labels on the picture, like "loading" or "checking". Then you can see which part of your code caused which bars.</p>
+<p>Then you look for empty space. An empty row means a worker was waiting. Bars that never sit above each other mean nothing happened at the same time. The picture shows where to look; your plan says what it should have looked like.</p>
+
+<h2 id="F6-32-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-32-l2-what">What a whole-program profiler records</h3>
+<p>Analogy first: one row per station, one bar per job. Nsight Systems is NVIDIA's system-wide performance analysis tool; its documentation describes tracing of CUDA API calls, memory copies and kernels, NVTX annotations, operating-system runtime calls and CPU sampling, all on one time axis, and exporting the collected report for later analysis. <sup class="src"><a href="#F6-32-src-D1">D1</a></sup> The value of the whole-program view is that it shows <i>relations</i>: the host call that caused a kernel, the copy that a kernel waited for, the host thread that sat in a synchronisation call while the GPU was idle. A kernel profiler (<a href="#F6-33">F6-33</a>) cannot show any of that, because it looks at one kernel at a time.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Nsight Systems was not installed in this build, so no command line, option name, report format or row name of the tool could be checked. The workflow in this chapter (record a report from the command line with CUDA and NVTX tracing enabled, open it in the graphical viewer, and export it or print summary statistics from the command line) is described from the guide's source registry entry for the Nsight Systems documentation (D1, title only). Before the lab, read the Nsight Systems User Guide for the version you install, copy the exact commands from it into your lab notes, and record the version the tool prints.</p></div>
+<h3 id="F6-32-l2-nvtx">Putting your program's phases on the timeline: NVTX</h3>
+<p>The profiler sees API calls and GPU work, but not your program's meaning: it cannot know that a loop is "fill input" or that a block of calls is "pipeline". The NVIDIA Tools Extension (NVTX) lets the program say so. The installed header describes NVTX as "a set of functions that a developer can use to provide additional information to tools", and distinguishes markers, which "describe events at a specific time", from ranges, which describe "a time span". <sup class="src"><a href="#F6-32-src-H2">H2</a></sup> Listing 1 brackets its phases with <code>nvtxRangePushA</code> and <code>nvtxRangePop</code>; ranges nest per thread. The header documents the return values: push returns "the 0 based level of range being started", pop returns "the level of the range being ended", and both return a negative value if an error occurs. <sup class="src"><a href="#F6-32-src-H2">H2</a></sup></p>
+<p>Two properties make NVTX safe to leave in production code. The header says the library "introduces close to zero overhead if no tool is attached to the application" and that the overhead with a tool attached "is specific to the tool". <sup class="src"><a href="#F6-32-src-H2">H2</a></sup> And with this toolkit's <code>nvtx3</code> headers, Listing 2 needed no extra library to build and run in this container: it compiled with g++ alone, ran, and showed that with no tool attached <code>nvtxRangePop</code> returned a negative value (R2), the documented error signal, while the program's own work was unaffected.</p>
+<pre class="output" data-run="F6-32/nvtx_host"></pre>
+<h3 id="F6-32-l2-read">Reading a timeline: three questions in order</h3>
+<ol>
+<li><b>Is the compute row full?</b> The GPU's kernels should cover most of the time of the phase you care about. Long idle gaps in the compute row are the first thing to explain.</li>
+<li><b>Do copies sit under kernels?</b> In a pipeline (<a href="#F6-29">F6-29</a>), the copy rows should have bars at the same times as the compute row. If copies and kernels alternate like a zip, something serialises them.</li>
+<li><b>Where does the host wait?</b> Look at the CUDA API row of each host thread: a long bar in a synchronisation call, or in a copy call, means the host was blocked. If the host is blocked, it cannot issue the next work, and the GPU will starve after it.</li>
+</ol>
+<p>The answers become numbers with Listing 3: busy fraction per lane, total and longest idle gap in the compute lane, and the time during which at least one copy and at least one kernel ran together.</p>
+<h3 id="F6-32-l2-sync">Why pageable memory serialises: the documented host behaviour</h3>
+<p>The runtime header has a section, "API synchronization behavior", that every profile reader should know. For the asynchronous copy functions it says: "For transfers from device memory to pageable host memory, the function will return only once the copy has completed", while "for all other transfers, the function is fully asynchronous. If pageable memory must first be staged to pinned memory, this will be handled asynchronously with a worker thread". For the synchronous forms, "for transfers from pageable host memory to device memory, a stream sync is performed before the copy is initiated". <sup class="src"><a href="#F6-32-src-H1">H1</a></sup> So in a loop that issues copy in, kernel and copy out for each chunk, a copy out into pageable memory holds the host thread until that chunk is completely done, and the next chunk is not even issued until then. The streams in the code are correct; the host simply never gets far enough ahead to give the GPU two chunks at once. That is the forensic lab of this course, predicted by the documentation before any profiler is opened.</p>
+
+<h2 id="F6-32-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: the wall chart is only as good as the questions you bring to it and the plan you compare it with.</p>
+<h3 id="F6-32-l3-method">Method: plan, record, reduce, compare</h3>
+<p>Milestone E8's first acceptance test is: "Timeline (Nsight Systems or ROCm Systems Profiler) shows overlapping copies and kernels; end-to-end time improves over the single-stream version by the amount predicted in your plan, within 20 %." <sup class="src"><a href="#F6-32-src-C1">C1</a></sup> It has three parts, and each needs its own evidence:</p>
+<ol>
+<li><b>Plan.</b> A prediction made <i>before</i> running: the model of <a href="#F6-29">F6-29</a> with your measured copy and kernel times, giving the expected pipeline time and the expected gain over one stream.</li>
+<li><b>Record.</b> A report of the single-stream run and of the pipeline run, with NVTX ranges around the measured phase so that set-up and checking are excluded the same way in both.</li>
+<li><b>Reduce and compare.</b> From the reports: the duration of the measured range, the overlap, the busy fractions. The verdict is |measured gain − predicted gain| ≤ 20 % of the predicted gain, and a visible overlap.</li>
+</ol>
+<p>Write the plan's numbers and the measured numbers in the same table. When they disagree by more than the tolerance, that is not failure; it is the start of a forensic investigation, and the timeline is the evidence.</p>
+<h3 id="F6-32-l3-overhead">The observer effect</h3>
+<p>Tracing is not free. Every traced API call and every GPU activity record costs some time, and the tool's documentation discusses its own overhead and how to reduce it (fewer traced APIs, shorter collection). <sup class="src"><a href="#F6-32-src-D1">D1</a></sup> Two rules follow. Take <i>durations</i> from the profiler but cross-check the end-to-end time with events or a host clock in an untraced run (<a href="#F6-06">F6-06</a>). And never take timing from a run under an instrumentation tool built for correctness, such as Compute Sanitizer; <a href="#F6-31">F6-31</a>'s forensic lab showed the same effect on the CPU with AddressSanitizer.</p>
+<h3 id="F6-32-l3-what-to-look-for">A catalogue of timeline patterns</h3>
+<div class="tw"><table>
+<thead><tr><th>Pattern on the timeline</th><th>Likely cause</th><th>Where it was taught</th></tr></thead>
+<tbody>
+<tr><td>Copies and kernels alternate; nothing overlaps; host API row shows long copy calls</td><td>Pageable host memory; copies holding the host (H1)</td><td><a href="#F6-29">F6-29</a>, this chapter's forensic lab</td></tr>
+<tr><td>Streams alternate although memory is pinned; one short operation on stream 0 between them</td><td>Legacy default stream synchronisation</td><td><a href="#F6-28">F6-28</a></td></tr>
+<tr><td>Copies in and out never overlap each other, only with kernels</td><td>One copy engine (<code>asyncEngineCount</code> = 1), depth-first issue</td><td><a href="#F6-29">F6-29</a> forensic lab</td></tr>
+<tr><td>Many tiny kernels with gaps longer than the kernels; host API row dense with launches</td><td>Launch overhead, host-bound issue</td><td><a href="#F6-30">F6-30</a></td></tr>
+<tr><td>Kernels much longer in one run than another; unified-memory activity during the kernel</td><td>Page faults and migration</td><td><a href="#F6-31">F6-31</a></td></tr>
+<tr><td>A <code>cudaDeviceSynchronize</code> bar in every iteration, GPU idle after each</td><td>Over-synchronisation</td><td><a href="#F6-28">F6-28</a></td></tr>
+<tr><td>Compute row full, all kernels long, overlap fine, still slow</td><td>The kernels themselves</td><td><a href="#F6-33">F6-33</a>: profile one kernel</td></tr>
+</tbody></table></div>
+<h3 id="F6-32-l3-nvprof">The older profiler in this toolkit</h3>
+<p>The CUDA 12.0 toolkit installed in this build includes an older command-line profiler, <code>nvprof</code>. Its own help text lists, among others, an option to print every kernel and copy in chronological order and one to export the result to a file (R3):</p>
+<pre class="output" data-run="F6-32/nvprof_help"></pre>
+<p>Run in this build on Listing 1, it reported that GPU profiling was skipped because of a device error, then passed on the program's own error (R4):</p>
+<pre class="output" data-run="F6-32/nvprof_run"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Which GPUs and toolkit versions <code>nvprof</code> still supports, and whether NVIDIA recommends Nsight Systems and Nsight Compute in its place for current GPUs, was not checked in this build; the only evidence here is that the tool exists in the CUDA 12.0 installation and prints the help shown above. Check the CUDA Toolkit release notes and the profiler documentation for your toolkit before using <code>nvprof</code>; this chapter's lab uses Nsight Systems.</p></div>
+
+<h2 id="F6-32-hardware">How the hardware actually does it</h2>
+<p>A timeline is assembled from timestamps taken in two places. On the host, the tool intercepts runtime and driver calls (and NVTX calls, through the injection mechanism the NVTX header's initialisation section describes) and stamps them with a host clock. <sup class="src"><a href="#F6-32-src-H2">H2</a></sup> On the GPU, start and end times of copies and kernels are recorded by the device and collected by the tool through NVIDIA's profiling interfaces; the tool then places both on one axis. <sup class="src"><a href="#F6-32-src-D1">D1</a></sup> <sup class="src"><a href="#F6-32-src-D2">D2</a></sup> This is why a launch call (host row) and its kernel (GPU row) appear at different times: the call only queues work (<a href="#F6-28">F6-28</a>). The copy lanes correspond to the DMA copy engines (<a href="#F1-44">F1-44</a>, <a href="#F1-62">F1-62</a>); counting the copy lanes that are busy at the same moment is a direct reading of <code>asyncEngineCount</code> in action.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>How GPU timestamps are generated and correlated with host time, the timestamp resolution, and how much tracing perturbs short kernels were not available in any document opened in this build. Read the Nsight Systems User Guide (D1) and the CUPTI documentation (D2) for your versions, and report profiler durations as "measured with Nsight Systems version …".</p></div>
+
+<h2 id="F6-32-worked">Worked example</h2>
+<p>Reduce a timeline by hand, then check with Listing 3. The timeline is <a href="#F6-28">F6-28</a>'s two-stream scenario (Figure 1 there), written as six export rows in <code>timeline_stats.in</code>: A-in 0–30 and B-in 30–60 on the copy-in lane; A-kernel 30–70 and B-kernel 70–110 on the compute lane; A-out 70–100 and B-out 110–140 on the copy-out lane.</p>
+<ol>
+<li><b>Total.</b> From the earliest start (0) to the latest end (140): 140.</li>
+<li><b>Busy fractions.</b> Compute: 40 + 40 = 80, so 80 / 140 = 57.1 %. Copy in: 60 / 140 = 42.9 %. Copy out: 60 / 140 = 42.9 %.</li>
+<li><b>Compute idle.</b> Before the first kernel: 30. Between kernels: 70 − 70 = 0. Total 30, longest gap 30.</li>
+<li><b>Overlap.</b> Cut the axis at every start and end: 0, 30, 60, 70, 100, 110, 140. In 0–30 only a copy runs; in 30–60 B-in and A-kernel (30); 60–70 only A-kernel; 70–100 B-kernel and A-out (30); 100–110 only B-kernel; 110–140 only B-out. Overlap = 60, which is 42.9 % of 140.</li>
+<li><b>Interpretation.</b> Without overlap the same work would take 200 (one stream). The overlap of 60 is exactly the time saved: 200 − 140. That identity holds whenever each lane is a single in-order engine and the lanes' busy times are fixed.</li>
+</ol>
+<p>Listing 3's real output on this input (R9):</p>
+<pre class="output" data-run="F6-32/timeline_stats"></pre>
+
+<h2 id="F6-32-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>nvtx_pipeline.cu</code>: the chunked pipeline of <a href="#F6-29">F6-29</a> in its simplest form, with NVTX ranges around each phase and a command-line switch between pinned (default) and pageable (<code>p</code>) host buffers. It is the program behind the forensic lab.</p>
+<pre class="listing" data-src="F6-32/nvtx_pipeline.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings nvtx_pipeline.cu -o nvtx_pipeline</code>, then <code>./nvtx_pipeline</code> (pinned) or <code>./nvtx_pipeline p</code> (pageable). <sup class="src"><a href="#F6-32-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F6-32/nvtx_pipeline"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> This build has no GPU. The program compiled without warnings; the run stopped at its first runtime call with <code>cudaErrorNoDevice</code>, and the run under <code>nvprof</code> (R4) skipped GPU profiling for the same reason. On an NVIDIA GPU the expected output is <code>pinned: 0 errors</code> (or <code>pageable: 0 errors</code>) and exit status 0. No timeline of this program has been recorded in this build.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>6</td><td><code>#include &lt;nvtx3/nvToolsExt.h&gt;</code></td><td>The NVTX header shipped with the toolkit.</td><td>The nvtx3 form built here without an extra library (R1, R2).</td></tr>
+<tr><td>19</td><td><code>usePinned = !(argc &gt; 1 &amp;&amp; argv[1][0] == 'p')</code></td><td>Pinned by default; <code>p</code> selects pageable.</td><td>One program, two behaviours: the comparison changes one thing only.</td></tr>
+<tr><td>20–23</td><td>sizes</td><td>16 Mi elements in 8 chunks over 4 streams.</td><td>The shape of the forensic model's input.</td></tr>
+<tr><td>27, 49</td><td><code>nvtxRangePushA("allocate")</code> … <code>nvtxRangePop()</code></td><td>Marks the allocation phase.</td><td>Allocation (especially pinned) has its own cost; you want to see it separately.</td></tr>
+<tr><td>32–40</td><td>pinned or pageable buffers</td><td><code>cudaMallocHost</code>, or <code>std::vector</code>.</td><td>The forensic variable.</td></tr>
+<tr><td>45–48</td><td>non-blocking streams</td><td>Four streams that ignore the legacy stream.</td><td>Rules out the <a href="#F6-28">F6-28</a> cause of serialisation.</td></tr>
+<tr><td>57</td><td>range name depends on the mode</td><td>"pipeline (pinned)" or "pipeline (pageable)".</td><td>The report says which run it is; no confusing two reports later.</td></tr>
+<tr><td>58–66</td><td>per chunk: copy in, kernel, copy out in stream <code>c % 4</code></td><td>Depth-first issue of the pipeline.</td><td>Correct in both modes; fast only if the host is never blocked (Layer 2).</td></tr>
+<tr><td>67</td><td><code>cudaDeviceSynchronize()</code></td><td>Waits for all streams.</td><td>The one wide wait, outside the loop.</td></tr>
+<tr><td>70–79</td><td>"check" range and loop</td><td>Compares every element with v² + 1.</td><td>Values are small integers, exact in <code>float</code>.</td></tr>
+<tr><td>86–89</td><td><code>cudaFreeHost</code> only when pinned</td><td>Frees what was allocated.</td><td>Vectors free themselves (RAII).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>nvtx_host.cpp</code>: NVTX in a host-only program, built with g++ and run in this build.</p>
+<pre class="listing" data-src="F6-32/nvtx_host.cpp"></pre>
+<p><b>Build and run</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined nvtx_host.cpp -o nvtx_host</code>, then <code>./nvtx_host</code>. Output in Layer 2 (R2).</p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–11</td><td>two nested pushes</td><td>Opens "whole program", then "fill".</td><td>Ranges nest per thread; the timeline shows them stacked.</td></tr>
+<tr><td>22</td><td><code>popResult = nvtxRangePop()</code></td><td>Ends "sum" and keeps the return value.</td><td>Documented: the level ended, or a negative value on error (H2).</td></tr>
+<tr><td>23</td><td><code>nvtxMarkA("sum done")</code></td><td>An instantaneous marker.</td><td>For events without duration.</td></tr>
+<tr><td>25–27</td><td><code>expected</code></td><td>Sum of i mod 10 for i below 2<sup>20</sup>: 104,857 full cycles of 45, plus 0 + 1 + … + 5 for the remaining 6 values.</td><td>The program checks its own answer; with doubles of small integers the sum is exact.</td></tr>
+<tr><td>29</td><td>prints the pop result</td><td>Shows −2 in this build.</td><td>With no tool attached, NVTX calls do nothing useful and report it, at close to zero cost (H2).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>timeline_stats.cpp</code>: reduces a timeline export to busy fractions, compute idle time and copy–kernel overlap.</p>
+<pre class="listing" data-src="F6-32/timeline_stats.cpp"></pre>
+<p><b>Build and run</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined timeline_stats.cpp -o timeline_stats</code>, then <code>./timeline_stats &lt; timeline_stats.in</code>. <sup class="src"><a href="#F6-32-src-R9">R9</a></sup></p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>4–5</td><td>input format</td><td>Rows <code>csv: lane,start,end,stream,label</code>.</td><td>The <a href="#F6-28">F6-28</a> model prints them; a real export can be converted to them with a few lines of script.</td></tr>
+<tr><td>26–39</td><td>parse loop</td><td>Keeps only rows with the prefix, skips the header row.</td><td>Robust to comments and other output around the rows.</td></tr>
+<tr><td>44–51</td><td>total</td><td>Earliest start to latest end.</td><td>Step 1 of the Worked example.</td></tr>
+<tr><td>52–56</td><td><code>busy</code> map</td><td>Sums bar lengths per lane.</td><td>Valid because bars in one lane never overlap (one engine per lane).</td></tr>
+<tr><td>57–72</td><td>compute idle</td><td>Time before the first kernel plus every positive gap between consecutive kernels.</td><td>Question 1 of Layer 2: is the compute row full?</td></tr>
+<tr><td>73–88</td><td>overlap by elementary intervals</td><td>Cuts the axis at every start and end and tests the midpoint of each piece.</td><td>Question 2: do copies sit under kernels? Exact for intervals; quadratic cost is fine for exports of this size.</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-32-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Zainab's assistant does not slow the cooks; a profiler slows the program.</b> Tracing has overhead (Layer 3), so a profile is a slightly different run than the one you ship.</li>
+<li><b>The wall chart shows every station; a timeline shows what was traced.</b> Work the tool did not trace (an untraced library, another process on the GPU) leaves empty space that looks like idleness.</li>
+<li><b>A bar on the chart means a person was working.</b> A bar on the CUDA API row may mean the host was <i>waiting</i> inside a call (a synchronisation, a pageable copy). Busy on the host row is not useful work.</li>
+<li><b>The chart's rows are fixed stations.</b> GPU rows group work by stream, by device or by engine, depending on how the tool is configured; the same run can look different in two views.</li>
+</ul>
+
+<h2 id="F6-32-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>The timeline shows only host rows, no GPU work</td><td>CUDA tracing not enabled, or the program failed before any GPU work (as in this build, R4)</td><td>Read the tool's own messages and the program's exit status</td><td>Enable CUDA tracing per the tool's documentation; fix the program's errors first</td></tr>
+<tr><td>No overlap although the code uses streams</td><td>Pageable memory, legacy stream, one copy engine, or over-synchronisation</td><td>Catalogue in Layer 3; the host API row shows which</td><td>The matching fix from <a href="#F6-28">F6-28</a>–<a href="#F6-30">F6-30</a></td></tr>
+<tr><td>Profiled time much longer than event-timed time</td><td>Tracing overhead, or first-use costs inside the range</td><td>Compare with an untraced run; add a warm-up</td><td>Take end-to-end times from untraced runs; use the profiler for structure</td></tr>
+<tr><td>NVTX ranges missing</td><td>NVTX tracing not enabled in the tool, or ranges pushed and popped on different threads</td><td>Check the tool options; check the pop's return value (negative on error, H2)</td><td>Push and pop on the same thread; enable NVTX tracing</td></tr>
+<tr><td>Busy fraction above 100 % in a home-made summary</td><td>Bars of several engines merged into one lane</td><td>Count lanes in the export</td><td>One lane per engine or stream, as Listing 3 assumes</td></tr>
+<tr><td><code>cudaErrorNoDevice</code> (this build's real output)</td><td>No GPU visible</td><td>Device query (<a href="#F6-07">F6-07</a>)</td><td>Run on a GPU machine</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-32-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#SP302">SP302</a>, where you profiled CPU programs with sampling and instrumenting profilers, and <a href="#F6-28">F6-28</a>–<a href="#F6-31">F6-31</a>, where you predicted timelines with a model but could not see the real one. <b>What carries over:</b> the benchmarking discipline (warm-up, median, one change at a time, <a href="#F6-06">F6-06</a>); the stream and engine rules behind every bar; the habit of writing a prediction before measuring. <sup class="src"><a href="#F6-32-src-C1">C1</a></sup> <b>What changes:</b> most dangerous first: the profiler perturbs what it measures, so durations from a traced run are not end-to-end times; a host bar may be a wait, not work; a GPU timeline has two clocks merged into one axis; and the evidence now has rows for engines you cannot see in code (H1, D1). <b>What comes next:</b> when the timeline says "the kernels themselves are the problem", <a href="#F6-33">F6-33</a> opens one kernel with Nsight Compute and places it on the roofline.</p></div>
+
+<h2 id="F6-32-check">Check yourself</h2>
+<ol>
+<li>Name three kinds of rows a whole-program timeline of a CUDA program contains, and one question each answers.</li>
+<li>Which statement is true? (a) NVTX calls make the program fail when no profiler is attached. (b) A device-to-host <code>cudaMemcpyAsync</code> into pageable memory returns only once the copy has completed. (c) A long bar on the CUDA API row always means the host did useful work. (d) Profiler durations are the best source for end-to-end times.</li>
+<li>Predict, then check with Listing 3: rows copy-in 0–10, compute 10–30, copy-in 10–20, compute 30–50, copy-out 30–40, copy-out 50–60. Compute the total, the compute idle time and the overlap by hand, then run the program on your rows.</li>
+<li>Explain in your own words why the forensic program's streams do not help when the buffers are pageable, using the documented behaviour of the copy calls.</li>
+<li>Apply to a new case: Tomás profiles a training step and sees, in every iteration, a 2 ms gap in the compute row that starts exactly when a small <code>cudaMemcpy</code> of a loss value from device to host begins on the host's API row. What is happening, and what two changes would remove the gap?</li>
+<li>Why should the NVTX range around "pipeline" contain the final synchronisation, and the "check" range be outside it?</li>
+<li>In the Worked example, the overlap (60) equals the time saved against one stream (200 − 140). Under what condition is that identity true, and when would it fail?</li>
+<li>What three pieces of evidence does milestone E8's overlap acceptance test need, and where does each come from?</li>
+</ol>
+
+<h2 id="F6-32-lab">Lab</h2>
+<p><b>Goal.</b> Record and reduce the timelines of the single-stream and pipelined versions of your <a href="#F6-29">F6-29</a> pipeline and complete milestone E8's overlap acceptance test. <sup class="src"><a href="#F6-32-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> For steps 1–4: an NVIDIA GPU, a CUDA Toolkit, a driver and Nsight Systems (record the versions each prints), or a cloud GPU instance with them. This build used <code>Cuda compilation tools, release 12.0, V12.0.140</code> and <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> (from the run logs); it had no GPU and no Nsight Systems. Steps 5–6 need no GPU. Folder <code>university/labs/F6-32</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p><b>GPU and Nsight Systems required for steps 1–4.</b> None of these steps could be run in this build. Copy the exact profiler commands from the Nsight Systems User Guide of your version (unverified box in Layer 2) and record them in your notes.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-32</code>; on a GPU, <code>nvtx_pipeline.out</code> shows <code>pinned: 0 errors</code>.</li>
+<li>Record a report of <code>./nvtx_pipeline</code> and of <code>./nvtx_pipeline p</code> with CUDA and NVTX tracing. Open both. Find the "pipeline" range and answer the three questions of Layer 2 for each.</li>
+<li>Export the GPU activity of each report (copies and kernels with start and end times) and convert it to <code>csv:</code> rows for Listing 3 (one lane per copy direction, one compute lane). Run Listing 3 on both and put the numbers next to the forensic model's numbers (R7, R8).</li>
+<li>Do the same for your own <a href="#F6-29">F6-29</a> pipeline, single-stream and pipelined: duration of the measured range in each, the gain, and your plan's predicted gain.</li>
+<li>Without a GPU: run Listing 3 on <code>timeline_pinned.out</code> and <code>timeline_pageable.out</code> and compare with <code>stats_pinned.out</code> and <code>stats_pageable.out</code>.</li>
+<li>Without a GPU: build and run <code>nvtx_host.cpp</code> and explain its two output lines.</li>
+</ol>
+<p><b>Expected observations.</b> On a GPU: overlap visible in the pinned run and absent or much smaller in the pageable run, consistent with Layer 2. In this build: the program's <code>cudaErrorNoDevice</code> (R1), <code>nvprof</code>'s "GPU profiling skipped" (R4), and the model and summary outputs (R5–R9).</p>
+<p><b>Verification.</b> Milestone E8, verbatim: "Timeline (Nsight Systems or ROCm Systems Profiler) shows overlapping copies and kernels; end-to-end time improves over the single-stream version by the amount predicted in your plan, within 20 %." <sup class="src"><a href="#F6-32-src-C1">C1</a></sup> Your notes contain: the plan's predicted gain (written before step 4), the measured gain from untraced runs (median of 20), a screenshot or export showing the overlap, and the Listing 3 summary of both runs.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>No GPU rows in the report → CUDA tracing not enabled, or the program failed early → check the program's exit status and the tool's messages.</li>
+<li>Gain far below plan, overlap present → your plan used wrong stage times or the wrong engine count → re-measure the stages and read <code>asyncEngineCount</code> (<a href="#F6-29">F6-29</a>).</li>
+<li>Gain far below plan, no overlap → work through the catalogue of Layer 3 from top to bottom.</li>
+<li>Listing 3 prints <code>no timeline rows found</code> → your converted rows lack the <code>csv: </code> prefix.</li>
+</ul>
+<p><b>Extension.</b> Add a second host thread that runs its own pipeline on its own streams, give each thread's ranges a distinct name, and use the timeline to show whether the two pipelines share the copy engines fairly.</p>
+
+<h2 id="F6-32-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "No overlap." Sofia ported the pipeline of Listing 1 into her team's application. The application allocates its buffers with <code>std::vector</code>, so she passes them directly, as in <code>./nvtx_pipeline p</code>. Her colleague Wei used <code>cudaMallocHost</code> and reports that the same pipeline is more than twice as fast for him. Sofia has two exported timelines.</p>
+<div class="co note"><span class="lbl">Note</span><p><b>How this evidence pack was made.</b> This build has no GPU and no Nsight Systems, so the two "exported timelines" were generated by the course's timeline model (<a href="#F6-28">F6-28</a>, Listing 2) from the exact sequence of operations in Listing 1, with 10 model units per copy and per kernel, and with one documented rule switched on for the pageable run: a device-to-host copy into pageable memory holds the host until it completes (H1). They are model exports in the same row format a real export can be converted to (Lab step 3), not recordings of a GPU. Replacing them with real exports is a decision left to the course owner.</p></div>
+<p><b>Evidence pack.</b> (1) Listing 1 (above). (2) Timeline A, pinned run, with its CSV export lines (R5):</p>
+<pre class="output" data-run="F6-32/timeline_pinned"></pre>
+<p>(3) Timeline B, pageable run (R6):</p>
+<pre class="output" data-run="F6-32/timeline_pageable"></pre>
+<p>(4) Listing 3's summaries of the two exports (R7, R8):</p>
+<pre class="output" data-run="F6-32/stats_pinned"></pre>
+<pre class="output" data-run="F6-32/stats_pageable"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare the two summaries. What are the totals, the compute busy fractions and the overlap? In timeline B, when does chunk 1's copy in start, and what has just ended at that moment?</li>
+<li>Hypotheses: list at least three causes that could produce "no overlap" (use the catalogue in Layer 3), and say which ones the source of Listing 1 already rules out.</li>
+<li>Which documented behaviour explains the start time of chunk 1's copy in, and why does that make the four streams useless?</li>
+<li>Sofia cannot change how the application allocates its vectors. Propose two fixes, and say what each costs.</li>
+<li>How would you verify the fix with a real timeline, and how would you stop the problem from returning?</li>
+</ol>
+<p><b>Method hints.</b> Start from the host's point of view: when was each chunk <i>issued</i>? A copy that starts late is often a copy that was issued late. Read the "API synchronization behavior" quotes in Layer 2. Hypothesis → evidence → conclusion.</p>
+
+<h2 id="F6-32-project">Mini-project</h2>
+<p><b>A timeline report generator.</b> Extend Listing 3 so that it prints, in addition: the busy fraction of each stream, the longest interval in which no engine is busy, and a list of the five largest compute-idle gaps with the operation that ended just before each gap and the one that started just after. Run it on the forensic exports and on a real export from your lab, and write a one-page report for a colleague who has not seen the timeline.</p>
+<p><b>Rubric.</b> Correct new statistics, checked by hand on the Worked example (4). A real or model export analysed, with the source of the export stated (3). A short report that leads from observation to cause to fix (3).</p>
+
+<h2 id="F6-32-summary">Summary</h2>
+<ul>
+<li>A whole-program timeline puts host threads, API calls, copies and kernels on one time axis; it shows relations between them that no kernel profiler can.</li>
+<li>NVTX ranges and markers put your program's own phases on the timeline at close to zero cost when no tool is attached; the calls return negative values when they cannot do anything.</li>
+<li>Read a timeline with three questions: is the compute row full, do copies sit under kernels, where does the host wait. Reduce it to busy fractions, idle gaps and overlap.</li>
+<li>A device-to-host asynchronous copy into pageable memory returns only once the copy has completed; in a per-chunk loop it serialises the whole pipeline regardless of streams.</li>
+<li>Profilers perturb what they measure: take structure from the profile and end-to-end times from untraced runs.</li>
+<li>Milestone E8's overlap test needs a plan made in advance, a timeline that shows overlap, and a measured gain within 20 % of the plan.</li>
+</ul>
+
+<h2 id="F6-32-sources">Sources</h2>
+<ol>
+<li id="F6-32-src-D1">D1 — NVIDIA, "Nsight Systems" documentation (User Guide) (tier 1): overview, CLI profiling, CUDA and NVTX trace, unified-memory trace, export and statistics, overhead. <i>Title only — not opened during this build, and the tool was not installed; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-32-src-D2">D2 — NVIDIA, "CUPTI" (CUDA Profiling Tools Interface) documentation (tier 1): activity records and timestamps. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-32-src-D3">D3 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): performance measurement and asynchronous transfers. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-32-src-D5">D5 — Brendan Gregg, "Systems Performance: Enterprise and the Cloud" (tier 3; edition to be recorded): tracing versus sampling, observer effect. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-32-src-H1">H1 — CUDA 12.0 headers as installed in the build container (Ubuntu package nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>cuda_runtime_api.h</code>, the section "API synchronization behavior" (memcpy synchronous and asynchronous behaviour, memset, kernel launches). Tier 1 (vendor file).</li>
+<li id="F6-32-src-H2">H2 — the NVTX version 3 header installed with the toolkit, <code>nvtx3/nvToolsExt.h</code>, read in this build: introduction (overhead with and without a tool), initialisation, markers and ranges, return values of <code>nvtxRangePushA</code> and <code>nvtxRangePop</code>. Tier 1 (vendor file).</li>
+<li id="F6-32-src-C1">C1 — Systems Curriculum (this project), milestone E8 (acceptance test quoted verbatim) and section 13.2 topic "Profiling and the roofline model". A map, not a source (AH-4).</li>
+<li id="F6-32-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-32/nvtx_pipeline.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+<li id="F6-32-src-R2">R2 — build and run of Listing 2 (<code>nvtx_host.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with sanitizers, exit code 0.</li>
+<li id="F6-32-src-R3">R3 — <code>nvprof --help</code>, excerpt (<code>nvprof_help.log</code>), CUDA 12.0 installation, exit code 0.</li>
+<li id="F6-32-src-R4">R4 — Listing 1 built and run under <code>nvprof --print-gpu-trace</code> with the pageable switch (<code>nvprof_run.log</code>); untested on hardware: the profiler reported a device error and skipped GPU profiling.</li>
+<li id="F6-32-src-R5">R5 — the <a href="#F6-28">F6-28</a> timeline model on <code>nooverlap_pinned.in</code> (<code>timeline_pinned.log</code>), g++ 13.3 with sanitizers, exit code 0. A model, not a measurement.</li>
+<li id="F6-32-src-R6">R6 — the same model on <code>nooverlap_pageable.in</code> (<code>timeline_pageable.log</code>), exit code 0.</li>
+<li id="F6-32-src-R7">R7 — Listing 3 on R5's output (<code>stats_pinned.log</code>), exit code 0.</li>
+<li id="F6-32-src-R8">R8 — Listing 3 on R6's output (<code>stats_pageable.log</code>), exit code 0.</li>
+<li id="F6-32-src-R9">R9 — Listing 3 on <code>timeline_stats.in</code> (<code>timeline_stats.log</code>), exit code 0.</li>
+</ol>
+
+<h2 id="F6-32-glossary">Glossary links</h2>
+<p><a href="#gl-system-level-profiler-timeline-profiler">System-level profiler</a> · <a href="#gl-trace-and-sampling">Trace and sampling</a> · <a href="#gl-nvtx-range-and-marker">NVTX range and marker</a> · <a href="#gl-lane-timeline-row">Lane (timeline row)</a> · <a href="#gl-busy-fraction-and-idle-gap">Busy fraction and idle gap</a> · <a href="#gl-copy-kernel-overlap">Copy–kernel overlap</a> · <a href="#gl-host-synchronisation-point">Host synchronisation point</a> · <a href="#gl-timeline">Timeline</a> · <a href="#gl-pageable-memory">Pageable memory</a></p>
+
+<h2 id="F6-32-next">Next chapter</h2>
+<p>Next: <a href="#F6-33">F6-33 Profiling one kernel with Nsight Compute; the roofline</a>. Previous: <a href="#F6-31">F6-31</a>. Back to the course: <a href="#CU303">CU303</a>.</p>
+
+<h2 id="F6-32-answers">Answers to Check yourself</h2>
+<ol>
+<li>For example: NVTX ranges (which phase of my program is this?); CUDA API calls per host thread (where does the host wait, and when was each piece of work issued?); copy lanes (are copies running, and do they overlap kernels or each other?); kernel lanes (is the GPU busy?).</li>
+<li>(b), quoted from the header (H1). (a) is false: with no tool attached the calls cost close to nothing and return a negative value (H2, R2). (c) is false: the host may be blocked inside the call. (d) is false: tracing perturbs timing; take end-to-end times from untraced runs.</li>
+<li>Total 60 (0 to 60). Compute: 10–30 and 30–50, busy 40; idle 10 before the first kernel and 10 after the last, but Listing 3 counts only the time before the first kernel and gaps between kernels: 10, longest 10. Overlap: 10–20 (copy-in with kernel) = 10, 30–40 (copy-out with kernel) = 10, total 20. Run the program with these six rows to confirm.</li>
+<li>Each device-to-host copy into pageable memory returns only when that copy has completed (H1). The host loop issues chunk 0's copy out and then blocks until chunk 0 is completely finished, so chunk 1's copy in is issued only afterwards. At any moment the GPU has work from one chunk only, so the four streams never have anything to overlap.</li>
+<li>The <code>cudaMemcpy</code> to (probably pageable) host memory is synchronous: the host waits for all prior work and the copy, and only then issues the next iteration's kernels, so the GPU idles while the host finishes the copy and launches again. Fixes: copy the loss with <code>cudaMemcpyAsync</code> into a pinned buffer in a stream and read it one iteration later (after an event), or accumulate the loss on the GPU and copy it only every N iterations.</li>
+<li>The pipeline's work is asynchronous; without the synchronisation inside the range, the range would end when the last call returns, long before the GPU finishes, and its duration would be meaningless. The check is host work that is not part of the pipeline; outside the range, it does not inflate the measured time.</li>
+<li>When each lane is one in-order engine whose total busy time is the same in both versions, and the pipelined version's total is the serial total minus the time during which work of two lanes overlapped (each moment of overlap saves exactly that moment). It fails when three lanes overlap at once (that moment counts once in the overlap but saves twice) or when the pipelined version adds or removes work (fixed costs, extra synchronisation).</li>
+<li>A plan's predicted gain made in advance (the <a href="#F6-29">F6-29</a> model with measured stage times); a timeline showing overlapping copies and kernels (Nsight Systems); and the measured end-to-end gain over the single-stream version (untraced runs, median), within 20 % of the plan (C1).</li>
+</ol>
+<h3 id="F6-32-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Timeline A (pinned): total 100.0, each lane busy 80.0 %, compute idle 10.0, overlap 80.0 (R7). Timeline B (pageable): total 240.0, each lane 33.3 %, compute idle 150.0 with gaps of 20.0 between every pair of kernels, overlap 0.0 (R8). In B, chunk 1's copy in (<code>in1</code>, stream 2) starts at 30.0, exactly when chunk 0's copy out (<code>out0</code>) ends.</p>
+<p><b>Hypotheses.</b> (a) Legacy default stream; (b) one copy engine; (c) over-synchronisation in the loop; (d) pageable host memory blocking the host; (e) kernels too long to overlap. The source rules out (a) (non-blocking streams, lines 45–48, no launch without a stream) and (c) (one <code>cudaDeviceSynchronize</code>, after the loop, line 67). (b) cannot explain B: even with one engine, chunk 1's copy in could run during chunk 0's kernel. (e) is ruled out by A, which overlaps with the same kernels.</p>
+<p><b>Evidence-based conclusion.</b> "For transfers from device memory to pageable host memory, the function will return only once the copy has completed" (H1). Line 65 issues chunk 0's copy out and the host waits there until it ends at 30.0; only then does the loop issue chunk 1. The host never has two chunks in flight, so the timeline is serial, and the single difference between A and B in the model's input is exactly that rule. The 2.4× difference (240.0 against 100.0) matches Wei's "more than twice as fast".</p>
+<p><b>Fixes.</b> (1) Stage through pinned buffers: allocate a few pinned chunk-sized buffers once, copy the result chunk from pinned to the vector on the host after an event says the chunk is done (cost: pinned memory and one host memcpy per chunk, which can overlap with GPU work of later chunks). (2) Register the vector's memory with <code>cudaHostRegister</code> once, which page-locks existing memory (H1 of <a href="#F6-29">F6-29</a>; cost: registration time, and the vector must not reallocate while registered). Reordering the loop breadth-first helps the copies in but still blocks at each copy out.</p>
+<p><b>Verification and prevention.</b> Record a new timeline: the "pipeline" range should show copies under kernels and a total close to the plan; check <code>0 errors</code>. Prevent: a rule that every buffer passed to <code>cudaMemcpyAsync</code> is pinned or registered, enforced by a small wrapper that checks <code>cudaPointerGetAttributes</code> in debug builds; and the E8 timeline test in the team's performance checks. <b>How the evidence was produced:</b> two runs of the <a href="#F6-28">F6-28</a> model on inputs whose operation order is copied from Listing 1, with the documented pageable rule enabled only in B; summaries by Listing 3. No GPU and no profiler were involved, and the pack says so.</p>

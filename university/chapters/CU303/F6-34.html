@@ -1,0 +1,358 @@
+<!--meta
+id: F6-34
+title: Reading PTX and SASS
+course: CU303
+level: L4
+prereqs: F6-33 (counting instructions for the roofline); F1-57 (warps and SIMT); F1-58 (registers, shared memory and spills); F2-44 (ELF); F2-47 (ABIs); F6-23 (vectorised loads)
+time: 12–16 hours including the lab
+hardware: None for reading PTX and SASS: every listing below was produced in this build by nvcc, cuobjdump and nvdisasm without a GPU. Lab steps 4–5 (confirming a predicted effect in a profiler, milestone E10) need an NVIDIA GPU with a CUDA Toolkit, a driver and Nsight Compute (record the versions), or a cloud GPU instance
+maps: Curriculum E10 (read the machine code: CUDA part); Track E 13.2 topic 11 (reading PTX and SASS: spills, uncoalesced loads, bank-conflict-prone patterns, matrix instructions); CU303 forensic lab "The kernel that got slower after a compiler update"
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-34-hook">Story hook</h2>
+<p>Every recipe card in the great kitchen hall is written twice. The head chef writes the first version in the hall's general recipe language: "stir until smooth, add the sauce". It works in any of the guild's kitchens. Before the evening starts, the kitchen's own steward rewrites the card for this particular hall: which shelf, which ladle, which of the hall's four stoves, and in what exact order the helpers' hands move.</p>
+<p>Most cooks never read the steward's version. Ahmed does. When a dish is slow, he reads it line by line, and he finds things the head chef never wrote: a helper who puts a bowl down on the far shelf and walks back for it later, because her hands were full; a step that fetches one carrot at a time where a whole tray could have been carried.</p>
+<p>"The general card says what we want," Ahmed says. "The steward's card says what we actually do."</p>
+<p>The general recipe language is <b>PTX</b>, the steward is the assembler <b>ptxas</b>, the hall-specific card is <b>SASS</b>, and the bowl on the far shelf is a <b>register spill</b>. This chapter teaches you to read both cards.</p>
+
+<h2 id="F6-34-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the path from CUDA C++ to PTX to SASS, what the executable carries, and why both levels exist.</li>
+<li><b>Produce</b> PTX and SASS for your own kernels with <code>nvcc</code>, <code>cuobjdump</code> and <code>nvdisasm</code>, including source-line annotations, without a GPU.</li>
+<li><b>Read</b> a kernel's SASS: find the index computation, the bounds check, global loads and their width, shared-memory accesses, barriers, FMAs, and local-memory spills.</li>
+<li><b>Predict</b> the effect of one source or build change from a SASS reading (milestone E10), and say how to confirm it in a profiler.</li>
+<li><b>Diagnose</b> a kernel that became slower after a build change by comparing two SASS listings and the compiler's resource reports.</li>
+</ul>
+
+<div class="co jargon" id="F6-34-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>PTX (Parallel Thread Execution)</dt><dd><b>Simple words:</b> NVIDIA's portable GPU assembly language, one level below CUDA C++. <b>Analogy:</b> the recipe in the guild's general recipe language. <b>Precise:</b> a virtual instruction set with unlimited typed virtual registers (<code>%r</code>, <code>%rd</code>, <code>%f</code>, <code>%p</code>) and explicit state spaces (<code>.param</code>, <code>.global</code>, <code>.shared</code>, <code>.local</code>), specified by the "PTX ISA" document; nvcc emits it with <code>-ptx</code>. <sup class="src"><a href="#F6-34-src-D1">D1</a></sup> <sup class="src"><a href="#F6-34-src-R1">R1</a></sup> Already met in <a href="#F1-57">F1-57</a>.</dd>
+<dt>SASS</dt><dd><b>Simple words:</b> the real machine code one GPU generation executes. <b>Analogy:</b> the steward's card for this hall. <b>Precise:</b> the native instruction set of an <code>sm_XY</code> architecture, produced from PTX by <code>ptxas</code> and shown by <code>cuobjdump -sass</code> or <code>nvdisasm</code>; its instructions use physical registers (<code>R0</code>…, predicates <code>P0</code>…, uniform registers <code>UR</code>…) and differ between architectures. <sup class="src"><a href="#F6-34-src-D2">D2</a></sup> <sup class="src"><a href="#F6-34-src-R2">R2</a></sup></dd>
+<dt>Virtual and real architecture (compute_XY, sm_XY)</dt><dd><b>Simple words:</b> the PTX level a program targets, and the actual GPU generation its machine code is for. <b>Analogy:</b> the edition of the general recipe language, and the hall the steward writes for. <b>Precise:</b> nvcc's help text, recorded in this build, says that <code>--gpu-architecture=sm_50</code> "is equivalent to" <code>--gpu-architecture=compute_50 --gpu-code=sm_50,compute_50</code>: SASS for the real architecture plus PTX for the virtual one. <sup class="src"><a href="#F6-34-src-R8">R8</a></sup></dd>
+<dt>Fatbinary</dt><dd><b>Simple words:</b> the bundle of GPU code images stored inside your executable. <b>Analogy:</b> a folder holding the general card and the steward's cards for several halls. <b>Precise:</b> the container nvcc embeds in the host executable with SASS (ELF cubin) images and PTX images; <code>cuobjdump --list-elf --list-ptx</code> lists them (R9). <sup class="src"><a href="#F6-34-src-D2">D2</a></sup> Defined in <a href="#CU201">CU201</a>'s glossary.</dd>
+<dt>Predicate (guard)</dt><dd><b>Simple words:</b> a true/false flag that decides whether an instruction does anything. <b>Analogy:</b> "only the helpers whose bowl is empty do this step". <b>Precise:</b> in PTX, a <code>.pred</code> register set by <code>setp</code>; in SASS, <code>P0</code>–<code>P6</code> and the constant-true <code>PT</code>, written <code>@P0</code> or <code>@!P0</code> before an instruction (R2). <sup class="src"><a href="#F6-34-src-D1">D1</a></sup></dd>
+<dt>Register spill</dt><dd><b>Simple words:</b> a value the compiler had to park in memory because the thread ran out of registers. <b>Analogy:</b> the bowl put down on the far shelf and fetched back later. <b>Precise:</b> a store to and load from per-thread local memory (SASS <code>STL</code>/<code>LDL</code>), reported by <code>ptxas -v</code> as "spill stores" and "spill loads" in bytes; local memory is private in scope but resides in device memory (<a href="#F1-58">F1-58</a>). <sup class="src"><a href="#F6-34-src-D3">D3</a></sup> <sup class="src"><a href="#F6-34-src-R10">R10</a></sup></dd>
+<dt>Line information (-lineinfo)</dt><dd><b>Simple words:</b> notes in the binary that say which source line each machine instruction came from. <b>Analogy:</b> the steward writing the head chef's line number next to each of his steps. <b>Precise:</b> nvcc's <code>-lineinfo</code> keeps source-line correlation in the cubin; <code>nvdisasm -g</code> prints it as <code>//## File "...", line N</code> comments (R3), and profilers use it to attribute metrics to source lines. <sup class="src"><a href="#F6-34-src-D2">D2</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-34-pictures">The idea in pictures</h2>
+<p>Figure 1 shows where PTX and SASS come from and what the executable carries. The two boxes on the right are exactly what <code>cuobjdump</code> listed inside this chapter's program built with <code>-arch=sm_80</code> (R9).</p>
+<figure id="F6-34-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 260" role="img" aria-labelledby="F6-34-f1t F6-34-f1d">
+<title id="F6-34-f1t">Figure 1: from CUDA C++ to PTX to SASS</title>
+<desc id="F6-34-f1d">A left-to-right flow. Box 1: kernels.cu, CUDA C++. Arrow labelled nvcc front end, -ptx. Box 2: PTX for compute_80, virtual ISA, virtual registers. Arrow labelled ptxas, -cubin. Box 3: SASS for sm_80, real ISA, physical registers. Both box 2 and box 3 have arrows down into a box labelled executable with fatbinary, which contains ELF cubin images for sm_80 and one PTX image for sm_80, as listed by cuobjdump. A dashed arrow from the PTX image to a box labelled driver JIT compiles PTX for a newer GPU with no matching SASS, marked as described in the Programming Guide and unverified in this build. Tools shown under the boxes: nvcc -ptx, cuobjdump -sass, nvdisasm -g.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="260"/>
+<rect class="sv-b1" x="10" y="30" width="140" height="56" rx="6"/><text class="sv-tb" x="20" y="52">kernels.cu</text><text class="sv-ts" x="20" y="72">CUDA C++</text>
+<line class="sv-line" x1="150" y1="58" x2="218" y2="58"/><polygon class="sv-head" points="220,58 212,54 212,62"/><text class="sv-ts" x="156" y="50">front end</text>
+<rect class="sv-b2" x="222" y="30" width="170" height="56" rx="6"/><text class="sv-tb" x="232" y="52">PTX (compute_80)</text><text class="sv-ts" x="232" y="72">virtual ISA, %r %f %p</text>
+<line class="sv-line" x1="392" y1="58" x2="458" y2="58"/><polygon class="sv-head" points="460,58 452,54 452,62"/><text class="sv-ts" x="404" y="50">ptxas</text>
+<rect class="sv-b5" x="462" y="30" width="170" height="56" rx="6"/><text class="sv-tb" x="472" y="52">SASS (sm_80)</text><text class="sv-ts" x="472" y="72">real ISA, R0.. P0.. UR..</text>
+<rect class="sv-b3" x="222" y="140" width="410" height="60" rx="6"/><text class="sv-tb" x="232" y="160">executable: fatbinary</text>
+<text class="sv-ts" x="232" y="180">ELF (cubin) images for sm_80  ·  PTX image for sm_80 (R9)</text>
+<line class="sv-line" x1="307" y1="86" x2="307" y2="138"/><polygon class="sv-head" points="307,138 303,130 311,130"/>
+<line class="sv-line" x1="547" y1="86" x2="547" y2="138"/><polygon class="sv-head" points="547,138 543,130 551,130"/>
+<line class="sv-dash" x1="632" y1="170" x2="664" y2="170"/><polygon class="sv-head" points="666,170 658,166 658,174"/>
+<rect class="sv-b7" x="668" y="140" width="84" height="60" rx="6"/><text class="sv-ts" x="674" y="160">driver JIT</text><text class="sv-ts" x="674" y="176">PTX → SASS</text><text class="sv-ts" x="674" y="192">(unverified)</text>
+<text class="sv-ts" x="222" y="110">nvcc -ptx</text><text class="sv-ts" x="462" y="110">cuobjdump -sass, nvdisasm -g</text>
+<text class="sv-ts" x="10" y="232">-arch=sm_80 means compute_80 PTX plus sm_80 SASS (nvcc's own help text, R8). Not to scale.</text>
+<text class="sv-ts" x="10" y="250">Why the program carries two ELF images was not investigated in this build.</text>
+</svg></div><figcaption><b>Figure 1.</b> The two code levels and the executable that carries them. The equivalence of <code>-arch=sm_XY</code> to a virtual plus a real architecture is quoted from nvcc's help (R8); the contents of the executable are from <code>cuobjdump</code> (R9); the just-in-time compilation of PTX by the driver for GPUs without matching SASS is described in the CUDA Programming Guide (D3, title only). <sup class="src"><a href="#F6-34-src-R8">R8</a></sup> <sup class="src"><a href="#F6-34-src-R9">R9</a></sup> <sup class="src"><a href="#F6-34-src-D3">D3</a></sup></figcaption></figure>
+
+<p>Figure 2 aligns one source line with its PTX and its SASS for <code>axpyRestrict</code>, all three copied from this build's outputs (R1, R2). Reading SASS is mostly this: line up what you know (the source and the PTX) with what you want to understand.</p>
+<figure id="F6-34-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F6-34-f2t F6-34-f2d">
+<title id="F6-34-f2t">Figure 2: one line of source, its PTX and its SASS</title>
+<desc id="F6-34-f2d">Three columns. Left, source line 22: y[i] = a * x[i] + y[i]. Middle, PTX: mul.wide.s32 rd5 = i times 4; add.s64 rd6 = x plus offset; ld.global.nc.f32 f2 from rd6; add.s64 rd7 = y plus offset; ld.global.f32 f3 from rd7; fma.rn.f32 f4 = f2 times f1 plus f3; st.global.f32 to rd7. Right, SASS: IMAD.WIDE R2 = i times 4 plus x; IMAD.WIDE R4 = i times 4 plus y; LDG.E.CONSTANT R2; LDG.E R7; FFMA R7 = R2 times c[0x0][0x164] plus R7; STG.E. Connecting lines join: address arithmetic to IMAD.WIDE, the read-only load ld.global.nc to LDG.E.CONSTANT, the other load to LDG.E, fma to FFMA, the store to STG.E. A note says the parameter a is read directly from constant bank address c[0x0][0x164] in SASS, while PTX loaded it into f1 with ld.param.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="10" y="20">source (line 22)</text><text class="sv-tb" x="230" y="20">PTX</text><text class="sv-tb" x="520" y="20">SASS (sm_80)</text>
+<rect class="sv-b1" x="10" y="34" width="190" height="40" rx="5"/><text class="sv-ts" x="16" y="58">y[i] = a * x[i] + y[i];</text>
+<rect class="sv-b2" x="220" y="34" width="250" height="236" rx="5"/>
+<text class="sv-ts" x="228" y="56">mul.wide.s32 %rd5, %r1, 4</text>
+<text class="sv-ts" x="228" y="82">add.s64 %rd6, %rd4, %rd5</text>
+<text class="sv-ts" x="228" y="108">ld.global.nc.f32 %f2, [%rd6]</text>
+<text class="sv-ts" x="228" y="134">add.s64 %rd7, %rd3, %rd5</text>
+<text class="sv-ts" x="228" y="160">ld.global.f32 %f3, [%rd7]</text>
+<text class="sv-ts" x="228" y="186">fma.rn.f32 %f4, %f2, %f1, %f3</text>
+<text class="sv-ts" x="228" y="212">st.global.f32 [%rd7], %f4</text>
+<text class="sv-ts" x="228" y="250">(a arrived earlier: ld.param.f32 %f1)</text>
+<rect class="sv-b5" x="510" y="34" width="240" height="236" rx="5"/>
+<text class="sv-ts" x="518" y="68">IMAD.WIDE R2, R4, R5, c[..][0x168]</text>
+<text class="sv-ts" x="518" y="94">IMAD.WIDE R4, R4, R5, c[..][0x170]</text>
+<text class="sv-ts" x="518" y="120">LDG.E.CONSTANT R2, [R2.64]</text>
+<text class="sv-ts" x="518" y="160">LDG.E R7, [R4.64]</text>
+<text class="sv-ts" x="518" y="186">FFMA R7, R2, c[..][0x164], R7</text>
+<text class="sv-ts" x="518" y="212">STG.E [R4.64], R7</text>
+<text class="sv-ts" x="518" y="250">(a read straight from c[0x0][0x164])</text>
+<line class="sv-dash" x1="470" y1="78" x2="512" y2="66"/><line class="sv-dash" x1="470" y1="130" x2="512" y2="92"/>
+<line class="sv-line" x1="470" y1="104" x2="512" y2="116"/><line class="sv-line" x1="470" y1="156" x2="512" y2="156"/>
+<line class="sv-line" x1="470" y1="182" x2="512" y2="182"/><line class="sv-line" x1="470" y1="208" x2="512" y2="208"/>
+<line class="sv-line" x1="200" y1="54" x2="220" y2="54"/>
+<text class="sv-ts" x="10" y="110">Dashed: address arithmetic</text><text class="sv-ts" x="10" y="128">(two PTX adds fold into</text><text class="sv-ts" x="10" y="146">IMAD.WIDE with the base).</text>
+<text class="sv-ts" x="10" y="176">Solid: loads, FMA, store</text><text class="sv-ts" x="10" y="194">map one to one.</text>
+<text class="sv-ts" x="10" y="226">c[..] = c[0x0], constant bank 0</text>
+</svg></div><figcaption><b>Figure 2.</b> Source, PTX and SASS of <code>axpyRestrict</code>, line 22, copied from R1 and R2. The <code>.nc</code> load in PTX (from <code>const __restrict__</code>) becomes <code>LDG.E.CONSTANT</code>; the meaning of the suffixes is inferred from this correspondence and must be confirmed in the PTX ISA (D1) and the instruction set reference of the CUDA Binary Utilities (D2). <sup class="src"><a href="#F6-34-src-R1">R1</a></sup> <sup class="src"><a href="#F6-34-src-R2">R2</a></sup> <sup class="src"><a href="#F6-34-src-D1">D1</a></sup> <sup class="src"><a href="#F6-34-src-D2">D2</a></sup></figcaption></figure>
+
+<h2 id="F6-34-layer1">Layer 1 — the kid explanation</h2>
+<p>You write a kernel in C++. The GPU cannot run C++. The compiler translates it twice. First into PTX, a GPU language that works for many GPU generations. Then into SASS, the exact instructions for one generation.</p>
+<p>You do not need a GPU to look at either one. The compiler and two small tools print them for you.</p>
+<p>Reading SASS shows what really happens. You can count the loads and stores. You can see how many bytes each load fetches. You can see whether the compiler had to park values in slow memory because it ran out of registers.</p>
+<p>Then you can make a prediction: "if I change this line, these three instructions will disappear". You make the change, read the SASS again, and measure. That is how engineers find speed without guessing.</p>
+
+<h2 id="F6-34-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-34-l2-tools">Producing the listings</h3>
+<p>Analogy first: ask the steward for both cards. Every listing in this chapter was produced in this build with three commands, recorded in <code>run.sh</code> and its logs:</p>
+<ul>
+<li><code>nvcc -arch=sm_80 -ptx kernels.cu -o kernels.ptx</code> writes the PTX (R1).</li>
+<li><code>nvcc -arch=sm_80 -cubin kernels.cu -o kernels.cubin</code> writes the SASS for sm_80 into a cubin; <code>cuobjdump -sass -fun &lt;mangled name&gt; kernels.cubin</code> prints one kernel (R2).</li>
+<li><code>nvcc -arch=sm_80 -cubin -lineinfo …</code> and <code>nvdisasm -g kernels.cubin</code> print the SASS with source-line comments (R3).</li>
+</ul>
+<p>Kernel names appear in their C++ mangled form: <code>_Z12axpyRestrictifPKfPf</code> is <code>axpyRestrict(int, float, const float*, float*)</code> (the mangling scheme of <a href="#F2-47">F2-47</a>). <code>sm_80</code> was chosen because a target must be named; the GPU of your lab may need another (<a href="#F6-07">F6-07</a>), and SASS differs between architectures. <sup class="src"><a href="#F6-34-src-D2">D2</a></sup> The executable built normally with <code>-arch=sm_80</code> carries both levels (R9):</p>
+<pre class="output" data-run="F6-34/fatbin_contents"></pre>
+<p>nvcc's help text explains the PTX image: a real architecture given to <code>-arch</code> means its closest virtual architecture as well (R8). <sup class="src"><a href="#F6-34-src-R8">R8</a></sup></p>
+<pre class="output" data-run="F6-34/arch_help"></pre>
+<h3 id="F6-34-l2-ptx">Reading PTX</h3>
+<p>PTX is typed, in SSA-like style with fresh virtual registers, and names its memory state space in every load and store. The real PTX of the two <code>axpy</code> kernels, filtered to the instructions that do the work (R1):</p>
+<pre class="output" data-run="F6-34/ptx_axpy"></pre>
+<p>Line by line: <code>ld.param</code> reads the four kernel parameters; <code>%ctaid.x</code>, <code>%ntid.x</code> and <code>%tid.x</code> are <code>blockIdx.x</code>, <code>blockDim.x</code> and <code>threadIdx.x</code>, combined by <code>mad.lo.s32</code> into <code>i</code>; <code>setp.ge.s32</code> sets the predicate for the bounds check; <code>cvta.to.global</code> converts the generic pointers to global addresses; <code>mul.wide.s32 … 4</code> computes the byte offset; then two loads, one <code>fma.rn.f32</code> (round-to-nearest fused multiply-add) and one store. <sup class="src"><a href="#F6-34-src-D1">D1</a></sup> The only difference between the two kernels is one load: <code>ld.global.f32</code> for plain <code>x</code>, <code>ld.global.nc.f32</code> when <code>x</code> is <code>const __restrict__</code>. The PTX ISA defines <code>.nc</code> as a load through the non-coherent (read-only) path, allowed only when the data is read-only during the kernel, which is what <code>__restrict__</code> lets the compiler assume. <sup class="src"><a href="#F6-34-src-D1">D1</a></sup> <sup class="src"><a href="#F6-34-src-D3">D3</a></sup></p>
+<h3 id="F6-34-l2-sass">Reading SASS: a kernel's anatomy</h3>
+<p>The SASS of the same two kernels for sm_80 (R2):</p>
+<pre class="output" data-run="F6-34/sass_axpy"></pre>
+<p>Most short kernels have this anatomy. The table reads <code>axpyRestrict</code>; where a meaning is inferred by lining SASS up with PTX rather than read in a document, the last column says so.</p>
+<div class="tw"><table>
+<thead><tr><th>Address</th><th>SASS</th><th>Role</th><th>Evidence for the meaning</th></tr></thead>
+<tbody>
+<tr><td>0000</td><td><code>MOV R1, c[0x0][0x28]</code></td><td>Initialises R1 from the constant bank.</td><td>Inferred: R1 is used as the base of every local-memory access (<code>STL [R1+…]</code>) in the forensic listing, so it is the per-thread stack pointer.</td></tr>
+<tr><td>0010–0030</td><td><code>S2R</code> ×2, <code>IMAD R4, R4, c[0x0][0x0], R3</code></td><td><code>i = blockIdx.x * blockDim.x + threadIdx.x</code>.</td><td>Matches PTX <code>mad.lo.s32</code> of <code>%ctaid.x</code>, <code>%ntid.x</code>, <code>%tid.x</code>; so <code>c[0x0][0x0]</code> holds <code>blockDim.x</code> (inferred).</td></tr>
+<tr><td>0040–0050</td><td><code>ISETP.GE.AND P0, …, c[0x0][0x160]</code>, <code>@P0 EXIT</code></td><td>Bounds check: threads with <code>i ≥ n</code> exit.</td><td>Matches <code>setp.ge.s32</code>; <code>n</code> is parameter 0, so parameters start at <code>c[0x0][0x160]</code> for this kernel (inferred; <code>a</code> at 0x164, <code>x</code> at 0x168, <code>y</code> at 0x170 follow by size and alignment).</td></tr>
+<tr><td>0060</td><td><code>HFMA2.MMA R5, -RZ, RZ, 0, 2.384185791015625e-07</code></td><td>Puts the integer 4 into R5.</td><td>Inferred by arithmetic: the half-precision value 2.384185791015625e-07 is 4 × 2<sup>−24</sup>, whose 16-bit pattern is 0x0004; with 0 in the other half, R5 holds 0x00000004, used next as <code>sizeof(float)</code>.</td></tr>
+<tr><td>0070</td><td><code>ULDC.64 UR4, c[0x0][0x118]</code></td><td>Loads a 64-bit constant into uniform registers.</td><td>Its role (it appears before every global access) is not documented in the sources opened here: unverified.</td></tr>
+<tr><td>0080–0090</td><td><code>IMAD.WIDE</code> ×2</td><td>Addresses <code>x + 4i</code> and <code>y + 4i</code> as 64-bit values.</td><td>Matches PTX <code>mul.wide</code> + <code>add.s64</code>, folded into one instruction each.</td></tr>
+<tr><td>00a0–00b0</td><td><code>LDG.E.CONSTANT</code>, <code>LDG.E</code></td><td>Two 4-byte global loads; <code>x</code> through the read-only form.</td><td>Matches <code>ld.global.nc.f32</code> and <code>ld.global.f32</code> one to one.</td></tr>
+<tr><td>00c0</td><td><code>FFMA R7, R2, c[0x0][0x164], R7</code></td><td><code>a * x[i] + y[i]</code>, with <code>a</code> read straight from the constant bank.</td><td>Matches <code>fma.rn.f32</code>.</td></tr>
+<tr><td>00d0–00e0</td><td><code>STG.E</code>, <code>EXIT</code></td><td>Store and end.</td><td>Matches <code>st.global.f32</code>.</td></tr>
+<tr><td>00f0</td><td><code>BRA 0xf0</code></td><td>A branch to itself after <code>EXIT</code>, followed by <code>NOP</code> padding (removed by the lab's filter).</td><td>Never executed by a thread that exited; count it as padding (<a href="#F6-33">F6-33</a>, Listing 2).</td></tr>
+</tbody></table></div>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>NVIDIA publishes an instruction set reference for SASS in the "CUDA Binary Utilities" document (D2), with short descriptions of opcodes per architecture; it was not opened in this build. The meanings in the table above marked "inferred" come only from lining up this build's SASS with its PTX and source, and from arithmetic. Before relying on any of them (the role of <code>R1</code>, of <code>c[0x0][0x0]</code>, of the parameter offsets, of <code>ULDC</code>, of <code>HFMA2.MMA</code> as a constant loader, of the <code>.CONSTANT</code> and <code>.E</code> suffixes), check D2 for your toolkit, and expect them to differ on other architectures.</p></div>
+<h3 id="F6-34-l2-lineinfo">Source lines in SASS</h3>
+<p>Built with <code>-lineinfo</code>, the cubin records which source line each instruction came from, and <code>nvdisasm -g</code> prints it (R3):</p>
+<pre class="output" data-run="F6-34/sass_lineinfo"></pre>
+<p>Line 22 (the <code>axpy</code> statement) owns the address arithmetic, both loads, the FFMA and the store; line 21 the bounds check; line 20 the index. In a long kernel this is how you find the instructions of one loop. A kernel profiler uses the same information to attribute stalls and memory traffic to source lines. <sup class="src"><a href="#F6-34-src-D2">D2</a></sup> <sup class="src"><a href="#F6-34-src-D4">D4</a></sup></p>
+
+<h2 id="F6-34-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: read the steward's card for the four things that cost time in a hall, carrying, waiting, the work itself and the far shelf.</p>
+<h3 id="F6-34-l3-checklist">The E10 checklist, applied</h3>
+<p>Milestone E10 asks: "For each listing you identify: global loads and their width, shared/LDS accesses, synchronization, the FMA or matrix instructions, any register spills; and you predict one change, make it, and confirm the predicted effect in the profiler." <sup class="src"><a href="#F6-34-src-C1">C1</a></sup> Each item has a signature in sm_80 SASS, all seen in this build's listings:</p>
+<div class="tw"><table>
+<thead><tr><th>E10 item</th><th>What to look for</th><th>Seen in this build</th></tr></thead>
+<tbody>
+<tr><td>Global loads and their width</td><td><code>LDG</code> with its suffix: no width suffix for 32 bits, <code>.64</code>, <code>.128</code>; <code>.CONSTANT</code> for read-only loads</td><td><code>LDG.E.128.CONSTANT</code> in <code>copy4</code> (R4); 32-bit <code>LDG.E</code> in <code>axpy</code> (R2)</td></tr>
+<tr><td>Global stores</td><td><code>STG</code> with width</td><td><code>STG.E.128</code> in <code>copy4</code> (R4)</td></tr>
+<tr><td>Shared-memory accesses</td><td><code>LDS</code>, <code>STS</code>; the address form tells the stride (<code>[R3.X4+0x200]</code>: index × 4 plus 512 bytes)</td><td><code>blockSum</code> (R5)</td></tr>
+<tr><td>Synchronisation</td><td><code>BAR.SYNC</code> for <code>__syncthreads()</code></td><td>9 in <code>blockSum</code>: one before the loop, one per halving step (R5)</td></tr>
+<tr><td>FMA or matrix instructions</td><td><code>FFMA</code>, <code>FMUL</code>, <code>FADD</code>; matrix instructions on GPUs that have them (<a href="#F6-26">F6-26</a>)</td><td><code>FFMA</code> in <code>axpy</code>; split into <code>FMUL</code> + <code>FADD</code> with <code>--fmad=false</code> (R6)</td></tr>
+<tr><td>Register spills</td><td><code>STL</code>, <code>LDL</code>; <code>ptxas -v</code> spill bytes and stack frame</td><td>forensic "after" listing (R10)</td></tr>
+</tbody></table></div>
+<p>The wide copy (R4) and the shared-memory reduction (R5):</p>
+<pre class="output" data-run="F6-34/sass_copy4"></pre>
+<pre class="output" data-run="F6-34/sass_blocksum"></pre>
+<p>Read the <code>blockSum</code> excerpt as the reduction tree of <a href="#F6-14">F6-14</a>: store the loaded value to <code>tile[t]</code> (<code>STS [R3.X4]</code>), barrier, then for stride 128 load <code>tile[t]</code> and <code>tile[t + 128]</code> (<code>+0x200</code> = 128 × 4 bytes), store the sum, barrier; for stride 64 the offset is <code>+0x100</code>. The loop was unrolled, so each step appears in sequence, each under a predicate that implements <code>if (t &lt; stride)</code> (<code>@!P1</code>, <code>@!P0</code>). Notice what <i>is not</i> there: no branch around the shared-memory code, only predication (<a href="#F1-57">F1-57</a>).</p>
+<h3 id="F6-34-l3-fma">A build flag in the SASS: contraction</h3>
+<p>By default nvcc contracts <code>a * x + y</code> into one fused multiply-add. Built with <code>--fmad=false</code>, the same line becomes <code>FMUL</code> then <code>FADD</code> (R6):</p>
+<pre class="output" data-run="F6-34/sass_nofma"></pre>
+<p>That is one more instruction and, numerically, two roundings instead of one: results can differ in the last bit (<a href="#MA302">MA302</a>; CU201's glossary entry "Contraction (FMA contraction)"). The SASS is the place to check which you got; the source cannot tell you.</p>
+<h3 id="F6-34-l3-predict">Predict, change, verify: the method of E10 and of this course's practical exam</h3>
+<ol>
+<li><b>Read</b> the SASS of the hot loop and write down counts: loads by width, stores, shared accesses, barriers, FMAs, spills.</li>
+<li><b>Predict</b> one change with a number: "with <code>float4</code>, four <code>LDG.E</code> become one <code>LDG.E.128</code>; global load instructions drop by 4×; bytes stay the same", or "removing the register cap removes all <code>STL</code>/<code>LDL</code>; local-memory traffic drops to zero".</li>
+<li><b>Change</b> one thing and re-read the SASS: did the predicted instructions change, and nothing else of importance?</li>
+<li><b>Verify</b> on the GPU with a kernel profiler: instruction counts per kind, local-memory traffic, and the kernel's time (median of several runs, <a href="#F6-06">F6-06</a>). A prediction about instructions is verified by counts; a prediction about time needs a model (<a href="#F6-33">F6-33</a>) and a measurement.</li>
+</ol>
+<p>Step 3 needs no GPU, and it already catches most wrong predictions: the compiler may have done the change for you, or refused to.</p>
+<h3 id="F6-34-l3-portability">What SASS does not promise</h3>
+<p>SASS is generated for one architecture by one version of <code>ptxas</code>. A new toolkit can reorder, combine or replace instructions; a new architecture has another instruction set. The PTX ISA is the stable contract between versions; SASS is evidence about one build. <sup class="src"><a href="#F6-34-src-D1">D1</a></sup> <sup class="src"><a href="#F6-34-src-D2">D2</a></sup> Record the toolkit version and the architecture next to every SASS listing you keep, as this chapter's run logs do.</p>
+
+<h2 id="F6-34-hardware">How the hardware actually does it</h2>
+<p>Each SASS instruction is issued for a whole warp (<a href="#F1-57">F1-57</a>): an <code>LDG.E</code> asks for one 4-byte word per active lane, which the memory system combines into sector-sized transactions when the addresses are neighbours (<a href="#F6-08">F6-08</a>); an <code>LDG.E.128</code> asks for 16 bytes per lane, so a warp moves the same data with a quarter of the load instructions. <sup class="src"><a href="#F6-34-src-D3">D3</a></sup> Registers are allocated per thread from the SM's register file; the more registers each thread uses, the fewer warps fit (<a href="#F6-20">F6-20</a>), which is why a build may cap them, and why a cap that is too tight produces spills to local memory: per-thread memory that lives in device memory and is cached (<a href="#F1-58">F1-58</a>). <sup class="src"><a href="#F6-34-src-D3">D3</a></sup> A barrier (<code>BAR.SYNC</code>) makes every warp of the block wait until all have arrived, so its cost depends on the slowest warp. The <code>.CONSTANT</code> loads use the read-only path the PTX <code>.nc</code> qualifier names. <sup class="src"><a href="#F6-34-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The latency and throughput of individual SASS instructions, the size of the register file and the register allocation granularity, the caching of local memory, and the exact path taken by <code>.CONSTANT</code> loads are architecture-specific and were not available in any document opened in this build. Read the tuning guide and whitepaper of your GPU's architecture (D5) and the Programming Guide's sections on device memory accesses and compute capabilities (D3); measure with Nsight Compute (<a href="#F6-33">F6-33</a>).</p></div>
+
+<h2 id="F6-34-worked">Worked example</h2>
+<p>Predict from SASS, without a GPU, what <code>__restrict__</code> and <code>float4</code> change in the global memory instructions, then check against the real listings.</p>
+<ol>
+<li><b>axpyPlain.</b> Per thread: <code>LDG.E</code> (x), <code>LDG.E</code> (y), <code>FFMA</code>, <code>STG.E</code>. 8 bytes loaded, 4 stored, 2 load instructions (R2).</li>
+<li><b>Prediction for <code>__restrict__</code>.</b> The PTX now says <code>ld.global.nc</code> for <code>x</code>, so the SASS load of <code>x</code> should become a read-only form; counts unchanged. Check: <code>LDG.E.CONSTANT R2</code> replaces <code>LDG.E R2</code>, everything else identical (R2). Prediction confirmed at the instruction level; whether it changes time is a GPU question.</li>
+<li><b>Prediction for <code>copy4</code>.</b> One <code>float4</code> per thread is 16 bytes: one 128-bit load and one 128-bit store per thread, instead of four of each with <code>float</code>. Check: <code>LDG.E.128.CONSTANT</code> and <code>STG.E.128</code> (R4). For 2<sup>20</sup> floats: 2<sup>18</sup> threads issue 262,144 thread-level loads, against 1,048,576 with one float per thread, for the same 4 MiB of data.</li>
+<li><b>Warp-level view.</b> With 32 lanes, one <code>LDG.E</code> instruction requests 32 × 4 = 128 bytes and one <code>LDG.E.128</code> requests 32 × 16 = 512 bytes. Fewer instructions for the same bytes leaves more issue slots for other work.</li>
+<li><b>What would falsify the prediction.</b> If the SASS of <code>copy4</code> had shown four 32-bit loads, the likely cause would be a pointer the compiler cannot prove 16-byte aligned; <code>float4</code> pointers carry that alignment by type (<a href="#F6-23">F6-23</a>).</li>
+</ol>
+
+<h2 id="F6-34-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>kernels.cu</code>: four small kernels, each chosen to show one thing in PTX and SASS, and a host program that runs them once and checks a result.</p>
+<pre class="listing" data-src="F6-34/kernels.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings kernels.cu -o kernels</code>, then <code>./kernels</code>. <sup class="src"><a href="#F6-34-src-R7">R7</a></sup></p>
+<pre class="output" data-run="F6-34/kernels"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> This build has no GPU; the host program compiled without warnings and its first runtime call returned <code>cudaErrorNoDevice</code>. On a GPU it should print <code>4096 blocks, 0 wrong block sums</code>. The PTX and SASS in this chapter do not depend on running it: they are real compiler output.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–15</td><td><code>axpyPlain</code></td><td>y = a·x + y with plain pointers.</td><td>The compiler must assume <code>x</code> and <code>y</code> may overlap: ordinary loads.</td></tr>
+<tr><td>18–24</td><td><code>axpyRestrict</code></td><td>The same with <code>const __restrict__</code> and <code>__restrict__</code>.</td><td>One qualifier, one changed load (<code>.nc</code> / <code>.CONSTANT</code>).</td></tr>
+<tr><td>27–33</td><td><code>copy4</code></td><td>Copies one <code>float4</code> per thread.</td><td>Shows 128-bit loads and stores.</td></tr>
+<tr><td>36–52</td><td><code>blockSum</code></td><td>Tree reduction of 256 values in shared memory.</td><td>Shows <code>STS</code>, <code>LDS</code>, <code>BAR.SYNC</code> and predication.</td></tr>
+<tr><td>43</td><td><code>for (int stride = 128; …; stride /= 2)</code></td><td>Eight halving steps.</td><td>Unrolled by the compiler: eight barriers in the loop plus one before it, 9 in the SASS (R5).</td></tr>
+<tr><td>69–73</td><td>four launches</td><td>y = 3, then 5; copy y to x; sum 256 fives per block.</td><td>Each kernel's result feeds the next, so one check (line 79) covers all four.</td></tr>
+<tr><td>79</td><td><code>s != 1280.0f</code></td><td>Exact comparison.</td><td>256 × 5 is exact in <code>float</code>, whatever the summation order.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>run.sh</code>: the commands that produced every PTX and SASS output of this chapter. The key lines are the <code>step</code> calls; each records its command, toolchain and exit code in a <code>.log</code> file.</p>
+<pre class="listing" data-src="F6-34/run.sh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>16–30</td><td><code>step()</code></td><td>Writes the log header, runs the command, appends the exit code.</td><td>The same record format as <code>run_lab.sh</code> (AH-25).</td></tr>
+<tr><td>33–34</td><td><code>FMT</code>, <code>SASSLINES</code></td><td>Keep instruction lines; reduce each to address and instruction; drop <code>NOP</code>.</td><td>Readable listings without changing any instruction.</td></tr>
+<tr><td>35</td><td><code>nvcc -arch=sm_80 -cubin kernels.cu</code></td><td>Builds the cubin once.</td><td>No GPU needed to generate machine code.</td></tr>
+<tr><td>36–37</td><td><code>ptx_axpy</code></td><td><code>-ptx</code>, then prints the bodies of the two kernels, filtered to working instructions.</td><td>R1.</td></tr>
+<tr><td>40–41</td><td><code>sass_lineinfo</code></td><td><code>-lineinfo</code> and <code>nvdisasm -g</code>.</td><td>R3: source lines next to SASS.</td></tr>
+<tr><td>46–47</td><td><code>sass_nofma</code></td><td>Rebuilds with <code>--fmad=false</code>.</td><td>R6: a build flag visible in SASS.</td></tr>
+<tr><td>48–51</td><td><code>arch_help</code>, <code>fatbin_contents</code></td><td>nvcc's help on <code>-arch</code>; the images in a built executable.</td><td>R8, R9.</td></tr>
+<tr><td>52–56</td><td>forensic loop</td><td>Builds <code>rowsums.cu</code> without and with <code>-maxrregcount=16</code>; prints the ptxas report, opcode counts and memory instructions in order.</td><td>R10, R11: the two listings of the forensic lab.</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-34-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The steward rewrites once; ptxas may rewrite at run time.</b> When the executable carries no SASS for the GPU it runs on, the driver compiles the PTX when the program loads (D3, unverified here). The "hall-specific card" can then come from a compiler you did not run yourself.</li>
+<li><b>One card per hall, but one instruction per warp.</b> The steward's card describes one helper's hands; a SASS instruction is executed by a whole warp at once, under a predicate mask. Reading SASS as one thread's program is right for meaning and wrong for cost.</li>
+<li><b>The far shelf is not far.</b> Local memory is cached (<a href="#F1-58">F1-58</a>); a spill can cost little or a lot depending on cache behaviour. The analogy makes every spill sound slow; only measurement says how slow.</li>
+<li><b>The general recipe language is not a recipe.</b> PTX is closer to SASS than to C++: it already fixes the algorithm, the types and the memory spaces. Many optimisations happen in ptxas, so PTX alone does not show register use or spills.</li>
+</ul>
+
+<h2 id="F6-34-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><code>cuobjdump -sass</code> prints nothing for your kernel</td><td>Wrong (unmangled) name, or the binary holds only PTX for that kernel</td><td><code>cuobjdump --list-elf --list-ptx</code>; <code>cuobjdump -sass</code> without <code>-fun</code></td><td>Use the mangled name; build with a real architecture (<code>-arch=sm_XY</code>)</td></tr>
+<tr><td>Reading the wrong architecture's SASS</td><td>Built for sm_80, running on another GPU</td><td>Device query (<a href="#F6-07">F6-07</a>); the <code>code for sm_XY</code> header of the dump</td><td>Build and read for your GPU's architecture</td></tr>
+<tr><td>"Unexpected" instructions inflate counts</td><td><code>NOP</code> padding, the self-branch after <code>EXIT</code></td><td>Compare count and listing</td><td>Filter padding (<code>run.sh</code>, <a href="#F6-33">F6-33</a>)</td></tr>
+<tr><td>Spills appear after a build change</td><td>A register cap (<code>-maxrregcount</code>, launch bounds) below what the kernel needs</td><td><code>-Xptxas -v</code>; <code>STL</code>/<code>LDL</code> in SASS</td><td>Raise or remove the cap; restructure the kernel; measure occupancy against spills</td></tr>
+<tr><td>Results differ in the last bit between builds</td><td>FMA contraction on in one, off in the other</td><td><code>FFMA</code> versus <code>FMUL</code>+<code>FADD</code> in SASS (R6)</td><td>Fix the flag in the build; set test tolerances (<a href="#MA302">MA302</a>)</td></tr>
+<tr><td>No source lines in <code>nvdisasm -g</code></td><td>Built without <code>-lineinfo</code> (or <code>-G</code>)</td><td>Check the build command</td><td>Add <code>-lineinfo</code>; it does not change optimisation the way <code>-G</code> does (D2, D4)</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-34-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F2-44">F2-44</a> and <a href="#F2-47">F2-47</a>, where you read ELF files, symbols and CPU calling conventions; <a href="#F1-57">F1-57</a> and <a href="#F1-58">F1-58</a>, where PTX, SASS and spills first appeared; <a href="#F6-33">F6-33</a>, where you counted SASS instructions for a roofline. <b>What carries over:</b> the habit of reading what the compiler produced instead of trusting the source; mangled names; the ptxas resource report; counting instructions per element. <sup class="src"><a href="#F6-34-src-D2">D2</a></sup> <b>What changes:</b> most dangerous first: SASS meanings are architecture- and version-specific, and much of what you read is inferred, not documented, so every reading must name its toolkit and target; one instruction is a warp's instruction; and a build flag can change both the instructions and the numerical results (R6). <b>What comes next:</b> <a href="#CU401">CU401</a> uses these skills on library and fused kernels (and compares with Triton); <a href="#HP302">HP302</a> applies the same reading to AMD's ISA, where wavefronts are 64 wide and the instruction names differ entirely.</p></div>
+
+<h2 id="F6-34-check">Check yourself</h2>
+<ol>
+<li>What two kinds of GPU code can an executable built with <code>-arch=sm_80</code> carry, and which nvcc text in this build says so?</li>
+<li>Which statement is true? (a) PTX shows the number of physical registers a kernel uses. (b) <code>LDG.E.128</code> loads 16 bytes per thread. (c) <code>BAR.SYNC</code> appears only when the kernel uses atomics. (d) SASS for sm_80 runs unchanged on every NVIDIA GPU.</li>
+<li>In the SASS of <code>axpyPlain</code>, which instruction computes <code>a * x[i] + y[i]</code>, and where does <code>a</code> come from?</li>
+<li>Predict, then check in <code>sass_blocksum.out</code>: what offset in bytes does the shared-memory load for stride 32 use? Then rebuild with the loop bound changed to start at 64 (for 128-thread blocks) and predict the number of <code>BAR.SYNC</code>.</li>
+<li>Explain in your own words why lining up SASS with PTX and source is a valid way to read SASS, and what its limits are.</li>
+<li>Apply to a new case: Mei's kernel reads a <code>struct { float x, y, z; }</code> per thread. What would you expect to see in the SASS for the loads, and what change might give wider loads?</li>
+<li>What does <code>--fmad=false</code> change in <code>axpyRestrict</code>'s SASS, and why could a test that compares results bit for bit fail?</li>
+<li>Name the E10 checklist items and one SASS signature for each.</li>
+</ol>
+
+<h2 id="F6-34-lab">Lab</h2>
+<p><b>Goal.</b> Produce annotated SASS listings of your own kernels, predict one change from the reading, make it, and confirm the predicted effect: in the SASS without a GPU, and in a profiler on a GPU (milestone E10, CUDA part). <sup class="src"><a href="#F6-34-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–3: no GPU; a CUDA Toolkit with <code>nvcc</code>, <code>cuobjdump</code> and <code>nvdisasm</code>. This build used <code>Cuda compilation tools, release 12.0, V12.0.140</code>. Steps 4–5: an NVIDIA GPU with a driver and Nsight Compute (record the versions), or a cloud GPU instance. Folder <code>university/labs/F6-34</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p><b>Steps 4–5 need a GPU and a kernel profiler</b>; they could not be run in this build. The SASS steps are real and complete without one.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-34</code> and open every <code>.out</code> file. Annotate <code>sass_axpy.out</code> line by line with the table of Layer 2 next to you.</li>
+<li>Take the inner loop of your reduction (<a href="#F6-14">F6-14</a>) and of your best GEMM kernel (<a href="#F6-23">F6-23</a>), produce their SASS for your GPU's architecture with <code>-lineinfo</code>, and fill the E10 checklist for each: loads and widths, shared accesses, barriers, FMAs, spills.</li>
+<li>Write one prediction with a number (for example: "vectorising the B-tile loads turns 4 <code>LDS</code> per k-step into 1 <code>LDS.128</code>"), make the change, rebuild, and check the SASS.</li>
+<li>On a GPU, profile the kernel before and after with Nsight Compute and record the instruction counts and memory metrics that test your prediction (exact metric names from its documentation, <a href="#F6-33">F6-33</a>).</li>
+<li>Measure the time before and after (median of 20, <a href="#F6-06">F6-06</a>) and compare with what your prediction implies.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: every SASS and PTX output shown in this chapter (R1–R6, R8–R11), and <code>kernels.cu:64: cudaMalloc(&amp;dX, bytes) failed: cudaErrorNoDevice (no CUDA-capable device is detected)</code> for the host program (R7). On a GPU: instruction-count changes that match your SASS reading exactly; a time change that may be smaller than the instruction change (memory-bound kernels, <a href="#F6-33">F6-33</a>).</p>
+<p><b>Verification.</b> E10, verbatim: "For each listing you identify: global loads and their width, shared/LDS accesses, synchronization, the FMA or matrix instructions, any register spills; and you predict one change, make it, and confirm the predicted effect in the profiler." <sup class="src"><a href="#F6-34-src-C1">C1</a></sup> Your submission: two annotated listings with toolkit and architecture named, the prediction written before the change, the SASS after the change, and the profiler evidence.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>cuobjdump</code> says the function is not found → use the mangled name from <code>cuobjdump -sass</code> without <code>-fun</code>.</li>
+<li>Your change did not change the SASS → the compiler already did it, or cannot (aliasing, alignment) → read the PTX to see which.</li>
+<li>Spills appear only in your GPU's build → another architecture with other register limits → read the ptxas report for that architecture.</li>
+<li>The profiler shows the predicted instruction change but no time change → the kernel is limited by something else (<a href="#F6-33">F6-33</a>'s gap table).</li>
+</ul>
+<p><b>Extension.</b> Compile one kernel for two architectures (for example <code>sm_80</code> and <code>sm_90</code>, both accepted by this toolkit's <code>-arch</code> list) and compare the SASS: which parts are identical, and which differ?</p>
+
+<h2 id="F6-34-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "The kernel that got slower after a compiler update." Kwame's team moved to a new build configuration together with a toolkit update. Since then, the row-statistics kernel <code>rowSums16</code> is noticeably slower; nothing in its source changed. Someone kept the compiler's resource report and the SASS from before the update. You have both. The evidence was produced in this build; no GPU is needed.</p>
+<p><b>Evidence pack.</b> (1) The kernel's source:</p>
+<pre class="listing" data-src="F6-34/rowsums.cu"></pre>
+<p>(2) The program's run in this build (R12):</p>
+<pre class="output" data-run="F6-34/rowsums"></pre>
+<p>(3) Before: the resource report, the opcode counts and the memory instructions and branches in order (R10):</p>
+<pre class="output" data-run="F6-34/forensic_before"></pre>
+<p>(4) After (R11):</p>
+<pre class="output" data-run="F6-34/forensic_after"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare registers, stack frame and spill bytes, and the opcode counts. Which instructions are new, and how many of them are inside the loop (the loop ends at the backward branch <code>@!P0 BRA</code>)?</li>
+<li>Hypotheses: list at least three explanations (for example: a new compiler schedules worse; a register cap appeared in the build; the source changed; a different architecture).</li>
+<li>Which lines of the evidence decide between them? Quote the line that names the cause.</li>
+<li>Estimate the extra memory traffic per thread per loop iteration in bytes, compared with the global loads of the same iteration.</li>
+<li>Propose a fix, a prediction of what the SASS and the profiler will show after it, and a way to stop this from returning.</li>
+</ol>
+<p><b>Method hints.</b> Diff the two resource reports first; then count local-memory instructions between the loop's start and its backward branch. A "compiler update" story is a hypothesis like any other: look for the evidence. Hypothesis → evidence → conclusion.</p>
+
+<h2 id="F6-34-project">Mini-project</h2>
+<p><b>A SASS diff tool.</b> Write a small script or C++ program that takes two SASS dumps of the same kernel and reports: opcode counts per class (global, shared, local, FP, integer, branch, barrier) for each, the differences, the ptxas resource lines, and the instructions between the first backward branch target and the branch (the inner loop) for each. Run it on the forensic pair and on your E10 before/after pair.</p>
+<p><b>Rubric.</b> Correct counts, checked by hand on one listing (4). Loop detection that works on both forensic listings (3). A one-paragraph report generated for each pair that a colleague can act on (3).</p>
+
+<h2 id="F6-34-summary">Summary</h2>
+<ul>
+<li>CUDA C++ becomes PTX (a virtual ISA with typed virtual registers and explicit state spaces) and then SASS (one architecture's machine code); an executable built with <code>-arch=sm_XY</code> carries SASS for sm_XY and PTX for compute_XY.</li>
+<li>No GPU is needed to read either: <code>nvcc -ptx</code>, <code>nvcc -cubin</code>, <code>cuobjdump -sass</code> and <code>nvdisasm -g</code> (with <code>-lineinfo</code>) produce them.</li>
+<li>Read SASS by lining it up with PTX and source; mark inferred meanings as inferred and check them in NVIDIA's instruction set reference.</li>
+<li>The E10 signatures: <code>LDG</code>/<code>STG</code> and their width, <code>LDS</code>/<code>STS</code>, <code>BAR.SYNC</code>, <code>FFMA</code> (or <code>FMUL</code>+<code>FADD</code> without contraction), <code>STL</code>/<code>LDL</code> for spills.</li>
+<li>Predict a change with a number, check it in the SASS first, then confirm it in a profiler and with a timed run.</li>
+<li>Build settings change machine code: a register cap creates spills; <code>--fmad=false</code> splits FMAs and changes results in the last bit. Keep the toolkit and architecture with every listing.</li>
+</ul>
+
+<h2 id="F6-34-sources">Sources</h2>
+<ol>
+<li id="F6-34-src-D1">D1 — NVIDIA, "Parallel Thread Execution ISA" (PTX ISA) (tier 1): state spaces, registers, <code>ld</code> with <code>.nc</code>, <code>fma</code>, <code>setp</code> and predicates, special registers. <i>Title only — not opened during this build (the guide's registry records that the page timed out); the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F6-34-src-D2">D2 — NVIDIA, "CUDA Binary Utilities" (tier 1): cuobjdump, nvdisasm, and the instruction set reference by architecture. <i>Title only — not opened during this build (dossier gate G1 open).</i> The tools themselves were run (R1–R11).</li>
+<li id="F6-34-src-D3">D3 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): compilation workflow and just-in-time compilation; binary and PTX compatibility; device memory accesses; local memory; <code>__restrict__</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-34-src-D4">D4 — NVIDIA, "Nsight Compute" documentation (tier 1): source-level metric attribution. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-34-src-D5">D5 — NVIDIA architecture tuning guide and whitepaper for the GPU used in your lab (tier 1; product to be recorded). <i>Title only — no product chosen in this build (dossier gate G1 open).</i></li>
+<li id="F6-34-src-C1">C1 — Systems Curriculum (this project), milestone E10 (goal and acceptance test quoted verbatim) and section 13.2 topic "Reading PTX and SASS". A map, not a source (AH-4).</li>
+<li id="F6-34-src-R1">R1 — <code>nvcc -arch=sm_80 -ptx kernels.cu</code>, bodies of the two axpy kernels (<code>university/labs/F6-34/ptx_axpy.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>, exit code 0.</li>
+<li id="F6-34-src-R2">R2 — <code>cuobjdump -sass</code> of the two axpy kernels for sm_80 (<code>sass_axpy.log</code>), CUDA 12.0, exit code 0.</li>
+<li id="F6-34-src-R3">R3 — <code>nvdisasm -g</code> of <code>axpyRestrict</code> built with <code>-lineinfo</code> (<code>sass_lineinfo.log</code>), CUDA 12.0, exit code 0; the source path was shortened to the file name.</li>
+<li id="F6-34-src-R4">R4 — global loads and stores of <code>copy4</code> (<code>sass_copy4.log</code>), exit code 0.</li>
+<li id="F6-34-src-R5">R5 — shared-memory accesses and barriers of <code>blockSum</code>, first 12 lines and the barrier count (<code>sass_blocksum.log</code>), exit code 0.</li>
+<li id="F6-34-src-R6">R6 — <code>axpyRestrict</code> built with <code>--fmad=false</code> (<code>sass_nofma.log</code>), exit code 0.</li>
+<li id="F6-34-src-R7">R7 — build and run of Listing 1 (<code>kernels.log</code>), CUDA 12.0; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+<li id="F6-34-src-R8">R8 — <code>nvcc --help</code>, the <code>--gpu-architecture</code> entry, excerpt (<code>arch_help.log</code>), CUDA 12.0, exit code 0.</li>
+<li id="F6-34-src-R9">R9 — <code>cuobjdump --list-elf --list-ptx</code> of Listing 1 built with <code>-arch=sm_80</code> (<code>fatbin_contents.log</code>), exit code 0; temporary file ids replaced by the placeholder <code>&lt;temporary-id&gt;</code>.</li>
+<li id="F6-34-src-R10">R10 — <code>rowsums.cu</code> built with <code>nvcc -arch=sm_80 -cubin -Xptxas -v</code>: resource report, opcode counts, memory instructions and branches (<code>forensic_before.log</code>), exit code 0.</li>
+<li id="F6-34-src-R11">R11 — the same with <code>-maxrregcount=16</code> (<code>forensic_after.log</code>), exit code 0. This build option is the injected fault.</li>
+<li id="F6-34-src-R12">R12 — build and run of the forensic program (<code>rowsums.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+</ol>
+
+<h2 id="F6-34-glossary">Glossary links</h2>
+<p><a href="#gl-ptx-parallel-thread-execution">PTX</a> · <a href="#gl-sass">SASS</a> · <a href="#gl-virtual-and-real-architecture-compute-xy-sm-xy">Virtual and real architecture</a> · <a href="#gl-fatbinary">Fatbinary</a> · <a href="#gl-predicate-guard">Predicate (guard)</a> · <a href="#gl-register-spill">Register spill</a> · <a href="#gl-line-information-lineinfo">Line information (-lineinfo)</a> · <a href="#gl-ptx-sass">PTX / SASS</a> · <a href="#gl-spill-local-memory">Spill / local memory</a></p>
+
+<h2 id="F6-34-next">Next chapter</h2>
+<p>This is the last chapter of <a href="#CU303">CU303</a>. Next course: <a href="#CU401">CU401 CUDA V: libraries, multi-GPU and fused kernels</a>; for AMD's machine code, <a href="#HP302">HP302</a>. Previous: <a href="#F6-33">F6-33</a>.</p>
+
+<h2 id="F6-34-answers">Answers to Check yourself</h2>
+<ol>
+<li>SASS (ELF cubin) for sm_80 and PTX for compute_80. nvcc's help: "'nvcc --gpu-architecture=sm_50' is equivalent to 'nvcc --gpu-architecture=compute_50 --gpu-code=sm_50,compute_50'" (R8); <code>cuobjdump</code> lists the images (R9).</li>
+<li>(b): 128 bits per lane (R4). (a) is false: PTX uses unlimited virtual registers; ptxas allocates physical registers (its report, F6-33 R2). (c) is false: <code>BAR.SYNC</code> comes from <code>__syncthreads()</code> (R5). (d) is false: SASS is architecture-specific; PTX is the portable level (D1, D2).</li>
+<li><code>FFMA R7, R2, c[0x0][0x164], R7</code>: R2 holds <code>x[i]</code>, R7 holds <code>y[i]</code>, and <code>a</code> is read directly from the constant bank at offset 0x164, the second kernel parameter (inferred from the parameter layout, R2).</li>
+<li>Stride 32 → 32 × 4 = 128 bytes = <code>+0x80</code>; check the later lines of the full dump (the excerpt shows 0x200 and 0x100 for strides 128 and 64). Starting at 64: seven halving steps (64 … 1) → 7 barriers in the loop plus 1 before it = 8. Rebuild and count to confirm.</li>
+<li>The source and PTX are known and documented; each SASS instruction must implement some part of them, so matching operands, constants and data flow identifies roles with high confidence. Limits: meanings of suffixes, special registers and constant-bank offsets are inferred, may be wrong, and change between architectures; ptxas may merge or split operations so that no one-to-one match exists. Inferred meanings must be checked in D2.</li>
+<li>Three 4-byte <code>LDG.E</code> per thread at addresses 12 bytes apart: neighbouring threads' requests interleave, and no 64- or 128-bit load is possible because 12-byte elements are not 8- or 16-byte aligned. Changing to a structure of arrays (three arrays) gives coalesced 4-byte loads per array; padding to <code>float4</code> allows <code>LDG.E.128</code> at the cost of 4 extra bytes per element.</li>
+<li><code>FFMA</code> becomes <code>FMUL</code> then <code>FADD</code> (R6). The product is rounded before the addition instead of being kept exact inside the fused operation, so some results differ in the last bit from the contracted version; a bit-exact test against a reference produced the other way fails.</li>
+<li>Global loads and their width (<code>LDG</code>, <code>.64</code>, <code>.128</code>); shared accesses (<code>LDS</code>, <code>STS</code>); synchronisation (<code>BAR.SYNC</code>); FMA or matrix instructions (<code>FFMA</code>, or the matrix instructions of <a href="#F6-26">F6-26</a>); spills (<code>STL</code>, <code>LDL</code>, ptxas spill bytes) (C1).</li>
+</ol>
+<h3 id="F6-34-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Before (R10): 31 registers, 0-byte stack frame, 0 spill bytes; opcodes 16 <code>LDG.E.CONSTANT</code>, 16 <code>FMUL</code>, 16 <code>FFMA</code>, 16 <code>FADD</code>, 1 <code>STG.E</code>, 4 <code>BRA</code>; the loop (from 0x240 to the backward branch at 0x5a0) contains 16 global loads and nothing else in memory. After (R11): a ptxas warning, 24 registers, a 24-byte stack frame, 68 bytes of spill stores and 48 bytes of spill loads; new opcodes 17 <code>STL</code> and 12 <code>LDL.LU</code>; inside the loop (0x220 to the backward branch at 0x680): 6 <code>LDL.LU</code> and 6 <code>STL</code> next to the 16 global loads. (Re-check the counts in your copy of the outputs; the build copies the latest run.)</p>
+<p><b>Hypotheses.</b> (a) A new compiler version schedules worse; (b) a register cap was added to the build; (c) the source changed; (d) a different target architecture. (c) is ruled out by the scenario and by identical FP and global-load counts. (d) is ruled out: both reports say <code>sm_80</code>. (a) and (b) both fit "after the update", which is why the scenario's own explanation must be tested.</p>
+<p><b>Evidence-based conclusion.</b> The first line of the "after" report names the cause: "ptxas warning : For profile sm_80 adjusting per thread register count of 16 to lower bound of 24". A per-thread register limit was requested by the build (<code>-maxrregcount=16</code>, recorded in <code>forensic_after.log</code>), ptxas raised it to the architecture's lower bound of 24, and with 24 registers instead of the 31 the kernel needs, it spills part of the 16 accumulators to local memory. The compiler is the same in both builds (same toolchain line in both logs): the "compiler update" was a build-configuration change.</p>
+<p><b>Traffic estimate.</b> Per loop iteration per thread: 16 global loads × 4 bytes = 64 bytes; 6 local loads + 6 local stores × 4 bytes = 48 bytes of local-memory traffic, 75 % on top of the useful traffic, plus 12 more memory instructions to issue. Whether the local traffic reaches DRAM depends on caching (unverified box), but the instructions are issued in any case.</p>
+<p><b>Fix and prediction.</b> Remove the cap for this kernel (or give it its own <code>__launch_bounds__</code> that allows enough registers). Prediction: the SASS returns to R10: 0 spill bytes, no <code>STL</code>/<code>LDL</code>, 31 registers; on a GPU, the profiler shows no local-memory traffic and the kernel time returns to its earlier value, unless the lower occupancy from 31 registers costs more, which you would see as fewer active warps (<a href="#F6-20">F6-20</a>). Prevention: keep <code>-Xptxas -v</code> output for every build in CI and fail the build when spill bytes of any kernel rise; avoid global register caps, prefer per-kernel launch bounds. <b>How the evidence was produced:</b> the same source compiled twice in this build with the same toolkit, the second time with <code>-maxrregcount=16</code> (the injected fault); outputs filtered by <code>run.sh</code> as recorded in the logs. Wrong answers to avoid: "the new compiler is worse" (same compiler) and "more registers is always better" (occupancy can matter).</p>
