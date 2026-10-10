@@ -22,7 +22,8 @@ Check any time with `python3 university/build/verify/vqueue.py`.
   - Exams: HW102, HW201, HW202, HW203, HW204, HW301 (partial files were deleted; start fresh).
   - Kit: naming a real breadboard component set (see section 4); nothing was written yet.
 - **Not started:** every other unit (`vqueue.py verify 200` lists them), all their exams, the
-  Fable re-check, the analogy additions, and the final rebuild.
+  analogy additions, and the final rebuild.
+- **Dropped (owner, 2026-10-10):** the Fable re-check of the first 9 units. They stay as verified.
 
 ## 2. Files to read first
 
@@ -81,9 +82,9 @@ One background agent per unit (verify) or per course (exams).
   specification-only. KID103 (F0-40, F0-41, F0-43) and HW101 Part B need named parts. Also no
   FPGA board is named for HW201 F1-22. Fix `KIT.md` and `KIT.fragment.html` (ids start `kit-`).
 - **Units verified before KIT.md existed:** RB101 F9-07 and HW201 F1-22 Part B name no kit.
-  Fix this in the Fable re-check.
-- **Fable re-check:** the first 9 units (KID101–103, MA101–102, RB101, HW101, HW102, HW201)
-  were verified on the older model. Re-run them on fable/medium after all units are verified.
+  Fix this as a small chapter edit in the final pass (the re-check that was to carry it is dropped).
+- **Fable re-check:** dropped by the owner on 2026-10-10. The first 9 units keep their
+  verification from the earlier pass.
 - **Source sweep:** when the web budget allows, reopen the documents the units list as
   "not opened (budget)". Each unit's NOTES.md "Verification pass" section and dossiers name
   them. Main gaps:
@@ -99,7 +100,7 @@ One background agent per unit (verify) or per course (exams).
 ## 6. Finish line
 
 1. All 105 units verified and all 87 courses with exams.
-2. The Fable re-check, kit fixes and analogy additions are done.
+2. The kit fixes and analogy additions are done (the Fable re-check was dropped by the owner).
 3. `python3 university/build/build.py --check` reports 0 PROBLEM lines.
 4. Commit `university/UNIVERSITY.html`. The page was about 57 MB before exams and dossiers, and
    GitHub refuses files over 100 MB. If it grows past about 90 MB, split the dossiers appendix
