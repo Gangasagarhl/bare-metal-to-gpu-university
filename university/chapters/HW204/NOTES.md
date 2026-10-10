@@ -112,6 +112,8 @@ Both say so where they appear.
 
 ## All D sources are title only
 
+*Superseded by the verification pass of 2026-10-10 (see "Verification pass" below): the sources that could be opened are now cited with edition and section in the chapters and in `university/_dossiers/F1-4x.dossier.html`; the rest are marked as not opened, with the reason.*
+
 Every book, specification and datasheet entry (Dx) is marked "Title only — not opened during this build (dossier gate G1 open)". The Source Researcher must confirm editions and sections. The main ones:
 
 - Patterson & Hennessy.
@@ -221,3 +223,33 @@ Each chapter has a "Where the analogy breaks" section. These are the points that
 - Edge versus level requests (F1-43).
 - Interrupt endpoints that are polled (F1-46).
 - Wrap-around values (F1-48).
+
+## Owner rulings applied
+
+Applied on 2026-10-10 (verification pass) to the five open decisions above:
+
+1. **Course kit** → ruling D1 (`university/build/KIT.md`). The three hardware parts now name the kit items: Raspberry Pi Pico 2 (RP2350) board, alternative ST NUCLEO-F446RE; Raspberry Pi Debug Probe as SWD and 3.3 V USB-to-UART bridge; Adafruit LSM6DSOX breakout as the I2C sensor; a sigrok-supported Cypress FX2 logic analyser running fx2lafw (alternative Digilent Analog Discovery 3 with WaveForms); PulseView. The sentences "the owner has not chosen the course kit" (F1-47, F1-48) are gone. Ruling C3: every hardware step stays marked "untested on hardware" and now says what is needed to test it (F1-42 step 6, F1-47 Part B, F1-48 project). Ruling C4: these three chapters are "internally checked · hardware steps untested".
+2. **Where the course labs live** → decided by verifier: the placement stands as listed (UART echo and "The missing bytes" in F1-42; I2C capture in F1-47 Part B; QEMU PCI inspection in F1-45; exam task P on the text capture in F1-47; the project in F1-48). Ruling A2 applies to the text capture and the C++ bus/UART/PIC/DMA models: the chapters say they are course-own models and name the real items they stand for.
+3. **Extra QEMU evidence; QEMU 8.2.2 and tshark** → decided by verifier under ruling A5 (recorded runs stay) and KIT.md's QEMU row (11.1.2 is current, runs used 8.2.2 and say so): the QEMU 8.2.2 and TShark 4.2.2 evidence stays, labelled with its version and as evidence of QEMU's model only. Ruling C1 (open every source) could not be met for the QEMU documentation pages (lookup budget); the chapters say the help text is the installed program's own output.
+4. **Glossary** → ruling A7: "Bus" stays defined once (KID101) and linked from F1-40; "Enumeration" (PCI) and "Enumeration (USB)" stay separate because their meanings differ (decided by verifier); "Port I/O" keeps no "PIO" abbreviation. `glossary.json` source strings now record the verification status of each source instead of "pending verification".
+5. **F1-45 build-machine output varies** → decided by verifier: kept, with the prose saying the reader's machine will differ; ruling A5 keeps the recorded run.
+
+Rulings A8 (committed test keys) and A10 (licence placeholder) do not apply: the HW204 lab folders contain no keys and no `LicenseRef-Uni-Lab` lines.
+
+## Verification pass
+
+Date: 2026-10-10. Checker: Fact-Checker agent. Dossiers: `university/_dossiers/F1-40..F1-48.dossier.html`; QA records: `university/qa/F1-40..F1-48.json`.
+
+**Web access.** The shared web-fetch budget was exhausted for most of the pass; roughly one fetch in ten succeeded. Everything that could not be opened is marked "not opened" with the reason in the chapter's Sources and in the dossier's "Not found" list.
+
+**Opened (full documents or sections):** RISC-V PLIC Specification 1.0.0 and ACLINT 1.0-rc4 (F1-43); Linux "Dynamic DMA mapping Guide" and LDD3 chapter 15 (F1-44); LDD3 chapter 10 (F1-42); Linux `include/linux/pci-ecam.h` (F1-45, new source L2); HID class definition 1.11 (F1-46); NXP UM10204 Rev. 7.0 and the PulseView User Manual 0.4.2 (F1-47); C++ working draft sections [intro.abstract] (F1-41), [basic.fundamental], [time.clock.steady], [thread.thread.this] (F1-48); GCC manual "Extended Asm" and "Machine Constraints" (F1-41).
+**Opened (catalogue or landing pages only):** Harris & Harris RISC-V edition (2021), Patterson & Hennessy RISC-V edition 2nd ed. (2020), CS:APP 3rd ed. (2015), The Art of Electronics 3rd ed. (2015), ISO 11898-1:2015 (ruling C2), the Intel SDM download page (version 093).
+**Not opened:** PC16550D, 8259A, 82093AA datasheets; PCI Express Base and PCI Local Bus specifications (PCI-SIG refuses automated access; cited by title, C2); Arm GIC, SMMU and Armv7-M/v8-M manuals (Arm site returned no content); Intel SDM chapters; VT-d; xHCI; USB 2.0; Bosch CAN 2.0; SPI Block Guide; QEMU documentation pages; Linux `proc.rst`, `memory-barriers.txt`, `arch/x86/pci/direct.c`; [intro.progress], [thread.req.timing]; *USB Complete*, *PCI Express System Architecture*, *Linux Kernel Development*, *Making Embedded Systems*.
+
+**Corrected or made precise:** F1-43 PLIC claim/complete (now in the text with the 0-if-none rule; EOI box narrowed to 8259A, local APIC, GICv3); F1-44 barrier sentence (wmb() as the Linux guide shows; read barrier where the architecture needs one) and D9's title; F1-45 ECAM formula (out of the box, stated as what Linux computes, tagged L2); F1-46 SET_PROTOCOL/SET_IDLE codes and HID sections; F1-47 bus-clear wording (nine clocks then STOP), I2C speeds from UM10204 §5, CAN facts from the ISO catalogue abstract, PulseView steps tagged; F1-48 steady_clock property tagged. No lab code or expected output needed a change.
+
+**Left unverified (boxes, with reasons):** F1-40 PCIe/AMBA ordering; F1-41 MMIO memory types, and the forward-progress sentence (Sources note); F1-42 registers saved on entry, board step; F1-43 EOI for 8259A/local APIC/GICv3; F1-44 which platforms are DMA-coherent, dma_wmb/writel ordering; F1-45 0xCF8 format, link speeds; F1-46 USB speeds and frame timing, xHCI Address Device, bInterval, bMaxPower units, transfer guarantees; F1-47 SPI modes, UART sampling/divisor, CAN ack/stuffing/resync, Part B; F1-48 reload conventions, TSC/HPET/APIC/SysTick, project.
+
+**Labs.** All nine lab folders re-run with `run_lab.sh` on 2026-10-10: every program exited 0. Differences were only dates, QEMU FlatView numbers, firmware interrupt counts, USB capture timestamps and sleep timings; the recorded files were restored with `git checkout` (ruling A5). Hardware steps (F1-42 step 6, F1-47 Part B, F1-48 project) remain untested on hardware.
+
+**Diagrams, editing, accessibility.** All 18 SVG figures have role=img, title, desc and caption, use only `sv-*` classes, and carry meaning by labels or dash patterns as well as colour; captions state arrow meaning and "not to scale" where needed. No phrase from guide 13.8 is used; sentence length averages 17–20 words (L2–L3). All tables have header cells; heading order is h2/h3; every claim tag resolves to a Sources entry. Nothing was trimmed (A1).
