@@ -1,0 +1,217 @@
+<!--meta
+id: F11-09
+title: Sanitizers and fuzzing
+course: SS302
+level: L3
+prereqs: F11-07; F11-08; SP202 (F2-29, F2-30); SP301 (F2-44)
+time: 8–12 hours including the lab
+hardware: none (host C++: g++ 13.3.0 with AddressSanitizer, UndefinedBehaviorSanitizer and -fsanitize-coverage, as recorded in the lab logs)
+maps: Curriculum P2 (a fuzzing run finds nothing on the ELF reader) and B12 (fuzzing the exec path); SS302 goal "fuzz"; course lab "fuzz the P2 ELF reader and a MAVLink parser; fix findings"; course forensic "the crash input"
+analogy: F11 — a castle with gates and guards
+-->
+
+<h2 id="F11-09-hook">Story hook</h2>
+<p>The castle hires an inspector who does nothing but hand the gate clerk strange documents all day: a visitor list with a torn corner, one with a length that says "three hundred names" above two names, one that is all blank, one with a smudge where the count should be. For each, the inspector watches whether the clerk stumbles — writes off the edge of the slate, reads a page already wiped, freezes in a loop. Most documents are rejected cleanly. Once in a while the clerk trips, and the inspector keeps the exact document that did it, then trims it down to the few marks that matter, so the fault can be reproduced and fixed. That inspector is a fuzzer, and the watcher on the clerk's pen is a sanitizer.</p>
+<p>In this chapter you build both — the university's own small coverage-guided fuzzer and the sanitizer builds it drives — and turn them on two real parsers: the ELF reader from <a href="#F2-44">SP301</a> and a MAVLink-style frame scanner. You will find a planted bug in each within a few inputs, shrink the crashing input, read the sanitizer report, fix the code, and then watch the fixed parser survive tens of thousands of inputs with nothing found.</p>
+
+<h2 id="F11-09-able">What you will be able to do</h2>
+<ul>
+<li><b>Build</b> a program with AddressSanitizer, UndefinedBehaviorSanitizer and coverage instrumentation, and explain what each adds.</li>
+<li><b>Explain</b> coverage-guided fuzzing: a corpus, mutation, an edge bitmap, and keeping inputs that reach new code.</li>
+<li><b>Run</b> a fuzzer against a parser, find a crash, and read the saved crashing input and its sanitizer report.</li>
+<li><b>Minimise</b> a crashing input to the few bytes that matter and turn it into a regression test.</li>
+<li><b>Fix</b> the bug and show, by fuzzing the fixed build, that the finding is gone.</li>
+<li><b>Apply</b> the method to a new parser (the course project and milestone P2).</li>
+</ul>
+
+<div class="co jargon" id="F11-09-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Fuzzing</dt><dd><b>Simple words:</b> testing a program by feeding it huge numbers of random or damaged inputs and watching for crashes. <b>Analogy:</b> handing the clerk thousands of torn and smudged documents. <b>Precise:</b> automated generation of inputs (here by mutating valid seeds) run against a target built with sanitizers, so that any memory error or undefined behaviour is detected and the input saved. <sup class="src"><a href="#F11-09-src-D1">D1</a></sup></dd>
+<dt>Coverage-guided fuzzing</dt><dd><b>Simple words:</b> a fuzzer that keeps inputs which make the program run new code. <b>Analogy:</b> keeping any document that makes the clerk open a drawer never opened before. <b>Precise:</b> fuzzing that measures which edges of the target's control-flow graph each input exercises and adds inputs that reach new edges to the corpus, so mutation is steered toward unexplored code. <sup class="src"><a href="#F11-09-src-D1">D1</a></sup></dd>
+<dt>Corpus</dt><dd><b>Simple words:</b> the set of interesting inputs the fuzzer keeps and mutates. <b>Analogy:</b> the stack of documents worth copying and altering again. <b>Precise:</b> the collection of seed inputs plus every input retained for reaching new coverage; mutations are drawn from it. <sup class="src"><a href="#F11-09-src-D1">D1</a></sup></dd>
+<dt>Edge / coverage bitmap</dt><dd><b>Simple words:</b> a table that records which jumps in the code have run. <b>Analogy:</b> a checklist of every drawer in the office, ticked when opened. <b>Precise:</b> an array indexed by a hash of each control-flow edge; the compiler's <code>-fsanitize-coverage</code> instrumentation sets an entry when that edge executes. <sup class="src"><a href="#F11-09-src-D2">D2</a></sup></dd>
+<dt>Test-case minimisation</dt><dd><b>Simple words:</b> shrinking a crashing input to the smallest that still crashes. <b>Analogy:</b> trimming the document to the few marks that trip the clerk. <b>Precise:</b> delta debugging — repeatedly removing parts of the input, keeping any removal that preserves the crash — to produce a small, readable reproducer. <sup class="src"><a href="#F11-09-src-D1">D1</a></sup></dd>
+<dt>Sanitizer</dt><dd><b>Simple words:</b> a checker built into the program that reports its own memory and undefined-behaviour mistakes as it runs. <b>Analogy:</b> the watcher on the clerk's pen. <b>Precise:</b> compiler instrumentation (<code>-fsanitize=address</code> for out-of-bounds and use-after-free; <code>-fsanitize=undefined</code> for undefined behaviour) with a runtime that aborts and prints a diagnostic on a violation. <sup class="src"><a href="#F11-09-src-D3">D3</a></sup></dd>
+</dl></div>
+
+<h2 id="F11-09-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the fuzzing loop: pick an input from the corpus, mutate it, run it against the sanitized target, and either save a crash or (if it reached new edges) keep it in the corpus.</p>
+<figure id="F11-09-fig1"><div class="svgbox">
+<svg viewBox="0 0 820 300" role="img" aria-labelledby="F11-09-f1t F11-09-f1d">
+<title id="F11-09-f1t">Figure 1: the coverage-guided fuzzing loop</title>
+<desc id="F11-09-f1d">A cycle of boxes. Corpus (a stack of inputs) feeds "pick one and mutate". The mutated input goes to "run the sanitized target in a forked child". Two outcomes branch out: if the child crashed, go to "save crashing input and sanitizer report" and stop; otherwise consult the edge bitmap, and if new edges were reached, arrow back to Corpus labelled "keep it"; if not, discard. The target box notes it is built with AddressSanitizer, UBSan and -fsanitize-coverage.</desc>
+<rect class="sv-bg" x="0" y="0" width="820" height="300"/>
+<rect class="sv-b1" x="30" y="120" width="140" height="56"/><text class="sv-tm" x="55" y="145">corpus of</text><text class="sv-tm" x="55" y="163">inputs</text>
+<rect class="sv-b2" x="220" y="120" width="160" height="56"/><text class="sv-tm" x="238" y="145">pick one and</text><text class="sv-tm" x="238" y="163">mutate it</text>
+<rect class="sv-b3" x="430" y="110" width="180" height="76"/><text class="sv-tm" x="448" y="138">run sanitized</text><text class="sv-tm" x="448" y="156">target in a</text><text class="sv-tm" x="448" y="174">forked child</text>
+<rect class="sv-b8" x="660" y="30" width="140" height="56"/><text class="sv-tm" x="675" y="55">save crash +</text><text class="sv-tm" x="675" y="73">report, stop</text>
+<rect class="sv-b5" x="660" y="200" width="140" height="56"/><text class="sv-tm" x="675" y="225">new edges?</text><text class="sv-tm" x="675" y="243">keep it</text>
+<line class="sv-line" x1="170" y1="148" x2="220" y2="148"/><polygon class="sv-head" points="220,148 210,143 210,153"/>
+<line class="sv-line" x1="380" y1="148" x2="430" y2="148"/><polygon class="sv-head" points="430,148 420,143 420,153"/>
+<line class="sv-line2" x1="610" y1="130" x2="660" y2="70"/><polygon class="sv-head" points="660,70 648,72 654,82"/>
+<text class="sv-ts" x="612" y="104">crash</text>
+<line class="sv-line" x1="610" y1="165" x2="660" y2="220"/><polygon class="sv-head" points="660,220 648,210 654,222"/>
+<text class="sv-ts" x="612" y="200">clean</text>
+<line class="sv-line" x1="730" y1="200" x2="100" y2="176"/><polygon class="sv-head" points="100,176 111,174 108,184"/>
+<text class="sv-ts" x="300" y="210">new coverage: return to the corpus</text>
+<text class="sv-ts" x="430" y="206">target built with ASan + UBSan + -fsanitize-coverage</text>
+<text class="sv-ts" x="30" y="285">Control/data flow clockwise. The fork keeps a crash from killing the fuzzer. Not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> The fuzzing loop of <code>fuzz.cc</code>: mutate, run in a forked child, save crashes, keep inputs that reach new edges. Control flow clockwise. <sup class="src"><a href="#F11-09-src-D1">D1</a></sup> <sup class="src"><a href="#F11-09-src-R6">R6</a></sup></figcaption></figure>
+
+<h2 id="F11-09-layer1">Layer 1 — the kid explanation</h2>
+<p>Two tools work together. A <b>sanitizer</b> is a watcher the compiler builds into your program; the moment the program touches memory it should not, the watcher stops it and prints exactly what went wrong and where. A <b>fuzzer</b> is a machine that throws millions of weird inputs at the program to try to make that happen. On their own, random inputs rarely find deep bugs; so a smart fuzzer watches which parts of the code each input runs and keeps the inputs that reach new parts, slowly working its way in. When the watcher finally shouts, the fuzzer saves the exact input, and you shrink it to the few bytes that matter so the bug is easy to see and fix.</p>
+
+<h2 id="F11-09-layer2">Layer 2 — the student explanation</h2>
+<p>You already build with sanitizers (<a href="#F2-29">SP202</a>): <code>-fsanitize=address</code> adds red zones around allocations and a quarantine for freed memory, catching out-of-bounds and use-after-free; <code>-fsanitize=undefined</code> catches undefined behaviour such as signed overflow and out-of-range shifts. A sanitizer only reports a bug an input actually triggers, so you need inputs that trigger bugs — that is the fuzzer's job. <sup class="src"><a href="#F11-09-src-D3">D3</a></sup></p>
+<p>Pure random fuzzing is weak against structured input: a random blob almost never looks like a valid ELF file, so it is rejected at the magic check and never reaches the interesting code. <b>Coverage-guided</b> fuzzing fixes this. The target is compiled with <code>-fsanitize-coverage</code>, which calls a small function on every control-flow edge; that function sets a byte in an <b>edge bitmap</b>. The fuzzer starts from a valid <b>seed</b>, mutates it, runs it, and if the run set any new bitmap byte, keeps the mutated input in the <b>corpus</b>. Over time the corpus accumulates inputs that reach deeper code, and mutation explores from there. <sup class="src"><a href="#F11-09-src-D1">D1</a></sup> <sup class="src"><a href="#F11-09-src-D2">D2</a></sup></p>
+<p>The lab's fuzzer runs each input in a forked child so a crash kills only the child; the parent saves the input and the child's sanitizer report and continues (or stops at the first crash, to minimise and fix). The edge bitmap lives in shared memory so the parent can read the coverage a child produced even after it exits — the same shared-bitmap idea real fuzzers use. <sup class="src"><a href="#F11-09-src-R6">R6</a></sup></p>
+
+<h2 id="F11-09-layer3">Layer 3 — the engineer's depth</h2>
+<p>A coverage-guided fuzzer is a feedback loop over the target's control-flow graph. Instrumentation (<code>-fsanitize-coverage=trace-pc</code> here; production tools use inline 8-bit counters) marks edges; the fuzzer treats "reached a new edge" as progress and retains the input that did so. This turns an astronomically unlikely random hit into a guided search: to pass the ELF magic check, one byte-flip that happens to produce <code>0x7f 'E' 'L' 'F'</code> is retained because it reaches new code, and all later mutations build on it. The lab shows the signature of this: fuzzing the <i>fixed</i> ELF reader grows the edge count as the corpus learns the format (46 to 51 edges in the recorded run), while the <i>buggy</i> reader is caught so quickly — within ten executions from the seed — that the corpus never grows (R3, R5). <sup class="src"><a href="#F11-09-src-D1">D1</a></sup> <sup class="src"><a href="#F11-09-src-R3">R3</a></sup> <sup class="src"><a href="#F11-09-src-R5">R5</a></sup></p>
+<p>The sanitizer is the oracle: it decides what counts as a bug. Without it, a fuzzer only sees hard crashes (a segfault that happens to hit an unmapped page); with it, an out-of-bounds read of one byte into valid heap — which would silently succeed in production and leak data — becomes a clean, located report. This is why the rule is "no run, no code" <i>and</i> "fuzz the sanitized build". The lab's ELF bug is an unbounded string read; a plain build might never crash on the crashing input, but under AddressSanitizer it is a heap-buffer-overflow READ at a named line (R7). <sup class="src"><a href="#F11-09-src-D3">D3</a></sup> <sup class="src"><a href="#F11-09-src-R7">R7</a></sup></p>
+<p>Minimisation (delta debugging) matters more than it looks. A fuzzer-found input is a mutated seed full of irrelevant bytes; the bug depends on a few. The lab's minimiser trims the ELF crash from 203 bytes to 168 and the MAVLink crash from 12 bytes to 2 (R4, R9) — and two bytes, <code>0xFE</code> followed by a non-zero length, is the whole bug: a start marker and a length claiming payload that is not there. A two-byte reproducer becomes a one-line regression test that will fail forever if the bug returns. The honest limit: this teaching fuzzer is mutation-only with a coarse bitmap and no dictionary or structure awareness, so it finds shallow parser bugs fast but would struggle with inputs gated on checksums or magic constants; production tools (libFuzzer, AFL++) add exactly those features, and the method is identical. <sup class="src"><a href="#F11-09-src-D1">D1</a></sup> <sup class="src"><a href="#F11-09-src-R4">R4</a></sup> <sup class="src"><a href="#F11-09-src-R9">R9</a></sup></p>
+
+<h2 id="F11-09-hardware">How the hardware actually does it</h2>
+<p>Coverage instrumentation is just extra instructions: at each edge the compiler emits a call that writes one byte. There is no special hardware here, though some processors offer branch-trace facilities (Intel PT) that production fuzzers can use instead of compile-time instrumentation to fuzz uninstrumented binaries. The lab uses the compiler route, which is portable and exact. <sup class="src"><a href="#F11-09-src-D2">D2</a></sup> The fork-per-input design rests on the operating system's copy-on-write fork: the child shares the parent's pages until it writes, so a fork is cheap, and the shared-memory bitmap (an <code>mmap</code> with <code>MAP_SHARED</code>) is one region both processes write, so a child's coverage survives its exit. AddressSanitizer's own machinery — shadow memory, red zones, quarantine — is software over ordinary memory; the processor enforces nothing about "a buffer", which is exactly why the sanitizer must. <sup class="src"><a href="#F11-09-src-D3">D3</a></sup> <sup class="src"><a href="#F11-09-src-R6">R6</a></sup></p>
+
+<h2 id="F11-09-worked">Worked example</h2>
+<p>Take the MAVLink-style scanner. A frame is a start byte <code>0xFE</code>, a length byte, four header bytes, then that many payload bytes, then two checksum bytes. The buggy scanner reads the length and then computes a checksum over the header and payload — six plus <code>len</code> bytes — without first checking that the buffer actually holds them. Seed the fuzzer with one valid frame. Within three executions it mutates the length byte to a value larger than the bytes present; the checksum loop walks off the end of the heap copy; AddressSanitizer reports a heap-buffer-overflow READ in <code>toy_sum</code> and the fuzzer saves the 12-byte input (R8). The minimiser then removes everything that does not matter and lands on two bytes: <code>0xFE</code> and a non-zero length (R9). Reading those two bytes, the bug is obvious: a start marker and a claim of payload that is not there. The fix is one line — before touching the payload, require <code>size - pos ≥ header + len + checksum</code> — after which the fuzzer runs ~18,000 inputs in thirty seconds with nothing found (R10). <sup class="src"><a href="#F11-09-src-R8">R8</a></sup> <sup class="src"><a href="#F11-09-src-R9">R9</a></sup> <sup class="src"><a href="#F11-09-src-R10">R10</a></sup></p>
+
+<h2 id="F11-09-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>mav_target.cc</code>: the frame scanner (the fuzz target; full file in the lab). The bug is the trusted length; the fix is one bounds check under <code>-DFIXED</code>.</p>
+<pre class="listing" data-src="F11-09/mav_target.cc"></pre>
+<table class="tw"><thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>38–39</td><td><code>std::vector owned(data, data+size)</code></td><td>Parses an exact-size heap copy.</td><td>Any over-read is a clean, locatable heap-buffer-overflow.</td></tr>
+<tr><td>45</td><td><code>unsigned len = p[pos + 1];</code></td><td>Reads the length byte from the wire.</td><td>Untrusted: 0–255, unrelated to bytes present.</td></tr>
+<tr><td>47–52</td><td><code>#ifdef FIXED ... size - pos &lt; header+len+chk</code></td><td>The fix: require the whole frame to be present.</td><td>Without it, the next reads run past the buffer.</td></tr>
+<tr><td>56–60</td><td><code>toy_sum(p, pos+1, payload_end); p[payload_end...]</code></td><td>Reads payload and checksum bytes.</td><td>The out-of-bounds read the fuzzer finds.</td></tr>
+</tbody></table>
+<p><b>The fuzzer finds the bug.</b> Starting from one valid seed frame, the buggy build crashes within a few executions and saves the input:</p>
+<pre class="output" data-run="F11-09/mav_fuzz"></pre>
+<p><b>Minimise</b> the crashing input to the bytes that matter:</p>
+<pre class="output" data-run="F11-09/mav_minimise"></pre>
+<p><b>Read the sanitizer report</b> by replaying the minimised input (this is the "crash input" evidence for the forensic lab):</p>
+<pre class="output" data-run="F11-09/mav_report"></pre>
+<p><b>Fix and re-fuzz.</b> With the one-line bound added, the fixed build survives the whole run:</p>
+<pre class="output" data-run="F11-09/mav_fixed_fuzz"></pre>
+<p>The ELF reader goes the same way. The fuzzer finds the unbounded section-name read, the minimiser shrinks it, and the fixed reader survives — the curriculum's P2 acceptance test ("a fuzzing run finds nothing"):</p>
+<pre class="output" data-run="F11-09/elf_fuzz"></pre>
+<pre class="output" data-run="F11-09/elf_minimise"></pre>
+<pre class="output" data-run="F11-09/elf_fixed_fuzz"></pre>
+<p>The fixed readers also carry unit tests, built and run under both sanitizers, over the crafted malformed inputs:</p>
+<pre class="output" data-run="F11-09/mav_tests"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The byte-level framing used by <code>mav_target.cc</code> (start marker <code>0xFE</code>, then length, sequence, system id, component id, message id, payload, two checksum bytes) follows the MAVLink v1 frame layout at the level this lab needs, but the exact checksum algorithm (a CRC-16) and the per-message "CRC_EXTRA" byte are <b>not</b> reproduced — the lab uses a toy running sum. Confirm the real field order, the checksum and the extra byte against the MAVLink Developer Guide (frame format and checksum sections) before using any of this to talk to a real vehicle. The untrusted-length bug and its fix do not depend on these details.</p></div>
+
+<h2 id="F11-09-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The inspector tries documents blindly; a coverage-guided fuzzer learns.</b> It remembers which inputs opened new drawers and builds on them, so it is a guided search, not random trial. The "random documents" picture undersells it. <sup class="src"><a href="#F11-09-src-D1">D1</a></sup></li>
+<li><b>A tripping clerk is obvious; a silent over-read is not.</b> Many real bugs do not crash on their own; the sanitizer is what makes the stumble visible. Without it the inspector would see nothing. <sup class="src"><a href="#F11-09-src-D3">D3</a></sup></li>
+<li><b>"Finds nothing" is not "no bugs".</b> A clean fuzzing run means the fuzzer, with this coverage and this time, found nothing — not that the parser is proven safe. The castle inspector who finds no fault today has not certified the gate. <sup class="src"><a href="#F11-09-src-D1">D1</a></sup></li>
+</ul>
+
+<h2 id="F11-09-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> the fuzzer runs for ages and finds nothing, even on buggy code. <b>Cause:</b> no sanitizer (so silent bugs are invisible) or no coverage (so it never reaches deep code). <b>How to find it:</b> check the build flags; print the edge count and watch it grow. <b>Fix:</b> build the target with <code>-fsanitize=address,undefined</code> and <code>-fsanitize-coverage</code>, and start from a valid seed.</li>
+<li><b>Symptom:</b> the fuzzer dies on the first crash and loses progress. <b>Cause:</b> running the target in-process. <b>How to find it:</b> the whole process aborts. <b>Fix:</b> run each input in a forked child (as the lab does) so a crash kills only the child.</li>
+<li><b>Symptom:</b> a crash reproduces sometimes but not always. <b>Cause:</b> uninitialised memory or address-dependent behaviour, or a non-fixed RNG. <b>How to find it:</b> fix the fuzzer's seed; replay the saved input with <code>repro</code>. <b>Fix:</b> use the saved input file, not a re-generated one; add the minimised input as a regression test.</li>
+</ul>
+
+<div class="co transition" id="F11-09-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F2-29">SP202</a> taught sanitizers and unit tests, <a href="#F2-44">SP301</a> built the bounds-checked ELF reader for milestone P2, and <a href="#F11-08">F11-08</a> gave the safe patterns that keep parsers in bounds. <b>What carries over:</b> the sanitizer build, the P2 reader, and the habit of treating file and wire bytes as untrusted. <sup class="src"><a href="#F11-09-src-D3">D3</a></sup> <b>What changes:</b> you now generate the inputs that trigger bugs, guided by coverage, and you close the loop — find, minimise, fix, re-fuzz. <b>What comes next:</b> <a href="#F11-10">F11-10</a> hardens the binary so a bug that escapes fuzzing is harder to exploit; <a href="#F11-11">F11-11</a> makes sanitizer and fuzzer builds part of the coding standard and CI; <a href="#F11-12">F11-12</a> applies all of it to untrusted device input. The course project is a fuzzing campaign on one university program.</p></div>
+
+<h2 id="F11-09-check">Check yourself</h2>
+<ol>
+<li>What does the sanitizer provide that the fuzzer cannot, and what does the fuzzer provide that the sanitizer cannot?</li>
+<li>Why does coverage guidance help so much on structured input like an ELF file?</li>
+<li>Explain in your own words why the fuzzer runs each input in a forked child.</li>
+<li>Which is true? (a) A clean fuzzing run proves the parser has no bugs. (b) Minimisation makes a crash easier to understand and to turn into a test. (c) Random fuzzing without coverage is as effective on structured input. (d) A sanitizer finds bugs with no input needed.</li>
+<li>The MAVLink crash minimised to two bytes. What are they, and why are exactly those two enough?</li>
+<li>Apply it: you must fuzz a parser whose inputs begin with a 4-byte CRC that the parser checks first. Why will this teaching fuzzer struggle, and what feature would a production fuzzer use?</li>
+<li>Predict, then run: fuzz the buggy ELF reader, note the executions-to-crash, then fuzz the fixed reader for thirty seconds. Predict which run grows the edge count and which finds a crash, then check against the logs.</li>
+</ol>
+
+<h2 id="F11-09-lab">Lab</h2>
+<p><b>Goal.</b> Fuzz the P2 ELF reader and a MAVLink-style parser, find the planted bug in each, minimise the crashing input, read the sanitizer report, fix the bug, and confirm the fixed build survives (curriculum P2's acceptance test).</p>
+<p><b>Hardware and software needed.</b> No hardware. Logged toolchain: <code>g++ 13.3.0</code> with <code>-fsanitize=address,undefined</code> and <code>-fsanitize-coverage=trace-pc</code>. Run <code>university/labs/run_lab.sh university/labs/F11-09</code> from the repository root (about one to two minutes).</p>
+<p><b>Safety.</b> None beyond normal computer use. The fuzzer forks; it writes only inside its own work directory.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In <code>elf_fuzz.out</code> and <code>mav_fuzz.out</code>, read the executions-to-crash and the saved input size.</li>
+<li>In <code>elf_minimise.out</code> and <code>mav_minimise.out</code>, read the before/after sizes. Open <code>mav_crash_min.bin</code> and <code>elf_crash_min.bin</code> (kept in the lab folder) with a hex viewer.</li>
+<li>In <code>elf_report.out</code> and <code>mav_report.out</code>, read the AddressSanitizer report: READ or WRITE, the source line, and the object.</li>
+<li>In <code>elf_fixed_fuzz.out</code> and <code>mav_fixed_fuzz.out</code>, confirm "no crash" and note the edge count growing (the fuzzer learning the format).</li>
+<li>Read the one-line fix in each target (the <code>#ifdef FIXED</code> branch). Write one paragraph per bug: what the fuzzer found, the minimised input, and why the fix closes it.</li>
+</ol>
+<p><b>Expected observations.</b> Each buggy build crashes within a few executions; the minimiser shrinks both inputs (ELF 203→168 bytes, MAVLink 12→2 bytes in the recorded run); the reports name a heap-buffer-overflow READ; each fixed build runs tens of thousands of inputs with none found. <sup class="src"><a href="#F11-09-src-R3">R3</a></sup> <sup class="src"><a href="#F11-09-src-R4">R4</a></sup> <sup class="src"><a href="#F11-09-src-R5">R5</a></sup> <sup class="src"><a href="#F11-09-src-R7">R7</a></sup></p>
+<p><b>Verification.</b> <code>run_lab.sh</code> exits 0; the fixed-build steps contain "no crash"; the unit tests (<code>elf_tests</code>, <code>mav_tests</code>) pass under both sanitizers. For milestone P2, extend the fixed ELF run to one hour (change the seconds argument in a copy of <code>run.sh</code>) and keep the log.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The buggy build does not crash → the seed was rejected before reaching the bug → confirm the ELF/MAVLink seed is well-formed (the lab builds it with <code>mkelf</code>/<code>mkseed</code>).</li>
+<li>Minimisation runs too long → the crash depends on absolute offsets (large ELF) → start from a small seed, as the lab does; the safety cap stops it at 20,000 tests.</li>
+<li>The fixed build reports a crash → your fix is incomplete → check the bound is <code>off &lt;= size &amp;&amp; len &lt;= size - off</code> form, not <code>off + len &lt;= size</code> (which can wrap, <a href="#F2-44">F2-44</a>).</li>
+</ul>
+<p><b>Extension.</b> Add a dictionary of interesting tokens (the ELF magic, common section names) to the mutator and measure whether the fixed ELF reader's edge count grows faster. Add a second planted bug and confirm the fuzzer finds it.</p>
+
+<h2 id="F11-09-forensic">Forensic lab</h2>
+<p><b>Scenario — "the crash input".</b> Overnight, a fuzzing bot filed a ticket: the frame parser crashed, and it attached the exact input it fed and the sanitizer report. Your job is to reproduce it, minimise it, find the root cause, and fix it.</p>
+<p><b>Evidence pack.</b> The sanitizer report from replaying the crashing input (and the fuzzer's own summary):</p>
+<pre class="output" data-run="F11-09/mav_report"></pre>
+<pre class="output" data-run="F11-09/mav_fuzz"></pre>
+<p>The minimised crashing input is <code>mav_crash_min.bin</code> in the lab folder (two bytes).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what does the report's summary line say (READ/WRITE, size, location)? In which function and line is the bad access?</li>
+<li>Hypotheses: give two reasons the access could be out of bounds; which does the two-byte minimised input support?</li>
+<li>Root cause: what field does the parser trust that it must not, and what is missing before it is used?</li>
+<li>Fix: write the exact bounds check, in the overflow-safe form, and say where it goes.</li>
+<li>Prevention: what would you add to CI so this class of bug is caught before release? (Think of the fixed-build fuzzing step and a regression test built from the minimised input.)</li>
+</ol>
+<p><b>Method hints.</b> Start from the minimised two bytes: a start marker and a length. Ask "what does the code read next, and is it there?". The fix is the same shape as the ELF reader's range check in <a href="#F2-44">F2-44</a>.</p>
+
+<h2 id="F11-09-project">Mini-project</h2>
+<p><b>A fuzzing campaign (course project seed).</b> Pick one parser from a university program — the P2 ELF reader, a packet or log parser, a descriptor parser from <a href="#F11-12">F11-12</a>. Build it with both sanitizers and coverage. Write seeds. Run the fuzzer; for every finding, save the input, minimise it, read the report, fix the bug, add the minimised input as a regression test, and re-fuzz. Produce a campaign report: targets and seeds, executions and edges reached, every finding with its minimised input and fix, and an honest statement of coverage and limits. This is the shape of the full course project (a fuzzing campaign report for one university project).</p>
+<p><b>Rubric.</b> Target built with sanitizers and coverage, seeds justified (2). Each finding minimised, reported, fixed, and turned into a regression test (4). Fixed build re-fuzzed with the finding gone (2). Report honest about coverage and limits (2).</p>
+
+<h2 id="F11-09-summary">Summary</h2>
+<ul>
+<li>Sanitizers are the oracle (they decide what is a bug and locate it); fuzzers are the input generator (they trigger bugs).</li>
+<li>Coverage-guided fuzzing keeps inputs that reach new edges, so it learns structured formats a random fuzzer never would.</li>
+<li>The loop is: mutate a corpus input, run the sanitized target (in a forked child), save crashes, keep new-coverage inputs.</li>
+<li>Minimise a crashing input to the bytes that matter and make it a regression test.</li>
+<li>Fix the bug, then re-fuzz the fixed build to show the finding is gone — but "finds nothing" is not "proven safe".</li>
+<li>The lab finds and fixes a planted bug in both the ELF reader (milestone P2) and a MAVLink-style parser.</li>
+</ul>
+
+<h2 id="F11-09-sources">Sources</h2>
+<ol>
+<li id="F11-09-src-D1">LLVM documentation, "libFuzzer — a library for coverage-guided fuzz testing", and the AFL/AFL++ documentation: corpus, mutation, coverage feedback, minimisation (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-09-src-D2">Clang documentation, "SanitizerCoverage" (<code>-fsanitize-coverage</code>, trace-pc and inline counters) (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-09-src-D3">GCC and LLVM documentation for AddressSanitizer and UndefinedBehaviorSanitizer: what each detects and its runtime (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-09-src-D4">MAVLink Developer Guide: frame format (v1/v2), field order, checksum (CRC-16) and the per-message CRC_EXTRA byte (tier 2). <i>Title only — not opened during this build (dossier gate G1 open); the lab uses a toy checksum, see the unverified box.</i></li>
+<li id="F11-09-src-R3">R3 — lab run, step <code>elf_fuzz</code> (<code>elf_fuzz.log</code>): the buggy ELF reader crashes within ten executions from a valid seed.</li>
+<li id="F11-09-src-R4">R4 — lab run, step <code>elf_minimise</code> (<code>elf_minimise.log</code>): the crashing ELF input shrinks from 203 to 168 bytes and still crashes.</li>
+<li id="F11-09-src-R5">R5 — lab run, step <code>elf_fixed_fuzz</code> (<code>elf_fixed_fuzz.log</code>): the fixed ELF reader runs ~16,000 inputs, edge count grows 46→51, no crash.</li>
+<li id="F11-09-src-R6">R6 — the fuzzer design: <code>fuzz.cc</code> and <code>cov.cc</code> (shared-memory edge bitmap, fork-per-input), built and exercised by <code>run_lab.sh</code>.</li>
+<li id="F11-09-src-R7">R7 — lab run, step <code>elf_report</code> (<code>elf_report.log</code>): AddressSanitizer heap-buffer-overflow READ in <code>fuzz_one</code> at <code>elf_target.cc</code> line 85.</li>
+<li id="F11-09-src-R8">R8 — lab run, step <code>mav_fuzz</code> (<code>mav_fuzz.log</code>): the buggy scanner crashes within a few executions; the input is saved.</li>
+<li id="F11-09-src-R9">R9 — lab run, step <code>mav_minimise</code> (<code>mav_minimise.log</code>): the crashing MAVLink input shrinks from 12 to 2 bytes.</li>
+<li id="F11-09-src-R10">R10 — lab run, step <code>mav_fixed_fuzz</code> (<code>mav_fixed_fuzz.log</code>): the fixed scanner runs ~18,000 inputs, no crash.</li>
+</ol>
+
+<h2 id="F11-09-glossary">Glossary links</h2>
+<p><a href="#gl-fuzzing">Fuzzing</a> · <a href="#gl-coverage-guided-fuzzing">Coverage-guided fuzzing</a> · <a href="#gl-corpus">Corpus</a> · <a href="#gl-edge-coverage-bitmap">Edge / coverage bitmap</a> · <a href="#gl-test-case-minimisation">Test-case minimisation</a> · <a href="#gl-sanitizer">Sanitizer</a></p>
+
+<h2 id="F11-09-next">Next chapter</h2>
+<p>Next: <a href="#F11-10">F11-10 Hardening: stack protectors, NX, ASLR, SMEP and SMAP</a>. Previous: <a href="#F11-08">F11-08 Bounds, lifetimes and ownership in C++</a>. Course: <a href="#SS302">SS302</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#found">Foundations</a> (milestone P2) and <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (B12, fuzzing the exec path).</p>
+
+<h2 id="F11-09-answers">Answers to Check yourself</h2>
+<ol>
+<li>The sanitizer provides the oracle: it detects and precisely locates a memory or undefined-behaviour error that an input triggers, including silent ones. The fuzzer provides the inputs: it generates and steers inputs toward code that triggers bugs. Neither alone finds much; together they close the loop.</li>
+<li>Structured input is gated: a random blob fails the first check (magic, length) and never reaches deep code. Coverage guidance keeps any mutation that reaches a new edge — such as one that happens to form valid magic — so the fuzzer accumulates inputs that penetrate the format and explores from there.</li>
+<li>So that a crash in the target kills only the child; the parent records the crashing input and the report and keeps going. In-process, the first crash would abort the whole fuzzer and lose its state.</li>
+<li>(b). (a) a clean run is evidence, not proof; (c) random fuzzing is far weaker on structured input; (d) a sanitizer only reports a bug an input actually triggers.</li>
+<li><code>0xFE</code> (the start marker) and a non-zero length byte. The marker makes the scanner enter a frame; the non-zero length makes it read payload/checksum bytes that are not present, which is the out-of-bounds read. Nothing else is needed.</li>
+<li>The fuzzer has no way to produce a correct CRC by mutation, so every input fails the CRC check and the body is never reached — coverage never grows past the check. A production fuzzer uses a custom mutator (or a "fix-up" hook) that recomputes the CRC after mutation, or structure-aware fuzzing, so the body is exercised.</li>
+<li>The buggy run finds a crash almost immediately (around ten executions) and its corpus does not grow, because it is caught before exploring. The fixed run finds no crash and its edge count grows as the corpus learns the format — exactly what the logs show.</li>
+</ol>
+<footer>Corrections log: <a href="../_qa/F11-09.qa.html#corrections">F11-09 QA record</a>.</footer>
