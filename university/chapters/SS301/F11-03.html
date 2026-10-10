@@ -1,0 +1,308 @@
+<!--meta
+id: F11-03
+title: Measured boot and the TPM
+course: SS301
+level: L3
+prereqs: F11-01; F11-02 (its keys, signed updates and sign.py are reused); F4-13 (TPM 2.0: measured boot you can check, DR302) recommended; OS301 (PCR extend, measured boot)
+time: 8–10 hours including the lab
+hardware: none (g++ 13.3.0 with OpenSSL 3.0.13 for the TPM model; clang 18.1.3 and lld-link for the UEFI program; QEMU 8.2.2 q35 with tpm-tis and the "emulator" backend, played by mock_tpm.py from F4-13 because swtpm is not installed; OVMF Secure Boot build from the ovmf package 2024.02-2ubuntu0.10); no real TPM was used
+maps: Curriculum 2.5 ("Measured boot: each stage hashes the next into TPM Platform Configuration Registers"); C13 (acceptance "PCR values … equal the values obtained by replaying the firmware event log", here with the mock TPM instead of swtpm); course SS301 goal "explain secure boot, measured boot and TPMs"
+analogy: F11 — a castle with gates and guards. Proposed in NOTES.md: the TPM is the castle's notary, who keeps a tally of everyone who passed the gates that can only grow, and signs statements about it for the king's messenger, who brings a fresh password each time
+-->
+
+<h2 id="F11-03-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>The gate guards of F11-01 stop strangers. But the king, far away, has a different question: who actually came into the castle last night? The guards could simply tell him "only friends", but a guard who has been bribed would say the same. So the castle has a notary in a locked tower. Every time someone passes a gate, the notary adds the visitor's name into a tally that can only grow and never be rubbed out, and the gate scribe writes the same name in an open visitors' book.</p>
+<p>When the king's messenger arrives, he brings a password nobody has heard before. The notary writes the password and the current tally on a parchment and seals it with a seal that never leaves the tower. The messenger takes the parchment and the visitors' book home. If the book, read from the first page, adds up to the tally on the parchment, the book is complete and true; if the password is the fresh one, the parchment was written today. Then the king can read the book and decide whether he likes who came in.</p>
+</div>
+<p>This chapter does that with a real UEFI firmware. OVMF, the firmware you used in F11-02, measures what it loads into a TPM and writes the visitors' book, the event log. You read the log with a UEFI program, replay it, and compare it with what the TPM holds; you enroll F11-02's keys and rotate them and watch exactly one register change. A model of a TPM, built on OpenSSL, then shows the two things the notary is for: signed reports to a verifier far away (attestation) and secrets that are released only when the tally is right (sealing).</p>
+
+<h2 id="F11-03-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the difference between verifying a boot (Secure Boot refuses bad code) and measuring it (the TPM records what ran and lets someone else judge).</li>
+<li><b>Compute</b> a PCR value by hand from an event log, and say why the order of events matters and why a PCR cannot be set back.</li>
+<li><b>Read</b> a real firmware event log: which events go into which PCR, and which PCR changes when the Secure Boot keys change.</li>
+<li><b>Describe</b> remote attestation: nonce, quote, attestation key, replay of the log, and the list of known-good values, and say which attack each check stops.</li>
+<li><b>Predict</b> when a secret sealed to PCRs will be released, and plan a key rotation so that machines do not lose their sealed disk keys.</li>
+<li><b>Diagnose</b> an attestation failure from an event log, a verifier report and a table of PCR values.</li>
+</ul>
+
+<div class="co jargon" id="F11-03-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Sealing (TPM)</dt><dd><b>Simple words:</b> locking a secret inside the TPM so that it comes out only if the machine booted in a known way. <b>Analogy:</b> a box the notary opens only while the tally reads exactly what it read when the box was closed. <b>Precise:</b> the TPM binds a data object to a policy over selected PCR values; unsealing succeeds only while those PCRs hold the values in the policy. In this chapter's model: a secret plus the composite digest of the selected PCRs, released when the current composite is equal (observed in <code>measured.out</code>). <sup class="src"><a href="#F11-03-src-D2">D2</a></sup> <sup class="src"><a href="#F11-03-src-R1">R1</a></sup></dd>
+<dt>Nonce (freshness value)</dt><dd><b>Simple words:</b> a random number used once, so that an old answer cannot be passed off as a new one. <b>Analogy:</b> the messenger's fresh password. <b>Precise:</b> a value chosen by the verifier and included in the data the TPM signs in a quote; a quote over a different nonce is rejected as possibly replayed (scenario 4 of the lab). <sup class="src"><a href="#F11-03-src-D2">D2</a></sup> <sup class="src"><a href="#F11-03-src-R1">R1</a></sup></dd>
+<dt>Attestation key (AK)</dt><dd><b>Simple words:</b> a signing key that lives inside the TPM and signs only reports about the TPM's own registers. <b>Analogy:</b> the notary's seal, which never leaves the tower. <b>Precise:</b> a restricted signing key created in the TPM whose private part cannot be exported; the verifier trusts its public part through a certificate chain to the TPM maker's endorsement key (not exercised in this build). In the model, a P-256 ECDSA key held by the <code>Tpm</code> object. <sup class="src"><a href="#F11-03-src-D2">D2</a></sup></dd>
+<dt>Reference values (golden measurements)</dt><dd><b>Simple words:</b> the list of digests a verifier knows to be good. <b>Analogy:</b> the king's list of welcome visitors. <b>Precise:</b> digests of approved firmware, configurations, Secure Boot variables and boot programs, or of whole PCR values from a known-good machine, against which a replayed event log is judged; they must be updated whenever something legitimate changes, such as a key rotation. <sup class="src"><a href="#F11-03-src-R1">R1</a></sup></dd>
+</dl></div>
+<p>From earlier chapters, not redefined here: <a href="#gl-tpm-trusted-platform-module">TPM</a>, <a href="#gl-pcr-platform-configuration-register">PCR</a>, <a href="#gl-extend-tpm">extend</a>, <a href="#gl-event-log-tpm">event log</a>, <a href="#gl-attestation-and-quote">attestation and quote</a> and <a href="#gl-root-of-trust-for-measurement">root of trust for measurement</a> (F4-13); <a href="#gl-measured-boot">measured boot</a> (OS301); <a href="#gl-chain-of-trust">chain of trust</a> (F11-01); <a href="#gl-authenticode">Authenticode</a> (F3-16).</p>
+
+<h2 id="F11-03-pictures">The idea in pictures</h2>
+<p>Figure 1 is one register of the real firmware run, PCR 4, followed event by event. Each box is the register's value; each arrow is one extend.</p>
+<figure id="F11-03-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F11-03-f1t F11-03-f1d">
+<title id="F11-03-f1t">PCR 4 in the fw_enrolled run, extended three times</title>
+<desc id="F11-03-f1d">Four boxes from left to right hold the value of PCR 4: 32 zero bytes at reset; after the EV_EFI_ACTION event with digest 3d6772b4; after the EV_SEPARATOR event with digest df3f6198; after the EV_EFI_BOOT_SERVICES_APPLICATION event with digest 386895b2, giving d9d728c6, the value both the replay and the mock TPM hold. Below, the rule: new value equals SHA-256 of old value followed by the event digest. Bottom note: the application digest equals the Authenticode hash of evlog.efi printed by sign.py, the same for the unsigned and both signed copies.</desc>
+<rect class="sv-b1" x="20" y="40" width="140" height="60"/><text class="sv-tb" x="30" y="62">at reset</text><text class="sv-tm" x="30" y="84">00000000…</text>
+<rect class="sv-b2" x="210" y="40" width="140" height="60"/><text class="sv-tb" x="220" y="62">after event 16</text><text class="sv-tm" x="220" y="84">(not printed)</text>
+<rect class="sv-b2" x="400" y="40" width="140" height="60"/><text class="sv-tb" x="410" y="62">after event 21</text><text class="sv-tm" x="410" y="84">(not printed)</text>
+<rect class="sv-b3" x="590" y="40" width="150" height="60"/><text class="sv-tb" x="600" y="62">after event 25</text><text class="sv-tm" x="600" y="84">d9d728c6…</text>
+<line class="sv-line" x1="160" y1="70" x2="202" y2="70"/><polygon class="sv-head" points="209,70 197,65 197,75"/>
+<line class="sv-line" x1="350" y1="70" x2="392" y2="70"/><polygon class="sv-head" points="399,70 387,65 387,75"/>
+<line class="sv-line" x1="540" y1="70" x2="582" y2="70"/><polygon class="sv-head" points="589,70 577,65 577,75"/>
+<text class="sv-ts" x="150" y="128">EV_EFI_ACTION</text><text class="sv-tm" x="150" y="146">3d6772b4…</text>
+<text class="sv-ts" x="345" y="128">EV_SEPARATOR</text><text class="sv-tm" x="345" y="146">df3f6198…</text>
+<text class="sv-ts" x="520" y="128">BOOT_SERVICES_APPLICATION</text><text class="sv-tm" x="520" y="146">386895b2…</text>
+<rect class="sv-box" x="20" y="175" width="720" height="44"/><text class="sv-t" x="30" y="202">extend:  PCR_new = SHA-256( PCR_old  ||  event digest )      no "set", no "subtract", no "reset" until the next boot</text>
+<rect class="sv-b5" x="20" y="235" width="720" height="50"/><text class="sv-ts" x="30" y="256">386895b2… = the Authenticode SHA-256 of evlog.efi (sign.py --hash): equal for the unsigned copy and the db1- and db2-signed copies,</text><text class="sv-ts" x="30" y="274">because Authenticode leaves the signature out of the hash. Which key signed it is recorded in PCR 7, not PCR 4.</text>
+</svg></div><figcaption><b>Figure 1.</b> Real values from <code>fw_enrolled.out</code> and <code>pcr_compare.out</code> <sup class="src"><a href="#F11-03-src-R5">R5</a></sup> <sup class="src"><a href="#F11-03-src-R6">R6</a></sup>. Event numbers are the log's own. The intermediate values are not printed by the lab; the final one is, by both the replay and the TPM.</figcaption></figure>
+<p>Figure 2 is remote attestation: what crosses the network, and what the verifier checks, in order.</p>
+<figure id="F11-03-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F11-03-f2t F11-03-f2d">
+<title id="F11-03-f2t">Remote attestation in four checks</title>
+<desc id="F11-03-f2d">Left: the verifier. Right: the machine, with its TPM holding PCRs and the attestation key. Arrow 1 from verifier to machine: a fresh nonce. Arrow 2 from machine to verifier: the quote (nonce and PCR digest, signed by the attestation key) and the event log. Below the verifier, four checks in order: signature valid with the known attestation key; nonce is the one sent; replaying the log gives the PCR digest in the quote; every digest in the log is in the reference values. Each check names the lab scenario that fails it: forged quote, scenario 4 old quote, scenario 3 edited log, scenario 2 and the forensic case unknown component.</desc>
+<rect class="sv-b4" x="20" y="20" width="230" height="80"/><text class="sv-tb" x="30" y="44">verifier</text><text class="sv-ts" x="30" y="64">knows the AK's public key</text><text class="sv-ts" x="30" y="82">and the reference values</text>
+<rect class="sv-b6" x="510" y="20" width="230" height="80"/><text class="sv-tb" x="520" y="44">machine + TPM</text><text class="sv-ts" x="520" y="64">PCRs (extend only)</text><text class="sv-ts" x="520" y="82">AK private key (never leaves)</text>
+<line class="sv-line" x1="250" y1="45" x2="502" y2="45"/><polygon class="sv-head" points="509,45 497,40 497,50"/><text class="sv-ts" x="300" y="38">1  nonce (fresh, random)</text>
+<line class="sv-line" x1="510" y1="80" x2="258" y2="80"/><polygon class="sv-head" points="251,80 263,75 263,85"/><text class="sv-ts" x="270" y="100">2  quote = sign_AK(nonce, PCR digest) + event log</text>
+<rect class="sv-b2" x="20" y="130" width="720" height="40"/><text class="sv-t" x="30" y="155">a  signature valid with the AK?          fails for a quote not made by this TPM</text>
+<rect class="sv-b2" x="20" y="176" width="720" height="40"/><text class="sv-t" x="30" y="201">b  nonce = the one sent?                 fails for an old quote replayed (scenario 4)</text>
+<rect class="sv-b2" x="20" y="222" width="720" height="40"/><text class="sv-t" x="30" y="247">c  replay(log) = PCR digest in quote?     fails for an edited log (scenario 3)</text>
+<rect class="sv-b2" x="20" y="268" width="720" height="40"/><text class="sv-t" x="30" y="293">d  every digest a reference value?       fails for unknown code (scenario 2, forensic lab)</text>
+</svg></div><figcaption><b>Figure 2.</b> The order of the checks matters: (c) makes the log trustworthy, and only then is reading it in (d) meaningful. Scenarios: <code>measured.out</code> <sup class="src"><a href="#F11-03-src-R1">R1</a></sup>; protocol from memory of D2, implemented only in the model.</figcaption></figure>
+
+<h2 id="F11-03-layer1">Layer 1 — the kid explanation</h2>
+<p>A computer has a tiny, stubborn chip called a TPM. It has a few number boxes. You cannot write a number into a box; you can only "stir in" a new fingerprint, and the box's number changes in a way nobody can undo or aim. While the computer starts, every piece of software stirs in the fingerprint of the next piece before running it. At the end, the boxes say, in a code only a computer can check, exactly what started. The computer also keeps a plain list of what it stirred in. If someone sends the list to a checker far away, the chip signs the box numbers, and the checker stirs the list itself and compares. If they match, the list is honest, and the checker can read it.</p>
+
+<h2 id="F11-03-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F11-03-l2-two">Two kinds of trust: verify, or record</h3>
+<p>F11-01 and F11-02 built a <b>verified</b> chain: each stage checks the next and refuses what fails. That protects the machine, but nobody outside the machine learns anything: a machine whose firmware was replaced would claim to be fine just as loudly as a healthy one. <b>Measured boot</b> adds a record. Each stage hashes the next and extends the hash into a Platform Configuration Register (PCR) of the TPM before running it, and appends an entry to an event log.<sup class="src"><a href="#F11-03-src-S1">S1</a></sup> Nothing is refused because of a measurement. The value of the measurement is that it cannot be undone: once a stage has been measured, even a malicious stage that runs afterwards cannot make the PCR look as if it had not run.</p>
+<h3 id="F11-03-l2-extend">Extend, and why order matters</h3>
+<p>A PCR starts at zero when the platform resets. The only way to change it is extend: new value = SHA-256(old value || digest).<sup class="src"><a href="#F11-03-src-D2">D2</a></sup> The model implements exactly that line (<code>tpm_model.h</code> line 63), and Python's <code>hashlib</code> recomputes the same five PCR values from the same strings.<sup class="src"><a href="#F11-03-src-R2">R2</a></sup> Two consequences follow. Order matters: scenario 6 extends the same two digests in both orders and gets 86f38b45… and 6782288f….<sup class="src"><a href="#F11-03-src-R1">R1</a></sup> And there is no way back: to reach a target value you would need a digest whose hash, combined with the current value, gives the target, which is as hard as breaking SHA-256.</p>
+<h3 id="F11-03-l2-real">A real firmware's log</h3>
+<p>OVMF with a TPM device measured 26 events in every run of this lab, into PCRs 0, 1, 2, 3, 4, 5, 6 and 7.<sup class="src"><a href="#F11-03-src-R4">R4</a></sup> Reading the <code>fw_enrolled</code> log from the top: PCR 0 receives the firmware's own version string and two firmware blobs; PCR 7 receives the five Secure Boot variables (SecureBoot, PK, KEK, db, dbx) and a separator; PCR 1 receives four events of a type our table does not name and the boot variables (BootOrder, Boot0000, Boot0001); PCR 4 receives an EV_EFI_ACTION event; then every PCR from 0 to 6 receives a separator; then PCR 7 receives the db entry that authorised our program (EV_EFI_VARIABLE_AUTHORITY) and PCR 4 the program itself (EV_EFI_BOOT_SERVICES_APPLICATION).<sup class="src"><a href="#F11-03-src-R5">R5</a></sup> That is the usual division of the PC world, as the TCG firmware profile describes it: PCR 0 firmware code, PCR 1 firmware configuration, PCR 4 boot programs, PCR 7 Secure Boot policy.<sup class="src"><a href="#F11-03-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Written from memory of D1 and D3, which were not opened: the PCR assignment just stated, the event type names and numbers in <code>evlog.cc</code> (lines 36–54), the layout of the TCG2 log (a first entry in the old SHA-1 format holding the "Spec ID Event03" header, then entries with a digest count and one digest per algorithm), the slot order of EFI_TCG2_PROTOCOL and its GUID (lines 9–15). What is verified is narrower: with these assumptions the program parsed the log of OVMF 2024.02 without error, and its replay equals the PCR values the TPM device holds, for all eight PCRs in three different boots.<sup class="src"><a href="#F11-03-src-R6">R6</a></sup> The four PCR 1 events of type 0x0000000a are printed as numbers because the table has no name for them; their meaning was not looked up.<sup class="src"><a href="#F11-03-src-D1">D1</a></sup> <sup class="src"><a href="#F11-03-src-D3">D3</a></sup></p></div>
+<h3 id="F11-03-l2-check">Replay: the log checks itself</h3>
+<p>The event log is ordinary memory: anyone who controls the operating system can edit it. The PCRs cannot be edited. So a log is believed only after a replay: start eight registers at zero, extend each event's digest into its PCR, compare with the TPM. <code>evlog.cc</code> does the replay inside the firmware environment (lines 146–151); the TPM's values come from <code>mock_tpm.py</code>, which records every extend the firmware sent it. For all three boots and all eight PCRs, the replay and the TPM agree.<sup class="src"><a href="#F11-03-src-R6">R6</a></sup> That is the curriculum's C13 acceptance check ("PCR values … equal the values obtained by replaying the firmware event log"), here with a stand-in TPM instead of swtpm, and read through the TPM emulator's record rather than by your own kernel's driver; F4-13 builds that driver side.<sup class="src"><a href="#F11-03-src-S1">S1</a></sup> <sup class="src"><a href="#F11-03-src-S2">S2</a></sup></p>
+<h3 id="F11-03-l2-uses">What measurements are for</h3>
+<p>A PCR value alone is just a number. It becomes useful in two ways. <b>Attestation</b>: the TPM signs the PCR values together with a verifier's nonce, and the verifier, far away, decides whether it trusts the machine. <b>Sealing</b>: the TPM releases a secret, typically a disk encryption key, only while selected PCRs hold the values they held when the secret was sealed. Both are shown in the model, because the stand-in TPM of the real-firmware lab implements neither (it has no keys at all).<sup class="src"><a href="#F11-03-src-S2">S2</a></sup></p>
+
+<h2 id="F11-03-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F11-03-l3-pcr7">PCR 7 is the key-database register</h3>
+<p>The three firmware boots differ only in the key store: empty (setup mode, unsigned program), F11-02's keys enrolled (program signed with db1), and F11-02's rotation applied (program signed with db2). <code>pcr_compare.out</code> lines them up: PCRs 0 to 6 are identical in all three; only PCR 7 differs, and it differs in every pair.<sup class="src"><a href="#F11-03-src-R6">R6</a></sup> The logs say why. In the empty store the PK, KEK and db events carry 36–38 bytes of data (the variable header with no content) and there is no authority event, because nothing was verified. After enrolment the PK, KEK and db events carry 820, 830 and 828 bytes, and a sixth PCR 7 event records the db entry that authorised the program. After the rotation, db grows to 1,620 bytes and dbx to 830 bytes, and the authority event carries the db2 certificate instead of db1 (digest 20f59096… instead of 28cea840…).<sup class="src"><a href="#F11-03-src-R4">R4</a></sup> <sup class="src"><a href="#F11-03-src-R5">R5</a></sup></p>
+<p>Two consequences for design. First, PCR 7 is the right register to seal a disk key to if you want "only while this Secure Boot policy is in force", and the wrong one if you rotate keys often: every legitimate rotation changes it. Second, PCR 4 does not tell you who signed the boot program. The application event's digest 386895b2… is the same for the unsigned copy and both signed copies, and equals the Authenticode hash that <code>sign.py --hash</code> prints for each file.<sup class="src"><a href="#F11-03-src-R6">R6</a></sup> Authenticode leaves the signature out of the hash (F3-16), so re-signing a program with a new key does not change PCR 4. Sealing to PCR 4 survives a re-signing; sealing to PCR 7 does not.</p>
+<h3 id="F11-03-l3-attest">Attestation, check by check</h3>
+<p>The model's verifier (<code>measured.cc</code> lines 57–78) makes the four checks of Figure 2 and prints each. The scenarios each break one check.</p>
+<div class="tw"><table>
+<thead><tr><th>Scenario</th><th>What happened</th><th>First check that fails</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td class="n">1</td><td>Healthy boot</td><td>none</td><td>TRUSTED</td></tr>
+<tr><td class="n">2</td><td>Secure Boot off, a patched loader</td><td>(d) two unknown components, in PCR 7 and PCR 4</td><td>NOT TRUSTED</td></tr>
+<tr><td class="n">3</td><td>As 2, the operating system edits the log to look healthy</td><td>(c) replay 3e711f75 ≠ quote 75ad2979</td><td>NOT TRUSTED</td></tr>
+<tr><td class="n">4</td><td>As 2, the machine resends scenario 1's quote and log</td><td>(b) nonce is not the one sent</td><td>NOT TRUSTED</td></tr>
+<tr><td class="n">5</td><td>Legitimate key rotation</td><td>(d) three new digests, until the verifier learns them</td><td>NOT TRUSTED, then TRUSTED</td></tr>
+</tbody></table></div>
+<p>All from <code>measured.out</code>.<sup class="src"><a href="#F11-03-src-R1">R1</a></sup> Notice scenario 3: the edited log contains only known-good components, so a verifier that skipped check (c) and only read the log would say TRUSTED. And scenario 4: an old, genuinely signed quote of a healthy boot is perfect evidence of the wrong boot. Without the nonce, a compromised machine would simply keep one good quote and send it forever.</p>
+<p>Scenario 5 is the operational lesson. A correct, planned key rotation looks to the verifier exactly like an attack on the Secure Boot policy until the reference values are updated. The rotation procedure of F11-02 therefore needs one more step: publish the new reference values (the new db and dbx contents and the re-signed boot programs) to the attestation service before the machines reboot into the new policy.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The model's quote is a P-256 ECDSA signature over the nonce and a SHA-256 over the selected PCR values. A real TPM 2.0 quote (TPM2_Quote) signs a structure that also carries, among other things, the TPM's clock, a reset counter and the PCR selection, and a real attestation key is certified through the TPM's endorsement key and the maker's certificate. All of that is from memory of D2, not opened, and not exercised: the stand-in TPM implements no keys, quotes, sessions or sealing.<sup class="src"><a href="#F11-03-src-S2">S2</a></sup> Treat the model as the shape of the protocol, not its format.</p></div>
+<h3 id="F11-03-l3-seal">Sealing and the rotation problem</h3>
+<p>In scenario 1 the model seals "disk key 7f3a" to PCR 7 and unseals it immediately: released. In scenario 5 the same sealed object is presented after the rotation: REFUSED, because PCR 7 changed; the machine would ask for its recovery key. After resealing under the new PCR 7, the key is released again.<sup class="src"><a href="#F11-03-src-R1">R1</a></sup> The real firmware runs show that a rotation really does change PCR 7 (65caf8dd… → 236e8c98… → ab7e9f6e… across the three boots).<sup class="src"><a href="#F11-03-src-R6">R6</a></sup> Put together: a fleet that seals disk keys to PCR 7 must reseal every disk key to the predicted new PCR 7 value before the machines reboot into the rotated policy, or every machine will ask its user for a recovery key the next morning. Predicting the value is possible precisely because extend is deterministic: the new event data is known in advance.</p>
+<h3 id="F11-03-l3-limits">What measured boot does not do</h3>
+<ul>
+<li>It does not stop anything. Scenario 2's patched loader ran; only the verdict caught it. Combine it with Secure Boot (refuse) for protection and use measurement for evidence.</li>
+<li>It measures only what the measuring code chooses to measure, and only before it runs. Code that is never measured, or a measured program that is attacked while it runs (TOCTOU, F11-01), is invisible.</li>
+<li>Its root is the first measuring code (the root of trust for measurement). If that code lies, every PCR value is a lie that still replays perfectly.<sup class="src"><a href="#F11-03-src-S2">S2</a></sup></li>
+<li>A verifier is only as good as its reference values. Scenario 5's false alarm and the forensic case are both about reference values, not cryptography.</li>
+</ul>
+
+<h2 id="F11-03-hardware">How the hardware actually does it</h2>
+<p>A TPM is either a separate chip on the board, connected by a low-speed bus, or firmware running in a protected part of the main processor (a "firmware TPM").<sup class="src"><a href="#F11-03-src-S1">S1</a></sup> The operating system and the firmware reach it through one of two register interfaces, FIFO (TIS) or CRB, described by the TCG platform TPM profile; QEMU's <code>tpm-tis</code> device used here offers the FIFO interface at a fixed address, and F4-13 drives it directly.<sup class="src"><a href="#F11-03-src-S2">S2</a></sup> The PCRs reset only when the platform resets, which is what makes "zero at the start of this boot" meaningful; a TPM that could be reset alone, without resetting the processor, would let software start a fresh, clean-looking chain after the real one.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Untested on hardware and with no real TPM. Every firmware run used QEMU 8.2.2's <code>tpm-tis</code> device with its "emulator" backend, answered by <code>mock_tpm.py</code>, a Python script from F4-13 that implements just enough commands (Startup, SelfTest, GetCapability, GetRandom, PCR_Extend, PCR_Read) for OVMF; it has no keys, no sealing and no authorisation checks, and its control protocol was written from memory of swtpm's and is proven only by QEMU accepting it.<sup class="src"><a href="#F11-03-src-S2">S2</a></sup> The bus types, the firmware-TPM implementations named by the curriculum (Intel PTT, AMD fTPM, OP-TEE-based TPMs on Arm) and the reset behaviour stated above are not checked here.</p></div>
+
+<h2 id="F11-03-worked">Worked example</h2>
+<p><b>Problem.</b> (a) Use the <code>fw_enrolled</code> log to list the events that go into PCR 7, in order. (b) The separator event's digest in every PCR is df3f6198…. What data was hashed, if the event data is 4 bytes? (c) The verifier has the reference value of PCR 7 for the db1 policy. After the rotation it receives a quote whose PCR 7 is ab7e9f6e…. Which events must it look at to decide whether the change is the planned rotation? (d) A disk key sealed to PCRs 4 and 7 on a db1 machine: after the rotation and re-signing, which of the two values changed?</p>
+<p><b>Solution.</b> (a) Events 3–7 (SecureBoot, PK, KEK, db, dbx), event 8 (separator), event 24 (the authority, a db entry).<sup class="src"><a href="#F11-03-src-R5">R5</a></sup> (b) Four bytes; the lab does not print them, but SHA-256 of four zero bytes begins df3f6198 (check with <code>printf '\0\0\0\0' | sha256sum</code>), consistent with a separator value of zero.<sup class="src"><a href="#F11-03-src-D1">D1</a></sup> (c) Replay first; then compare the db event (now 1,620 bytes, digest dbe4a147…), the dbx event (830 bytes, f0421189…) and the authority event (20f59096…) with the published new reference values; every other PCR 7 event is unchanged.<sup class="src"><a href="#F11-03-src-R5">R5</a></sup> (d) Only PCR 7: PCR 4's application digest is the Authenticode hash, which ignores the signature (386895b2… in both runs).<sup class="src"><a href="#F11-03-src-R6">R6</a></sup> So the key will not be released until it is resealed to the new PCR 7.</p>
+
+<h2 id="F11-03-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>tpm_model.h</code>: PCRs, replay, quotes and sealing as a model.</p>
+<pre class="listing" data-src="F11-03/tpm_model.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">46</td><td><code>kPcrCount = 10</code></td><td>The model keeps PCRs 0–9.</td><td>Enough for the PCRs used (0, 1, 4, 7, 8); a real TPM has more.</td></tr>
+<tr><td class="n">49–54</td><td><code>struct Event</code></td><td>PCR, type, digest, description.</td><td>The event log's entry: the digest is what is extended, the description is for humans.</td></tr>
+<tr><td class="n">57–69</td><td><code>PcrBank</code></td><td>Registers start at zero; the only writer is <code>extend</code> (line 63).</td><td>No setter exists, just as in the TPM.</td></tr>
+<tr><td class="n">72–79</td><td><code>replay</code></td><td>Extends every logged digest into a fresh bank.</td><td>The verifier's half of check (c).</td></tr>
+<tr><td class="n">82–89</td><td><code>composite</code></td><td>SHA-256 over the selected PCR values in order.</td><td>What a quote signs and what a seal compares.</td></tr>
+<tr><td class="n">101–106</td><td><code>struct Quote</code></td><td>Nonce, selection, digest, signature.</td><td>The message of Figure 2's arrow 2.</td></tr>
+<tr><td class="n">110</td><td><code>EVP_EC_gen("P-256")</code></td><td>Each <code>Tpm</code> creates its own attestation key.</td><td>Only the public half is handed out (line 117).</td></tr>
+<tr><td class="n">119–136</td><td><code>quote</code></td><td>Signs nonce || composite with ECDSA and SHA-256.</td><td>Binds "these PCRs" to "this request".</td></tr>
+<tr><td class="n">139–155</td><td><code>seal</code>, <code>unseal</code></td><td>Stores the composite; releases the secret only if the current composite is equal.</td><td>The policy idea of sealing. The secret is kept in plain text: a real TPM encrypts it.</td></tr>
+<tr><td class="n">162–168</td><td><code>verify_signature</code></td><td>The verifier's check (a).</td><td>Uses only the public key.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>measured.cc</code>: a simulated firmware, a verifier, six scenarios and the forensic evidence.</p>
+<pre class="listing" data-src="F11-03/measured.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">29–50</td><td><code>boot</code></td><td>Measures firmware (PCR 0), Secure Boot state, db, dbx (PCR 7), boot order (PCR 1), separators, boot apps (PCR 4), kernel (PCR 8).</td><td>A simplified copy of the real log's structure; it records no authority events.</td></tr>
+<tr><td class="n">57–78</td><td><code>judge</code></td><td>Checks (a)–(d) of Figure 2 and prints each.</td><td>The output shows which check failed, not only the verdict.</td></tr>
+<tr><td class="n">71</td><td><code>e.type != "separator"</code></td><td>Separators are not looked up.</td><td>They carry no information about the platform.</td></tr>
+<tr><td class="n">98–108</td><td><code>make_verifier</code></td><td>Reference values from the healthy platform.</td><td>Everything else is "unknown".</td></tr>
+<tr><td class="n">124–126</td><td><code>seal</code> to PCR 7</td><td>The disk key of scenario 1.</td><td>Reused in scenario 5 (line 164).</td></tr>
+<tr><td class="n">142–146</td><td>the lying log</td><td>Replaces the bad events by good ones.</td><td>Scenario 3: caught by replay, not by reading.</td></tr>
+<tr><td class="n">152</td><td><code>judge(..., nonce4, q1, log)</code></td><td>The old quote against a new nonce.</td><td>Scenario 4: caught by the nonce.</td></tr>
+<tr><td class="n">163–173</td><td>rotation</td><td>Unseal refused, then reference values learned and resealed.</td><td>The operational cost of PCR 7 sealing.</td></tr>
+<tr><td class="n">185–206</td><td><code>forensic</code></td><td>Robot R-2207's boot with an extra program and boot entry.</td><td>The forensic lab's evidence.</td></tr>
+</tbody></table></div>
+<p><b>Build command</b> (from <code>run.sh</code>): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined measured.cc -lcrypto -o measured</code>.</p>
+<pre class="output" data-run="F11-03/measured"></pre>
+<pre class="output" data-run="F11-03/crosscheck"></pre>
+<p><b>Listing 3</b> — <code>evlog.cc</code>: a UEFI program that asks the firmware for its event log through the TCG2 protocol, prints it and replays it. It reuses F11-02's <code>efi.hpp</code> and <code>console.hpp</code> (the build adds <code>-I ../F11-02</code>).</p>
+<pre class="listing" data-src="F11-03/evlog.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">9–15</td><td><code>struct Tcg2</code>, GUID</td><td>The first two slots of the TCG2 protocol and its GUID.</td><td>Only GetEventLog is needed; from memory of D3 (see the box in Layer 2).</td></tr>
+<tr><td class="n">78–82</td><td><code>locate_protocol</code></td><td>Finds the protocol; exits with 0x11 if there is none.</td><td>Without a TPM device OVMF offers no TCG2 protocol.</td></tr>
+<tr><td class="n">85</td><td><code>get_event_log(..., kLogFormatTcg2, ...)</code></td><td>Asks for the crypto-agile log: address of the first and of the last entry.</td><td>"Last entry" is the start of the last event, not the end of the log.</td></tr>
+<tr><td class="n">93–107</td><td>header event</td><td>Reads the "Spec ID Event03" header and the list of digest algorithms and sizes.</td><td>The sizes are needed to step over digests of algorithms we do not use.</td></tr>
+<tr><td class="n">111–121</td><td>event walk</td><td>PCR, type, digest count, then each digest; keeps the SHA-256 one.</td><td>The log describes its own format; nothing is hard-coded except the header layout.</td></tr>
+<tr><td class="n">144</td><td>variable name</td><td>For variable events, prints the UTF-16 name as ASCII.</td><td>This is how "PK", "db" and "BootOrder" appear in the output.</td></tr>
+<tr><td class="n">146–151</td><td>replay</td><td>Extends every SHA-256 digest except EV_NO_ACTION events.</td><td>EV_NO_ACTION events are informational and are not extended (from memory of D1).</td></tr>
+</tbody></table></div>
+<p><b>Build commands</b> (from <code>run.sh</code>): <code>clang++ --target=x86_64-unknown-windows -std=c++20 -ffreestanding -fno-exceptions -fno-rtti -mno-red-zone -fno-stack-protector -O2 -Wall -Wextra -Wpedantic -Werror -I ../F11-02 -I . -c evlog.cc</code> and <code>lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /Brepro</code>. The run starts <code>mock_tpm.py</code> (Listing 4, unchanged in its code from F4-13, where it is explained) on a socket and gives QEMU <code>-chardev socket,… -tpmdev emulator,… -device tpm-tis,…</code>; the full command is in each run record.</p>
+<pre class="listing" data-src="F11-03/mock_tpm.py"></pre>
+<pre class="output" data-run="F11-03/fw_empty"></pre>
+<pre class="output" data-run="F11-03/fw_enrolled"></pre>
+<pre class="output" data-run="F11-03/fw_rotated"></pre>
+<p>The comparison step, an inline Python script in <code>run.sh</code>, puts the three runs side by side and checks the PCR 4 application event against <code>sign.py --hash</code> of each booted file:</p>
+<pre class="output" data-run="F11-03/pcr_compare"></pre>
+
+<h2 id="F11-03-breaks">Where the analogy breaks</h2>
+<ol>
+<li><b>The notary's tally contains no names.</b> The PCR value is a hash: from it alone nobody can read who passed. That is why the open visitors' book (the event log) exists, and why the book must be checked against the tally before it is read.</li>
+<li><b>The notary does not judge.</b> A castle notary might refuse to record a known thief; the TPM records everything it is given, good or bad, and leaves the judgement to the verifier.</li>
+<li><b>The notary only records what the guards report.</b> If the first guard (the root of trust for measurement) lies, the tally and the book agree perfectly and both are wrong.</li>
+</ol>
+
+<h2 id="F11-03-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Reading the log without replaying it.</b> Symptom: an edited log passes (scenario 3). Fix: replay first, compare with the quoted PCRs, only then read.</li>
+<li><b>Accepting a quote without a fresh nonce.</b> Symptom: an old, valid quote passes (scenario 4). Fix: a new random nonce per request, checked.</li>
+<li><b>Extending EV_NO_ACTION events in a replay.</b> Symptom: the replay of PCR 0 differs from the TPM. Fix: skip them (<code>evlog.cc</code> line 146).</li>
+<li><b>Stepping over digests with a fixed size.</b> Symptom: garbage after the first event on a firmware that logs several algorithms. Fix: take each algorithm's digest size from the header event, as lines 103–106 and 118 do.</li>
+<li><b>Sealing to PCR 7 and rotating keys.</b> Symptom: every machine asks for a recovery key after the rotation (scenario 5). Fix: reseal to the predicted new values before the reboot, or seal to a policy that names a signing authority instead of fixed values (a TPM feature not exercised here).</li>
+<li><b>Expecting PCR 4 to show the signer.</b> Symptom: two programs signed with different keys give the same PCR 4. Cause: Authenticode excludes the signature. Fix: the signer is in PCR 7's authority event.</li>
+</ul>
+
+<div class="co transition" id="F11-03-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F11-02, where Secure Boot refused programs and key updates, and F4-13, where a driver read a TPM's PCRs. <b>What carries over:</b> the same OVMF, the same keys and rotation, the same Authenticode hash, and F4-13's stand-in TPM.<sup class="src"><a href="#F11-03-src-R6">R6</a></sup> <b>What changes:</b> nothing is refused any more; the question moves from "may this run?" to "can I prove to someone else what ran?", and the answer depends on a verifier's reference values. <b>What comes next:</b> F11-04 takes the signed chain to microcontrollers, where there is no UEFI and no TPM, and a boot loader verifies firmware updates itself.</p></div>
+
+<h2 id="F11-03-check">Check yourself</h2>
+<ol>
+<li>What is the difference between Secure Boot refusing a program and measured boot recording it? Give one attack each one handles that the other does not.</li>
+<li>Why can't software that runs after a measurement change the PCR back to the value it would have had without it?</li>
+<li>In the firmware runs, PCRs 0–6 were the same in all three boots. Why, and what does that tell you about where key changes are recorded?</li>
+<li>Explain in your own words why the verifier must replay the log before reading it.</li>
+<li>Which check stops a machine from sending last week's quote, and why does a valid signature not help?</li>
+<li>Apply to a new case: a company seals disk keys to PCRs 0, 4 and 7 and plans to install a firmware update next month. Which sealed keys break, and what must the update process do first?</li>
+<li>Predict, then run: in <code>measured.cc</code>, swap the order of the db and dbx measurements in <code>boot</code> (lines 39–40). Which scenarios change their verdict, and why? Then run <code>run_lab.sh</code> and check.</li>
+<li>The PCR 4 application digest was identical for the unsigned and the signed copies of <code>evlog.efi</code>. Explain, and say where a verifier finds the signer.</li>
+<li>What exactly does the stand-in TPM of this lab not do, and which parts of the chapter therefore rest only on the model?</li>
+</ol>
+
+<h2 id="F11-03-lab">Lab</h2>
+<h3 id="F11-03-lab-goal">Goal</h3>
+<p>See a real firmware measure a boot, check its log against the TPM (the C13 acceptance idea), watch PCR 7 follow the key changes of F11-02, and use a TPM model for attestation and sealing.<sup class="src"><a href="#F11-03-src-S1">S1</a></sup></p>
+<h3 id="F11-03-lab-hw">Hardware and software needed</h3>
+<p>No hardware, no TPM. As printed in the run records: g++ 13.3.0 and OpenSSL 3.0.13; clang 18.1.3 and LLD 18.1.3; Python 3.13; QEMU 8.2.2; OVMF from the ovmf package 2024.02-2ubuntu0.10. The curriculum asks for swtpm; it is not installed in this build, so <code>mock_tpm.py</code> plays the TPM. The lab uses F11-02's folder (<code>mkvars.py</code>, <code>setvars.cc</code>, <code>sign.py</code>, <code>qemu_run.py</code>, the headers and <code>keys/</code>), so keep both folders side by side.</p>
+<h3 id="F11-03-lab-safety">Safety</h3>
+<div class="co safety"><span class="lbl">Safety</span><p>Do not clear, take ownership of or experiment with the TPM of a computer you depend on. Operating systems use it to seal disk-encryption keys; clearing it or changing what is measured can lock you out of your own disk unless you have the recovery key at hand. Everything in this lab runs in QEMU with a copied variable store and a stand-in TPM.</p></div>
+<h3 id="F11-03-lab-steps">Steps</h3>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F11-03</code> (about 25 seconds, including five QEMU boots).</li>
+<li>In <code>fw_enrolled.out</code>, extend PCR 4 by hand with Python's <code>hashlib</code>: start from 32 zero bytes and use the full digests of events 16, 21 and 25 (print them by changing <code>hex_bytes(con, sha, 8)</code> to 32 on line 140). Compare with d9d728c6….</li>
+<li>Compare the PCR 7 events of the three runs and account for every difference.</li>
+<li>In <code>measured.cc</code>, make the verifier skip check (c) and re-run: which scenario now says TRUSTED?</li>
+<li>Do Check yourself question 7.</li>
+</ol>
+<h3 id="F11-03-lab-expect">Expected observations</h3>
+<p><code>measured.out</code> as shown: TRUSTED only for scenario 1 and for scenario 5 after the update of the reference values; the sealed key refused after the rotation. <code>pcr_compare.out</code>: "yes, all eight" three times, only PCR 7 marked as different, three "equal" lines for PCR 4.<sup class="src"><a href="#F11-03-src-R1">R1</a></sup> <sup class="src"><a href="#F11-03-src-R6">R6</a></sup></p>
+<h3 id="F11-03-lab-verify">Verification</h3>
+<p><code>run.sh</code> exits 0 only if the model builds without warnings under the address and undefined-behaviour sanitizers and runs, Python's recomputation equals the model's PCRs, all five QEMU boots end with exit code 33 (the program wrote 0x10 to the debug-exit port), and the comparison script finds the replay equal to the TPM and the PCR 4 event equal to the Authenticode hash in all three runs.</p>
+<h3 id="F11-03-lab-trouble">Troubleshooting</h3>
+<ul>
+<li>"no TCG2 protocol" (exit 0x11) → QEMU was started without the TPM arguments, or the socket was not ready; <code>run.sh</code> waits for the socket before starting QEMU.</li>
+<li>QEMU stops at once with a TPM error → the mock was not listening; look at its log file in <code>.build/</code> (keep the folder by removing the last <code>rm -rf</code>).</li>
+<li>Replay differs in PCR 0 only → EV_NO_ACTION events were extended.</li>
+<li>The enrolled boots refuse <code>evlog</code> → F11-02's keys were regenerated; re-run F11-02 first so that its <code>keys/</code> folder exists.</li>
+</ul>
+<h3 id="F11-03-lab-ext">Extension</h3>
+<p>Write a Python verifier that reads <code>fw_rotated.out</code> and a JSON file of reference values (event type and digest per PCR), replays the log and prints TRUSTED or the list of unknown events. Feed it the <code>fw_enrolled</code> values as references and show that it flags exactly the db, dbx and authority events of the rotated run.</p>
+
+<h2 id="F11-03-forensic">Forensic lab</h2>
+<p><b>Scenario: "Attestation failed on one robot".</b> A fleet of delivery robots attests every morning to the depot's server before it is allowed to load parcels. Robot R-2207 has failed today; every other robot passed. The operator says the robot "was only in the workshop yesterday for a wheel change". You have the event log the robot sent with its quote, the server's report, and the PCR values of R-2207 next to the golden record of the robot model, all produced by the model of Listing 2.<sup class="src"><a href="#F11-03-src-R3">R3</a></sup></p>
+<pre class="output" data-run="F11-03/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Is the event log trustworthy? Which line of the evidence decides that, and why must it be decided first?</li>
+<li>What ran on R-2207 that does not run on a healthy robot, and in what order?</li>
+<li>Which PCRs differ from the golden record, and does each difference match an event in the log?</li>
+<li>PCR 7 is the same as on the golden record. What does that tell you, and what does it not tell you?</li>
+<li>Give two hypotheses for what happened in the workshop, the next evidence you would collect to decide between them, and what you would do with the robot today.</li>
+</ol>
+<p><b>Method hints.</b> Read the report's checks in the order of Figure 2. Then match every DIFFERENT row in evidence 3 to events in evidence 1, by PCR number.</p>
+
+<h2 id="F11-03-project">Mini-project</h2>
+<p>Extend <code>tpm_model.h</code> with an authority-based seal: instead of sealing to a fixed PCR 7 value, seal to "PCR 7 as produced by any db and dbx contents signed by this KEK", and show in a new scenario that a disk key survives a legitimate rotation but not a switch-off of Secure Boot. Rubric: the scenario output shows both cases (released / refused); the code explains in comments what the verifier of the policy must check; the build stays warning-free under the sanitizers; a paragraph compares your design with the "reseal before the reboot" procedure and names one risk of each.</p>
+
+<h2 id="F11-03-summary">Summary</h2>
+<ul>
+<li>Measured boot records; Secure Boot refuses. They answer different questions and are used together.</li>
+<li>A PCR can only be extended: new = SHA-256(old || digest). Order matters and nothing can be undone until the next reset.</li>
+<li>The event log is untrusted until a replay matches the TPM; in OVMF's real log, all eight PCRs replayed exactly (with a stand-in TPM).</li>
+<li>Key changes show up only in PCR 7; the PCR 4 digest of a program is its Authenticode hash and ignores who signed it.</li>
+<li>Attestation needs four checks: AK signature, fresh nonce, replay equals quote, every digest known. Each lab scenario fails a different one.</li>
+<li>Sealing to PCR 7 breaks at every key rotation unless the keys are resealed first; reference values must be updated before a planned change.</li>
+</ul>
+
+<h2 id="F11-03-sources">Sources</h2>
+<ol>
+<li id="F11-03-src-D1">D1 — Trusted Computing Group, "TCG PC Client Platform Firmware Profile Specification" (curriculum items 2.5 and 53: what is measured, PCR usage, event types, the event log format). Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F11-03-src-D2">D2 — Trusted Computing Group, "TPM 2.0 Library Specification", Part 1 (architecture: PCRs, extend, attestation, sealing) and Part 3 (commands such as PCR_Extend and Quote) (curriculum item 53, C13). Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F11-03-src-D3">D3 — Trusted Computing Group, "TCG EFI Protocol Specification" (EFI_TCG2_PROTOCOL, GetEventLog). Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F11-03-src-S1">S1 — Systems Curriculum (this project), section 2.5 "Security and hidden components" (measured boot), milestone C13 "TPM 2.0" (goal and acceptance quoted) and the TPM row of the hardware catalog. Opened in this build (local file); a map, not a source (AH-4).</li>
+<li id="F11-03-src-S2">S2 — Chapter F4-13 "TPM 2.0: measured boot you can check" (DR302) and its lab's <code>mock_tpm.py</code>, copied here with its header adapted. Opened in this build (local files).</li>
+<li id="F11-03-src-R1">R1 — Lab run <code>F11-03/measured.log</code>: g++ 13.3.0 with OpenSSL 3.0.13, sanitizers on, exit code 0; 2026-10-10; untested on hardware.</li>
+<li id="F11-03-src-R2">R2 — Lab run <code>F11-03/crosscheck.log</code>: Python hashlib recomputation of PCRs 0, 1, 4, 7 and 8, exit code 0.</li>
+<li id="F11-03-src-R3">R3 — Lab run <code>F11-03/forensic.log</code>: the evidence pack, exit code 0.</li>
+<li id="F11-03-src-R4">R4 — Lab run <code>F11-03/fw_empty.log</code>: QEMU 8.2.2 q35 with tpm-tis and mock_tpm.py, OVMF 2024.02-2ubuntu0.10 Secure Boot build, clang 18.1.3; exit code 33 (ran); untested on hardware.</li>
+<li id="F11-03-src-R5">R5 — Lab runs <code>F11-03/fw_enrolled.log</code> and <code>fw_rotated.log</code> (same set-up, F11-02's keys enrolled, then rotated; each exit code 33).</li>
+<li id="F11-03-src-R6">R6 — Lab run <code>F11-03/pcr_compare.log</code>: the comparison of the three firmware runs with the TPM's PCRs and with F11-02's <code>sign.py --hash</code>, exit code 0.</li>
+</ol>
+
+<h2 id="F11-03-glossary">Glossary links</h2>
+<p><a href="#gl-sealing-tpm">Sealing (TPM)</a> · <a href="#gl-nonce-freshness-value">Nonce</a> · <a href="#gl-attestation-key-ak">Attestation key (AK)</a> · <a href="#gl-reference-values-golden-measurements">Reference values</a> · <a href="#gl-tpm-trusted-platform-module">TPM</a> · <a href="#gl-pcr-platform-configuration-register">PCR</a> · <a href="#gl-extend-tpm">Extend</a> · <a href="#gl-event-log-tpm">Event log</a> · <a href="#gl-attestation-and-quote">Attestation and quote</a> · <a href="#gl-root-of-trust-for-measurement">Root of trust for measurement</a> · <a href="#gl-measured-boot">Measured boot</a> · <a href="#gl-chain-of-trust">Chain of trust</a> · <a href="#gl-authenticode">Authenticode</a></p>
+
+<h2 id="F11-03-next">Next chapter</h2>
+<p>Next: <a href="#F11-04">F11-04 Signed firmware updates</a>. Previous: <a href="#F11-02">F11-02</a>. Back to the course: <a href="#SS301">SS301</a>.</p>
+
+<h2 id="F11-03-answers">Answers to Check yourself</h2>
+<ol>
+<li>Secure Boot stops unsigned or revoked code from running, but tells nobody outside what ran. Measured boot lets a remote verifier detect, for example, that Secure Boot was switched off (scenario 2), which Secure Boot itself cannot report; Secure Boot stops a malicious loader before it runs, which measurement cannot.</li>
+<li>Extend is the only operation, and the new value is a hash of the old one with the digest. Reaching a chosen value would require finding a digest that hashes to it, which is breaking SHA-256; and the measurement happened before the measured code ran.</li>
+<li>The firmware, its configuration and the boot program were the same; only the Secure Boot variables and the authorising db entry changed, and those are measured into PCR 7.</li>
+<li>The log is ordinary memory that the operating system can edit; the PCRs cannot be edited. Only if replaying the log reproduces the quoted PCRs is the log the one that was measured (scenario 3 shows an edited log of good-looking entries).</li>
+<li>The nonce check. The signature proves the TPM made the quote, but not when; an old quote of a healthy boot has a valid signature.</li>
+<li>A firmware update changes PCR 0 (firmware code), so every key sealed to PCR 0 breaks; PCRs 4 and 7 may be unchanged. The process must reseal the keys to the predicted new PCR 0 value (or temporarily to a policy without PCR 0) before rebooting into the new firmware, and keep the recovery keys available.</li>
+<li>All PCR 7 values change, so the reference values (made by the same changed code) still match: scenario verdicts do not change. The PCR digest numbers printed in the scenarios do change. The order is part of the measurement; the verifier only notices if its references come from a different order.</li>
+<li>Authenticode's hash excludes the certificate table, so re-signing does not change it. The signer appears in PCR 7 as the EV_EFI_VARIABLE_AUTHORITY event (the db entry used), 28cea840… for db1 and 20f59096… for db2.</li>
+<li>It has no keys, quotes, sealing, sessions or authorisation, and its control protocol is unverified. Everything about quotes, the attestation key and sealing rests on the model in <code>tpm_model.h</code>; the PCR values, the event log and the PCR 7 behaviour rest on the real firmware runs.</li>
+</ol>
+<h3 id="F11-03-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Yes: the signature is valid, the nonce is the one sent, and "PCR digest in quote d5110031, from replaying the log d5110031 equal". That must come first because only a log that replays to the quoted PCRs can be believed.</li>
+<li>A "UEFI shell 2.2 from USB" ran first (event 9, PCR 4), then the normal loader (event 10) and the kernel. The boot configuration (event 4, PCR 1) put a USB entry, Boot0003, before the disk.</li>
+<li>PCR 1 (the boot order) and PCR 4 (the extra application); both match the two unknown components in the report. PCRs 0, 7 and 8 are the same.</li>
+<li>The firmware and the Secure Boot policy (state, db, dbx) are unchanged, so the shell ran with Secure Boot on and was accepted by the existing db: something signed with a trusted key. It does not tell you what the shell did while it ran (it could have changed files that are measured later, or not).</li>
+<li>Hypotheses: (a) a technician booted a diagnostic shell from USB during the wheel change and left the USB-first boot order; (b) someone used the workshop visit to run a tool that tampered with the robot. Evidence: the workshop's tool list and the shell image (is 2.2 a sanctioned tool? its hash against f2256eeb…), the robot's disk compared with a known-good image, the firmware setup logs. Today: keep it out of service, restore the boot order, re-image from a trusted source and attest again; then remove the shell's signer from db or put its hash in dbx, lock the firmware setup with a password, and add USB boot to the workshop checklist.</li>
+</ol>

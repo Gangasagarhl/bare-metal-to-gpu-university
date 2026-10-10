@@ -1,0 +1,316 @@
+<!--meta
+id: F11-02
+title: Secure Boot keys and databases
+course: SS301
+level: L3
+prereqs: F11-01; F3-16 (Secure Boot, Authenticode, sign.py); F3-10 (UEFI applications in C++); F3-15
+time: 8–12 hours including the lab
+hardware: none (clang 18.1.3 and lld-link for the UEFI programs; Python 3 with python3-cryptography 50.0.1 for keys, signed variable updates and Authenticode; QEMU 8.2.2 q35 with SMM and the distribution's Secure Boot OVMF build, ovmf package 2024.02-2ubuntu0.10); never on a real PC
+maps: Curriculum 2.5 (Secure Boot: PK, KEK, db, dbx; "enroll your own PK/KEK/db in OVMF and sign your loader … as an exercise"); course lab "Enroll your own keys in OVMF and sign your loader"; course forensic lab "Boot refused" (a firmware log shows a signature failure after a key rotation)
+analogy: F11 — a castle with gates and guards (registered: chain of trust = each gate guard checks the badge of the next person). Proposed in NOTES.md: the castle's owner (PK) appoints the stewards (KEK) who keep the guest list (db) and the banned list (dbx)
+-->
+
+<h2 id="F11-02-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>The castle's gate guard does not decide on his own who may enter. He works from two lists nailed to the gatehouse wall: the guest list of seal-makers whose seals he accepts, and the banned list, which wins over everything. The lists are kept by the stewards; a change is valid only if it carries a steward's seal, and the stewards themselves are appointed by the castle's owner. When the castle is brand new and has no owner yet, anybody may nail anything to the wall. On the day the owner's name goes up, that ends.</p>
+<p>One spring the stewards replace the old seal-maker, whose stamp may have been copied, with a new one: they add the new seal-maker to the guest list and put the old one on the banned list. The next morning the castle's own baker is turned away at the gate. Her pass still carries the old seal.</p>
+</div>
+<p>This chapter does all of that for real in the UEFI firmware OVMF: you create the four keys of a platform, enroll them with signed variable updates that you build byte by byte, sign your program, watch the firmware refuse a forged update and a replayed one, rotate the signing key, and then investigate the morning the baker was turned away.</p>
+
+<h2 id="F11-02-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the roles of PK, KEK, db and dbx, setup mode and user mode, and the order in which keys must be enrolled.</li>
+<li><b>Build</b> authenticated variable updates (a time stamp, a PKCS#7 signature and an EFI signature list) and enroll your own keys in OVMF with SetVariable.</li>
+<li><b>Sign</b> a UEFI program with your own db key and predict whether the firmware will run a program signed with any given key.</li>
+<li><b>Show</b> that the firmware refuses database updates signed with the wrong key and updates replayed with an old time stamp.</li>
+<li><b>Rotate</b> a signing key (add the new key to db, revoke the old one in dbx) and explain the order of steps that avoids refused boots.</li>
+<li><b>Diagnose</b> a "boot refused" incident from a firmware log, a key database listing and the program's signer.</li>
+</ul>
+
+<div class="co jargon" id="F11-02-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>EFI signature list (ESL)</dt><dd><b>Simple words:</b> the file format of the key lists: a header saying what kind of entries follow, then the entries. <b>Analogy:</b> one sheet on the gatehouse wall, headed "seal-makers" or "banned passes". <b>Precise:</b> EFI_SIGNATURE_LIST: a signature-type GUID (for example X.509 certificate or SHA-256 hash), the list size, a header size and the size of each entry, followed by entries of a 16-byte owner GUID and the signature data; PK, KEK, db and dbx each hold one or more such lists. <sup class="src"><a href="#F11-02-src-D1">D1</a></sup> <sup class="src"><a href="#F11-02-src-R3">R3</a></sup></dd>
+<dt>Authenticated variable</dt><dd><b>Simple words:</b> a firmware setting that can be changed only with a signed, dated request. <b>Analogy:</b> a change to the wall lists, accepted only with a steward's seal and a date later than the last change. <b>Precise:</b> a UEFI variable written with the time-based authenticated-write attribute; the data passed to SetVariable starts with an EFI_VARIABLE_AUTHENTICATION_2 descriptor (an EFI_TIME time stamp and a WIN_CERTIFICATE_UEFI_GUID holding a PKCS#7 signature) over the variable name, vendor GUID, attributes, time stamp and new content. <sup class="src"><a href="#F11-02-src-D1">D1</a></sup> <sup class="src"><a href="#F11-02-src-R4">R4</a></sup></dd>
+<dt>Key rotation</dt><dd><b>Simple words:</b> replacing a signing key with a new one without breaking the machines that trust the old one. <b>Analogy:</b> the stewards appoint a new seal-maker and, later, ban the old one. <b>Precise:</b> a sequence of authenticated updates (add the new certificate to db, re-sign every boot component with the new key, deploy them, then add the old certificate or the hashes it signed to dbx) whose order decides whether machines keep booting. <sup class="src"><a href="#F11-02-src-R6">R6</a></sup></dd>
+<dt>Revocation (dbx)</dt><dd><b>Simple words:</b> putting a key or a program on the "never run" list. <b>Analogy:</b> the banned list, which wins over the guest list. <b>Precise:</b> adding a certificate, or the hash of an image, to the forbidden signature database dbx; an image matching dbx is refused even if it also matches db (observed in this lab: db still held the old certificate). <sup class="src"><a href="#F11-02-src-D1">D1</a></sup> <sup class="src"><a href="#F11-02-src-R6">R6</a></sup></dd>
+<dt>Replay protection (monotonic time stamp)</dt><dd><b>Simple words:</b> an old, genuinely signed update cannot be sent again. <b>Analogy:</b> a steward's order dated last winter is not accepted after a spring order. <b>Precise:</b> for time-based authenticated variables the firmware requires the new time stamp to be later than the stored one (except for appends); a validly signed but older update is refused with EFI_SECURITY_VIOLATION (observed). <sup class="src"><a href="#F11-02-src-D1">D1</a></sup> <sup class="src"><a href="#F11-02-src-R5">R5</a></sup></dd>
+</dl></div>
+<p>From earlier chapters: <a href="#gl-secure-boot-pk-kek-db-dbx">Secure Boot (PK, KEK, db, dbx)</a>, <a href="#gl-authenticode">Authenticode</a> and <a href="#gl-shim">shim</a> (F3-16); <a href="#gl-chain-of-trust">chain of trust</a> and <a href="#gl-root-of-trust">root of trust</a> (F11-01).</p>
+
+<h2 id="F11-02-pictures">The idea in pictures</h2>
+<p>Figure 1 shows who signs what. Each arrow means "an update of the target must be signed by a key in the source". The two boxes at the bottom are the two refused updates of the lab.</p>
+<figure id="F11-02-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F11-02-f1t F11-02-f1d">
+<title id="F11-02-f1t">Who signs what in UEFI Secure Boot, with the lab's keys</title>
+<desc id="F11-02-f1d">Top row: PK (the lab's Platform Key, fingerprint a58d02bb) signs updates of PK itself and of KEK; KEK (the lab's Key Exchange Key, d5c5008a) signs updates of db and dbx. db holds the lab signing key 2026 (ed41f69f), later also the 2027 key (42265442); dbx is empty, later holds the 2026 key. Middle: the firmware's image check at load time: an image signed by a certificate in db runs unless it matches dbx. Bottom: two refused update paths observed in the lab: a db update signed with the db1 key instead of KEK gave Security Violation; the enrolment's db update sent again with its old time stamp gave Security Violation.</desc>
+<rect class="sv-b6" x="20" y="20" width="160" height="62"/><text class="sv-tb" x="30" y="42">PK</text><text class="sv-ts" x="30" y="60">platform owner</text><text class="sv-tm" x="30" y="76">a58d02bb…</text>
+<rect class="sv-b4" x="230" y="20" width="160" height="62"/><text class="sv-tb" x="240" y="42">KEK</text><text class="sv-ts" x="240" y="60">updates db, dbx</text><text class="sv-tm" x="240" y="76">d5c5008a…</text>
+<rect class="sv-b3" x="440" y="20" width="140" height="62"/><text class="sv-tb" x="450" y="42">db (allowed)</text><text class="sv-tm" x="450" y="60">ed41f69f… (2026)</text><text class="sv-tm" x="450" y="76">+42265442… (2027)</text>
+<rect class="sv-b8" x="600" y="20" width="140" height="62"/><text class="sv-tb" x="610" y="42">dbx (forbidden)</text><text class="sv-ts" x="610" y="60">empty, then</text><text class="sv-tm" x="610" y="76">ed41f69f… (2026)</text>
+<line class="sv-line" x1="180" y1="51" x2="222" y2="51"/><polygon class="sv-head" points="229,51 217,46 217,56"/>
+<line class="sv-line" x1="390" y1="51" x2="432" y2="51"/><polygon class="sv-head" points="439,51 427,46 427,56"/>
+<text class="sv-ts" x="186" y="100">signs</text><text class="sv-ts" x="396" y="100">signs db and dbx updates</text>
+<rect class="sv-b2" x="20" y="130" width="720" height="70"/><text class="sv-tb" x="30" y="152">firmware, when it loads a UEFI image (user mode, SecureBoot = 1)</text>
+<text class="sv-ts" x="30" y="172">signer certificate or image hash in dbx → refuse ("Access Denied")</text>
+<text class="sv-ts" x="30" y="190">otherwise signed by a certificate in db → run;  anything else → refuse</text>
+<line class="sv-dash" x1="510" y1="82" x2="510" y2="128"/><line class="sv-dash" x1="670" y1="82" x2="670" y2="128"/>
+<rect class="sv-box" x="20" y="230" width="350" height="80"/><text class="sv-tb" x="30" y="252">forged: db update signed by db1</text><text class="sv-ts" x="30" y="272">signer is not in KEK</text><text class="sv-ts" x="30" y="292">SetVariable → Security Violation</text>
+<rect class="sv-box" x="390" y="230" width="350" height="80"/><text class="sv-tb" x="400" y="252">replay: enrolment update resent</text><text class="sv-ts" x="400" y="272">valid KEK signature, old time stamp</text><text class="sv-ts" x="400" y="292">SetVariable → Security Violation</text>
+</svg></div><figcaption><b>Figure 1.</b> The key hierarchy with the lab's own certificates (fingerprints from <code>keys.out</code> and <code>sbinfo</code>, R1, R3). The order "dbx before db" in the image check is the observed outcome of the rotation step (R6), not a reading of the specification's text <sup class="src"><a href="#F11-02-src-D1">D1</a></sup>. Refusals: R5. Arrows are control (who may sign), not data flow.</figcaption></figure>
+<p>Figure 2 is the byte layout of one of the lab's updates: what <code>mkvars.py</code> puts together and what the firmware takes apart.</p>
+<figure id="F11-02-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 220" role="img" aria-labelledby="F11-02-f2t F11-02-f2d">
+<title id="F11-02-f2t">Layout of an authenticated update of db</title>
+<desc id="F11-02-f2d">A horizontal bar of the 2,004 bytes passed to SetVariable for db at enrolment: 16 bytes EFI_TIME time stamp; a WIN_CERTIFICATE_UEFI_GUID header of 24 bytes (length, revision, certificate type, the PKCS#7 type GUID); the PKCS#7 signature; then the 792-byte EFI signature list: a 28-byte header (type GUID X.509, list size, header size, entry size), a 16-byte owner GUID and the 748-byte DER certificate. Below, the bytes that the signature covers: the variable name in UTF-16, the vendor GUID, the 4-byte attributes, the time stamp and the signature list.</desc>
+<rect class="sv-b4" x="20" y="30" width="70" height="50"/><text class="sv-ts" x="26" y="52">EFI_TIME</text><text class="sv-ts" x="26" y="70">16</text>
+<rect class="sv-b6" x="90" y="30" width="120" height="50"/><text class="sv-ts" x="96" y="52">WIN_CERT hdr</text><text class="sv-ts" x="96" y="70">4+2+2+16 = 24</text>
+<rect class="sv-b8" x="210" y="30" width="200" height="50"/><text class="sv-ts" x="216" y="52">PKCS#7 SignedData</text><text class="sv-ts" x="216" y="70">2004 − 16 − 24 − 792</text>
+<rect class="sv-b3" x="410" y="30" width="100" height="50"/><text class="sv-ts" x="416" y="52">ESL header</text><text class="sv-ts" x="416" y="70">28</text>
+<rect class="sv-b3" x="510" y="30" width="70" height="50"/><text class="sv-ts" x="516" y="52">owner</text><text class="sv-ts" x="516" y="70">16</text>
+<rect class="sv-b3" x="580" y="30" width="160" height="50"/><text class="sv-ts" x="586" y="52">X.509 certificate</text><text class="sv-ts" x="586" y="70">748 (DER)</text>
+<line class="sv-line2" x1="410" y1="95" x2="740" y2="95"/><text class="sv-ts" x="410" y="112">the new value of db: 792 bytes (what sbinfo reads back)</text>
+<text class="sv-tb" x="20" y="150">signed by the PKCS#7 signature (not stored in this order):</text>
+<rect class="sv-box" x="20" y="165" width="120" height="36"/><text class="sv-ts" x="26" y="188">"db" in UTF-16</text>
+<rect class="sv-box" x="140" y="165" width="120" height="36"/><text class="sv-ts" x="146" y="188">vendor GUID</text>
+<rect class="sv-box" x="260" y="165" width="120" height="36"/><text class="sv-ts" x="266" y="188">attributes 0x27</text>
+<rect class="sv-box" x="380" y="165" width="120" height="36"/><text class="sv-ts" x="386" y="188">EFI_TIME</text>
+<rect class="sv-box" x="500" y="165" width="240" height="36"/><text class="sv-ts" x="506" y="188">the signature list (792)</text>
+</svg></div><figcaption><b>Figure 2.</b> One update, to scale only in its labels (widths are not proportional). Sizes 2,004 and 792 are from the run (R2, R3); the field layout is how <code>mkvars.py</code> builds it, written from memory of D1 and accepted by the firmware <sup class="src"><a href="#F11-02-src-D1">D1</a></sup> <sup class="src"><a href="#F11-02-src-R2">R2</a></sup>.</figcaption></figure>
+
+<h2 id="F11-02-layer1">Layer 1 — the kid explanation</h2>
+<p>The firmware keeps lists of who is allowed to sign programs. A program signed by someone on the list may start; anything else is turned away. The lists can be changed only by a note signed by a higher-up, and the notes must carry a newer date than the last one, so an old note cannot be used twice. When a signer is replaced, every program signed by the old signer must be signed again, or it will be turned away.</p>
+
+<h2 id="F11-02-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F11-02-l2-four">Four variables, three levels of authority</h3>
+<p>Secure Boot's state lives in four non-volatile firmware variables. The <b>Platform Key</b> (PK) identifies the platform owner and authorizes changes to PK and KEK; the <b>Key Exchange Keys</b> (KEK) authorize changes to db and dbx; <b>db</b> lists the certificates and image hashes that may run; <b>dbx</b> lists forbidden ones.<sup class="src"><a href="#F11-02-src-S1">S1</a></sup> <sup class="src"><a href="#F11-02-src-D1">D1</a></sup> F3-16 read these variables on firmware stores prepared by the distribution. Here you create them. Your four keys (<code>keys.out</code>)<sup class="src"><a href="#F11-02-src-R1">R1</a></sup> are RSA-2048 key pairs with self-signed X.509 certificates named "SS301 lab Platform Key", "SS301 lab Key Exchange Key", "SS301 lab signing key 2026" (db1) and "SS301 lab signing key 2027" (db2).</p>
+<p>A platform without a PK is in <b>setup mode</b>: no images are verified, and the key variables can be written.<sup class="src"><a href="#F11-02-src-D1">D1</a></sup> The empty OVMF store started that way: <code>sbinfo</code> reported SecureBoot = 0, SetupMode = 1 and all four databases empty, and it ran unsigned.<sup class="src"><a href="#F11-02-src-R2">R2</a></sup> Writing PK ends setup mode. The order therefore matters: <code>setvars</code> wrote db first, then KEK, then PK, and the run shows the switch: SetupMode went from 1 to 0 and SecureBoot from 0 to 1 within the same program, without a reboot.<sup class="src"><a href="#F11-02-src-R2">R2</a></sup></p>
+<h3 id="F11-02-l2-update">What a signed update contains</h3>
+<p>Each update is the 16-byte time stamp, a signature header and a PKCS#7 signature, followed by the new value of the variable: an EFI signature list holding one certificate (Figure 2). The signature covers the variable's name, its vendor GUID, the attribute bits, the time stamp and the new value; so an update for db cannot be replayed as an update for dbx, and a change of one attribute bit breaks it.<sup class="src"><a href="#F11-02-src-D1">D1</a></sup> <sup class="src"><a href="#F11-02-src-D2">D2</a></sup> The attribute value 0x27 combines non-volatile (0x01), boot-service access (0x02), runtime access (0x04) and time-based authenticated write (0x20); appends add 0x40, which is why the rotation's updates carry 0x67.<sup class="src"><a href="#F11-02-src-D1">D1</a></sup> <sup class="src"><a href="#F11-02-src-R6">R6</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Written from memory of D1 and not opened: every GUID in <code>mkvars.py</code> and <code>efi.hpp</code> (global variable, image security database, X.509, SHA-256, PKCS#7), the attribute bit values, the EFI_TIME and WIN_CERTIFICATE_UEFI_GUID layouts, the list of bytes the signature covers, and the rule that the firmware checks the PK update against the certificate inside it. The firmware's behaviour is the evidence that OVMF agrees with our encoding: it accepted all three enrolment updates and the rotation, and refused the forged and replayed ones. It does not prove that every detail matches the specification, nor that other firmware accepts the same bytes. Whether OVMF's build of the PKCS#7 verifier requires our options (detached, no signed attributes) or only accepts them was not tested.</p></div>
+<h3 id="F11-02-l2-sign">Signing your program</h3>
+<p>The program is signed exactly as in F3-16 (Authenticode, PKCS#7 in the PE certificate table), with <code>sign.py</code> copied from that lab and given your db1 key. After enrolment the unsigned <code>sbinfo</code> was refused ("Access Denied"), the db1-signed one ran and listed the databases, and a copy signed with the distribution's test key, a valid signature from a key that is not in your db, was refused.<sup class="src"><a href="#F11-02-src-R2">R2</a></sup> <sup class="src"><a href="#F11-02-src-R3">R3</a></sup> A signature proves only who signed; db decides whether that signer counts.</p>
+
+<h2 id="F11-02-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F11-02-l3-walk">The lab as one story of one machine</h3>
+<p>All runs share one variable store (a copy of the empty <code>OVMF_VARS_4M.fd</code>), so the steps form a history. Each row is one QEMU boot:</p>
+<div class="tw"><table>
+<thead><tr><th>Step</th><th>Program booted (signer)</th><th>Firmware said</th><th>State afterwards</th></tr></thead>
+<tbody>
+<tr><td class="n">sb_setup</td><td>sbinfo (unsigned)</td><td>ran</td><td>setup mode, all empty</td></tr>
+<tr><td class="n">enroll</td><td>setvars (unsigned)</td><td>ran; db, KEK, PK → Success</td><td>user mode, SecureBoot = 1</td></tr>
+<tr><td class="n">sb_unsigned</td><td>sbinfo (unsigned)</td><td>Access Denied</td><td>unchanged</td></tr>
+<tr><td class="n">sb_db1</td><td>sbinfo (db1)</td><td>ran; PK 784 B, KEK 792 B, db 792 B, dbx empty</td><td>unchanged</td></tr>
+<tr><td class="n">sb_snakeoil</td><td>sbinfo (distribution test key)</td><td>Access Denied</td><td>unchanged</td></tr>
+<tr><td class="n">forged</td><td>setvars (db1)</td><td>ran; db update signed by db1 → Security Violation</td><td>unchanged</td></tr>
+<tr><td class="n">replay</td><td>setvars (db1)</td><td>ran; old enrolment update → Security Violation</td><td>unchanged</td></tr>
+<tr><td class="n">rotate</td><td>setvars (db1)</td><td>ran; db append db2, dbx append db1 → Success</td><td>db = {db1, db2}, dbx = {db1}</td></tr>
+<tr><td class="n">forensic_boot</td><td>sbinfo (db1)</td><td>Access Denied</td><td>unchanged</td></tr>
+<tr><td class="n">sb_db2</td><td>sbinfo (db2)</td><td>ran; db 1,584 B, dbx 792 B</td><td>unchanged</td></tr>
+</tbody></table></div>
+<p>Sources for the rows: R2 to R6. Three observations deserve a second look.</p>
+<p><b>The forged update ran as a program but failed as an update.</b> The program <code>setvars</code> itself was signed with db1, a key in db, so the firmware ran it. It then asked the firmware to append to db with an update signed by db1. That key may sign programs, not database updates; only KEK may. The answer was EFI_SECURITY_VIOLATION.<sup class="src"><a href="#F11-02-src-R5">R5</a></sup> This separation is the point of the hierarchy: a compromised program-signing key cannot add more program-signing keys.</p>
+<p><b>The replay was a perfectly signed update.</b> It was byte for byte the db update that the enrolment had applied successfully, KEK signature and all. The firmware refused it because its time stamp (2026-01-01) was not later than the one stored with db.<sup class="src"><a href="#F11-02-src-R5">R5</a></sup> <sup class="src"><a href="#F11-02-src-D1">D1</a></sup> Without this rule, an attacker who once captured an old db update could restore an old db, re-enabling keys that were since removed. In our run the replay came before the rotation; the same refusal after a rotation is what protects the rotation.</p>
+<p><b>dbx won over db.</b> After the rotation, db still contained the db1 certificate (the listing shows both certificates), and dbx contained the same certificate. The db1-signed program was refused.<sup class="src"><a href="#F11-02-src-R6">R6</a></sup> Revocation therefore does not require removing anything from db, which would need the full db to be re-sent; appending to dbx is enough.</p>
+<h3 id="F11-02-l3-rotation">Rotation as a procedure</h3>
+<p>The lab rotated in one step and then booted a program nobody had re-signed: the forensic case. A safe rotation is ordered so that no machine ever holds a dbx entry for a key that still signs something it boots:</p>
+<ol>
+<li>Create the new key; protect it as the old one was (offline, ideally in a hardware security module).</li>
+<li>Append the new certificate to db (signed by KEK) on every machine. Both keys now work.</li>
+<li>Re-sign every boot component (loader, kernel or second-stage loader, option ROMs if your platform verifies them, recovery tools) with the new key and deploy them. Verify on a test machine with the old key already in dbx.</li>
+<li>Only when the fleet reports that nothing signed with the old key is still installed, append the old certificate (or the hashes of specific vulnerable images) to dbx.</li>
+<li>Keep the recovery path working: a recovery medium signed with the new key, and a documented way to reach setup mode with physical presence.</li>
+</ol>
+<p>On PCs with Microsoft's certificates in db, a distribution boots through shim (F3-16), and revocation of vulnerable boot loaders happens through dbx updates published for the whole ecosystem; the curriculum names that structure.<sup class="src"><a href="#F11-02-src-S1">S1</a></sup> The order of steps above is the same; the difference is that many parties sign, and the dbx update reaches machines whose loaders were signed by someone else.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>How PC vendors and operating systems deliver db and dbx updates in practice, which certificates retail PCs carry in KEK and db, and how shim's own revocation mechanisms work are described here only in outline from the curriculum (S1); none of it was observed in this build. Read the UEFI Specification's Secure Boot chapter and the shim project's documentation before planning a real rotation.<sup class="src"><a href="#F11-02-src-D1">D1</a></sup> <sup class="src"><a href="#F11-02-src-D3">D3</a></sup></p></div>
+<h3 id="F11-02-l3-owner">Who owns the PK</h3>
+<p>On a retail PC the PK belongs to the manufacturer; the KEK and db contain the manufacturer's and Microsoft's certificates.<sup class="src"><a href="#F11-02-src-S1">S1</a></sup> Taking ownership, as this lab did on an empty store, means clearing the keys to reach setup mode (through the firmware's setup screen, with physical presence), then enrolling your own. A machine you own fully is the right target for this; a machine whose operating system was installed under the vendor's keys will refuse that operating system afterwards unless you also enroll the certificates it needs (see the Safety box of the lab).</p>
+
+<h2 id="F11-02-hardware">How the hardware actually does it</h2>
+<p>Secure Boot is firmware logic, not processor logic: the image loader calls a verification routine, and SetVariable calls an authentication routine before writing to flash. Its strength rests on the variable store being writable only through that routine. On PCs the store is in SPI flash that only System Management Mode code may write; that is why the Secure Boot build of OVMF requires QEMU's <code>smm=on</code> and a secure flash device, as every run's command line shows.<sup class="src"><a href="#F11-02-src-R2">R2</a></sup> <sup class="src"><a href="#F11-02-src-S1">S1</a></sup> If the flash were writable from the operating system, an attacker would not bother forging a KEK signature: they would write db directly. The firmware itself is protected by an earlier root of trust (F11-01).</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Untested on hardware: every run used QEMU 8.2.2 with the ovmf package 2024.02-2ubuntu0.10 Secure Boot build. The SMM-protection explanation is from the curriculum and memory, not from a PC's documentation; on a real PC, check the platform's firmware documentation for how its variable store is protected and how setup mode is entered.</p></div>
+
+<h2 id="F11-02-worked">Worked example</h2>
+<p><b>Problem.</b> (a) <code>sbinfo</code> reported PK as 784 bytes holding one certificate of 740 bytes, and KEK as 792 bytes with a 748-byte certificate. Account for the bytes. (b) The enrolment update of db was 2,004 bytes. How long is its PKCS#7 signature? (c) After the rotation, db is 1,584 bytes. Is that one list with two entries or two lists? (d) Which time stamp must the next KEK-signed replacement of db carry?</p>
+<p><b>Solution.</b> (a) One signature list: a 28-byte header plus one entry of a 16-byte owner GUID and the certificate: 28 + 16 + 740 = 784; 28 + 16 + 748 = 792.<sup class="src"><a href="#F11-02-src-R3">R3</a></sup> (b) 2,004 − 16 (EFI_TIME) − 24 (WIN_CERTIFICATE_UEFI_GUID header) − 792 (the list) = 1,172 bytes, if the layout of Figure 2 is right; the firmware's acceptance is consistent with it.<sup class="src"><a href="#F11-02-src-R2">R2</a></sup> (c) 1,584 = 2 × 792: two complete lists, each with its own 28-byte header. The append added a second list rather than merging the entry into the first; <code>sbinfo</code> walks lists, so it showed both.<sup class="src"><a href="#F11-02-src-R6">R6</a></sup> (d) A time stamp later than the one stored with db. The enrolment used 2026-01-01, the rotation's append 2026-06-01; whether an append updates the stored time stamp was not tested, so a careful tool uses a time stamp later than every update ever sent.</p>
+
+<h2 id="F11-02-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>sign.py</code>: Authenticode signing, copied from F3-16 (where every line is explained), with two additions: "-" for an unencrypted key (line 149) and <code>--signer</code> (lines 131–141), which reads the certificate out of a signed file. Its run on the db1-signed program:</p>
+<pre class="output" data-run="F11-02/sign_db1"></pre>
+<p><b>Listing 2</b> — <code>mkvars.py</code>: the keys and the signed updates.</p>
+<pre class="listing" data-src="F11-02/mkvars.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">42–43</td><td><code>guid_bytes</code></td><td>GUIDs in EFI byte order: first three fields little-endian.</td><td>A GUID written in the wrong order is a different GUID; the firmware would not recognise db.</td></tr>
+<tr><td class="n">46–59</td><td><code>make_key</code></td><td>RSA-2048 key and self-signed certificate, fixed validity from 2026-01-01.</td><td>Made once and kept in <code>keys/</code>, so fingerprints in this chapter stay valid.</td></tr>
+<tr><td class="n">68–72</td><td><code>esl_x509</code></td><td>One signature list: type GUID, list size, header size 0, entry size, owner GUID + certificate.</td><td>The format the firmware stores and <code>sbinfo</code> walks.</td></tr>
+<tr><td class="n">75–77</td><td><code>efi_time</code></td><td>The 16-byte EFI_TIME with only date fields set.</td><td>The replay rule compares these.</td></tr>
+<tr><td class="n">80–89</td><td><code>auth2</code></td><td>Signs name + GUID + attributes + time + data (detached PKCS#7, SHA-256, no signed attributes); prepends time and the WIN_CERTIFICATE header.</td><td>The whole of "authenticated variable" in ten lines.</td></tr>
+<tr><td class="n">92–106</td><td><code>emit</code></td><td>Writes the updates as C++ arrays for <code>setvars.cc</code>.</td><td>No file access is needed in the UEFI program.</td></tr>
+<tr><td class="n">118–122</td><td><code>enroll</code></td><td>db (signed by KEK), KEK (signed by PK), PK (signed by PK), in that order.</td><td>PK last: writing it ends setup mode.</td></tr>
+<tr><td class="n">123–128</td><td><code>rotate</code></td><td>Appends db2 to db and db1 to dbx, both signed by KEK.</td><td>The one-step rotation that causes the forensic case.</td></tr>
+<tr><td class="n">129–136</td><td><code>replay</code>, <code>forged</code></td><td>The old update again; an update signed by the wrong key.</td><td>The two attacks the firmware refused.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F11-02/keys"></pre>
+<p><b>Listing 3</b> — <code>setvars.cc</code>: a UEFI program that applies the updates with SetVariable. (<code>efi.hpp</code> and <code>console.hpp</code> are F3-10's files, with SetVariable, more status codes and the db GUIDs added.)</p>
+<pre class="listing" data-src="F11-02/setvars.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">10–18</td><td><code>struct Update</code>, <code>#include "updates.inc"</code></td><td>The generated table of name, GUID, attributes and bytes.</td><td>The same program is rebuilt for each step with a different table.</td></tr>
+<tr><td class="n">20–30</td><td><code>status_text</code></td><td>Names the status codes the lab meets.</td><td>"Security Violation" in the output is the firmware's answer, decoded.</td></tr>
+<tr><td class="n">67–68, 82–83</td><td><code>show_flag</code></td><td>SetupMode and SecureBoot before and after.</td><td>Shows the switch to user mode inside one run.</td></tr>
+<tr><td class="n">69–80</td><td><code>set_variable</code> loop</td><td>Applies each update and prints the answer.</td><td>The firmware, not our code, decides; we only report.</td></tr>
+</tbody></table></div>
+<p><b>Build commands</b> (as in <code>run.sh</code>): <code>clang++ --target=x86_64-unknown-windows -std=c++20 -ffreestanding -fno-exceptions -fno-rtti -mno-red-zone -fno-stack-protector -O2 -Wall -Wextra -Wpedantic -Werror -I . -c setvars.cc</code>, then <code>lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /Brepro /out:enroll.efi setvars.o</code>.</p>
+<pre class="output" data-run="F11-02/enroll"></pre>
+<p><b>Listing 4</b> — <code>sbinfo.cc</code>: the state and a listing of the four databases, with each certificate's SHA-256 fingerprint.</p>
+<pre class="listing" data-src="F11-02/sbinfo.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">46–56</td><td><code>list_db</code>, <code>get_variable</code></td><td>Reads a whole variable into a 16 KiB buffer.</td><td>"empty (not present)" is how a missing dbx looks.</td></tr>
+<tr><td class="n">61–72</td><td>list walk</td><td>Reads type, list size, header size, entry size; stops on inconsistent sizes.</td><td>The firmware's data is checked before use, even here.</td></tr>
+<tr><td class="n">73–82</td><td>X.509 entry</td><td>SHA-256 of the certificate's DER bytes, first 8 bytes printed.</td><td>The same value <code>openssl x509 -fingerprint -sha256</code> prints: the listing can be matched with <code>keys.out</code>.</td></tr>
+<tr><td class="n">104–107</td><td>four calls</td><td>PK and KEK under the global GUID, db and dbx under the image-database GUID.</td><td>A variable is named by name and GUID together.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F11-02/sb_setup"></pre>
+<pre class="output" data-run="F11-02/sb_unsigned"></pre>
+<pre class="output" data-run="F11-02/sb_db1"></pre>
+<pre class="output" data-run="F11-02/sb_snakeoil"></pre>
+<pre class="output" data-run="F11-02/forged"></pre>
+<pre class="output" data-run="F11-02/replay"></pre>
+<pre class="output" data-run="F11-02/rotate"></pre>
+
+<h2 id="F11-02-breaks">Where the analogy breaks</h2>
+<ol>
+<li><b>The stewards' seal is not a face.</b> Anyone who copies the KEK private key is, for the firmware, a steward. Castle guards could recognise a stranger; the firmware recognises only mathematics.</li>
+<li><b>The banned list in a castle names people; dbx can name a single pass.</b> dbx may hold the hash of one specific image, revoking that program while its signer stays trusted, which a list of people cannot express.</li>
+<li><b>A new castle without an owner is rare; a PC in setup mode is a normal, reachable state.</b> Clearing the keys from the setup screen returns the platform to "anybody may nail anything to the wall". Physical access to the machine is part of the trust model.</li>
+</ol>
+
+<h2 id="F11-02-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Enrolling PK first.</b> Symptom: the db and KEK updates that follow fail with Security Violation (they are now checked). Cause: PK ends setup mode. Fix: db and KEK first, PK last, or sign every update properly so the order does not matter.</li>
+<li><b>Re-sending an update with the same time stamp.</b> Symptom: Security Violation for a correctly signed update (the replay step). Fix: a new, later time stamp for every non-append update.</li>
+<li><b>Signing a db update with a db key.</b> Symptom: Security Violation (the forged step). Fix: db and dbx updates are signed with a KEK.</li>
+<li><b>Revoking before re-signing.</b> Symptom: "Access Denied" for your own loader after a rotation (forensic lab). Find it: <code>sign.py --signer</code> on the refused file, <code>sbinfo</code> listing of dbx. Fix: follow the order of Layer 3.</li>
+<li><b>The plain OVMF build or no SMM.</b> Symptom: nothing is enforced, or the firmware does not start. Fix: the <code>secboot</code> build with <code>smm=on</code> and secure flash.</li>
+<li><b>Losing the PK or KEK private key.</b> Symptom: no further database updates are possible. Fix: keys backed up offline before enrolment; a recovery plan that uses physical presence.</li>
+</ul>
+
+<div class="co transition" id="F11-02-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F11-01 (the chain-of-trust model) and F3-16 (reading Secure Boot state and signing with a key the distribution had enrolled). <b>What carries over:</b> the Authenticode signer, the UEFI programs in C++, the QEMU set-up with SMM, and the rule that only a run decides.<sup class="src"><a href="#F11-02-src-R2">R2</a></sup> <b>What changes:</b> you own the keys now, so you also own the mistakes: the order of enrolment, time stamps, which key signs what, and rotation; the firmware's refusals are now your tests. <b>What comes next:</b> F11-03 leaves enforcement for measurement: the same db and dbx you changed here end up as values in a TPM register, and a remote verifier notices the change.</p></div>
+
+<h2 id="F11-02-check">Check yourself</h2>
+<ol>
+<li>Which key may authorize an update of db? Of KEK? Of PK?</li>
+<li>Why did <code>setvars</code> run in the "forged" step although its update was refused?</li>
+<li>Which of these does the update's signature cover? (a) the variable name (b) the vendor GUID (c) the attributes (d) the time stamp (e) the new value. Explain the danger of leaving out (a).</li>
+<li>After the rotation, db still contained the db1 certificate. Why was the db1-signed program refused?</li>
+<li>Explain in your own words why the replayed update was refused although its signature was valid.</li>
+<li>Apply to a new case: your company signs its loader with key L, which is in db on 5,000 machines. L's private key may have leaked. Write the sequence of updates and deployments, and say what each machine must have before the dbx update arrives.</li>
+<li>Predict, then run: in <code>mkvars.py</code>, make the rotation replace db (no APPEND bit, a new time stamp) with only db2, and do not touch dbx. What does <code>sb_db2</code> list, and is the db1-signed program refused?</li>
+<li>Why must the variable store be writable only through the firmware's authenticated path?</li>
+</ol>
+
+<h2 id="F11-02-lab">Lab</h2>
+<h3 id="F11-02-lab-goal">Goal</h3>
+<p>The course lab and the curriculum exercise: "enroll your own PK/KEK/db in OVMF and sign your loader".<sup class="src"><a href="#F11-02-src-S1">S1</a></sup> Then rotate the signing key and see what breaks.</p>
+<h3 id="F11-02-lab-hw">Hardware and software needed</h3>
+<p>No hardware. As printed in the run records: Ubuntu clang 18.1.3 and LLD 18.1.3; Python 3.13 with python3-cryptography 50.0.1; OpenSSL 3.0.13 (fingerprints only); QEMU 8.2.2; OVMF from the ovmf package 2024.02-2ubuntu0.10 (<code>OVMF_CODE_4M.secboot.fd</code> with a copy of the empty <code>OVMF_VARS_4M.fd</code>). The curriculum names sbsigntools as the usual signing tool; it is not installed in this build, so <code>sign.py</code> takes its place.</p>
+<h3 id="F11-02-lab-safety">Safety</h3>
+<div class="co safety"><span class="lbl">Safety</span><p>Do this lab only in QEMU with a copy of the variable store. Never enroll keys, clear keys or update dbx on a computer you depend on: a mistake leaves a machine that refuses its own operating system, and on some machines the firmware also verifies the graphics card's option ROM against db, so removing the vendor's certificates can leave no display at all. The keys in <code>keys/</code> are public test material (their private halves are in the repository): never enroll them on a real machine.</p></div>
+<h3 id="F11-02-lab-steps">Steps</h3>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F11-02</code> (about 40 seconds: ten QEMU boots). Every step's output is shown in this chapter.</li>
+<li>Match each certificate fingerprint in <code>sb_db1.out</code> with <code>keys.out</code>. Which certificate is PK?</li>
+<li>Before reading <code>forged.out</code> and <code>replay.out</code>, predict the SetVariable result of each.</li>
+<li>Do Check yourself question 7: change the rotation, re-run, compare <code>sb_db2.out</code>.</li>
+<li>Add a step that appends the SHA-256 Authenticode hash of one specific program to dbx (a list of type SHA-256; <code>sign.py --hash</code> gives the hash) and show that only that program is refused while others signed with the same key still run.</li>
+</ol>
+<h3 id="F11-02-lab-expect">Expected observations</h3>
+<p>The ten rows of the Layer 3 table: setup mode first; Success ×3 and SecureBoot = 1 at enrolment; Access Denied for the unsigned and the distribution-key copies; Security Violation for the forged and replayed updates; Success ×2 for the rotation; Access Denied for the db1-signed program afterwards; the db2-signed program lists two certificates in db and one in dbx (R2–R6).</p>
+<h3 id="F11-02-lab-verify">Verification</h3>
+<p><code>run.sh</code> exits 0 only if every boot ended as expected (exit code 33 for "ran", 124 for "refused"), the enrolment printed SecureBoot = 1, the forged and replayed updates printed Security Violation, the rotation printed two Successes, and the final listing shows a 792-byte dbx.</p>
+<h3 id="F11-02-lab-trouble">Troubleshooting</h3>
+<ul>
+<li>Every signed program is refused after enrolment → the db certificate is not the one you signed with: compare <code>sign.py --signer</code> with the <code>sbinfo</code> listing (boot an unsigned <code>sbinfo</code> on a fresh store copy to read it).</li>
+<li>Enrolment returns Security Violation for PK → the PK update must be signed by the PK key itself; check which key <code>auth2</code> received.</li>
+<li>The firmware never starts → the Secure Boot code image needs <code>smm=on</code> and <code>-global driver=cfi.pflash01,property=secure,value=on</code>.</li>
+<li>Results differ between runs → you are not starting from a fresh copy of the store; <code>run.sh</code> copies it at the start.</li>
+</ul>
+<h3 id="F11-02-lab-ext">Extension</h3>
+<p>Write the rotation as the five-step procedure of Layer 3, as five <code>run.sh</code> steps with a boot after each, and prove that no step ever refuses a program the fleet still uses.</p>
+
+<h2 id="F11-02-forensic">Forensic lab</h2>
+<p><b>Scenario: "Boot refused".</b> On Monday the lab's test machine boots its diagnostic tool from <code>\EFI\BOOT\BOOTX64.EFI</code> as every day. On Tuesday the screen shows the lines below and stops. Over the weekend the security team ran their key rotation. Lindiwe, who maintains the tool, says she "didn't change anything". A technician boots a freshly signed copy of the tool from a USB stick to list the key databases, and runs <code>sign.py --signer</code> on the file from the disk.</p>
+<p><b>Evidence 1</b> — the firmware's log on Tuesday morning:</p>
+<pre class="output" data-run="F11-02/forensic_boot"></pre>
+<p><b>Evidence 2</b> — the key database listing from the technician's tool:</p>
+<pre class="output" data-run="F11-02/sb_db2"></pre>
+<p><b>Evidence 3</b> — who signed the file on the disk:</p>
+<pre class="output" data-run="F11-02/forensic_signer"></pre>
+<p><b>Evidence 4</b> — the security team's key list: <code>keys.out</code> in the code walk-through.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>What exactly did the firmware refuse, and with which status?</li>
+<li>Which certificate signed the refused file? Find it in db and in dbx.</li>
+<li>State two hypotheses for the refusal and the evidence that decides between them.</li>
+<li>Why is "I didn't change anything" both true and the cause?</li>
+<li>Give the fix for Lindiwe's machine today and the process change that prevents the next occurrence.</li>
+</ol>
+<p><b>Method hints.</b> Match fingerprints across all four evidence items by their first eight hex digits. Ask what the firmware checks first. Then compare the order of the team's steps with the order in Layer 3.</p>
+
+<h2 id="F11-02-project">Mini-project</h2>
+<p>Write <code>keyctl.py</code>, a small key-management tool for the lab: <code>status</code> (boots <code>sbinfo</code> and prints the databases with the key names from <code>keys/</code> instead of fingerprints), <code>add-db NAME</code>, <code>revoke NAME</code> (refuses if any file in a given folder is signed by that key and not re-signed), <code>rotate OLD NEW FOLDER</code> (the safe five-step order, with a boot test after each step). Rubric: <code>status</code> names every certificate correctly (1); <code>revoke</code> refuses the unsafe case of the forensic lab (2); every update uses a strictly increasing time stamp, shown by a test that tries the same operation twice (1); a short README section on what the tool cannot protect against (stolen KEK, physical access) (1).</p>
+
+<h2 id="F11-02-summary">Summary</h2>
+<ul>
+<li>PK authorizes PK and KEK; KEK authorizes db and dbx; db allows signers or hashes; dbx forbids them and wins over db.</li>
+<li>Setup mode accepts key writes; writing PK switches to user mode and Secure Boot on at once (observed).</li>
+<li>An update is a time stamp, a PKCS#7 signature over name, GUID, attributes, time stamp and data, and an EFI signature list.</li>
+<li>The firmware refused an update signed by a program-signing key, and a validly signed update with an old time stamp.</li>
+<li>Key rotation is an order of operations: add, re-sign, deploy, then revoke. Revoking first produces "Boot refused".</li>
+<li>Everything ran in QEMU with OVMF; nothing was tried on a real PC.</li>
+</ul>
+
+<h2 id="F11-02-sources">Sources</h2>
+<ol>
+<li id="F11-02-src-D1">D1 — UEFI Forum, "UEFI Specification" (curriculum item 12): "Secure Boot and Driver Signing" (PK, KEK, db, dbx, setup and user mode, EFI_SIGNATURE_LIST, image verification), "Variable Services" (SetVariable, EFI_VARIABLE_AUTHENTICATION_2, time-based authenticated variables, attribute bits), "Globally Defined Variables". Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</li>
+<li id="F11-02-src-D2">D2 — IETF, "RFC 2315: PKCS #7: Cryptographic Message Syntax Version 1.5"; ITU-T "X.509". Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F11-02-src-D3">D3 — The shim project's documentation (the first-stage UEFI loader of Linux distributions). Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F11-02-src-S1">S1 — Systems Curriculum (this project), section 2.5 "Security and hidden components" (the key roles, shim and MOK, the exercise quoted). Opened in this build (local file); a map, not a source (AH-4).</li>
+<li id="F11-02-src-R1">R1 — Lab run <code>F11-02/keys.log</code>: mkvars.py keys with Python 3.13 and python3-cryptography 50.0.1; OpenSSL 3.0.13 fingerprints; exit code 0.</li>
+<li id="F11-02-src-R2">R2 — Lab runs <code>F11-02/sb_setup.log</code> (exit 33, ran), <code>enroll.log</code> (exit 33), <code>sb_unsigned.log</code> (exit 124, refused): QEMU 8.2.2, OVMF 2024.02-2ubuntu0.10 Secure Boot build, clang 18.1.3; 2026-10-10; untested on hardware.</li>
+<li id="F11-02-src-R3">R3 — Lab runs <code>F11-02/sign_db1.log</code> (exit 0), <code>sb_db1.log</code> (exit 33, ran), <code>sb_snakeoil.log</code> (exit 124, refused).</li>
+<li id="F11-02-src-R4">R4 — The update bytes produced by <code>mkvars.py</code> and accepted by the firmware in <code>F11-02/enroll.log</code> and <code>rotate.log</code>.</li>
+<li id="F11-02-src-R5">R5 — Lab runs <code>F11-02/forged.log</code> and <code>replay.log</code> (each exit 33: the program ran; its SetVariable call returned Security Violation).</li>
+<li id="F11-02-src-R6">R6 — Lab runs <code>F11-02/rotate.log</code> (exit 33), <code>forensic_boot.log</code> (exit 124, refused), <code>forensic_signer.log</code> (exit 0), <code>sb_db2.log</code> (exit 33).</li>
+</ol>
+
+<h2 id="F11-02-glossary">Glossary links</h2>
+<p><a href="#gl-efi-signature-list-esl">EFI signature list (ESL)</a> · <a href="#gl-authenticated-variable">Authenticated variable</a> · <a href="#gl-key-rotation">Key rotation</a> · <a href="#gl-revocation-dbx">Revocation (dbx)</a> · <a href="#gl-replay-protection-monotonic-time-stamp">Replay protection</a> · <a href="#gl-secure-boot-pk-kek-db-dbx">Secure Boot (PK, KEK, db, dbx)</a> · <a href="#gl-authenticode">Authenticode</a> · <a href="#gl-shim">shim</a> · <a href="#gl-chain-of-trust">Chain of trust</a></p>
+
+<h2 id="F11-02-next">Next chapter</h2>
+<p>Next: <a href="#F11-03">F11-03 Measured boot and the TPM</a>. Previous: <a href="#F11-01">F11-01</a>. Back to the course: <a href="#SS301">SS301</a>.</p>
+
+<h2 id="F11-02-answers">Answers to Check yourself</h2>
+<ol>
+<li>db: a KEK (in setup mode, anyone). KEK: the PK. PK: the PK itself (in setup mode, the update is checked against the certificate it carries; from memory of D1, not tested separately here).</li>
+<li>The firmware checks programs against db and updates against KEK. The program was signed by db1, which is in db; the update was signed by db1, which is not in KEK.</li>
+<li>All five. Without the name, an update signed for db could be presented as an update for dbx or KEK (with the same GUID for PK and KEK), moving a certificate into a list it was never meant for.</li>
+<li>Its signer's certificate is in dbx, and a dbx match refuses the image whatever db says (observed in <code>forensic_boot</code>).</li>
+<li>The firmware remembers the time stamp of the last accepted update and refuses one that is not later; the replay carried the enrolment's time stamp, so it was refused even though KEK really signed it.</li>
+<li>Create key L2; append L2's certificate to db everywhere (KEK-signed); re-sign the loader (and anything else that boots) with L2 and deploy; confirm on every machine that the installed loader is L2-signed; then append L's certificate to dbx. Before the dbx update each machine must have L2 in db and an L2-signed loader on disk, and a recovery medium signed with L2.</li>
+<li>db lists only the db2 certificate (one list, 792 bytes) and dbx is empty; the db1-signed program is refused because its signer is no longer in db, not because of dbx. (Run it: the listing is the evidence.)</li>
+<li>Otherwise any program could write db directly and add its own certificate, and no signature check would ever be needed; the authentication on SetVariable would protect nothing.</li>
+</ol>
+<h3 id="F11-02-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Boot0001 (the disk's <code>\EFI\BOOT\BOOTX64.EFI</code>) failed to load with "Access Denied"; the firmware then found no other boot option.</li>
+<li>"SS301 lab signing key 2026", fingerprint ed41f69f…: present in db (first entry) and in dbx.</li>
+<li>H1: the file was modified or corrupted, so its signature no longer verifies. H2: the file is intact but its signer was revoked. Evidence 3 shows a signer certificate that exists and is the team's own 2026 key; evidence 2 shows that key in dbx. The file's integrity could be confirmed further by booting it on a machine without the rotation (it ran in <code>sb_db1</code>, the same bytes). H2.</li>
+<li>Lindiwe changed nothing, which is exactly the problem: her tool kept its 2026 signature while the team revoked the 2026 key. The rotation's step "re-sign and deploy" was skipped.</li>
+<li>Today: re-sign the tool with the 2027 key and install it (the lab's <code>sb_db2</code> boot shows the re-signed file running). Process: revocation (dbx) only after an inventory shows nothing still signed with the old key, and after a test boot of every component with the new dbx on a test machine.</li>
+</ol>
+<p><b>How the evidence was produced:</b> <code>run.sh</code> ran the rotation (db append 2027, dbx append 2026) and then booted the program signed with the 2026 key before the rotation; evidence 2 is the 2027-signed <code>sbinfo</code> on the same store.</p>
