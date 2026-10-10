@@ -122,3 +122,47 @@ Existing terms from other courses are linked rather than redefined: Sampling and
 3. **Laser safety (F1-67).** Confirm which laser class is allowed for L2 learners once a sensor is chosen.
 4. **Course project.** The course project (F1-72) is defined as the course card's "sensor board logger with calibrated output, reused in RB201 and DN202". It uses H2's acceptance tests verbatim for the hardware part. The owner should confirm that RB201 and DN202 expect this scope and log format.
 5. **Chapter titles.** The chapter titles follow the course card. F1-71's meta title is "Batteries (LiPo) and power distribution", and F1-72 is "Noise, grounding and interference"; the course project lives in F1-72's mini-project.
+
+## Owner rulings applied
+
+Applied on 2026-10-10 by the HW302 verifier (ruling file `university/OWNER_RULINGS.md`).
+
+1. **Kit parts (decision 1) — ruling D1.** The reference kit in `build/KIT.md` now names the parts. HW302 refers to them as follows (every hardware step stays "untested on hardware", ruling C3, and says what a test needs): microcontroller = Raspberry Pi Pico 2 (RP2350) with the ST NUCLEO-F446RE as the alternative (F1-64, F1-65, F1-66, F1-70, F1-71); IMU = Adafruit LSM6DSOX 6-DoF breakout (ST LSM6DSOX) (F1-65, F1-72); motor with encoder = Pololu 100:1 Micro Metal Gearmotor HPCB 6V with 12 CPR encoder, item 5190 (F1-66, F1-69); motor driver = Pololu DRV8833 dual motor driver carrier, item 2130 (F1-70); logic analyser = a sigrok fx2lafw analyser or the Analog Discovery 3's digital channels; oscilloscope = Digilent Analog Discovery 3 (F1-70, F1-72); charger = SkyRC B6neo (F1-71). The kit names no hobby servo, no bench BLDC/ESC, no standalone LiDAR or camera for HW302: those stay "no kit item; datasheet of the part you use" (F1-67, F1-68, F1-69). The BLDC/ESC taught in F1-69/F1-70 is the X500 V2 drone kit's motor and BLHeli S ESC, which HW302 never powers (ruling B2: motors and propellers get no power before gate R3).
+2. **Safety rules (decision 2) — rulings C3, D1 and KIT.md "Safety notes".** The F1-71 LiPo rules are kept and now also point to the KIT.md LiPo rules (balance charger in LiPo mode, LiPo bag or metal box, never unattended); the maker's and charger's instructions still override everything. Decided by verifier: no numbers (voltages, currents, temperatures) are added; they stay with the maker.
+3. **Laser safety (decision 3) — ruling C2 and decided by verifier.** IEC 60825-1 is cited by its official catalogue entry only; the chapter claims nothing about the standard's content. Which laser class L2 learners may use remains an owner/organisation decision; until then the box requires the maker's stated class and a supervising adult.
+4. **Course project scope (decision 4) — decided by verifier.** Kept as written (sensor-board logger meeting curriculum H2's acceptance tests verbatim); RB201/DN202 are told in the F1-72 text that they reuse the log format; no cross-course edit is made here.
+5. **Chapter titles (decision 5) — decided by verifier.** Kept as the course card gives them.
+6. **A1 length:** no trimming. **A2 stand-ins:** the U-IMU6, the simulators and the invented values are approved; each page says it is the course's own and now names the real kit item it stands for. **A4 exercise values:** the pretend values are labelled "pretend exercise value" where they could be mistaken for a part's value. **A5 recorded runs:** all 35 listings were re-run on 2026-10-10; every `.out` was byte-identical, so the recorded files were kept. **A6/A8/A10:** no forensic giveaway was changed; HW302 commits no keys and its listings carry no licence placeholder (nothing to rename). **B4 exams:** not part of this verification pass (quizzes exist in every chapter's "Check yourself"). **C1/C2:** see "Verification pass" below. **C4:** every chapter's hardware Part B is untested, so the catalogue status for HW302 chapters is "internally checked · hardware steps untested".
+
+## Verification pass
+
+Done on 2026-10-10 by the Source Researcher and Fact-Checker agent (ruling C1: dossiers written after the fact). Dossiers: `university/_dossiers/F1-64.dossier.html` … `F1-72.dossier.html`; QA records: `university/qa/F1-64.json` … `F1-72.json`.
+
+**Documents opened (URL recorded in each dossier):** NXP UM10204 Rev 7.0 (I2C, §3.1.4–3.1.10, speed modes); ST LSM6DSOX datasheet DS12814 Rev 4 (address, WHO_AM_I, CTRL1_XL/CTRL2_G/CTRL3_C, output registers, sensitivities); TI DRV8833 datasheet SLVSAR1E (supply, currents, 450 ns internal dead time, truth table, decay modes, protections, bypass); Pololu item 5190 page (gearmotor and encoder facts); BIPM SI Brochure 9th ed. V4.01 (§2.2, §2.3.1, c = 299 792 458 m/s); IEC 60825-1:2014 catalogue entry; The Art of Electronics 3rd ed. table of contents (authors' site); Oppenheim & Schafer 3rd ed. (Pearson page, brief contents); Hartley & Zisserman 2nd ed. 2004 (Cambridge page, contents); Szeliski 2nd ed. 2022 (Springer page and author's page, no contents); Beard & McLain 2012 (Princeton page, no contents). `build/KIT.md` supplied the kit parts (Pico 2 / NUCLEO-F446RE, Adafruit LSM6DSOX 4438, Pololu 5190 and 2130, TurtleBot3 3S 1800 mAh LiPo, SkyRC B6neo, fx2lafw analyser, Analog Discovery 3, Fluke 17B+) and the LiPo safety rules.
+
+**Not opened (the shared web-fetch budget was exhausted; every retry over several hours was refused):** RP2350 datasheet (the datasheets.raspberrypi.com link redirects to pip-assets.raspberrypi.com), STM32F446 reference manual, Adafruit 4438 page, Modern Robotics (Lynch & Park), Harris & Harris, Blitzstein & Hwang, Hughes & Drury, Ott, Thrun et al., Linden's Handbook, the BLHeli S ESC documentation, the TurtleBot3 pack maker's datasheet and the B6neo manual. Their Sources entries now say so, and the claims tagged to them are described as general textbook mechanisms that were not checked against the text. No chapter claims any fact about the Pico 2's ADC, PWM dead time, I2C or brown-out detector.
+
+**Claims:** every claim tag and every "Not verified" box was read against the opened documents or the recorded lab runs.
+
+| Chapter | Dossier | Claims checked | Corrected | Left unverified (document not opened) |
+|---|---|---|---|---|
+| F1-64 | 2 documents opened (4 D-ids listed), 39 facts, 3 not found | 39 | 3 | 21 |
+| F1-65 | 4 documents opened (4 D-ids listed), 48 facts, 4 not found | 48 | 4 | 20 |
+| F1-66 | 2 documents opened (5 D-ids listed), 34 facts, 4 not found | 34 | 4 | 25 |
+| F1-67 | 4 documents opened (6 D-ids listed), 39 facts, 3 not found | 39 | 3 | 19 |
+| F1-68 | 3 documents opened (5 D-ids listed), 40 facts, 3 not found | 40 | 2 | 24 |
+| F1-69 | 2 documents opened (5 D-ids listed), 40 facts, 3 not found | 40 | 3 | 29 |
+| F1-70 | 2 documents opened (5 D-ids listed), 42 facts, 4 not found | 42 | 3 | 11 |
+| F1-71 | 1 documents opened (5 D-ids listed), 38 facts, 3 not found | 38 | 3 | 13 |
+| F1-72 | 3 documents opened (5 D-ids listed), 42 facts, 2 not found | 42 | 2 | 14 |
+| Total | | 362 | 27 | 176 |
+
+**Most important corrections:** (1) F1-65: the kit's LSM6DSOX stores the low byte first (OUTX_L_A 0x28, OUTX_H_A 0x29), the opposite of the invented U-IMU6, and starts in power-down; the chapter now says so and gives the real address options, WHO_AM_I value, ranges and sensitivities. (2) F1-66: The Art of Electronics has no encoder section, so the encoder facts the Pololu page confirms were re-tagged to it (12 CPR counts both edges of both channels; about 1204 counts per output revolution; direction from A-B order; no index pulse). (3) F1-70: the kit's DRV8833 has 450 ns of internal dead time and cannot be commanded into shoot-through, so the forensic "bridge that gets hot at standstill" is stated to apply to discrete bridges; the chip's supply, current, protection and bypass facts were added. (4) F1-69: the kit motor's 1.5 A stall (extrapolated) and 330 rpm output speed are contrasted with the pretend 3.00 A / 5583 rpm model. (5) F1-67: the exact speed of light and the metre definition are now cited to SI Brochure §2.2 and §2.3.1; IEC 60825-1 is cited as a catalogue entry only (ruling C2). (6) F1-71: the LiPo safety box now carries the KIT.md rules and names the kit pack and charger, with every limit still deferred to the maker. (7) F1-66: raw `<<` in prose escaped. All "pretend exercise value" labels were kept (ruling A4).
+
+**Labs:** all nine re-run with `university/labs/run_lab.sh` on 2026-10-10: 35 steps, every exit code 0, every `.out` byte-identical to the recorded one; only `.log` dates differed, so the recorded files were restored (`git checkout`, ruling A5). No lab is an expected failure. Nothing was run on hardware (ruling C3); each "untested on hardware" box now names the kit parts and documents a test needs.
+
+**Diagrams, edit, accessibility:** 21 SVG figures re-checked (role=img, title, desc, sv-* classes, no colour-only meaning); all internal links and ids resolve; each chapter has 20 h2 sections, header cells in every table; chapters contain no URLs or scripts.
+
+**Glossary:** the 75 `glossary.json` source fields no longer say "pending verification"; each names whether its document was opened, confirmed by contents only, or not opened.
+
+**Still open:** the not-opened documents above (a later pass with fetch budget should open the RP2350 datasheet first, then the textbooks); the laser class allowed for L2 learners (owner decision); whether the RP2350 or STM32F446 decodes quadrature and generates PWM dead time in hardware; the kit pack maker's datasheet.
