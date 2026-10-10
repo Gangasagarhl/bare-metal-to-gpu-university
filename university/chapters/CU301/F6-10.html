@@ -1,0 +1,257 @@
+<!--meta
+id: F6-10
+title: Shared memory: the table in the middle of the row
+course: CU301
+level: L3
+prereqs: CU201 (F6-03 memory spaces, F6-08 coalescing); F1-58; SP203; MA302 (may run in parallel)
+time: 6–10 hours including the lab
+hardware: Lab: an NVIDIA GPU with the CUDA Toolkit recorded in the lab log, or a cloud GPU. The models, the compiler reports and the forensic lab run on any computer with g++ and nvcc (this build: no GPU)
+maps: Curriculum Track E 13.2 topic 1 (memory spaces, synchronization within a block) and topic 4 (shared memory); preparation for E3–E5
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-10-hook">Story hook</h2>
+<p>In the great kitchen hall, each group of rows works around one table. Today the group bakes a long line of flatbreads, and every flatbread gets a topping made from seven neighbouring bowls of spice paste: its own bowl and the three bowls on each side. Amira, the newest helper, walks to the far pantry seven times for every flatbread she tops. So does everyone else. The path to the pantry is jammed.</p>
+<p>Then Kofi has an idea. Each helper fetches <em>one</em> bowl from the pantry and puts it on the group's table. A few helpers at the ends fetch the extra bowls just past the edges of the group's stretch. They all wait until the table is full. Now everyone reads their seven bowls from the table, which is right in front of them. The pantry path is quiet again, and the flatbreads come out faster.</p>
+<p>The table is <b>shared memory</b>: a small, fast store that the threads of one block fill together, wait on together, and then read many times. This chapter teaches you to use it on purpose.</p>
+
+<h2 id="F6-10-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what shared memory is, who can see it, how long it lives, and why a block uses it to turn many global reads into one.</li>
+<li><b>Write</b> a kernel that stages a tile with a halo in shared memory, with both a static and a dynamic shared array, and launch it correctly.</li>
+<li><b>Compute</b> the global reads saved by staging, and the shared memory a block needs, for a given block size and stencil radius.</li>
+<li><b>Read</b> a kernel's shared-memory use from the ptxas report and its <code>LDS</code>/<code>STS</code>/<code>BAR.SYNC</code> instructions from SASS.</li>
+<li><b>Diagnose</b> a stencil whose answers are wrong only at block edges.</li>
+</ul>
+
+<div class="co jargon" id="F6-10-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Shared memory (GPU)</dt><dd><b>Simple words:</b> a small, fast memory that the threads of one block share and fill themselves. <b>Analogy:</b> the table in the middle of a row group. <b>Precise:</b> on-chip memory allocated per thread block, declared with <code>__shared__</code>, visible to all threads of that block and only for the lifetime of the block; the kernel itself writes it, synchronises and reads it. Not the same as shared memory between processes (OS304). <sup class="src"><a href="#F6-10-src-D1">D1</a></sup> <sup class="src"><a href="#F6-10-src-D3">D3</a></sup></dd>
+<dt>Tile</dt><dd><b>Simple words:</b> the piece of a big array that one block copies to its table and works on. <b>Analogy:</b> the stretch of bowls one group puts on its table. <b>Precise:</b> a contiguous sub-block of the data, sized by the programmer, that a thread block stages in shared memory to reuse it (MA201 uses "tile" for a sub-block of a matrix). <sup class="src"><a href="#F6-10-src-D3">D3</a></sup></dd>
+<dt>Halo (ghost cells)</dt><dd><b>Simple words:</b> the few extra values just outside a tile that the threads at its edges also need. <b>Analogy:</b> the extra bowls just past the ends of the group's stretch. <b>Precise:</b> the elements outside a block's output range that its computation reads; for a 1-D stencil of radius <i>R</i>, <i>R</i> elements on each side. <sup class="src"><a href="#F6-10-src-D3">D3</a></sup></dd>
+<dt>Stencil</dt><dd><b>Simple words:</b> a calculation where every output uses a fixed pattern of nearby inputs. <b>Analogy:</b> every flatbread's topping uses the seven nearest bowls. <b>Precise:</b> out[<i>i</i>] = f(in[<i>i</i>−<i>R</i>], …, in[<i>i</i>+<i>R</i>]) for a fixed radius <i>R</i>; here f is a sum. <sup class="src"><a href="#F6-10-src-D3">D3</a></sup></dd>
+<dt>Static and dynamic shared memory</dt><dd><b>Simple words:</b> a shared array whose size is fixed when you compile, or one whose size you choose when you launch. <b>Analogy:</b> a table built to one size, or a folding table opened to the size you ask for. <b>Precise:</b> a <code>__shared__</code> array with a compile-time size, or an <code>extern __shared__</code> array whose size in bytes is the third parameter of the execution configuration <code>&lt;&lt;&lt;grid, block, bytes&gt;&gt;&gt;</code>. <sup class="src"><a href="#F6-10-src-D1">D1</a></sup></dd>
+<dt>Barrier (<code>__syncthreads</code>)</dt><dd><b>Simple words:</b> a "wait here until everyone in the block arrives" point. <b>Analogy:</b> nobody starts reading the table until every bowl is on it. <b>Precise:</b> a block-wide barrier: no thread of the block continues past it until all threads of the block have reached it, and shared-memory writes made before it are visible to the block after it. Full treatment in <a href="#F6-12">F6-12</a>. <sup class="src"><a href="#F6-10-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-10-pictures">The idea in pictures</h2>
+<p>Figure 1 shows one block of a 1-D stencil. Every thread loads one element from global memory into the tile; the first <i>R</i> threads also load the left and right halo. After the barrier, each thread reads its 2<i>R</i>+1 neighbours from the tile.</p>
+<figure id="F6-10-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-10-f1t F6-10-f1d">
+<title id="F6-10-f1t">Figure 1: staging a stencil tile with its halo in shared memory</title>
+<desc id="F6-10-f1d">At the top, a long bar labelled global memory, the input array, with one stretch marked as the block's range and three cells on each side marked as halo. Arrows go down from every cell of the range and the halo into a shorter bar in the middle labelled shared memory tile: R halo cells, then BLOCK cells, then R halo cells. A dashed line across the figure is labelled __syncthreads: every cell written. Below the tile, one thread t is drawn reading seven neighbouring cells of the tile, from t minus 3 to t plus 3, and writing one output to a bar labelled global memory, the output array. A note says: each input element is read from global memory once per block instead of seven times.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="24">global memory: input array</text>
+<rect class="sv-box" x="20" y="34" width="720" height="34"/>
+<rect class="sv-b6" x="150" y="34" width="60" height="34"/><text class="sv-ts" x="156" y="56">left halo</text>
+<rect class="sv-b1" x="210" y="34" width="330" height="34"/><text class="sv-t" x="300" y="56">this block's range (BLOCK elements)</text>
+<rect class="sv-b6" x="540" y="34" width="60" height="34"/><text class="sv-ts" x="544" y="56">right halo</text>
+<line class="sv-line" x1="180" y1="68" x2="180" y2="112"/><polygon class="sv-head" points="180,118 175,109 185,109"/>
+<line class="sv-line" x1="375" y1="68" x2="375" y2="112"/><polygon class="sv-head" points="375,118 370,109 380,109"/>
+<line class="sv-line" x1="570" y1="68" x2="570" y2="112"/><polygon class="sv-head" points="570,118 565,109 575,109"/>
+<text class="sv-ts" x="390" y="96">one load per thread (threads 0..R-1 also load the halo)</text>
+<rect class="sv-b6" x="150" y="118" width="60" height="34"/><rect class="sv-b2" x="210" y="118" width="330" height="34"/><rect class="sv-b6" x="540" y="118" width="60" height="34"/>
+<text class="sv-t" x="250" y="140">shared memory tile: R + BLOCK + R ints</text>
+<line class="sv-dash" x1="20" y1="172" x2="740" y2="172"/><text class="sv-ts" x="24" y="166">__syncthreads(): every cell of the tile is written</text>
+<rect class="sv-b5" x="330" y="190" width="98" height="30"/><text class="sv-ts" x="336" y="210">t-3 ... t ... t+3</text>
+<text class="sv-t" x="440" y="210">thread t reads 2R+1 = 7 cells from the tile</text>
+<line class="sv-line" x1="379" y1="220" x2="379" y2="262"/><polygon class="sv-head" points="379,268 374,259 384,259"/>
+<text class="sv-tb" x="20" y="262">global memory: output array</text>
+<rect class="sv-box" x="20" y="268" width="720" height="30"/><rect class="sv-b5" x="370" y="268" width="18" height="30"/>
+<text class="sv-ts" x="20" y="318">Not to scale. R = 3 and BLOCK = 256 in Listing 1; 7 bowls per flatbread in the story.</text>
+</svg></div><figcaption><b>Figure 1.</b> A tile with a halo. Each input element is read from global memory once per block (plus 2<i>R</i> halo reads), instead of 2<i>R</i>+1 times (Listing 2 counts it). The barrier separates the "fill the table" phase from the "use the table" phase. Data flow runs top to bottom. <sup class="src"><a href="#F6-10-src-D1">D1</a></sup> <sup class="src"><a href="#F6-10-src-D3">D3</a></sup> <sup class="src"><a href="#F6-10-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F6-10-layer1">Layer 1 — the kid explanation</h2>
+<p>A group of helpers who all need the same ingredients should not each walk to the pantry. One trip per bowl is enough, if the bowl goes on the table where everyone can reach it. The only rule is patience: nobody may take from the table until everyone has put their bowl down. And the table is small, so each group only brings the bowls it needs right now.</p>
+
+<h2 id="F6-10-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-10-l2-what">What shared memory is</h3>
+<p>Shared memory is memory declared with <code>__shared__</code> inside a kernel. Every thread block gets its own copy; all threads of that block can read and write it; threads of other blocks cannot see it; and it disappears when the block finishes. <sup class="src"><a href="#F6-10-src-D1">D1</a></sup> It is on-chip, unlike global memory, which lives in the GPU's device memory and is reached through caches (<a href="#F1-58">F1-58</a>). <sup class="src"><a href="#F6-10-src-D1">D1</a></sup> <sup class="src"><a href="#F6-10-src-D3">D3</a></sup> Nothing moves into shared memory by itself: it is a scratchpad that the kernel manages, not a cache. <sup class="src"><a href="#F6-10-src-D3">D3</a></sup></p>
+<h3 id="F6-10-l2-pattern">The pattern: load, barrier, compute</h3>
+<p>Almost every use of shared memory follows the same three steps. (1) Each thread copies a part of the data from global memory into the shared array. (2) The block waits at <code>__syncthreads()</code>, so that every part is written. (3) Each thread reads what it needs from the shared array, often many values, often values that other threads loaded. <sup class="src"><a href="#F6-10-src-D1">D1</a></sup> Listing 1 does this for a 1-D stencil of radius 3: out[<i>i</i>] is the sum of in[<i>i</i>−3] to in[<i>i</i>+3]. Without shared memory, each output needs 7 global reads; neighbouring outputs read almost the same 7 values.</p>
+<h3 id="F6-10-l2-count">How many reads does staging save?</h3>
+<p>For a block of <i>B</i> threads and radius <i>R</i>, the direct version requests <i>B</i>(2<i>R</i>+1) global elements; the staged version requests <i>B</i>+2<i>R</i>. Listing 2 prints the ratio: for <i>B</i> = 256 and <i>R</i> = 3, 1,792 requests become 262, a factor of 6.84; for <i>R</i> = 32 it is 52.00. <sup class="src"><a href="#F6-10-src-R2">R2</a></sup> The shared array costs (<i>B</i>+2<i>R</i>) × 4 bytes for <code>int</code>s: 1,048 bytes for <i>B</i> = 256, <i>R</i> = 3. <sup class="src"><a href="#F6-10-src-R2">R2</a></sup></p>
+<div class="co warning"><span class="lbl">Watch out</span><p>"Requests" is not "trips to device memory". The GPU's caches may already serve many of the repeated reads of the direct version, so the real gain is smaller than the ratio and must be measured on your GPU (the lab's extension). What staging guarantees is that the reuse no longer depends on the cache's luck. <sup class="src"><a href="#F6-10-src-D2">D2</a></sup></p></div>
+<h3 id="F6-10-l2-static">Static and dynamic shared arrays</h3>
+<p>A static array has its size in the source (<code>__shared__ int tile[BLOCK + 2 * RADIUS];</code>). A dynamic array is declared <code>extern __shared__ int dtile[];</code> without a size, and the launch supplies the size in bytes as the third execution-configuration parameter: <code>stencilDynamic&lt;&lt;&lt;blocks, BLOCK, smem&gt;&gt;&gt;(…)</code>. <sup class="src"><a href="#F6-10-src-D1">D1</a></sup> Use dynamic shared memory when the size depends on a runtime value, here the radius. The ptxas report makes the difference visible: for <code>sm_80</code>, <code>stencilStatic</code> reports <code>1056 bytes smem</code>, and <code>stencilDynamic</code> reports no static shared memory at all, because its size is only known at launch. <sup class="src"><a href="#F6-10-src-R3">R3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The array is 262 × 4 = 1,048 bytes, but ptxas reported 1,056. In check runs of modified copies (Lab Engineer's check run in scratch space; not in the recorded output), 258 ints (1,032 bytes) were reported as 1,040, while 264 ints (1,056 bytes) and 136 ints (544 bytes) were reported exactly. That pattern fits a rounding of the allocation up to a multiple of 16 bytes, but this build found no document that says so. Check: the ptxas and nvcc documentation for the toolkit in the lab log.</p></div>
+
+<h2 id="F6-10-layer3">Layer 3 — the engineer's depth</h2>
+<p>In one line of analogy: the table is fast but small, and every group that sits in the hall needs its own table, so the size of your table decides how many groups fit.</p>
+<h3 id="F6-10-l3-limits">Limits you must query, not assume</h3>
+<p>The amount of shared memory a block may use, and the amount an SM has in total, are properties of the device. The CUDA 12.0 headers read in this build describe them as <code>sharedMemPerBlock</code> ("Shared memory available per block in bytes"), <code>sharedMemPerMultiprocessor</code> ("Shared memory available per multiprocessor in bytes"), <code>sharedMemPerBlockOptin</code> ("the per device maximum shared memory per block usable by special opt in") and <code>reservedSharedMemPerBlock</code> ("the shared memory reserved by CUDA driver per block in bytes"). <sup class="src"><a href="#F6-10-src-H1">H1</a></sup> A kernel that wants more dynamic shared memory than the default per-block amount must opt in through the function attribute <code>cudaFuncAttributeMaxDynamicSharedMemorySize</code> ("Maximum dynamic shared memory size"). <sup class="src"><a href="#F6-10-src-H1">H1</a></sup> <sup class="src"><a href="#F6-10-src-D1">D1</a></sup> This chapter quotes no values: read them for your GPU with the device query of <a href="#F6-07">F6-07</a>.</p>
+<h3 id="F6-10-l3-occupancy">Shared memory and occupancy</h3>
+<p>A block can become resident on an SM only if its shared memory fits beside the shared memory of the blocks already there; so shared memory per block is one of the limits on resident blocks, next to registers and thread slots (<a href="#F1-58">F1-58</a> computed this for the invented teaching GPU TG-1). <sup class="src"><a href="#F6-10-src-D1">D1</a></sup> <sup class="src"><a href="#F6-10-src-D3">D3</a></sup> A tile of 1 KiB rarely limits anything; a GEMM tile of tens of KiB often does (<a href="#F6-22">F6-22</a>). The trade-off is reuse per block against blocks per SM.</p>
+<h3 id="F6-10-l3-edges">Edges: the part that goes wrong</h3>
+<p>Three edges need code. (1) The halo: the first <i>R</i> threads load <i>R</i> extra elements on each side (Listing 1, lines 18–23). (2) The array ends: halo elements before index 0 or past <i>n</i>−1 are replaced by 0, the boundary rule chosen for this stencil. (3) The last block: when <i>n</i> is not a multiple of the block size, threads with <i>g</i> ≥ <i>n</i> still take part in the load and the barrier (they store 0) but write no output. A thread must never skip the barrier because it has no output: every thread of the block has to reach <code>__syncthreads()</code> (<a href="#F6-12">F6-12</a>). <sup class="src"><a href="#F6-10-src-D1">D1</a></sup></p>
+<h3 id="F6-10-l3-when">When shared memory is the wrong tool</h3>
+<p>Data read only once per block gains nothing from staging: the copy into shared memory is pure overhead. Data that every thread of the block reads at the same address may be better served by constant memory or a broadcast. And when the reuse is between neighbouring threads of one warp only, register shuffles (<a href="#F6-15">F6-15</a>) avoid shared memory altogether. <sup class="src"><a href="#F6-10-src-D2">D2</a></sup> <sup class="src"><a href="#F6-10-src-D3">D3</a></sup></p>
+
+<h2 id="F6-10-hardware">How the hardware actually does it</h2>
+<p>Shared memory is an SRAM inside each SM; it has its own address space and its own load and store instructions, separate from global memory. <sup class="src"><a href="#F6-10-src-D1">D1</a></sup> The SASS of <code>stencilStatic</code> for <code>sm_80</code> shows the whole pattern in machine code: <code>LDG.E</code> (global load), <code>STS</code> (store to shared), <code>BAR.SYNC 0x0</code> (the barrier), seven <code>LDS</code> (loads from shared) and one <code>STG.E</code> (global store). <sup class="src"><a href="#F6-10-src-R4">R4</a></sup> The immediate offsets match the source: <code>STS [R9.X4+0xc]</code> writes <code>tile[s]</code> with <i>s</i> = threadIdx.x + 3, so 3 × 4 = 12 = 0xc bytes past the thread's base; the right-halo store is at <code>+0x40c</code> = (256 + 3) × 4 = 1,036 bytes; the seven <code>LDS</code> read offsets 0x0 to 0x18, the seven neighbours 4 bytes apart; the right-halo global load reads <code>+0x400</code> = 256 × 4 bytes past the thread's own element and the left one <code>-0xc</code>. <sup class="src"><a href="#F6-10-src-R4">R4</a></sup> Shared memory is split into banks so that one warp's access can complete in one pass when the addresses spread over the banks; that is the subject of <a href="#F6-11">F6-11</a>. <sup class="src"><a href="#F6-10-src-D1">D1</a></sup></p>
+
+<h2 id="F6-10-worked">Worked example</h2>
+<p><b>Task.</b> A stencil of radius <i>R</i> = 8 runs with 512 threads per block on <code>int</code> data. (a) How many global elements does one block request without and with staging? (b) How many bytes of dynamic shared memory must the launch pass? (c) On TG-1, the invented teaching GPU of <a href="#F1-58">F1-58</a> (32 KiB of shared memory per SM, at most 4 blocks per SM), does shared memory limit the resident blocks?</p>
+<ol>
+<li>Without staging: 512 × (2 × 8 + 1) = 512 × 17 = 8,704 requests.</li>
+<li>With staging: 512 + 2 × 8 = 528 requests. Ratio 8,704 / 528 = 16.48.</li>
+<li>Shared memory: 528 × 4 = 2,112 bytes, so the launch passes <code>(512 + 2 * 8) * sizeof(int)</code> = 2,112.</li>
+<li>TG-1: 32,768 / 2,112 = 15.5, so 15 blocks would fit by shared memory; the block limit of 4 is reached first. Shared memory does not limit this kernel there.</li>
+</ol>
+<p>Steps 1–3 are the row <code>512 8</code> of Listing 2's output (8,704; 528; 16.48; 2,112). <sup class="src"><a href="#F6-10-src-R2">R2</a></sup> TG-1 is invented; redo step 4 with your GPU's device-query values.</p>
+
+<h2 id="F6-10-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>stencil.cu</code>: the stencil with a static and a dynamic tile (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-10/stencil.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings stencil.cu -o stencil</code>, then <code>./stencil</code>.</p>
+<pre class="output" data-run="F6-10/stencil"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 1 was built for real; its run stopped at the first allocation because the build container has no GPU. On a GPU it should print 0 errors for both tiles; that has not been verified. What would be needed: any NVIDIA GPU supported by CUDA 12.0, and a rerun of <code>run_lab.sh</code>.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–10</td><td><code>RADIUS</code>, <code>BLOCK</code></td><td>Stencil radius and block size, chosen by us.</td><td>The static tile's size must be a compile-time constant.</td></tr>
+<tr><td>14</td><td><code>__shared__ int tile[BLOCK + 2 * RADIUS];</code></td><td>One tile per block, with room for both halos.</td><td>262 ints; ptxas reports the allocation (R3).</td></tr>
+<tr><td>15–16</td><td><code>g</code>, <code>s</code></td><td>Global index, and the position in the tile shifted by <i>R</i>.</td><td>Tile cell 0 holds element <i>g</i>−<i>R</i> of thread 0.</td></tr>
+<tr><td>17</td><td><code>tile[s] = (g &lt; n) ? in[g] : 0;</code></td><td>Every thread loads one element, coalesced.</td><td>Threads past the end store 0 but still take part.</td></tr>
+<tr><td>18–23</td><td>halo loads</td><td>Threads 0..<i>R</i>−1 also load one left and one right halo element.</td><td>Without these, outputs near block edges are wrong (forensic lab).</td></tr>
+<tr><td>24</td><td><code>__syncthreads();</code></td><td>Waits until the whole tile is written.</td><td>Becomes <code>BAR.SYNC 0x0</code> (R4).</td></tr>
+<tr><td>25–31</td><td>compute</td><td>Sums 7 tile cells and writes one output.</td><td>7 shared reads replace 7 global reads.</td></tr>
+<tr><td>34–55</td><td><code>stencilDynamic</code></td><td>The same with <code>extern __shared__</code> and a runtime radius.</td><td>Size comes from the launch.</td></tr>
+<tr><td>57–63</td><td><code>check</code></td><td>Prints the error name and string and exits.</td><td>Every call is checked (<a href="#F6-05">F6-05</a>).</td></tr>
+<tr><td>65–78</td><td><code>countErrors</code></td><td>CPU reference with the same boundary rule.</td><td>A GPU result is trusted only after a check.</td></tr>
+<tr><td>91–94</td><td>static launch</td><td>No third parameter: the tile is static.</td><td>—</td></tr>
+<tr><td>96–102</td><td>dynamic launch</td><td>Passes <code>(BLOCK + 2 * radius) * sizeof(int)</code> = 1,088 bytes for radius 8.</td><td>The size must cover the halo, or the kernel writes past the array.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>reuse.cpp</code>: the read counts (arithmetic only).</p>
+<pre class="listing" data-src="F6-10/reuse.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined reuse.cpp -o reuse</code>, then <code>./reuse</code>.</p>
+<pre class="output" data-run="F6-10/reuse"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12</td><td><code>naive = block * (2 * radius + 1)</code></td><td>Requests when each thread reads its own neighbours.</td><td>Grows with the radius.</td></tr>
+<tr><td>13</td><td><code>tiled = block + 2 * radius</code></td><td>Requests when the block stages a tile.</td><td>Almost independent of the radius.</td></tr>
+<tr><td>15–16</td><td>print</td><td>Ratio and tile bytes.</td><td>The bytes are the launch's shared-memory size for <code>int</code>.</td></tr>
+</tbody></table></div>
+
+<p><b>Compiler evidence</b>, produced without a GPU. The ptxas report for <code>sm_80</code>:</p>
+<pre class="output" data-run="F6-10/resources"></pre>
+<p>The memory instructions of <code>stencilStatic</code> (SASS, <code>sm_80</code>):</p>
+<pre class="output" data-run="F6-10/sass_smem"></pre>
+
+<h2 id="F6-10-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The table is wiped when the group leaves.</b> Shared memory lives only as long as the block; the next block on the same SM cannot read what the last one left, and must not rely on what it finds there (the forensic lab of <a href="#F6-17">F6-17</a>). <sup class="src"><a href="#F6-10-src-D1">D1</a></sup></li>
+<li><b>The table has drawers.</b> Real shared memory is divided into banks; helpers reaching into the same drawer for different items wait in line. The kitchen story has no reason for this; <a href="#F6-11">F6-11</a> uses a picture instead.</li>
+<li><b>Nobody "walks" to the pantry.</b> A global load is an instruction that returns later while the warp does other work; repeated loads may also be served by caches. The story's "jammed path" exaggerates the saving; the real gain must be measured.</li>
+</ul>
+
+<h2 id="F6-10-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> wrong outputs only near block boundaries (positions 0–2 and 253–255 of each block for <i>R</i> = 3). <b>Cause:</b> halo not loaded. <b>How to find it:</b> print the wrong indices modulo the block size (the forensic lab). <b>Fix:</b> load the halo; test with <i>n</i> spanning several blocks.</li>
+<li><b>Symptom:</b> results wrong sometimes, different from run to run. <b>Cause:</b> missing <code>__syncthreads()</code> between the load and the compute phase. <b>How to find it:</b> Compute Sanitizer's racecheck tool (<a href="#F6-05">F6-05</a>). <b>Fix:</b> a barrier that every thread reaches.</li>
+<li><b>Symptom:</b> the program hangs, or the results are garbage, only in the last block. <b>Cause:</b> threads with <i>g</i> ≥ <i>n</i> return early, before the barrier. <b>How to find it:</b> look for <code>return</code> before <code>__syncthreads()</code>. <b>Fix:</b> let them load a neutral value and skip only the output write.</li>
+<li><b>Symptom:</b> a launch error, or out-of-bounds shared accesses. <b>Cause:</b> the dynamic size passed at launch is smaller than the kernel uses (for example forgetting the halo), or larger than the device allows without opting in. <b>How to find it:</b> check the launch error; compare with <code>sharedMemPerBlock</code>. <b>Fix:</b> compute the size from the same formula the kernel uses.</li>
+</ul>
+
+<div class="co transition" id="F6-10-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#CU201">CU201</a>, where every thread read its own data from global memory, and <a href="#F1-58">F1-58</a>, where shared memory appeared as hardware. <b>What carries over:</b> the index formula, the bounds check, error checking, coalesced global reads (<a href="#F6-08">F6-08</a>). <sup class="src"><a href="#F6-10-src-D1">D1</a></sup> <b>What changes:</b> threads now cooperate: one thread's load serves another thread's computation, so correctness depends on a barrier that every thread reaches; a kernel's resource use now includes shared bytes per block, which you choose. <sup class="src"><a href="#F6-10-src-R3">R3</a></sup> <b>What comes next:</b> <a href="#F6-11">F6-11</a> looks inside the table: banks, and why some access patterns make helpers wait.</p></div>
+
+<h2 id="F6-10-check">Check yourself</h2>
+<ol>
+<li>Who can read a block's shared array, and when does its content disappear?</li>
+<li>For <i>B</i> = 128 and <i>R</i> = 1, how many global elements does a block request with and without staging?</li>
+<li>Which statement is true? (a) Shared memory is a cache that fills itself. (b) A block can read another block's shared memory after a barrier. (c) The size of a dynamic shared array is given at launch. (d) Shared memory is in device memory.</li>
+<li>Explain in your own words why threads past the end of the array must still execute <code>__syncthreads()</code>.</li>
+<li>Apply: a 2-D stencil uses a 16 × 16 block and radius 2 in both directions. How many <code>float</code> elements does the tile hold, and how many bytes is that?</li>
+<li>Predict, then run: change <code>RADIUS</code> to 4 in Listing 1 and rerun the <code>resources</code> step of <code>run.sh</code>. What smem figure do you expect, and what do you see?</li>
+<li>In the SASS of <code>stencilStatic</code>, which instruction is the barrier, and why are there seven <code>LDS</code>?</li>
+</ol>
+
+<h2 id="F6-10-lab">Lab</h2>
+<p><b>Goal.</b> Build the staged stencil, read its resource use and machine code, and (on a GPU) measure the effect of staging.</p>
+<p><b>Hardware and software needed.</b> Steps 1–4: no GPU; g++ 13.3 and nvcc/cuobjdump from CUDA 12.0 as in the logs. Steps 5–6: an NVIDIA GPU (or a cloud GPU) with a CUDA Toolkit; record its version line as the logs do. Folder <code>university/labs/F6-10</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>From the repository root run <code>university/labs/run_lab.sh university/labs/F6-10</code>. Open <code>reuse.out</code>, <code>resources.out</code> and <code>sass_smem.out</code>.</li>
+<li>Find in <code>sass_smem.out</code> the store of the right halo and check its offset against (BLOCK + RADIUS) × 4.</li>
+<li>Change <code>RADIUS</code> to 4 and <code>BLOCK</code> to 128, rerun, and explain the new smem figure and offsets.</li>
+<li>Add a radius of 16 to Listing 2 and read off the ratio for <i>B</i> = 256.</li>
+<li>On a GPU: run Listing 1 and confirm 0 errors for both kernels.</li>
+<li>On a GPU: write a third kernel without shared memory (each thread reads its 2<i>R</i>+1 neighbours from global memory) and time both with events, median of 20 runs, for <i>R</i> = 1, 3, 8, 32 (the measurement protocol of <a href="#F6-06">F6-06</a>).</li>
+</ol>
+<p><b>Expected observations.</b> In this build: the outputs shown above. With <code>RADIUS</code> = 4 and <code>BLOCK</code> = 128, the array is 136 ints = 544 bytes, and the Lab Engineer's check run saw ptxas report 544; the right-halo store moves to (128 + 4) × 4 = 528 = 0x210 bytes. On a GPU: write your own times; no expected numbers are given, because none were measured (AH-23).</p>
+<p><b>Verification.</b> Steps 1–4: your predictions match the files, or you can explain the difference. Step 5: 0 errors, exit status 0, and Compute Sanitizer reports no errors. Step 6: a table of four radii × two kernels with medians, and one sentence explaining the trend.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>resources.out</code> shows no smem line → ptxas only reports with a real architecture: keep <code>-arch=sm_80</code> and <code>-cubin</code>.</li>
+<li><code>cuobjdump -fun</code> finds nothing → the mangled name changed with your edits; list names with <code>cuobjdump -sass .tmp.cubin | grep Function</code>.</li>
+<li>On a GPU, the dynamic kernel fails for a large radius → the requested shared memory exceeds the per-block default; compute it, compare with <code>sharedMemPerBlock</code>, opt in with <code>cudaFuncAttributeMaxDynamicSharedMemorySize</code> if your GPU allows more.</li>
+</ul>
+<p><b>Extension.</b> Turn the stencil into a 2-D 5-point stencil with a 2-D tile and a one-element halo on four sides; count requests as in Listing 2.</p>
+
+<h2 id="F6-10-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Jonas ported a smoothing filter to the GPU with a shared-memory tile. His test on 100 elements passed. On a million elements, about 2 % of the outputs are wrong, and a colleague noticed that the wrong values "come in little clusters, regularly spaced". No error is reported.</p>
+<p><b>Evidence pack.</b> Jonas's kernel is Listing 1's <code>stencilStatic</code> without lines 18–23. The Lab Engineer replayed both versions on the CPU block by block (<code>edges.cpp</code>, R5); the replay keeps one tile array for all blocks, so halo cells that nobody writes hold what the previous block left there (on a GPU their content is undefined).</p>
+<pre class="listing" data-src="F6-10/edges.cpp"></pre>
+<pre class="output" data-run="F6-10/edges"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which values of threadIdx.x produce wrong outputs, and how many per thread position?</li>
+<li>Hypotheses: list at least two causes that could produce wrong values at regular spacing (missing halo; missing barrier; an off-by-one in the grid size). Which line of the evidence rules each in or out?</li>
+<li>Root cause: why exactly these six thread positions for <i>R</i> = 3?</li>
+<li>Why did the 100-element test pass?</li>
+<li>Fix and prevention: the fix, and a test that would have caught it.</li>
+</ol>
+<p><b>Method hints.</b> Compute the first wrong index modulo 256. For thread 255, list the seven tile cells it reads and which thread wrote each of them.</p>
+
+<h2 id="F6-10-project">Mini-project</h2>
+<p><b>The first piece of your primitives library.</b> The course project (<a href="#CU301">CU301</a>) is a small library of reduce, scan, histogram and sort with tests and a comparison against CUB. Start it now: create the library's folder, its error-check helper, a host test harness that compares a GPU result with a CPU reference for sizes 1, 2<sup>k</sup>−1, 2<sup>k</sup>+1 and a large size (the E4 size list), and add the staged stencil as its first "primitive" with a radius parameter.</p>
+<p><b>Rubric.</b> Harness tests all required sizes and reports failures with indices (3). Stencil correct for every radius 1–32, including at array ends (3). Shared-memory size computed in one place and used by both the launch and the kernel (2). A README listing what was and was not tested on hardware (2).</p>
+
+<h2 id="F6-10-summary">Summary</h2>
+<ul>
+<li>Shared memory is per block, visible to all its threads, and lives as long as the block.</li>
+<li>The pattern is load, barrier, compute: one global read serves many threads.</li>
+<li>A 1-D stencil block of <i>B</i> threads and radius <i>R</i> requests <i>B</i>+2<i>R</i> elements instead of <i>B</i>(2<i>R</i>+1).</li>
+<li>Static arrays have a compile-time size; dynamic ones get theirs from the third launch parameter.</li>
+<li>Every thread must reach the barrier, including threads with no output.</li>
+<li>The ptxas report and SASS (<code>STS</code>, <code>BAR.SYNC</code>, <code>LDS</code>) show what the compiler made of it, without a GPU.</li>
+</ul>
+
+<h2 id="F6-10-sources">Sources</h2>
+<ol>
+<li id="F6-10-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): sections on the memory hierarchy, shared memory, <code>__syncthreads()</code>, the execution configuration (dynamic shared memory) and the hardware implementation. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-10-src-D2">D2 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): memory optimizations, shared memory. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-10-src-D3">D3 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): chapters on memory architecture and data locality, and on stencils (tiling with halo cells). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-10-src-H1">H1 — CUDA 12.0 headers as installed (Ubuntu package nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>driver_types.h</code> (field comments of <code>sharedMemPerBlock</code>, <code>sharedMemPerMultiprocessor</code>; <code>cudaFuncAttributeMaxDynamicSharedMemorySize</code>) and <code>cuda_runtime_api.h</code> (descriptions of <code>sharedMemPerBlockOptin</code> and <code>reservedSharedMemPerBlock</code>). Tier 1.</li>
+<li id="F6-10-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-10/stencil.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F6-10-src-R2">R2 — run of Listing 2 (<code>reuse.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-10-src-R3">R3 — ptxas resource report of Listing 1 for <code>sm_80</code> (<code>resources.log</code>), compiled only.</li>
+<li id="F6-10-src-R4">R4 — SASS memory instructions of <code>stencilStatic</code> for <code>sm_80</code> (<code>sass_smem.log</code>), compiled only.</li>
+<li id="F6-10-src-R5">R5 — run of the forensic replay (<code>edges.log</code>), g++ 13.3.0, exit code 0.</li>
+</ol>
+
+<h2 id="F6-10-glossary">Glossary links</h2>
+<p><a href="#gl-shared-memory">Shared memory</a> · <a href="#gl-tile">Tile (shared memory)</a> · <a href="#gl-halo-ghost-cells">Halo (ghost cells)</a> · <a href="#gl-stencil">Stencil</a> · <a href="#gl-static-and-dynamic-shared-memory">Dynamic shared memory</a> · <a href="#gl-barrier-syncthreads">Barrier (__syncthreads)</a></p>
+
+<h2 id="F6-10-next">Next chapter</h2>
+<p>Next: <a href="#F6-11">F6-11 Bank conflicts: helpers reaching into the same drawer</a>. Previous course: <a href="#CU201">CU201</a> (last chapter <a href="#F6-09">F6-09</a>). Back to the course: <a href="#CU301">CU301</a>.</p>
+
+<h2 id="F6-10-answers">Answers to Check yourself</h2>
+<ol>
+<li>All threads of the same block, and no other block; the content disappears when the block finishes.</li>
+<li>With staging 128 + 2 = 130; without 128 × 3 = 384 (Listing 2's first row).</li>
+<li>(c). (a) is wrong: nothing enters shared memory unless the kernel writes it. (b) is wrong: a block cannot see another block's shared memory at all. (d) is wrong: shared memory is on-chip; "local" and global memory are in device memory.</li>
+<li>The barrier waits for every thread of the block; a thread that returns early never arrives, so the others may wait forever or the behaviour is undefined (<a href="#F6-12">F6-12</a>). Those threads also load the neutral value that the last real outputs may need.</li>
+<li>(16 + 2 × 2) × (16 + 2 × 2) = 20 × 20 = 400 floats = 1,600 bytes. (A 5-point stencil would not need the four corner regions; loading them is simpler.)</li>
+<li>(256 + 8) × 4 = 1,056 bytes, and the Lab Engineer's check run saw ptxas report 1,056 (the same figure as for radius 3, where 1,048 bytes were rounded up; see the unverified box). Run it yourself and compare.</li>
+<li><code>BAR.SYNC 0x0</code>. The loop over <i>k</i> = −3..3 was fully unrolled, giving one shared load per neighbour.</li>
+</ol>
+<h3 id="F6-10-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Only thread positions 0, 1, 2, 253, 254 and 255 are wrong: 3,906 times each for 0, 1, 254, 255 and 3,551 times for 2 and 253, 22,726 outputs in total; the first wrong indices are 253–258, at the boundary between blocks 0 and 1.</p>
+<p><b>Root cause.</b> With <i>R</i> = 3, thread <i>t</i> reads tile cells <i>t</i> .. <i>t</i>+6. Threads 0–2 read the left-halo cells 0–2 and threads 253–255 read the right-halo cells 259–261; nobody wrote those cells, so they hold stale values. The replay shows stale values from the previous block; on a GPU the content is undefined.</p>
+<p><b>Why the small test passed.</b> 100 elements fit in one block. Its left halo lies before index 0, where the boundary rule wants 0, and in the replay the tile starts zero-filled, which happens to match; its last real outputs (97–99) read tile cells written by threads 100–102, which store 0 because they are past the end. On a GPU the unwritten left-halo cells hold undefined values, so even that pass was luck. Edge bugs need tests that span several blocks.</p>
+<p><b>Wrong answers and why.</b> "A missing barrier": a race gives different wrong values from run to run and at varying positions, not always the same six positions. "Grid too small": would leave the end of the array unwritten, not regular clusters.</p>
+<p><b>Fix.</b> Restore lines 18–23. <b>Prevention:</b> tests with <i>n</i> spanning many blocks and not a multiple of the block size; a check that prints wrong indices modulo the block size. <b>How the evidence was produced:</b> <code>edges.cpp</code>, both versions, same input as Listing 1.</p>

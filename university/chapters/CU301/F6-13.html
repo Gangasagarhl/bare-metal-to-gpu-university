@@ -1,0 +1,269 @@
+<!--meta
+id: F6-13
+title: Atomics: one tally counter, many hands
+course: CU301
+level: L3
+prereqs: F6-12; SP203 (F2-35 data races, F2-38 atomics on the CPU); HW301 F1-57 (warps)
+time: 6–10 hours including the lab
+hardware: Lab extension: any NVIDIA GPU with compute capability 6.0 or later. The lost-update replay, the contention count, the PTX and SASS evidence and the forensic lab run on any computer with g++ and nvcc (this build: no GPU)
+maps: Curriculum Track E 13.2 topic 5 (parallel primitives: reductions with atomics); BR-03 (synchronization cost inside versus across blocks); preparation for E4 (histogram, F6-17)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-13-hook">Story hook</h2>
+<p>At the end of the evening the head of the hall wants to know how many plates were served. On the wall hangs one tally counter: press the button, and the number goes up by one. Mira has a faster idea. She reads the number on the counter, adds one in her head, and writes the new number on a sticky note over the display. When only Mira does this, it works. When the whole hall does it, two helpers read 41 at the same moment, both write 42, and a plate disappears from the count. By the end of the night the wall says 1,472 where 32,000 plates were served.</p>
+<p>The real tally counter does the reading, adding and writing in one press that nobody can interrupt. That is an <b>atomic operation</b>. It is correct, but there is one counter, and a long queue forms in front of it. So the smarter helpers count on their own row first, and only one of them walks to the wall with the row's total. This chapter is about both halves of that story: why "read, add, write" loses updates, and how to keep atomics from becoming a queue.</p>
+
+<h2 id="F6-13-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> why <code>(*counter)++</code> by many threads loses updates, using the three machine steps it compiles to.</li>
+<li><b>Use</b> <code>atomicAdd</code>, <code>atomicCAS</code> and their scoped variants correctly, and build an atomic operation the hardware lacks from a compare-and-swap loop.</li>
+<li><b>Reduce contention</b> with warp aggregation (ballot plus population count) and block aggregation (shared-memory atomics), and count how many global atomics each version issues.</li>
+<li><b>Read</b> PTX and SASS to see whether an update is atomic and whether the compiler already aggregated it.</li>
+<li><b>Diagnose</b> a counter that is too small and different on every run.</li>
+</ul>
+
+<div class="co jargon" id="F6-13-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Atomic operation (GPU)</dt><dd><b>Simple words:</b> a read, change and write of one memory word that no other thread can cut into. <b>Analogy:</b> pressing the tally counter's button. <b>Precise:</b> a read-modify-write on a 32-, 64- (or for some operations 16- or 128-) bit word in global or shared memory, guaranteed to be performed without interference from other threads in its scope; CUDA exposes it as <code>atomicAdd</code>, <code>atomicSub</code>, <code>atomicExch</code>, <code>atomicMin</code>, <code>atomicMax</code>, <code>atomicInc</code>, <code>atomicDec</code>, <code>atomicCAS</code>, <code>atomicAnd</code>, <code>atomicOr</code>, <code>atomicXor</code>. <sup class="src"><a href="#F6-13-src-D1">D1</a></sup></dd>
+<dt>Read-modify-write</dt><dd><b>Simple words:</b> read a value, change it, write it back. <b>Analogy:</b> reading the counter, adding in your head, writing a sticky note. <b>Precise:</b> three steps (a load, an arithmetic operation, a store); when not atomic, another thread's store can fall between them. <sup class="src"><a href="#F6-13-src-D3">D3</a></sup></dd>
+<dt>Lost update</dt><dd><b>Simple words:</b> an increment that disappears because another thread overwrote it. <b>Analogy:</b> two sticky notes that both say 42. <b>Precise:</b> the outcome of a data race on a read-modify-write; the final value is smaller than the number of increments, and different between runs. <sup class="src"><a href="#F6-13-src-R2">R2</a></sup></dd>
+<dt>Contention</dt><dd><b>Simple words:</b> many threads wanting the same address at the same time. <b>Analogy:</b> the queue in front of the one counter. <b>Precise:</b> atomics on one address are performed one after another, so their throughput falls as more of them target it; the cost per operation depends on the GPU. <sup class="src"><a href="#F6-13-src-D2">D2</a></sup> <sup class="src"><a href="#F6-13-src-D3">D3</a></sup></dd>
+<dt>Warp aggregation</dt><dd><b>Simple words:</b> the lanes of a warp combine their updates, and one lane makes a single atomic for all. <b>Analogy:</b> the row counts its plates, one helper walks to the wall. <b>Precise:</b> use a warp vote (<code>__ballot_sync</code>, <a href="#F6-15">F6-15</a>) and <code>__popc</code> to count passing lanes, elect a leader with <code>__ffs</code>, and issue one atomic with the total. <sup class="src"><a href="#F6-13-src-H1">H1</a></sup></dd>
+<dt>Compare-and-swap (CAS)</dt><dd><b>Simple words:</b> "write my new value only if the old value is still what I saw." <b>Analogy:</b> replacing the sticky note only if it still shows the number you read. <b>Precise:</b> <code>atomicCAS(addr, compare, val)</code> reads <code>old</code>, stores <code>val</code> if <code>old == compare</code>, and returns <code>old</code>; any atomic read-modify-write can be built from it with a retry loop. <sup class="src"><a href="#F6-13-src-D1">D1</a></sup></dd>
+<dt>Atomic scope</dt><dd><b>Simple words:</b> which threads the "cannot be cut into" promise covers. <b>Analogy:</b> a counter for one table, one for the hall, one for the whole restaurant chain. <b>Precise:</b> <code>atomicAdd_block</code> is atomic with respect to the threads of the block, <code>atomicAdd</code> of the device, <code>atomicAdd_system</code> also of the host and other devices; available from compute capability 6.0. <sup class="src"><a href="#F6-13-src-D1">D1</a></sup> <sup class="src"><a href="#F6-13-src-H1">H1</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-13-pictures">The idea in pictures</h2>
+<figure id="F6-13-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 320" role="img" aria-labelledby="F6-13-f1t F6-13-f1d">
+<title id="F6-13-f1t">Figure 1: a lost update, and three ways to count with atomics</title>
+<desc id="F6-13-f1d">Left: a time line with two threads A and B and a counter in memory that holds 41. A loads 41, B loads 41, A adds one and stores 42, B adds one and stores 42. Final value 42 instead of 43: one update was lost. Right: three columns that count the atomics reaching one global counter for 2 to the 24 elements: one atomic per passing thread, 5,592,417; one per warp, 524,288; one per block, 65,536. Bar lengths are drawn in proportion on a log scale and labelled with the counts from Listing 3.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="320"/>
+<text class="sv-tb" x="20" y="24">lost update (not atomic)</text>
+<text class="sv-t" x="40" y="50">thread A</text><text class="sv-t" x="230" y="50">thread B</text>
+<rect class="sv-b1" x="20" y="62" width="120" height="28"/><text class="sv-ts" x="28" y="81">load 41</text>
+<rect class="sv-b5" x="210" y="98" width="120" height="28"/><text class="sv-ts" x="218" y="117">load 41</text>
+<rect class="sv-b1" x="20" y="134" width="120" height="28"/><text class="sv-ts" x="28" y="153">add: 42, store 42</text>
+<rect class="sv-b5" x="210" y="170" width="120" height="28"/><text class="sv-ts" x="218" y="189">add: 42, store 42</text>
+<line class="sv-line" x1="175" y1="60" x2="175" y2="210"/><text class="sv-ts" x="150" y="226">time</text>
+<polygon class="sv-head" points="175,216 170,206 180,206"/>
+<rect class="sv-b8" x="20" y="240" width="310" height="34"/><text class="sv-t" x="30" y="262">counter = 42, expected 43: one lost</text>
+<line class="sv-line" x1="360" y1="10" x2="360" y2="310"/>
+<text class="sv-tb" x="380" y="24">atomics on one counter, 2^24 elements (Listing 3)</text>
+<text class="sv-ts" x="380" y="66">per thread</text>
+<rect class="sv-b6" x="480" y="50" width="260" height="26"/><text class="sv-ts" x="490" y="68">5,592,417</text>
+<text class="sv-ts" x="380" y="116">per warp</text>
+<rect class="sv-b2" x="480" y="100" width="203" height="26"/><text class="sv-ts" x="490" y="118">524,288</text>
+<text class="sv-ts" x="380" y="166">per block</text>
+<rect class="sv-b3" x="480" y="150" width="149" height="26"/><text class="sv-ts" x="490" y="168">65,536</text>
+<text class="sv-ts" x="380" y="206">bar length: log10 of the count, scaled</text>
+<text class="sv-ts" x="380" y="232">same answer every time; fewer operations</text>
+<text class="sv-ts" x="380" y="250">on the single address that serialises them</text>
+<text class="sv-ts" x="380" y="290">Counts, not times: the cost per atomic is GPU-specific.</text>
+</svg></div><figcaption><b>Figure 1.</b> Left: the interleaving that loses an update (the replay of Listing 2 finds thousands of them). Right: how aggregation cuts the number of atomics on one address (Listing 3, R3). <sup class="src"><a href="#F6-13-src-R2">R2</a></sup> <sup class="src"><a href="#F6-13-src-R3">R3</a></sup></figcaption></figure>
+
+<h2 id="F6-13-layer1">Layer 1 — the kid explanation</h2>
+<p>If everyone writes the new total on a note, two people can write the same number and one plate is forgotten. If everyone presses the counter's button, nothing is forgotten, but everyone waits in line. So each row counts its own plates first, and one person per row presses the button once with the row's number. Same total, much shorter line.</p>
+
+<h2 id="F6-13-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-13-l2-plain">What <code>(*counter)++</code> really is</h3>
+<p>Listing 1's <code>countPlain</code> counts elements divisible by 3 with <code>(*counter)++</code>. The PTX the compiler made of it, in Evidence R4, is three instructions: <code>ld.global.u32</code>, <code>add.s32 … 1</code>, <code>st.global.u32</code>; the SASS shows <code>LDG.E</code> and <code>STG.E</code> on the same address (R5). <sup class="src"><a href="#F6-13-src-R4">R4</a></sup> <sup class="src"><a href="#F6-13-src-R5">R5</a></sup> Between the load and the store, any other thread may store too. That is a data race (<a href="#F6-12">F6-12</a>), and its result is a lost update.</p>
+<h3 id="F6-13-l2-howmany">How many are lost?</h3>
+<p>Listing 2 replays it without a GPU: <i>K</i> model threads each increment a counter 1,000 times; a seeded scheduler interleaves their load, add and store steps. With 1 thread nothing is lost. With 2, the non-atomic result is 1,137 instead of 2,000; with 4, 1,188 of 4,000; with 32, 1,472 of 32,000; with 256, 1,547 of 256,000. The same 32 threads under five different schedules give 1,503, 1,481, 1,463, 1,509 and 1,463. The atomic version is exact every time. <sup class="src"><a href="#F6-13-src-R2">R2</a></sup> A real GPU's interleaving is different from this model's, so the exact numbers will differ (see the unverified box); the two signatures, "too small" and "different every run", are the point.</p>
+<h3 id="F6-13-l2-atomic">The fix: one indivisible step</h3>
+<p><code>atomicAdd(counter, 1)</code> performs the read, add and write as one operation, and returns the old value. <sup class="src"><a href="#F6-13-src-D1">D1</a></sup> In PTX it is <code>atom.global.add.u32</code> (R4). Atomics exist for global and shared memory, for <code>int</code>, <code>unsigned</code>, <code>unsigned long long</code>, <code>float</code> and (on newer GPUs) <code>double</code> addition and several other operations; check the programming guide for which type and operation your target supports. <sup class="src"><a href="#F6-13-src-D1">D1</a></sup></p>
+<h3 id="F6-13-l2-order">Atomics give no order</h3>
+<p>An atomic makes one update safe; it does not say in which order updates happen. Integer addition does not care. Floating-point addition does: <code>atomicAdd</code> on <code>float</code> sums in an order that can change between runs, so the result can differ in the last bits (<a href="#F6-14">F6-14</a>). And an atomic on one word does not make other memory visible to other threads; for that you need a fence or a barrier (<a href="#F6-12">F6-12</a>). <sup class="src"><a href="#F6-13-src-D1">D1</a></sup></p>
+
+<h2 id="F6-13-layer3">Layer 3 — the engineer's depth</h2>
+<p>In the kitchen: the counter is a queue, so you count locally and send a delegate. The rest of this layer is the precise version.</p>
+<h3 id="F6-13-l3-contention">Contention: atomics on one address serialise</h3>
+<p>Atomics on different addresses can proceed in parallel; atomics on the same address are performed one after another. <sup class="src"><a href="#F6-13-src-D3">D3</a></sup> <sup class="src"><a href="#F6-13-src-D2">D2</a></sup> So the useful number is not "how many atomics" but "how many on the busiest address". Listing 3 counts them for Listing 1's data (2^24 elements, about a third pass): <code>countAtomic</code>, one per passing thread, sends 5,592,417 atomics to the one counter; <code>countWarpAgg</code>, one per warp, 524,288; <code>countBlockAgg</code>, one per block of 256, 65,536. Within one warp instruction, 32 lanes on one address is 32 operations; 32 lanes on 32 addresses is 1 per address; 32 lanes on 4 bins is 8 on the busiest. <sup class="src"><a href="#F6-13-src-R3">R3</a></sup> These are counts. How much time each costs depends on the GPU and is not stated here.</p>
+<h3 id="F6-13-l3-warp">Warp aggregation, by hand</h3>
+<p><code>countWarpAgg</code> (Listing 1, lines 31–40): every lane computes its predicate; <code>__ballot_sync(0xffffffff, p)</code> returns a 32-bit mask with bit <i>k</i> set when lane <i>k</i> passes; the lowest set bit, found by <code>__ffs(mask) - 1</code>, elects a leader; the leader adds <code>__popc(mask)</code>. All lanes must execute the ballot with the full mask, so it sits outside the <code>if</code>. <sup class="src"><a href="#F6-13-src-H1">H1</a></sup> <sup class="src"><a href="#F6-13-src-D1">D1</a></sup></p>
+<h3 id="F6-13-l3-compiler">The compiler already does some of this</h3>
+<p>A surprise in Evidence R5. The SASS of the plain <code>countAtomic</code> for <code>sm_80</code> is not one atomic per thread: it contains <code>VOTEU.ANY</code>, <code>POPC</code> and a single <code>RED.E.ADD.STRONG.GPU</code>, which means ptxas turned the per-thread <code>atomicAdd(counter, 1)</code> on a uniform address into a warp-aggregated one. <code>RED</code> is the form used when the returned old value is not needed. The hand-written <code>countWarpAgg</code> becomes <code>VOTE.ANY</code>, <code>POPC</code>, <code>REDUX.SUM</code> and one <code>RED</code>; <code>countBlockAgg</code>'s shared-memory atomic becomes <code>ATOMS.POPC.INC.32</code>. <sup class="src"><a href="#F6-13-src-R5">R5</a></sup> Two lessons: read the machine code before optimising, and do not depend on this rewrite, which applies only when the compiler can prove the address and the added value are the same for all lanes.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The reading of <code>VOTEU.ANY</code> + <code>POPC</code> + <code>RED</code> as automatic warp aggregation is an interpretation of the SASS of one toolkit (CUDA 12.0, <code>sm_80</code>); this build did not find documentation of when ptxas does it, and did not time it. Listing 3's counts therefore describe the source code, not necessarily what the hardware executes for <code>countAtomic</code>. Also unverified: the relative cost of global atomics, shared atomics and <code>RED</code> on any GPU. Check: the CUDA C++ Best Practices Guide and the Nsight Compute memory workload analysis on your GPU.</p></div>
+<h3 id="F6-13-l3-cas">Building a missing atomic from CAS</h3>
+<p>There is no <code>atomicMax</code> for <code>float</code> in the list of built-in functions. <code>atomicMaxFloat</code> (lines 55–65) builds it: read the word; while the stored value is smaller than ours, try <code>atomicCAS</code> with the value we last saw; if another thread changed the word in between, CAS returns the new value and we retry. <sup class="src"><a href="#F6-13-src-D1">D1</a></sup> It is lock-free: some thread always succeeds. It is slow under contention, because failed attempts repeat. Do not build a spin <em>lock</em> from CAS on a GPU without great care: lanes of one warp spinning on a lock that another lane of the same warp holds were a classic deadlock before independent thread scheduling, and are still slow (<a href="#F6-15">F6-15</a>). <sup class="src"><a href="#F6-13-src-D1">D1</a></sup></p>
+<h3 id="F6-13-l3-scope">Scope</h3>
+<p><code>scopes</code> (lines 73–79) compiles to <code>atom.global.cta.add.u32</code> for <code>atomicAdd_block</code> and <code>atom.global.sys.add.u32</code> for <code>atomicAdd_system</code> (R4). <sup class="src"><a href="#F6-13-src-R4">R4</a></sup> A narrower scope can be cheaper but is only correct if no thread outside it touches the word. The CUDA 12.0 header <code>sm_60_atomic_functions.h</code>, read in this build, declares these variants. <sup class="src"><a href="#F6-13-src-H1">H1</a></sup></p>
+
+<h2 id="F6-13-hardware">How the hardware actually does it</h2>
+<p>Global atomics are carried out near the memory side, in the L2 cache, rather than by the SM that issued them; that is why atomics from different SMs to one address are coherent, and why they serialise there. Shared-memory atomics are performed by the SM on its own shared memory. <sup class="src"><a href="#F6-13-src-D3">D3</a></sup> In SASS the forms are visible: <code>ATOM</code> (returns the old value), <code>RED</code> (no return; "reduction to memory") and <code>ATOMS</code> (shared memory), as in Evidence R5. <sup class="src"><a href="#F6-13-src-R5">R5</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Where exactly a given GPU executes global atomics, and how many per clock it can sustain on one address or on many, was not checked in this build; the statement above is from the textbook's general description (D3, title only). Check: the GPU's architecture whitepaper or tuning guide, and a measurement with Listing 1 extended to time each version.</p></div>
+
+<h2 id="F6-13-worked">Worked example</h2>
+<p><b>Task.</b> 2^24 elements, 65,536 blocks of 256. A third of the elements pass. How many global atomics does each version send to the counter, and what is the worst-case number from one warp instruction?</p>
+<ol>
+<li>Per thread: one per passing element: about 2^24 / 3 ≈ 5.59 million; Listing 3 counts exactly 5,592,417 for this data. <sup class="src"><a href="#F6-13-src-R3">R3</a></sup></li>
+<li>Per warp: one per warp with at least one passing lane. 2^24 / 32 = 524,288 warps; every warp has at least one pass here, so 524,288.</li>
+<li>Per block: one per block, 2^24 / 256 = 65,536, plus up to 256 shared-memory atomics inside each block on the block's own counter.</li>
+<li>Worst from one warp instruction in the per-thread version: the busiest warp has 14 passing lanes (R3), so 14 operations on one address, unless the compiler aggregates (R5).</li>
+</ol>
+<p>Result: aggregation cuts the global operations on one address by about 10× (warp) and 85× (block), at the cost of a vote, a population count, or a shared-memory phase and two barriers.</p>
+
+<h2 id="F6-13-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>atomics.cu</code>: counting four ways, and a CAS-built atomic (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-13/atomics.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings atomics.cu -o atomics</code>.</p>
+<pre class="output" data-run="F6-13/atomics"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The build is real; the run stopped at the first <code>cudaMalloc</code> because the container has no GPU (R1). Expected on a GPU, not observed: <code>countPlain</code> far below the expected count and different between runs; the other three exactly equal to it; <code>atomicMaxFloat</code> equal to the host maximum. What would be needed: an NVIDIA GPU and a rerun.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–21</td><td><code>countPlain</code></td><td><code>(*counter)++</code>.</td><td>The bug: three steps, not one.</td></tr>
+<tr><td>23–29</td><td><code>countAtomic</code></td><td><code>atomicAdd(counter, 1)</code> per passing thread.</td><td>Correct; maximal contention in the source.</td></tr>
+<tr><td>31–40</td><td><code>countWarpAgg</code></td><td>Ballot, leader by <code>__ffs</code>, one add of <code>__popc</code>.</td><td>One global atomic per warp.</td></tr>
+<tr><td>42–53</td><td><code>countBlockAgg</code></td><td>Shared counter, zeroed, barrier, shared atomics, barrier, one global add.</td><td>One global atomic per block; both barriers needed (<a href="#F6-12">F6-12</a>).</td></tr>
+<tr><td>55–65</td><td><code>atomicMaxFloat</code></td><td>CAS retry loop on the float's bits.</td><td>Any atomic read-modify-write from CAS.</td></tr>
+<tr><td>73–79</td><td><code>scopes</code></td><td>Block- and system-scope adds, guarded for compute capability 6.0+.</td><td>Scope is part of correctness.</td></tr>
+<tr><td>106–117</td><td>host loop</td><td>Zero the counter, launch, check, compare.</td><td>Every version checked against the host count.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>lost.cpp</code>: lost updates, replayed deterministically.</p>
+<pre class="listing" data-src="F6-13/lost.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined lost.cpp -o lost</code>.</p>
+<pre class="output" data-run="F6-13/lost"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17</td><td>scheduler</td><td>A seeded random choice of the next thread.</td><td>Repeatable, unlike real hardware.</td></tr>
+<tr><td>19–23</td><td>atomic</td><td>Increment as one step.</td><td>Nothing can fall between read and write.</td></tr>
+<tr><td>24–30</td><td>non-atomic</td><td>Load, add, store as three separate steps.</td><td>Another thread's store between them is lost.</td></tr>
+<tr><td>45–46</td><td>five seeds</td><td>Same work, different schedules.</td><td>"Different every run" in miniature.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>contention.cpp</code>: atomics per address for each version.</p>
+<pre class="listing" data-src="F6-13/contention.cpp"></pre>
+<p><b>Build command</b>: the same g++ command; <code>./contention</code>.</p>
+<pre class="output" data-run="F6-13/contention"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–22</td><td>per warp</td><td>Recomputes Listing 1's data and counts passing lanes per warp.</td><td>Same data, so the counts match the kernels.</td></tr>
+<tr><td>19–20</td><td>counts</td><td>One per passing thread; one per warp with a pass.</td><td>The two numbers of Figure 1.</td></tr>
+<tr><td>31–35</td><td>one instruction</td><td>Busiest-address operations for four address patterns.</td><td>Contention is about the busiest address.</td></tr>
+</tbody></table></div>
+<p><b>Compiler evidence.</b> PTX and SASS of the kernels (<code>sm_80</code>), filtered to memory, atomic and vote instructions:</p>
+<pre class="output" data-run="F6-13/ptx_atom"></pre>
+<pre class="output" data-run="F6-13/sass_atom"></pre>
+
+<h2 id="F6-13-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The queue is invisible and has no fairness you can rely on.</b> In the hall you can see who is next; on the GPU you cannot tell, and the order of atomics is unspecified.</li>
+<li><b>A tally counter only adds one.</b> GPU atomics add any value, take minimum and maximum, swap, and compare-and-swap; the analogy covers only <code>atomicAdd(…, 1)</code>.</li>
+<li><b>Sticky notes would be noticed.</b> A lost update leaves no trace at all: no error, no warning, only a wrong number.</li>
+<li><b>The walking delegate is not free in the hall but nearly free on a GPU.</b> Combining a row's count costs a vote and a population count, a few instructions, not a walk.</li>
+</ul>
+
+<h2 id="F6-13-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> a count or sum that is too small and changes between runs. <b>Cause:</b> a non-atomic read-modify-write. <b>How to find it:</b> look for <code>++</code>, <code>+=</code> on shared or global locations used by many threads; read the PTX for <code>ld</code>/<code>st</code> instead of <code>atom</code>/<code>red</code>; Compute Sanitizer racecheck for shared memory. <b>Fix:</b> an atomic, or a reduction (<a href="#F6-14">F6-14</a>).</li>
+<li><b>Symptom:</b> correct but slow. <b>Cause:</b> every thread hits one address. <b>Fix:</b> warp or block aggregation; privatised copies (<a href="#F6-17">F6-17</a>).</li>
+<li><b>Symptom:</b> <code>countBlockAgg</code> wrong on the first block only, or randomly. <b>Cause:</b> missing barrier after zeroing the shared counter, or before reading it. <b>Fix:</b> both barriers of lines 46 and 51.</li>
+<li><b>Symptom:</b> a float total differs in the last digits between runs. <b>Cause:</b> atomic float addition in a varying order. <b>Fix:</b> accept a tolerance (<a href="#F6-14">F6-14</a>), or reduce in a fixed order.</li>
+<li><b>Symptom:</b> the warp-aggregated kernel hangs or gives wrong counts in a block whose size is not a multiple of 32. <b>Cause:</b> the full mask <code>0xffffffff</code> names lanes that do not exist. <b>Fix:</b> block sizes that are multiples of 32, or <code>__activemask()</code> with care (<a href="#F6-15">F6-15</a>).</li>
+</ul>
+
+<div class="co transition" id="F6-13-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> SP203 <a href="#F2-38">F2-38</a> (<code>std::atomic</code>, <code>fetch_add</code>, compare-exchange, memory orders) and <a href="#F6-12">F6-12</a> (barriers). <b>What carries over:</b> a read-modify-write is three steps; atomics make one location safe; compare-and-swap loops build any operation; atomics on one hot location do not scale. <sup class="src"><a href="#F6-13-src-D1">D1</a></sup> <b>What changes:</b> there is no <code>std::atomic&lt;int&gt;</code> type: atomics are functions on ordinary memory; tens of thousands of threads contend instead of a handful; the warp offers a nearly free way to combine updates first; atomics have a scope (block, device, system). <sup class="src"><a href="#F6-13-src-H1">H1</a></sup> <b>What comes next:</b> <a href="#F6-14">F6-14</a> replaces "everyone adds into one place" with a tree, the parallel reduction, and meets milestone E3.</p></div>
+
+<h2 id="F6-13-check">Check yourself</h2>
+<ol>
+<li>Name the three instructions <code>(*counter)++</code> compiles to in R4.</li>
+<li>Why does the non-atomic result in R2 grow so slowly as threads are added (1,137 for 2 threads, 1,547 for 256)?</li>
+<li>Which version in Listing 1 issues the fewest global atomics, and how many shared atomics does it issue per block at most?</li>
+<li>Why must <code>__ballot_sync</code> in <code>countWarpAgg</code> be executed by all lanes, not only the passing ones?</li>
+<li>Apply: write an atomic multiply for <code>int</code> using <code>atomicCAS</code>.</li>
+<li>When is <code>atomicAdd_block</code> correct and when is it wrong?</li>
+<li>Predict: in Listing 3, what is the per-thread count if every element passes?</li>
+<li>Explain in your own words why giving each block its own counter in shared memory, and adding it to the global counter once, makes counting faster, and what it cannot change about correctness.</li>
+</ol>
+
+<h2 id="F6-13-lab">Lab</h2>
+<p><b>Goal.</b> See lost updates, fix them, and reduce contention while measuring what changes.</p>
+<p><b>Hardware and software needed.</b> Steps 1–4: g++ 13.3 and CUDA 12.0 (no GPU). Steps 5–6: an NVIDIA GPU of compute capability 6.0 or later. Folder <code>university/labs/F6-13</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-13</code>. Read <code>lost.out</code>, <code>contention.out</code>, <code>ptx_atom.out</code> and <code>sass_atom.out</code>.</li>
+<li>In Listing 2, change the non-atomic model so that load and add are one step (two steps per increment). Predict whether fewer updates are lost; run.</li>
+<li>In Listing 3, change the predicate to <code>v % 64 == 0</code>. How do the three counts and the busiest warp change?</li>
+<li>Change <code>countAtomic</code> to <code>int old = atomicAdd(counter, 1); if (old &lt; 0) in[0] = 0;</code> (use the return value) and regenerate the SASS. Does the compiler still aggregate?</li>
+<li>On a GPU: run Listing 1 three times; record <code>countPlain</code> each time.</li>
+<li>On a GPU: add event timing around each version (as in <a href="#F6-14">F6-14</a>) and record the medians; then change the predicate as in step 3 and time again.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: still lost updates (the window between load and store remains). Step 3: fewer per-thread atomics; the per-warp count may fall below the number of warps. Step 4: your observation; the return value needs per-lane results. Steps 5–6: your measurements; none were made in this build.</p>
+<p><b>Verification.</b> <code>countAtomic</code>, <code>countWarpAgg</code> and <code>countBlockAgg</code> equal the host count on every run.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>atomicAdd_block</code> not found → compile for <code>sm_60</code> or later (<code>-arch=sm_80</code>).</li>
+<li>No <code>atomicAdd</code> overload for your type → check the programming guide's list; use CAS for others.</li>
+<li><code>countBlockAgg</code> off by a block's worth → missing <code>__syncthreads()</code> after zeroing.</li>
+</ul>
+<p><b>Extension.</b> Count elements into 256 counters (one per value of <code>v % 256</code>) with the three strategies. This is the histogram of <a href="#F6-17">F6-17</a>.</p>
+
+<h2 id="F6-13-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A data-cleaning job counts rejected records on the GPU. The number in the report is "about 1,500" on every run, but never the same twice, and a CPU recount of one day's file finds over 30,000 rejections. The kernel passed review because "it is only a counter".</p>
+<p><b>Evidence pack.</b> The kernel (<code>countPlain</code>, Listing 1, lines 15–21); its PTX and SASS (R4, R5); the replay of Listing 2 (R2).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what do the counts have in common, and how do they compare with the true count?</li>
+<li>Hypotheses: a wrong predicate; an integer overflow; a lost-update race. Which evidence rules out each?</li>
+<li>Root cause: point to the instructions that make it possible.</li>
+<li>Fix: give the minimal fix and a better one, and say how many global atomics each issues for 2^24 records.</li>
+<li>Prevention: which review rule and which test would have caught it?</li>
+</ol>
+<p><b>Method hints.</b> Overflow makes numbers jump, not shrink to a stable range. A wrong predicate gives the same wrong number every time.</p>
+
+<h2 id="F6-13-project">Mini-project</h2>
+<p><b>A counting module for the primitives library.</b> Write <code>countIf(in, n, pred)</code> with a warp-aggregated atomic, a 64-bit counter for large inputs, and a test against the CPU on the E4 sizes (1, 31, 32, 33, 1,000,003, 2^24). Add a one-paragraph note on what the compiler's SASS shows for your kernel.</p>
+<p><b>Rubric.</b> Correct on all sizes (4). No overflow for <i>n</i> above 2^31 (2). SASS read and explained (2). Clear note (2).</p>
+
+<h2 id="F6-13-summary">Summary</h2>
+<ul>
+<li><code>x++</code> by many threads is load, add, store, and loses updates silently.</li>
+<li>Atomics make a read-modify-write indivisible; they do not order updates or publish other memory.</li>
+<li>Atomics on one address serialise: count operations on the busiest address.</li>
+<li>Aggregate first: warp (ballot + popc + leader), block (shared atomics), then one global atomic.</li>
+<li>CAS loops build any atomic; scope (block, device, system) is part of correctness.</li>
+<li>Read the SASS: the compiler may already aggregate.</li>
+</ul>
+
+<h2 id="F6-13-sources">Sources</h2>
+<ol>
+<li id="F6-13-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): atomic functions, scoped atomics, warp vote functions. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-13-src-D2">D2 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-13-src-D3">D3 — Hwu, Kirk, El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): atomic operations, contention and privatization. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-13-src-H1">H1 — CUDA 12.0 headers as installed (nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>sm_60_atomic_functions.h</code> (<code>atomicAdd_block</code>, <code>atomicAdd_system</code>), <code>sm_30_intrinsics.h</code> (<code>__ballot_sync</code>). Tier 1.</li>
+<li id="F6-13-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-13/atomics.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F6-13-src-R2">R2 — run of Listing 2 (<code>lost.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-13-src-R3">R3 — run of Listing 3 (<code>contention.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-13-src-R4">R4 — PTX of Listing 1, <code>sm_80</code> (<code>ptx_atom.log</code>), compiled only.</li>
+<li id="F6-13-src-R5">R5 — SASS of Listing 1, <code>sm_80</code> (<code>sass_atom.log</code>), compiled only.</li>
+</ol>
+
+<h2 id="F6-13-glossary">Glossary links</h2>
+<p><a href="#gl-atomic-operation-gpu">Atomic operation (GPU)</a> · <a href="#gl-read-modify-write">Read-modify-write</a> · <a href="#gl-lost-update">Lost update</a> · <a href="#gl-contention">Contention (atomics)</a> · <a href="#gl-warp-aggregation">Warp aggregation</a> · <a href="#gl-compare-and-swap-cas">Compare-and-swap (CAS)</a> · <a href="#gl-atomic-scope">Atomic scope</a> · <a href="#gl-data-race">Data race</a></p>
+
+<h2 id="F6-13-next">Next chapter</h2>
+<p>Next: <a href="#F6-14">F6-14 Parallel reduction (milestone E3)</a>. Previous: <a href="#F6-12">F6-12 Synchronization</a>. Back to the course: <a href="#CU301">CU301</a>.</p>
+
+<h2 id="F6-13-answers">Answers to Check yourself</h2>
+<ol>
+<li><code>ld.global.u32</code>, <code>add.s32</code> (+1), <code>st.global.u32</code>.</li>
+<li>When many threads interleave, most stores overwrite values that were read long before; each "round" of overlapping increments contributes about one to the total, so the result grows with rounds, not with threads. In the model, about 1,000 rounds per thread give about 1,000 to 1,500 survivors.</li>
+<li><code>countBlockAgg</code>: one global atomic per block; at most 256 shared atomics per block (one per passing thread).</li>
+<li>A ballot combines the predicates of the lanes in the mask; every named lane must execute it, otherwise the result is undefined (and the leader would count only lanes that happened to be there).</li>
+<li><code>int old = *a, assumed; do { assumed = old; old = atomicCAS(a, assumed, assumed * m); } while (old != assumed); return old;</code></li>
+<li>Correct when only threads of the same block update that word (for example a block-private counter in global memory); wrong when other blocks or the host also update it.</li>
+<li>2^24 = 16,777,216 per thread; 524,288 per warp; 65,536 per block.</li>
+<li>Most clicks then go to a counter close by that only the block's own threads use, so the queue at the single global counter shrinks from one entry per thread to one per block. Correctness does not change: both versions count every event exactly once, because every update is still atomic; only where the queues form changes.</li>
+</ol>
+<h3 id="F6-13-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Every run gives a different number in a narrow band (about 1,500), and all are far below the true count (over 30,000), like R2's 1,503, 1,481, 1,463, 1,509, 1,463 against 32,000.</p>
+<p><b>Hypotheses.</b> A wrong predicate would give the same wrong number every run. An overflow of a 32-bit counter at 30,000 is impossible and would wrap, not shrink. A lost-update race explains "too small" and "different every run"; the PTX shows a non-atomic load, add, store.</p>
+<p><b>Root cause.</b> <code>(*counter)++</code> compiles to <code>ld.global.u32</code> / <code>add.s32</code> / <code>st.global.u32</code> (R4) and <code>LDG</code> / <code>STG</code> (R5); stores of other threads between the load and the store are overwritten.</p>
+<p><b>Fix.</b> Minimal: <code>atomicAdd(counter, 1)</code>, one global atomic per passing record in the source (5,592,417 for 2^24 records with a third passing, R3). Better: warp-aggregated (524,288) or block-aggregated (65,536). <b>Prevention:</b> review rule "no plain <code>++</code> or <code>+=</code> on memory shared between threads"; a test that compares GPU and CPU counts on every run.</p>
+<p><b>How the evidence was produced:</b> <code>lost.cpp</code> (a seeded model, not a GPU), and <code>run.sh</code> (PTX and SASS). The scenario's numbers were chosen to match the model; a GPU would give its own.</p>

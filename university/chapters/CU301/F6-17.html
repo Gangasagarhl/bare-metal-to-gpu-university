@@ -1,0 +1,307 @@
+<!--meta
+id: F6-17
+title: Histograms and privatization
+course: CU301
+level: L3
+prereqs: F6-10 (shared memory), F6-12 (barriers), F6-13 (atomics, contention, warp aggregation), F6-16 (scans); CU201 F6-08 (coalescing)
+time: 8–12 hours including the lab
+hardware: Lab extension: an NVIDIA GPU. The contention model, the E4 acceptance replay, the forensic replay, the compiler evidence and the CUB header evidence run on any computer with g++ and nvcc (this build: no GPU)
+maps: Curriculum Track E 13.2 topic 5 (parallel primitives: histograms, privatization); milestone E4 (a shared-memory histogram with privatization; results identical to a CPU reference for random, sorted, reverse-sorted and all-equal inputs, including sizes 1, 2^k−1, 2^k+1)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-17-hook">Story hook</h2>
+<p>The hall is sorting a delivery of 60 crates of fruit by kind: apples, pears, plums, and so on, 256 kinds in all. On the wall by the door hangs one tally board with a counter for every kind. Amara's first plan: every helper opens a crate, takes one fruit, walks to the wall and clicks the counter for its kind. It is correct, and it is slow. The walk is long, and when a crate is full of apples, every helper queues at the same apple counter.</p>
+<p>Kenji suggests a change. Each table gets its own small tally sheet, lying on the table in the middle of the row. Helpers click the counters on their table's sheet, a few steps away. When a table has finished all its crates, one helper per kind carries the table's count to the wall and adds it in one click. The wall now sees one click per table and kind, not one per fruit.</p>
+<p>That is <b>privatization</b>, and it is the whole idea of this chapter. The details are where it goes wrong: a sheet that was not wiped before use, a table that only had one crate to count, and a wall counter that still gets a queue when all the fruit is apples.</p>
+
+<h2 id="F6-17-able">What you will be able to do</h2>
+<ul>
+<li><b>Write</b> a 256-bin byte histogram three ways: global atomics, shared-memory privatized bins per block, and privatized bins with a grid-stride loop.</li>
+<li><b>Count</b> how many global atomic operations each version issues and how many land on the busiest address, for uniform, skewed and constant inputs, and explain the difference.</li>
+<li><b>Explain</b> why the three steps of a privatized histogram (zero, count, merge) each need a barrier between them.</li>
+<li><b>Test</b> a histogram on milestone E4's sizes and input kinds and compare it with CUB's <code>DeviceHistogram</code>.</li>
+<li><b>Diagnose</b> a privatized histogram whose totals grow with the input size (the forensic lab).</li>
+</ul>
+
+<div class="co jargon" id="F6-17-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Histogram</dt><dd><b>Simple words:</b> a count of how many items fall into each category. <b>Analogy:</b> the tally board by the door, one counter per kind of fruit. <b>Precise:</b> for input values <i>x</i><sub><i>i</i></sub> and a bin function <i>b</i>(<i>x</i>) with <i>B</i> possible results, the array <i>h</i>[<i>k</i>] = |{ <i>i</i> : <i>b</i>(<i>x</i><sub><i>i</i></sub>) = <i>k</i> }|, <i>k</i> = 0 … <i>B</i> − 1; the bins add up to the number of items. <sup class="src"><a href="#F6-17-src-D3">D3</a></sup></dd>
+<dt>Bin</dt><dd><b>Simple words:</b> one category of a histogram and its counter. <b>Analogy:</b> the counter for "plums". <b>Precise:</b> one element <i>h</i>[<i>k</i>]; in CUB's <code>HistogramEven</code>, bins are equal-width ranges between a lower and an upper level, and "the number of histogram bins is (<code>num_levels - 1</code>)" (quoted from the installed header). <sup class="src"><a href="#F6-17-src-H2">H2</a></sup></dd>
+<dt>Privatization</dt><dd><b>Simple words:</b> each group keeps its own private copy of the counters and adds it to the shared result once at the end. <b>Analogy:</b> a tally sheet on each table, carried to the wall when the table is done. <b>Precise:</b> replicate the output (here the <i>B</i> bins) per block (or per warp or thread), update the copies with low contention, then merge them into the global result; correct for any associative and commutative update. <sup class="src"><a href="#F6-17-src-D3">D3</a></sup></dd>
+<dt>Merge (of private bins)</dt><dd><b>Simple words:</b> adding a private copy into the global counters. <b>Analogy:</b> one helper per kind walks the table's count to the wall. <b>Precise:</b> after a barrier, threads of the block each take some bins and do <code>atomicAdd(&amp;global[b], local[b])</code>, skipping zeros; at most <i>B</i> global atomics per block. <sup class="src"><a href="#F6-17-src-R1">R1</a></sup></dd>
+<dt>Contention (in a histogram)</dt><dd><b>Simple words:</b> many updates aimed at the same bin at the same time. <b>Analogy:</b> the queue at the apple counter when every crate is apples. <b>Precise:</b> atomic updates to one address are serialised (<a href="#F6-13">F6-13</a>); its cost depends on the input's distribution, so a histogram's speed depends on its data. <sup class="src"><a href="#F6-17-src-D1">D1</a></sup> <sup class="src"><a href="#F6-17-src-D3">D3</a></sup></dd>
+<dt>Skewed input</dt><dd><b>Simple words:</b> input where a few values are far more common than the rest. <b>Analogy:</b> a delivery that is nine-tenths apples. <b>Precise:</b> in this chapter, a test input where 9 of every 10 bytes are 0 and the rest are spread over all 256 values (Listing 2's <code>sample</code>, kind 1). <sup class="src"><a href="#F6-17-src-R2">R2</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-17-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the three steps of a privatized histogram and where the barriers go. Figure 2 shows the effect of privatization on the busiest counter, with numbers from Listing 2.</p>
+<figure id="F6-17-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-17-f1t F6-17-f1d">
+<title id="F6-17-f1t">Figure 1: a privatized histogram in three steps</title>
+<desc id="F6-17-f1d">At the top, the input bytes in global memory, divided into tiles, one per block. Below them, two blocks, block 0 and block 1, each with its own row of bins in shared memory labelled local bins 0 to 255. Inside each block three steps are written from left to right: step 1, zero the local bins; a barrier; step 2, count: each thread does atomicAdd on the shared bin of its byte; a barrier; step 3, merge: each thread takes some bins and does one atomicAdd of the bin's count into the global bins. At the bottom, the global bins in global memory, 256 counters. Arrows go from the input tiles down to the blocks (reads of the input), and from each block's local bins down to the global bins (the merges). A note says: global atomics per block at most 256, instead of one per byte.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="24">input bytes in global memory</text>
+<rect class="sv-b1" x="20" y="34" width="340" height="30"/><text class="sv-ts" x="30" y="54">tile of block 0 (256 bytes)</text>
+<rect class="sv-b1" x="380" y="34" width="340" height="30"/><text class="sv-ts" x="390" y="54">tile of block 1 (256 bytes)</text>
+<line class="sv-line" x1="190" y1="64" x2="190" y2="88"/><polygon class="sv-head" points="185,84 195,84 190,92"/>
+<line class="sv-line" x1="550" y1="64" x2="550" y2="88"/><polygon class="sv-head" points="545,84 555,84 550,92"/>
+<rect class="sv-box" x="20" y="94" width="340" height="132"/>
+<text class="sv-tb" x="30" y="112">block 0</text>
+<rect class="sv-b3" x="30" y="120" width="320" height="26"/><text class="sv-ts" x="40" y="138">local bins 0 … 255 (shared memory)</text>
+<text class="sv-ts" x="30" y="166">1. zero local bins</text>
+<line class="sv-dash" x1="30" y1="174" x2="350" y2="174"/><text class="sv-ts" x="250" y="170">barrier</text>
+<text class="sv-ts" x="30" y="192">2. count: atomicAdd(local[byte], 1)</text>
+<line class="sv-dash" x1="30" y1="200" x2="350" y2="200"/><text class="sv-ts" x="250" y="196">barrier</text>
+<text class="sv-ts" x="30" y="218">3. merge: atomicAdd(global[b], local[b])</text>
+<rect class="sv-box" x="380" y="94" width="340" height="132"/>
+<text class="sv-tb" x="390" y="112">block 1</text>
+<rect class="sv-b3" x="390" y="120" width="320" height="26"/><text class="sv-ts" x="400" y="138">local bins 0 … 255 (shared memory)</text>
+<text class="sv-ts" x="390" y="166">1. zero local bins</text>
+<line class="sv-dash" x1="390" y1="174" x2="710" y2="174"/><text class="sv-ts" x="610" y="170">barrier</text>
+<text class="sv-ts" x="390" y="192">2. count: atomicAdd(local[byte], 1)</text>
+<line class="sv-dash" x1="390" y1="200" x2="710" y2="200"/><text class="sv-ts" x="610" y="196">barrier</text>
+<text class="sv-ts" x="390" y="218">3. merge: atomicAdd(global[b], local[b])</text>
+<line class="sv-line" x1="190" y1="226" x2="330" y2="256"/><polygon class="sv-head" points="324,250 332,258 322,259"/>
+<line class="sv-line" x1="550" y1="226" x2="430" y2="256"/><polygon class="sv-head" points="438,250 428,258 438,259"/>
+<rect class="sv-b2" x="220" y="262" width="320" height="30"/><text class="sv-ts" x="230" y="282">global bins 0 … 255 (global memory)</text>
+<text class="sv-ts" x="20" y="316">Global atomics per block: at most 256 (one per non-empty bin), instead of one per byte. Not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> Privatization: each block counts into its own bins in shared memory and merges them into the global bins once. The dashed lines are the two barriers; arrows show data flow. <sup class="src"><a href="#F6-17-src-D3">D3</a></sup> <sup class="src"><a href="#F6-17-src-R1">R1</a></sup></figcaption></figure>
+
+<figure id="F6-17-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F6-17-f2t F6-17-f2d">
+<title id="F6-17-f2t">Figure 2: operations on the busiest global bin, skewed input</title>
+<desc id="F6-17-f2d">Three horizontal bars compare, for the skewed input of 2 to the power 26 bytes (90 percent zeros), how many atomic operations hit the busiest global address over the whole kernel. histGlobal: 60,424,194. histShared with 262,144 blocks: 262,144. histStride with 320 blocks: 320. The bars are drawn on a logarithmic scale, marked as such, because the values differ by a factor of almost 200,000. A note says the counts come from Listing 2's exact replay, not from a GPU measurement.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<text class="sv-tb" x="20" y="24">atomics on the busiest global bin (skewed input, n = 2^26) — logarithmic scale</text>
+<text class="sv-ts" x="20" y="64">histGlobal</text>
+<rect class="sv-b8" x="170" y="48" width="415" height="24"/><text class="sv-ts" x="593" y="65">60,424,194</text>
+<text class="sv-ts" x="20" y="114">histShared</text>
+<rect class="sv-b4" x="170" y="98" width="289" height="24"/><text class="sv-ts" x="467" y="115">262,144</text>
+<text class="sv-ts" x="20" y="164">histStride</text>
+<rect class="sv-b5" x="170" y="148" width="134" height="24"/><text class="sv-ts" x="312" y="165">320</text>
+<line class="sv-line2" x1="170" y1="40" x2="170" y2="182"/>
+<text class="sv-ts" x="170" y="200">1</text><text class="sv-ts" x="330" y="200">10^3</text><text class="sv-ts" x="490" y="200">10^6</text><text class="sv-ts" x="650" y="200">10^9</text>
+<text class="sv-ts" x="20" y="232">Bar length ∝ log10(count); counts from Listing 2 (exact replay, R2), not a GPU measurement.</text>
+</svg></div><figcaption><b>Figure 2.</b> The queue at the busiest counter: privatization divides it by the number of elements per block, and a fixed grid divides it again. The counts are exact, from Listing 2; time on a GPU was not measured. <sup class="src"><a href="#F6-17-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F6-17-layer1">Layer 1 — the kid explanation</h2>
+<p>Counting things is easy for one person. When many helpers count at once, they all want the same counters. If they all walk to one board, they queue. If every table keeps its own small sheet, the queues are short and close by. At the end, each table adds its sheet to the board once. Two rules keep the count right: wipe the sheet before you start, and do not carry it to the board until everyone at the table has finished counting.</p>
+
+<h2 id="F6-17-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-17-l2-global">Version 1: one global atomic per element</h3>
+<p>The simplest GPU histogram gives one thread to each byte and does <code>atomicAdd(&amp;bins[in[i]], 1u)</code> on the global bins (Listing 1, lines 17–21). It is correct, because an atomic read-modify-write cannot lose an update (<a href="#F6-13">F6-13</a>). <sup class="src"><a href="#F6-17-src-D1">D1</a></sup> For 2^26 bytes it issues 67,108,864 global atomics, one per byte, whatever the data. <sup class="src"><a href="#F6-17-src-R2">R2</a></sup> What changes with the data is how many land on the same address. For the uniform input, the busiest bin receives 262,148; for the skewed input (90 % zeros), bin 0 receives 60,424,194; for an input of one repeated byte, all 67,108,864 go to one bin. <sup class="src"><a href="#F6-17-src-R2">R2</a></sup> Updates to one address are serialised, so the same kernel can be fast on one input and slow on another. <sup class="src"><a href="#F6-17-src-D3">D3</a></sup></p>
+<h3 id="F6-17-l2-shared">Version 2: privatized bins in shared memory</h3>
+<p>Listing 1's <code>histShared</code> (lines 23–34) gives every block 256 counters in shared memory. Step 1 zeroes them (line 26); a barrier (line 27) makes sure no thread counts into a bin that another thread has not yet zeroed; step 2 counts with shared-memory atomics (line 29); a second barrier (line 30) makes sure all counting is done; step 3 merges, each thread taking bins <code>threadIdx.x</code>, <code>threadIdx.x + blockDim.x</code>, … and skipping empty bins (lines 31–33). <sup class="src"><a href="#F6-17-src-R1">R1</a></sup> The ptxas report confirms the cost: 1,024 bytes of shared memory per block (256 four-byte counters) for the two privatized kernels, none for <code>histGlobal</code>. <sup class="src"><a href="#F6-17-src-R4">R4</a></sup></p>
+<p>Does it help? Listing 2 counts exactly. With one byte per thread and 256 threads per block, each block sees only 256 bytes. For uniform data most of those are different, so a block has many non-empty bins and merges almost all of them: 58,025,860 global atomics, barely fewer than the 67,108,864 of version 1. For skewed data the merges drop to 6,347,595 and the busiest global address falls from 60,424,194 to 262,144 operations (one per block). <sup class="src"><a href="#F6-17-src-R2">R2</a></sup> Privatization helps exactly when a block's private copy absorbs many updates per bin, and that needs many elements per block.</p>
+<h3 id="F6-17-l2-stride">Version 3: privatized bins and a grid-stride loop</h3>
+<p><code>histStride</code> (lines 36–49) launches a fixed number of blocks (four per SM in Listing 1, line 96) and lets each thread walk the input with the grid-stride loop of <a href="#F6-14">F6-14</a> (lines 41–44). Each block now counts thousands of bytes before it merges. Listing 2 models 320 blocks: the merges fall to 81,920 for every input (320 blocks × 256 bins at most), and the busiest global address receives at most 320. <sup class="src"><a href="#F6-17-src-R2">R2</a></sup> The global traffic of the merge becomes negligible next to reading 2^26 input bytes. What remains is the contention inside each block: for skewed data, the busiest shared bin in a block of 256 bytes receives 233 updates; for constant data, 256, meaning every thread of the block queues on one shared counter. <sup class="src"><a href="#F6-17-src-R2">R2</a></sup></p>
+<h3 id="F6-17-l2-correct">Correctness first: E4's cases</h3>
+<p>Milestone E4 asks for "results identical to a CPU reference for random, sorted, reverse-sorted and all-equal inputs, including sizes 1, 2^k−1, 2^k+1". <sup class="src"><a href="#F6-17-src-C1">C1</a></sup> For integer counts, "identical" is the right standard: integer addition is associative and commutative, so the order of the atomics cannot change the result. Listing 3 replays <code>histStride</code> block by block with an odd grid of 7 blocks and checks 9 sizes, including 1,791 and 1,793 on either side of 7 × 256, against a plain count: 36 cases, 0 failures. <sup class="src"><a href="#F6-17-src-R3">R3</a></sup></p>
+
+<h2 id="F6-17-layer3">Layer 3 — the engineer's depth</h2>
+<p>The tally-sheet story says nothing about how big a sheet may be or who wipes it; the engineering is in those questions.</p>
+<h3 id="F6-17-l3-levels">Levels of privatization</h3>
+<p>Private copies can live at several levels: per block in shared memory (this chapter), per warp (several copies in shared memory, more space, less contention), per thread in registers (only for a handful of bins), or per block in global memory when the bins do not fit in shared memory. <sup class="src"><a href="#F6-17-src-D3">D3</a></sup> CUB's histogram agent makes the same choice explicit: its policy has a parameter described in the installed header as "Whether to prefer privatized shared-memory bins (versus privatized global-memory bins)", and <code>PRIVATIZED_SMEM_BINS</code>, where "Zero indicates privatized counters to be maintained in device-accessible memory". <sup class="src"><a href="#F6-17-src-H2">H2</a></sup> Its shared array is declared <code>histograms[NUM_ACTIVE_CHANNELS][PRIVATIZED_SMEM_BINS + 1]</code> "(with 1 word of padding)": the bank-conflict padding of <a href="#F6-11">F6-11</a> in a production library. <sup class="src"><a href="#F6-17-src-R6">R6</a></sup></p>
+<h3 id="F6-17-l3-budget">The shared-memory budget</h3>
+<p>256 four-byte counters cost 1,024 bytes per block (R4). A 4,096-bin histogram per block costs 16 KiB, per warp 16 KiB times the warps per block; at some point the private copies limit how many blocks fit on an SM (<a href="#F6-10">F6-10</a>), and smaller counters (16-bit, flushed before they overflow) or global privatization become the better trade. The point where that happens depends on your GPU's shared-memory size; measure it rather than assume it.</p>
+<h3 id="F6-17-l3-agg">Contention inside the block</h3>
+<p>For constant input, every thread of a block hits one shared bin. Two remedies come from earlier chapters. Warp aggregation (<a href="#F6-13">F6-13</a>, <a href="#F6-15">F6-15</a>): lanes with the same value elect a leader with <code>__match_any_sync</code> and the leader adds the count of its group in one atomic. Per-warp copies: each warp counts in its own sub-histogram, so contention is at most 32 lanes. The compiler already does something on its own: the SASS of <code>histShared</code> shows the shared-memory counting step as <code>ATOMS.POPC.INC.32</code>, not a plain add. <sup class="src"><a href="#F6-17-src-R5">R5</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The meaning of the <code>.POPC.INC</code> suffix of <code>ATOMS</code> was not looked up in this build. The name suggests that the compiler counted, with a population count, how many active lanes increment by 1, and that lanes with equal addresses are combined, but NVIDIA's SASS instruction list was not opened. Do not rely on the compiler to aggregate for you until you have measured it. Check: the CUDA binary utilities documentation (instruction set reference for your architecture), and a GPU timing of Listing 1 on constant input with and without explicit warp aggregation.</p></div>
+<h3 id="F6-17-l3-coarsen">Thread coarsening and input loading</h3>
+<p>The grid-stride loop is a form of <b>thread coarsening</b>: each thread does more work so that the fixed per-block costs (zeroing and merging 256 bins, two barriers) are paid less often. <sup class="src"><a href="#F6-17-src-D3">D3</a></sup> The loads are bytes; one byte per thread per iteration gives a warp 32 consecutive bytes, coalesced but small. Loading four bytes as one 32-bit word (or sixteen as a vector) and counting them in registers reduces load instructions, at the cost of tail handling. That is a tuning step for your E4 report, not a correctness step.</p>
+<h3 id="F6-17-l3-cub">Comparing with CUB</h3>
+<p>Listing 1 checks every version, and <code>cub::DeviceHistogram::HistogramEven</code> with 257 levels between 0 and 256, against the CPU count (lines 88–100). <sup class="src"><a href="#F6-17-src-R1">R1</a></sup> CUB is the reference for E4's "X % of CUB" criteria; for histograms the course project adds its own row in the comparison table.</p>
+
+<h2 id="F6-17-hardware">How the hardware actually does it</h2>
+<p>Shared-memory atomics are carried out by the SM on its own shared memory; global atomics are carried out at the memory side, in the L2 cache, which is why they are coherent across SMs and why many of them to one address serialise there (<a href="#F6-13">F6-13</a>). <sup class="src"><a href="#F6-17-src-D3">D3</a></sup> The compiled kernels show the two kinds side by side: <code>histGlobal</code> uses <code>RED.E.ADD.STRONG.GPU</code> (a global reduction with no returned value, at GPU scope), while <code>histShared</code> counts with <code>ATOMS.POPC.INC.32</code> on shared memory between two <code>BAR.SYNC</code> barriers, and its merge again uses <code>RED.E.ADD.STRONG.GPU</code>. <sup class="src"><a href="#F6-17-src-R5">R5</a></sup> The global bins are only 1 KiB in total, small enough that they are likely to stay in the L2 cache; if so, the cost of version 1 is not DRAM traffic for the bins but the serialisation of updates to the same few cache lines. (Not measured in this build: a profiler on a GPU can confirm it.)</p>
+
+<h2 id="F6-17-worked">Worked example</h2>
+<p><b>Task.</b> 16 values with 4 bins, 2 blocks of 8 threads. Block 0 sees 0 1 1 3 0 0 2 1; block 1 sees 3 3 3 3 0 3 3 1. Count the global atomics and the busiest global address for the global and the privatized versions, and the busiest shared bin.</p>
+<ol>
+<li><b>Global version.</b> 16 global atomics, one per value. Bin 3 receives 1 + 6 = 7 of them: the busiest address.</li>
+<li><b>Block 0's local bins.</b> bin 0: 3, bin 1: 3, bin 2: 1, bin 3: 1. All four non-empty: 4 merges.</li>
+<li><b>Block 1's local bins.</b> bin 0: 1, bin 1: 1, bin 2: 0, bin 3: 6. Three non-empty: 3 merges (bin 2 is skipped).</li>
+<li><b>Privatized totals.</b> 4 + 3 = 7 global atomics instead of 16; bins 0, 1 and 3 each receive 2 merges, bin 2 receives 1: the busiest address now sees 2 operations instead of 7.</li>
+<li><b>Busiest shared bin.</b> Block 1's bin 3 receives 6 of its 8 updates: the queue has moved from the wall to the table, and it is shorter.</li>
+<li><b>Check.</b> Global bins: 4, 4, 1, 7; sum 16, the number of values.</li>
+</ol>
+<p>Listing 2 performs exactly this bookkeeping for 2^26 bytes.</p>
+
+<h2 id="F6-17-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>histogram.cu</code>: three histogram kernels and CUB, checked against a CPU count (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-17/histogram.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings histogram.cu -o histogram</code>.</p>
+<pre class="output" data-run="F6-17/histogram"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The program was built for real; the run stopped at <code>cudaGetDevice</code> because the build container has no GPU (R1). Expected, not observed: "matches the CPU count" for all four versions and both inputs. The times it prints are single runs and are not a measurement protocol (<a href="#F6-06">F6-06</a>). What would be needed: an NVIDIA GPU and a rerun; then the timing protocol of CU201 for the E4 report.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–21</td><td><code>histGlobal</code></td><td>One global <code>atomicAdd</code> per byte.</td><td>The baseline; its speed depends on the data.</td></tr>
+<tr><td>25</td><td><code>__shared__ unsigned local[BINS]</code></td><td>256 private counters per block.</td><td>1,024 bytes of shared memory (R4).</td></tr>
+<tr><td>26–27</td><td>zero, barrier</td><td>Threads zero bins in a strided loop; all wait.</td><td>Shared memory is not cleared for you (forensic lab).</td></tr>
+<tr><td>29–30</td><td>count, barrier</td><td>Shared-memory atomic per byte; all wait.</td><td>Merging before everyone has counted loses counts.</td></tr>
+<tr><td>31–33</td><td>merge</td><td>One global atomic per non-empty bin.</td><td>At most 256 global atomics per block.</td></tr>
+<tr><td>41–44</td><td>grid-stride loop</td><td>Each thread counts many bytes.</td><td>Fewer blocks, fewer merges (Listing 2).</td></tr>
+<tr><td>64–73</td><td>inputs</td><td>2^26 bytes, uniform or 90 % zeros, and the CPU count.</td><td>The same data as Listing 2.</td></tr>
+<tr><td>88–100</td><td>CUB</td><td>Size query, temporary storage, <code>HistogramEven</code> with 257 levels.</td><td>The reference library.</td></tr>
+<tr><td>96</td><td><code>histStride&lt;&lt;&lt;sms * 4, BLOCK&gt;&gt;&gt;</code></td><td>Four blocks per SM.</td><td>A tuning choice; try others.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>privatize_model.cpp</code>: where the atomics go, counted exactly for the three kernels and three inputs.</p>
+<pre class="listing" data-src="F6-17/privatize_model.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined privatize_model.cpp -o privatize_model</code> (time limit raised to 60 s with a <code>.timeout</code> file because of the sanitizers).</p>
+<pre class="output" data-run="F6-17/privatize_model"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9</td><td>constants</td><td>2^26 bytes, blocks of 256, 256 bins, a 320-block grid.</td><td>320 stands for "four blocks on each of 80 SMs"; your GPU's number differs.</td></tr>
+<tr><td>11–17</td><td><code>sample</code></td><td>Uniform, skewed or constant byte for index <i>i</i>.</td><td>The same formula as Listing 1, lines 70–71.</td></tr>
+<tr><td>30</td><td><code>++count[v]</code></td><td>Counts global atomics per bin for <code>histGlobal</code>.</td><td>The busiest address.</td></tr>
+<tr><td>31–32</td><td><code>blocksUsing</code></td><td>Counts the blocks that have bin <i>v</i> non-empty.</td><td>= merges into bin <i>v</i> for <code>histShared</code>.</td></tr>
+<tr><td>33</td><td><code>strideSeen</code></td><td>Which of the 320 blocks owns element <i>i</i>.</td><td>Block = (<i>i</i> / 256) mod 320 in a grid-stride loop.</td></tr>
+<tr><td>34–38</td><td><code>local</code></td><td>Largest count in one block's bins.</td><td>Contention inside shared memory.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>hist_cases.cpp</code>: E4's acceptance cases on a CPU replay of <code>histStride</code>.</p>
+<pre class="listing" data-src="F6-17/hist_cases.cpp"></pre>
+<pre class="output" data-run="F6-17/hist_cases"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10</td><td><code>GRID = 7</code></td><td>An odd number of blocks.</td><td>Sizes around 7 × 256 test the edge of the first sweep.</td></tr>
+<tr><td>15–21</td><td>replay</td><td>Zero, count with the grid stride, merge, per block.</td><td>The three steps of Figure 1.</td></tr>
+<tr><td>38–42</td><td>input kinds</td><td>Random, sorted, reverse-sorted, all-equal.</td><td>E4's four kinds.</td></tr>
+<tr><td>43–46</td><td>compare</td><td>Against a plain sequential count.</td><td>"Identical" is the right test for integer counts.</td></tr>
+</tbody></table></div>
+
+<p><b>Compiler evidence.</b> ptxas resource report (sm_80) and the atomic instructions in SASS:</p>
+<pre class="output" data-run="F6-17/resources"></pre>
+<pre class="output" data-run="F6-17/sass_atoms"></pre>
+<p><b>Source evidence.</b> CUB 2.0.1's histogram headers on bins and privatization:</p>
+<pre class="output" data-run="F6-17/cub_hist"></pre>
+
+<h2 id="F6-17-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The tally sheet is not wiped by anyone.</b> In the hall, a new table starts with a clean sheet. On a GPU, shared memory is not cleared between blocks; a block that skips step 1 starts with whatever is there (the forensic lab).</li>
+<li><b>The walk to the wall is not the main cost.</b> The global bins are small and are likely to stay in the L2 cache; what costs time is many updates on the same few addresses, not distance.</li>
+<li><b>Helpers at one table do not really click one at a time.</b> A warp issues one atomic instruction for 32 lanes, and the hardware or compiler may combine lanes with equal addresses (R5, unverified); the queue is per instruction and per address, not per helper.</li>
+</ul>
+
+<h2 id="F6-17-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> totals larger than the number of elements, growing with the input size. <b>Cause:</b> private bins not zeroed. <b>How to find it:</b> check that the bins sum to <i>n</i>, on a size with more blocks than the GPU can hold at once. <b>Fix:</b> step 1 and a barrier.</li>
+<li><b>Symptom:</b> counts slightly too small, varying between runs. <b>Cause:</b> the barrier between counting and merging is missing, so some threads merge bins others are still counting. <b>How to find it:</b> Compute Sanitizer racecheck (<a href="#F6-12">F6-12</a>). <b>Fix:</b> <code>__syncthreads()</code> before the merge.</li>
+<li><b>Symptom:</b> correct, but no faster than the global version. <b>Cause:</b> one element per thread; blocks are too small to absorb updates (Listing 2, uniform input). <b>Fix:</b> a grid-stride loop with a fixed grid.</li>
+<li><b>Symptom:</b> fast on random data, slow on real data. <b>Cause:</b> skew; contention on one bin. <b>Fix:</b> per-warp copies or warp aggregation; always test the all-equal input.</li>
+<li><b>Symptom:</b> bins wrong only for some values. <b>Cause:</b> signed <code>char</code> input used as an index (negative indices). <b>Fix:</b> <code>unsigned char</code>, as Listing 1.</li>
+<li><b>Symptom:</b> occupancy drops after increasing the number of bins. <b>Cause:</b> shared memory per block. <b>Fix:</b> read the ptxas report; consider 16-bit counters or global privatization.</li>
+</ul>
+
+<div class="co transition" id="F6-17-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-13">F6-13</a> (one tally counter, many hands; contention), <a href="#F6-10">F6-10</a> (shared memory as the table in the middle of the row), <a href="#F6-12">F6-12</a> (barriers). <b>What carries over:</b> atomics make concurrent counting correct; shared memory is the cheap place for data a block reuses; every shared write that others read needs a barrier in between. <sup class="src"><a href="#F6-17-src-D1">D1</a></sup> <b>What changes:</b> the question is no longer whether the count is correct, but where the updates go: you shape the traffic by giving each block a private copy, and its benefit depends on the input's distribution. <sup class="src"><a href="#F6-17-src-D3">D3</a></sup> <b>What comes next:</b> <a href="#F6-18">F6-18</a> uses a small histogram (16 digit values per tile) and the exclusive scan of <a href="#F6-16">F6-16</a> to give each key its place: a radix sort.</p></div>
+
+<h2 id="F6-17-check">Check yourself</h2>
+<ol>
+<li>How many global atomics does <code>histGlobal</code> issue for <i>n</i> bytes, and why does its speed still depend on the data?</li>
+<li>Name the three steps of a privatized histogram and say what each of the two barriers protects.</li>
+<li>Why did <code>histShared</code> issue 58,025,860 global atomics on uniform input, almost as many as <code>histGlobal</code>?</li>
+<li>Why is 81,920 the number of merges of <code>histStride</code> for uniform and skewed input alike?</li>
+<li>Which is likely to be slowest for <code>histStride</code>: uniform, skewed or all-equal input? Which number of Listing 2 supports your answer?</li>
+<li>Explain in your own words why "identical to a CPU reference" is the right test for a histogram, but not for a float sum.</li>
+<li>Apply: a 4,096-bin histogram with 32-bit counters and one private copy per warp, 8 warps per block. How much shared memory does a block need?</li>
+<li>Why does CUB's private shared array have <code>PRIVATIZED_SMEM_BINS + 1</code> entries per channel?</li>
+</ol>
+
+<h2 id="F6-17-lab">Lab</h2>
+<p><b>Goal.</b> E4's histogram part: "a shared-memory histogram with privatization", with "results identical to a CPU reference for random, sorted, reverse-sorted and all-equal inputs, including sizes 1, 2^k−1, 2^k+1". <sup class="src"><a href="#F6-17-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–4: g++ 13.3 and nvcc 12.0, no GPU. Steps 5–7: an NVIDIA GPU with CUDA 12.0 and CUB. Folder <code>university/labs/F6-17</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-17</code> from the repository root; read all outputs.</li>
+<li>Do the worked example by hand for a third block 2 2 2 2 2 2 2 2 and update the totals.</li>
+<li>Change <code>STRIDE_GRID</code> in Listing 2 to 80 and to 1,280. How do merges and the busiest address change? Predict first.</li>
+<li>Add per-warp private copies to Listing 2's model (8 copies per block) and report the busiest shared bin for the all-equal input.</li>
+<li>On a GPU: run Listing 1. All versions must print "matches the CPU count".</li>
+<li>On a GPU: port Listing 3's cases to Listing 1 (sizes 1, 2, 255, 257, 2^16 ± 1, 1,000,003; four kinds) and keep 0 failures.</li>
+<li>On a GPU: time the three kernels and CUB on uniform, skewed and all-equal input with the CU201 protocol; record your table. Then add warp aggregation to <code>histStride</code> and time again.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: block 2 merges once into bin 2 (8); totals 4, 4, 9, 7. Step 3: merges become 80 × 256 = 20,480 and 1,280 × 256 = 327,680 for uniform input; the busiest address is at most the number of blocks. Steps 5–7: your measurements; none exist in this build.</p>
+<p><b>Verification.</b> Bins sum to <i>n</i> and equal the CPU count in every case.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>CUB's size query returns 0 bytes → allocate anyway or skip; a 0-byte <code>cudaMalloc</code> is allowed.</li>
+<li>CUB histogram wrong in the last bin → <code>num_levels</code> is bins + 1 and the upper level is exclusive (H2).</li>
+<li>Listing 2 is slow → the sanitizers; drop <code>N</code> to 2^22 while experimenting.</li>
+</ul>
+<p><b>Extension.</b> Histogram of 32-bit values into 4,096 bins (the top 12 bits); compare shared and global privatization.</p>
+
+<h2 id="F6-17-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A team's privatized histogram passed its unit tests (256 and 1,024 bytes). On a 1 MiB image, the bins add up to about 537 million. Bin 0 is far too large. The kernel is <code>histShared</code> without the zeroing loop: "shared memory starts at zero, doesn't it?"</p>
+<p><b>Evidence pack.</b> A replay of the scenario on a toy GPU with 4 SMs, where a block's shared memory starts with whatever the previous block on the same SM left (<code>stale_bins.cpp</code>):</p>
+<pre class="listing" data-src="F6-17/stale_bins.cpp"></pre>
+<pre class="output" data-run="F6-17/stale_bins"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: for which sizes are the totals right, and how fast does the error grow?</li>
+<li>Hypotheses: a missing barrier, a missing zeroing step, an overflow. Which evidence rules each in or out?</li>
+<li>Explain why sizes 256 and 1,024 pass in the replay.</li>
+<li>Why would the error be different, and still wrong, on a real GPU?</li>
+<li>Fix and prevention.</li>
+</ol>
+<p><b>Method hints.</b> Count blocks per SM for each size. What does block 4 find in its shared bins?</p>
+
+<h2 id="F6-17-project">Mini-project</h2>
+<p><b>The histogram module of the primitives library.</b> A device histogram for 8-bit and 32-bit samples with a configurable number of equal-width bins, privatized in shared memory with a fallback to global privatization when the bins do not fit; tests on E4's sizes and input kinds; a timing row against <code>cub::DeviceHistogram::HistogramEven</code> on uniform, skewed and all-equal input.</p>
+<p><b>Rubric.</b> Correct on all cases, including bins not fitting in shared memory (4). Privatization with a fixed grid and a justified block count (2). Skew handled (warp copies or aggregation) and measured (2). Comparison table against CUB with the protocol of CU201 (2).</p>
+
+<h2 id="F6-17-summary">Summary</h2>
+<ul>
+<li>A histogram is correct with one global atomic per element, but its speed depends on how many elements share a bin.</li>
+<li>Privatization: zero private bins, barrier, count, barrier, merge once per block.</li>
+<li>It pays only when each block counts many elements: one byte per thread barely reduces global atomics on uniform data.</li>
+<li>A fixed grid with a grid-stride loop bounds the merges at blocks × bins.</li>
+<li>Contention moves into shared memory; skewed and constant inputs are the hard tests.</li>
+<li>Shared memory is not zeroed for you.</li>
+<li>Integer histograms must be identical to a CPU count on every E4 case.</li>
+</ul>
+
+<h2 id="F6-17-sources">Sources</h2>
+<ol>
+<li id="F6-17-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): atomic functions, shared memory, synchronization functions. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-17-src-D3">D3 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): the parallel histogram chapter (atomics, contention, privatization, coarsening, aggregation). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-17-src-C1">C1 — Systems Curriculum (this project), milestone E4 (goal, build and accept quoted). A map, not a source (AH-4).</li>
+<li id="F6-17-src-H2">H2 — CUB 2.0.1 headers as installed (libcub-dev 2.0.1-2), read in this build: <code>cub/device/device_histogram.cuh</code> (number of bins), <code>cub/agent/agent_histogram.cuh</code> (privatized shared-memory or global-memory bins). Tier 1.</li>
+<li id="F6-17-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-17/histogram.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F6-17-src-R2">R2 — run of Listing 2 (<code>privatize_model.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-17-src-R3">R3 — run of Listing 3 (<code>hist_cases.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-17-src-R4">R4 — ptxas resource report of Listing 1 for sm_80 (<code>resources.log</code>), CUDA 12.0; compiled only.</li>
+<li id="F6-17-src-R5">R5 — SASS of <code>histGlobal</code> and <code>histShared</code> for sm_80 (<code>sass_atoms.log</code>), cuobjdump from CUDA 12.0; compiled only.</li>
+<li id="F6-17-src-R6">R6 — CUB header excerpt (<code>cub_hist.log</code>), read only.</li>
+<li id="F6-17-src-R7">R7 — run of the forensic replay <code>stale_bins.cpp</code> (<code>stale_bins.log</code>), g++ 13.3.0, exit code 0.</li>
+</ol>
+
+<h2 id="F6-17-glossary">Glossary links</h2>
+<p><a href="#gl-histogram">Histogram</a> · <a href="#gl-bin">Bin</a> · <a href="#gl-privatization">Privatization</a> · <a href="#gl-merge-of-private-bins">Merge (of private bins)</a> · <a href="#gl-contention-in-a-histogram">Contention (in a histogram)</a> · <a href="#gl-skewed-input">Skewed input</a> · <a href="#gl-warp-aggregation">Warp aggregation</a> · <a href="#gl-grid-stride-loop">Grid-stride loop</a></p>
+
+<h2 id="F6-17-next">Next chapter</h2>
+<p>Next: <a href="#F6-18">F6-18 Sorting on the GPU: radix sort built on scan</a>. Previous: <a href="#F6-16">F6-16 Scans (prefix sums)</a>. Back to the course: <a href="#CU301">CU301</a>.</p>
+
+<h2 id="F6-17-answers">Answers to Check yourself</h2>
+<ol>
+<li><i>n</i>, one per byte. The number is fixed, but updates to one address serialise, and how many share an address depends on the data: 262,148 on the busiest bin for uniform data, 60,424,194 for skewed, 67,108,864 for constant (R2).</li>
+<li>Zero, count, merge. The first barrier stops a thread from counting into a bin another thread has not zeroed yet; the second stops a thread from merging a bin others are still counting into.</li>
+<li>Each block sees only 256 bytes; with uniform bytes most of a block's 256 bins hold 0 or 1 or 2, so almost every non-empty bin is merged, giving nearly one global atomic per byte. A distractor answer is "shared atomics are slow": the count is about the number of merges, not about speed.</li>
+<li>Each of the 320 blocks sees thousands of bytes, so all its 256 bins are non-empty for both inputs (the skewed input still spreads 10 % of its bytes over all values): 320 × 256 = 81,920.</li>
+<li>All-equal: every update in a block goes to one shared bin; Listing 2 reports 256 updates on the busiest shared bin per 256 bytes (233 for skewed, 2 for uniform).</li>
+<li>Integer addition is associative and commutative and exact, so any order of atomics gives the same bins; float addition rounds, so different orders can give different sums (<a href="#F6-14">F6-14</a>).</li>
+<li>4,096 × 4 bytes × 8 copies = 131,072 bytes = 128 KiB per block; check it against your GPU's limit (F6-10); it may not fit, which is the argument for 16-bit counters or per-block copies.</li>
+<li>One word of padding per row, as the header comment says, to avoid bank conflicts between channels' rows (<a href="#F6-11">F6-11</a>).</li>
+</ol>
+<h3 id="F6-17-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Sizes 256 (1 block) and 1,024 (4 blocks) are right. From 4,096 on, totals are too large: 10,240 instead of 4,096; 2,129,920 instead of 65,536; 537,395,200 instead of 1,048,576 (R7). The error grows much faster than <i>n</i>.</p>
+<p><b>Hypotheses.</b> A missing barrier would lose or duplicate a few counts at random, not inflate totals by hundreds of times. Overflow would make totals smaller or wrap, not grow. Unzeroed bins fit: each block adds its predecessors' leftovers again.</p>
+<p><b>Why small sizes pass.</b> With at most 4 blocks, each SM runs one block, which finds the zeroed memory the replay starts with. From 16 blocks, each SM runs 4 blocks in turn and every block starts with the previous block's counts, which it merges again: the leftovers are counted over and over, so the error grows roughly with the square of the number of blocks per SM.</p>
+<p><b>On a real GPU.</b> The initial content of shared memory is undefined: it may be zeros the first time, leftovers of another block or of another kernel. The error pattern would differ between runs and GPUs, which makes the bug look random.</p>
+<p><b>Fix.</b> Zero the private bins (Listing 1, line 26) and put a barrier after it (line 27). <b>Prevention:</b> test sizes with many more blocks than SMs; assert that the bins sum to <i>n</i>; check in the Compute Sanitizer documentation whether its initcheck tool covers uninitialised shared memory in your version (not verified in this build).</p>
+<p><b>How the evidence was produced:</b> <code>stale_bins.cpp</code>, a CPU replay with a deterministic choice of "previous block's leftovers"; no GPU was used. That a real GPU leaves leftovers in exactly this pattern is a modelling assumption.</p>

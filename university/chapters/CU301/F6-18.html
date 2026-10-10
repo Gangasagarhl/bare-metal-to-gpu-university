@@ -1,0 +1,305 @@
+<!--meta
+id: F6-18
+title: Sorting on the GPU: radix sort built on scan
+course: CU301
+level: L3
+prereqs: F6-16 (scans), F6-17 (histograms), F6-12 (barriers), F6-15 (warp primitives); SP203 (stable sorting, std::stable_sort); HW201 (two's complement and IEEE 754 bit patterns)
+time: 10–14 hours including the lab
+hardware: Lab extension: an NVIDIA GPU. The split trace, the CPU LSD radix sort with E4's acceptance cases, the forensic replay, the compiler evidence and the CUB header evidence run on any computer with g++ and nvcc (this build: no GPU)
+maps: Curriculum Track E 13.2 topic 5 (parallel primitives: radix sort built on scan); milestone E4 (an LSD radix sort built on your scan, for 32-bit keys and key-value pairs; results identical to a CPU reference; X % of CUB DeviceRadixSort)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-18-hook">Story hook</h2>
+<p>After the banquet, a thousand numbered plates must go back to the shelf in order, plate 0 first. Luis cannot compare plates two by two with a thousand helpers: who would compare with whom? Lucía has a different plan. "First, sort only by the last digit. Every table counts how many of its plates end in 0, in 1, … in 9. We add up the counts so every table knows where its plates ending in 0 go, where its plates ending in 1 go, and so on. Everyone puts their plates in place at once. Then we do it again for the middle digit, and then for the first."</p>
+<p>"But the second round will mess up the first," says Luis. "Only if you are careless," says Lucía. "When two plates have the same middle digit, keep them in the order they arrived. Then the last digit's order survives inside every group." Three rounds, no comparisons, every helper busy. That is <b>radix sort</b>, and its middle step, "add up the counts so everyone knows where to go", is the scan of <a href="#F6-16">F6-16</a>.</p>
+
+<h2 id="F6-18-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> why least-significant-digit (LSD) radix sort is correct only if every pass is stable.</li>
+<li><b>Trace</b> one pass by hand: per-tile digit counts, the digit-major exclusive scan, and the scatter.</li>
+<li><b>Build</b> a radix sort for 32-bit keys and key-value pairs from a histogram and a scan, and test it on milestone E4's sizes and inputs.</li>
+<li><b>Map</b> signed integers and floats to unsigned keys whose order matches, and back.</li>
+<li><b>Choose</b> the digit width by trading passes against counters per tile, and compare your sort with CUB's <code>DeviceRadixSort</code>.</li>
+<li><b>Diagnose</b> a radix sort whose every pass is right but whose result is not sorted (the forensic lab).</li>
+</ul>
+
+<div class="co jargon" id="F6-18-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Radix sort</dt><dd><b>Simple words:</b> sorting by looking at one digit at a time instead of comparing whole keys. <b>Analogy:</b> putting plates in order by the last digit, then the middle, then the first. <b>Precise:</b> a non-comparison sort that treats a key as a sequence of <i>d</i>-bit digits and distributes keys by one digit per pass; for <i>b</i>-bit keys it needs ⌈<i>b</i>/<i>d</i>⌉ passes, each linear in <i>n</i>. <sup class="src"><a href="#F6-18-src-D3">D3</a></sup> <sup class="src"><a href="#F6-18-src-D4">D4</a></sup></dd>
+<dt>LSD (least significant digit first)</dt><dd><b>Simple words:</b> sort by the lowest digit first, the highest last. <b>Analogy:</b> last digit of the plate number first. <b>Precise:</b> after pass <i>p</i>, keys are sorted by their lowest <i>p</i> digits, provided every pass is stable; the last pass leaves them fully sorted. <sup class="src"><a href="#F6-18-src-D4">D4</a></sup> <sup class="src"><a href="#F6-18-src-R2">R2</a></sup></dd>
+<dt>Stable sort</dt><dd><b>Simple words:</b> equal keys keep their original order. <b>Analogy:</b> plates with the same middle digit stay in the order they arrived. <b>Precise:</b> if <i>k</i><sub><i>i</i></sub> = <i>k</i><sub><i>j</i></sub> and <i>i</i> &lt; <i>j</i> in the input, the item from <i>i</i> comes first in the output; <code>std::stable_sort</code> guarantees it; the installed CUB header states "DeviceRadixSort is stable". <sup class="src"><a href="#F6-18-src-D4">D4</a></sup> <sup class="src"><a href="#F6-18-src-R6">R6</a></sup></dd>
+<dt>Digit (radix digit)</dt><dd><b>Simple words:</b> a small group of bits of the key looked at in one pass. <b>Analogy:</b> one digit of the plate number. <b>Precise:</b> (<i>key</i> &gt;&gt; <i>shift</i>) &amp; (2<sup><i>d</i></sup> − 1); with <i>d</i> = 4 a digit has 16 values, with <i>d</i> = 8, 256. <sup class="src"><a href="#F6-18-src-R2">R2</a></sup></dd>
+<dt>Split (1-bit partition)</dt><dd><b>Simple words:</b> one pass of radix sort with a one-bit digit: all keys with a 0 go first, then all with a 1, each group in its old order. <b>Analogy:</b> plates with an even number to the left, odd to the right, keeping the order. <b>Precise:</b> destination = exclusive scan of the 0-flags for 0-keys, and (number of 0-keys) + (number of 1-keys before me) for 1-keys. <sup class="src"><a href="#F6-18-src-D3">D3</a></sup> <sup class="src"><a href="#F6-18-src-R1">R1</a></sup></dd>
+<dt>Scatter</dt><dd><b>Simple words:</b> writing each item to a computed position, not the next one. <b>Analogy:</b> each helper carries a plate to the shelf spot it was given. <b>Precise:</b> <code>out[dst[i]] = in[i]</code> with <code>dst</code> a permutation; on a GPU its store pattern decides how well writes coalesce (<a href="#F6-08">F6-08</a>). <sup class="src"><a href="#F6-18-src-D3">D3</a></sup></dd>
+<dt>Key transformation (order-preserving)</dt><dd><b>Simple words:</b> changing the bits of signed numbers or floats so that sorting them as unsigned numbers gives the right order. <b>Analogy:</b> relabelling plates so the shelf order is right. <b>Precise:</b> the installed CUB header lists them: unsigned keys "used directly"; signed: "the sign bit is inverted"; positive floats: "the sign bit is inverted"; negative floats: "the full key is inverted". <sup class="src"><a href="#F6-18-src-R6">R6</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-18-pictures">The idea in pictures</h2>
+<p>Figure 1 is one pass of the sort, with the numbers of the worked example: two tiles of four keys and 2-bit digits (so the digit is the whole key, 0 to 3).</p>
+<figure id="F6-18-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 400" role="img" aria-labelledby="F6-18-f1t F6-18-f1d">
+<title id="F6-18-f1t">Figure 1: one radix-sort pass — count, scan, scatter</title>
+<desc id="F6-18-f1d">Step 1, count: tile 0 holds keys 3 1 2 1 and tile 1 holds keys 0 3 1 2. Each tile counts its digits: tile 0 has digit 0: 0, digit 1: 2, digit 2: 1, digit 3: 1; tile 1 has 1, 1, 1, 1. Step 2, scan: the counts are laid out digit-major, digit 0 of tile 0, digit 0 of tile 1, digit 1 of tile 0, and so on: 0 1 2 1 1 1 1 1. Their exclusive scan is 0 0 1 3 4 5 6 7: the first output position for each digit of each tile. Step 3, scatter: tile 0 writes key 3 to position 6, key 1 to 1, key 2 to 4, key 1 to 2; tile 1 writes 0 to 0, 3 to 7, 1 to 3, 2 to 5. The output is 0 1 1 1 2 2 3 3, with tile 0's keys before tile 1's keys inside each digit group: the pass is stable.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="400"/>
+<text class="sv-tb" x="20" y="24">1. count (one histogram per tile)</text>
+<rect class="sv-b1" x="20" y="36" width="160" height="30"/><text class="sv-t" x="30" y="56">tile 0: 3 1 2 1</text>
+<rect class="sv-b1" x="200" y="36" width="160" height="30"/><text class="sv-t" x="210" y="56">tile 1: 0 3 1 2</text>
+<text class="sv-ts" x="20" y="88">tile 0 counts d0..d3: 0 2 1 1</text>
+<text class="sv-ts" x="200" y="88">tile 1 counts d0..d3: 1 1 1 1</text>
+<text class="sv-tb" x="400" y="24">2. exclusive scan, digit-major</text>
+<text class="sv-ts" x="400" y="50">order:  d0t0 d0t1 d1t0 d1t1 d2t0 d2t1 d3t0 d3t1</text>
+<rect class="sv-b3" x="400" y="58" width="340" height="26"/><text class="sv-t" x="410" y="76">counts:  0  1  2  1  1  1  1  1</text>
+<rect class="sv-b4" x="400" y="96" width="340" height="26"/><text class="sv-t" x="410" y="114">offsets: 0  0  1  3  4  5  6  7</text>
+<line class="sv-line" x1="570" y1="84" x2="570" y2="94"/><polygon class="sv-head" points="565,90 575,90 570,96"/>
+<text class="sv-tb" x="20" y="160">3. scatter (each key to offset of its digit and tile, then offset + 1)</text>
+<rect class="sv-box" x="20" y="176" width="340" height="100"/>
+<text class="sv-ts" x="30" y="196">tile 0: 3 → 6, 1 → 1, 2 → 4, 1 → 2</text>
+<text class="sv-ts" x="30" y="216">tile 1: 0 → 0, 3 → 7, 1 → 3, 2 → 5</text>
+<text class="sv-ts" x="30" y="242">within a tile, equal digits are placed</text>
+<text class="sv-ts" x="30" y="260">in input order (rank inside the tile)</text>
+<line class="sv-line" x1="360" y1="226" x2="394" y2="296"/><polygon class="sv-head" points="388,292 398,292 396,302"/>
+<g>
+<rect class="sv-b2" x="400" y="304" width="40" height="34"/><text class="sv-t" x="414" y="326">0</text>
+<rect class="sv-b5" x="440" y="304" width="40" height="34"/><text class="sv-t" x="454" y="326">1</text>
+<rect class="sv-b5" x="480" y="304" width="40" height="34"/><text class="sv-t" x="494" y="326">1</text>
+<rect class="sv-b2" x="520" y="304" width="40" height="34"/><text class="sv-t" x="534" y="326">1</text>
+<rect class="sv-b5" x="560" y="304" width="40" height="34"/><text class="sv-t" x="574" y="326">2</text>
+<rect class="sv-b2" x="600" y="304" width="40" height="34"/><text class="sv-t" x="614" y="326">2</text>
+<rect class="sv-b5" x="640" y="304" width="40" height="34"/><text class="sv-t" x="654" y="326">3</text>
+<rect class="sv-b2" x="680" y="304" width="40" height="34"/><text class="sv-t" x="694" y="326">3</text>
+</g>
+<text class="sv-ts" x="400" y="296">output positions 0 … 7</text>
+<text class="sv-ts" x="400" y="358">under each key: t0 = from tile 0, t1 = from tile 1</text>
+<text class="sv-ts" x="408" y="378">t1</text><text class="sv-ts" x="448" y="378">t0</text><text class="sv-ts" x="488" y="378">t0</text><text class="sv-ts" x="528" y="378">t1</text><text class="sv-ts" x="568" y="378">t0</text><text class="sv-ts" x="608" y="378">t1</text><text class="sv-ts" x="648" y="378">t0</text><text class="sv-ts" x="688" y="378">t1</text>
+</svg></div><figcaption><b>Figure 1.</b> One pass of an LSD radix sort, as Listing 2 organises it: per-tile histograms (<a href="#F6-17">F6-17</a>), one exclusive scan over the digit-major counts (<a href="#F6-16">F6-16</a>), and a stable scatter. Arrows show data flow. <sup class="src"><a href="#F6-18-src-D3">D3</a></sup> <sup class="src"><a href="#F6-18-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F6-18-layer1">Layer 1 — the kid explanation</h2>
+<p>To sort numbers without comparing them, look at one digit at a time. Start with the last digit: put every number in the group for its last digit, keeping the order inside each group. Then do the same with the next digit. After the last round the numbers are in order. Every helper can work at the same time, because each one only needs to know where its group starts, and adding up the group sizes tells everyone that.</p>
+
+<h2 id="F6-18-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-18-l2-split">The smallest case: a 1-bit split</h3>
+<p>With a 1-bit digit, a pass is a split. Listing 1 traces it on 5 2 7 0 3 6 1 4. For bit 0, the flags "bit is 0" are 0 1 0 1 0 1 0 1; their exclusive scan 0 0 1 1 2 2 3 3 gives each 0-key its place; there are 4 zeros, so a 1-key at index <i>i</i> goes to 4 + (<i>i</i> − scan[<i>i</i>]). The destinations are 4 0 5 1 6 2 7 3 and the result is 2 0 6 4 5 7 3 1. After bits 1 and 2 the keys are 0 1 2 3 4 5 6 7. <sup class="src"><a href="#F6-18-src-R1">R1</a></sup> The whole pass is one scan and one scatter; no thread compares two keys.</p>
+<h3 id="F6-18-l2-why">Why LSD works, and why stability is the condition</h3>
+<p>Suppose after some passes the keys are sorted by their lowest <i>p</i> digits. The next pass sorts by digit <i>p</i> + 1. Two keys with different digits <i>p</i> + 1 end up in the right order by that digit. Two keys with the same digit <i>p</i> + 1 keep their previous order, if the pass is stable, and that order was right by the lower digits. By induction, after all passes the keys are sorted. <sup class="src"><a href="#F6-18-src-D4">D4</a></sup> Without stability the argument fails at the second pass; the forensic lab measures how badly.</p>
+<h3 id="F6-18-l2-pass">A pass with <i>d</i>-bit digits</h3>
+<p>Listing 2 uses 4-bit digits (16 values) and tiles of 256 keys, the way a GPU kernel would assign one block per tile (lines 18–41). Each pass has three steps:</p>
+<ol>
+<li><b>Count</b> (lines 25–29): every tile builds a 16-bin histogram of its digits, as in <a href="#F6-17">F6-17</a>.</li>
+<li><b>Scan</b> (line 30): one exclusive scan over all counts, laid out <i>digit-major</i>: all tiles' counts for digit 0, then all tiles' counts for digit 1, and so on. The scanned value at [<i>d</i>][<i>t</i>] is the first output position for digit <i>d</i> of tile <i>t</i>: after all smaller digits, and after the same digit of earlier tiles.</li>
+<li><b>Scatter</b> (lines 31–37): every key goes to that position plus its rank among equal digits inside the tile, in input order.</li>
+</ol>
+<p>The digit-major layout is what makes the scan do the work of two: it orders digits globally and tiles within a digit, which is exactly stability across tiles. <sup class="src"><a href="#F6-18-src-D3">D3</a></sup> Key-value pairs cost nothing extra in the logic: the value moves with its key (lines 35–36).</p>
+<h3 id="F6-18-l2-e4">E4's acceptance cases</h3>
+<p>Listing 2 sorts sizes 1, 2, 255, 257, 65,535, 65,537 and 1,000,003, each random, sorted, reverse-sorted and all-equal, as keys and as pairs. Every case passes, and the pairs equal those of <code>std::stable_sort</code>, which checks stability directly: the values are the original positions, so any unstable step would show. <sup class="src"><a href="#F6-18-src-R2">R2</a></sup> These are E4's words: "results identical to a CPU reference for random, sorted, reverse-sorted and all-equal inputs, including sizes 1, 2^k−1, 2^k+1". <sup class="src"><a href="#F6-18-src-C1">C1</a></sup></p>
+<h3 id="F6-18-l2-types">Signed and float keys</h3>
+<p>Radix sort orders bit patterns as unsigned numbers. Two's-complement negatives have the top bit set, so they would sort after the positives; inverting the sign bit fixes it (Listing 2, line 43). IEEE 754 floats are sign and magnitude: for positives, inverting the sign bit is enough; for negatives, a larger magnitude must come first, so all bits are inverted (lines 44–49). The run sorts −2147483648 −3 −1 0 3 5 2147483647 and −7.25 −0.5 −1e-09 0 2.5 3 1e+09 correctly. <sup class="src"><a href="#F6-18-src-R2">R2</a></sup> These are the transformations the CUB 2.0.1 header lists, quoted in the jargon box. <sup class="src"><a href="#F6-18-src-R6">R6</a></sup> One difference: CUB's header says that "<code>-0.0</code> and <code>+0.0</code> are considered equal and appear in the result in the same order as they appear in the input", while Listing 2's mapping gives −0.0 a smaller key than +0.0. <sup class="src"><a href="#F6-18-src-H1">H1</a></sup> NaNs are, in CUB's words, "sorted according to their bit representations after any transformations". <sup class="src"><a href="#F6-18-src-H1">H1</a></sup></p>
+
+<h2 id="F6-18-layer3">Layer 3 — the engineer's depth</h2>
+<p>Lucía's plan hides one cost: every round moves every plate. The engineering is about how many rounds, and how each move is made.</p>
+<h3 id="F6-18-l3-width">Digit width: passes against counters</h3>
+<p>For 32-bit keys, 1-bit digits need 32 passes (Listing 3), 4-bit digits 8 passes (Listing 2), 8-bit digits 4 passes. Each pass reads every key at least once and writes it once, so fewer passes means less memory traffic. Wider digits cost more counters per tile (2, 16, 256) and a bigger scan (2<sup><i>d</i></sup> × tiles entries: for 2^26 keys in tiles of 256 with 4-bit digits, 16 × 262,144 = 4,194,304). <sup class="src"><a href="#F6-18-src-D3">D3</a></sup> CUB's tuning policy for compute capability 8.0, read in this build, sets <code>ONESWEEP_RADIX_BITS = 8</code> and <code>ONESWEEP = sizeof(KeyT) &gt;= sizeof(uint32_t)</code>, and <code>PRIMARY_RADIX_BITS</code> 7 for keys wider than one byte: CUB chooses wide digits. <sup class="src"><a href="#F6-18-src-R7">R7</a></sup></p>
+<h3 id="F6-18-l3-traffic">Counting the traffic</h3>
+<p>Listing 2's pass reads the keys twice (count, then scatter) and writes them once: about 3 key accesses per key per pass, plus the counts. A sort that keeps a whole tile in shared memory during the pass reads each key once, counts and ranks it on chip, and writes it once. A further step removes the separate counting kernel: compute the histograms of all digits in one upfront pass, then do each digit pass as a single sweep, with tile offsets passed between blocks by decoupled look-back (<a href="#F6-16">F6-16</a>). The compiled CUB code in Listing 3's binary contains kernels named <code>DeviceRadixSortHistogramKernel</code>, <code>DeviceRadixSortOnesweepKernel</code> and, for other policies, <code>DeviceRadixSortUpsweepKernel</code>, <code>RadixSortScanBinsKernel</code> and <code>DeviceRadixSortDownsweepKernel</code>. <sup class="src"><a href="#F6-18-src-R8">R8</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That CUB's "onesweep" path works as described above (one upfront histogram, then one sweep per digit with decoupled look-back) is the author's reading of the kernel names and of memory of the published method, not of the source; the dispatch code that chooses between onesweep and the upsweep/scan/downsweep path was not traced. The CUB headers also contain throughput comments for named GPUs; they are not reproduced here because they are not measurements of this build. Check: <code>cub/device/dispatch/dispatch_radix_sort.cuh</code> and <code>cub/agent/agent_radix_sort_onesweep.cuh</code> in your CUB version, and the onesweep paper by Adinets and Merrill (title to be confirmed by the Source Researcher).</p></div>
+<h3 id="F6-18-l3-ranking">Ranking inside a tile</h3>
+<p>The scatter needs, for each key, its rank among keys with the same digit in its tile, in input order. On a CPU, Listing 2 gets it for free by walking the tile in order (<code>offset[...]++</code>, line 33). On a GPU, threads run concurrently, and the obvious shortcut, a shared-memory <code>atomicAdd</code> on the digit's counter, gives each key a unique place but in the order the atomics happened (the forensic lab). Stable ranking uses a scan: a 1-bit split per bit of the digit inside the tile (as Listing 3 does with <code>blockExclusiveScan</code>), or a scan of per-digit flags, or warp-level match operations that count equal digits among lower lanes (<a href="#F6-15">F6-15</a>). <sup class="src"><a href="#F6-18-src-D3">D3</a></sup></p>
+<h3 id="F6-18-l3-listing3">Listing 3: correct and simple, not fast</h3>
+<p>Listing 3 is the 1-bit split on the GPU. <code>countZeros</code> counts the 0-keys per block with <code>__syncthreads_count</code>, a barrier that also counts how many threads passed a true predicate (line 33). <sup class="src"><a href="#F6-18-src-D1">D1</a></sup> CUB's <code>DeviceScan::ExclusiveSum</code> turns the per-block counts into per-block starting positions (line 88). <code>scatter</code> ranks each key in its tile with a Hillis–Steele block scan (lines 14–27) and writes it (lines 44–51). Thirty-two passes of three kernels: a teaching baseline whose distance from CUB your E4 table will show. It sorts keys only; pairs are the lab's step 6.</p>
+
+<h2 id="F6-18-hardware">How the hardware actually does it</h2>
+<p>A block-wide count is cheap because the barrier hardware can count: the SASS of <code>countZeros</code> contains a single <code>BAR.RED.POPC</code> between the load (<code>LDG</code>) and the store (<code>STG</code>), which, as its name suggests, combines the barrier with a population count of the predicate. <sup class="src"><a href="#F6-18-src-R9">R9</a></sup> The expensive part of a pass is the scatter. Keys of one digit from one tile go to consecutive addresses, but neighbouring threads usually hold different digits, so one warp's 32 stores land in up to 2<sup><i>d</i></sup> separate runs and need many memory transactions (<a href="#F6-08">F6-08</a>). <sup class="src"><a href="#F6-18-src-D3">D3</a></sup> Production sorts therefore first reorder the tile in shared memory by digit, so that consecutive threads write consecutive addresses within each run; the shared-memory step costs barriers and bank traffic but turns scattered stores into near-coalesced ones. <sup class="src"><a href="#F6-18-src-D3">D3</a></sup> CUB's onesweep kernel, compiled into Listing 3's binary, contains 21 <code>ATOMS.POPC.INC.32</code> and 21 <code>ATOMS.ADD</code> shared-memory atomics, the same increment instruction as the histogram of <a href="#F6-17">F6-17</a>, and a single global <code>ATOMG.E.ADD</code>, which would fit a dynamic tile counter like the one of <a href="#F6-16">F6-16</a> (an interpretation, not traced in the source). <sup class="src"><a href="#F6-18-src-R10">R10</a></sup></p>
+
+<h2 id="F6-18-worked">Worked example</h2>
+<p><b>Task.</b> One pass with 2-bit digits over two tiles of four keys: tile 0 = 3 1 2 1, tile 1 = 0 3 1 2 (Figure 1).</p>
+<ol>
+<li><b>Count.</b> Tile 0: digit 0: 0, digit 1: 2, digit 2: 1, digit 3: 1. Tile 1: 1, 1, 1, 1. Check: each tile's counts add up to 4.</li>
+<li><b>Lay out digit-major.</b> d0t0, d0t1, d1t0, d1t1, d2t0, d2t1, d3t0, d3t1 = 0 1 2 1 1 1 1 1.</li>
+<li><b>Exclusive scan.</b> 0 0 1 3 4 5 6 7. So tile 0's 1-keys start at 1, tile 1's 1-keys at 3; tile 0's 3-key at 6, tile 1's at 7.</li>
+<li><b>Scatter tile 0</b> in input order: 3 → 6; 1 → 1 (then the 1-offset becomes 2); 2 → 4; 1 → 2.</li>
+<li><b>Scatter tile 1:</b> 0 → 0; 3 → 7; 1 → 3; 2 → 5.</li>
+<li><b>Result.</b> 0 1 1 1 2 2 3 3. The three 1-keys are, in order, tile 0's first, tile 0's second, tile 1's: input order is kept, so the pass is stable.</li>
+</ol>
+<p>Listing 2 performs exactly these steps, with 16 digit values, 256 keys per tile and eight passes.</p>
+
+<h2 id="F6-18-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>split_demo.cpp</code>: the 1-bit split on 8 keys, three passes, traced.</p>
+<pre class="listing" data-src="F6-18/split_demo.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined split_demo.cpp -o split_demo</code>.</p>
+<pre class="output" data-run="F6-18/split_demo"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15</td><td><code>isZero[i]</code></td><td>Flag: bit <code>bit</code> of the key is 0.</td><td>The predicate of the split.</td></tr>
+<tr><td>16–17</td><td><code>scan[i] = zeros</code></td><td>Exclusive scan of the flags, sequentially.</td><td>On a GPU: a block or device scan.</td></tr>
+<tr><td>21–22</td><td><code>dst[i]</code></td><td>0-keys to <code>scan[i]</code>; 1-keys after all zeros.</td><td>Stable: both groups keep input order.</td></tr>
+<tr><td>23</td><td><code>out[dst[i]] = keys[i]</code></td><td>The scatter.</td><td>Each key written once.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>lsd_sort.cpp</code>: LSD radix sort with 4-bit digits and 256-key tiles, keys and pairs, signed and float keys, E4's cases.</p>
+<pre class="listing" data-src="F6-18/lsd_sort.cpp"></pre>
+<p><b>Build command</b>: the same g++ command.</p>
+<pre class="output" data-run="F6-18/lsd_sort"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>16</td><td>constants</td><td>Tiles of 256, 4-bit digits, 16 digit values.</td><td>8 passes for 32-bit keys.</td></tr>
+<tr><td>22</td><td><code>offset(DIGITS * tiles)</code></td><td>The digit-major count array.</td><td>Index <code>digit * tiles + tile</code>.</td></tr>
+<tr><td>25–29</td><td>count</td><td>Per-tile digit histogram.</td><td>One block per tile on a GPU.</td></tr>
+<tr><td>30</td><td><code>std::exclusive_scan</code></td><td>Starting position for each (digit, tile).</td><td>The scan of F6-16.</td></tr>
+<tr><td>31–37</td><td>scatter</td><td>Each key and its value to <code>offset++</code>, in input order.</td><td>Stable by construction on the CPU.</td></tr>
+<tr><td>43–49</td><td><code>fromSigned</code>, <code>fromFloat</code></td><td>Order-preserving bit transformations.</td><td>Sort any 32-bit type as unsigned.</td></tr>
+<tr><td>54–76</td><td>tests</td><td>E4 sizes × 4 kinds; compare with <code>std::stable_sort</code>.</td><td>Values = original positions: checks stability.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>radix.cu</code>: a 1-bit split radix sort on the GPU, checked against <code>cub::DeviceRadixSort::SortKeys</code> (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-18/radix.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings radix.cu -o radix</code>.</p>
+<pre class="output" data-run="F6-18/radix"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Built for real; the run stopped at <code>cudaGetDevice</code> (R3). Expected, not observed: "split radix sort: pass; CUB SortKeys: pass" for 1,000,003 random keys. The kernel's indices are <code>int</code>, so it is limited to fewer than 2^31 keys (see the overflow lesson of <a href="#F6-14">F6-14</a>). What would be needed: an NVIDIA GPU and a rerun.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–27</td><td><code>blockExclusiveScan</code></td><td>Hillis–Steele with a read, a barrier, a write, a barrier.</td><td>The race-free form of F6-16's forensic lab.</td></tr>
+<tr><td>33</td><td><code>__syncthreads_count</code></td><td>Barrier plus count of true predicates.</td><td>0-keys per block in one instruction (R9).</td></tr>
+<tr><td>45</td><td><code>totalZeros</code></td><td>Last block's start plus its count.</td><td>Where the 1-keys begin.</td></tr>
+<tr><td>48–50</td><td><code>onesBeforeTile</code>, <code>dst</code></td><td>Global position of each key.</td><td>The split formula of Listing 1, across blocks.</td></tr>
+<tr><td>85–92</td><td>32 passes</td><td>Count, scan (CUB), scatter, swap buffers.</td><td>Kernel boundaries order the passes (F6-12).</td></tr>
+<tr><td>98–100</td><td>CUB</td><td><code>SortKeys</code> size query and sort.</td><td>The reference for E4's "X % of CUB".</td></tr>
+</tbody></table></div>
+
+<p><b>Compiler and source evidence.</b> The barrier-count instruction; the kernels in the binary; CUB's policy for compute capability 8.0; CUB's documentation of order, stability and transformations; the atomics in CUB's onesweep kernel:</p>
+<pre class="output" data-run="F6-18/sass_count"></pre>
+<pre class="output" data-run="F6-18/cub_kernels"></pre>
+<pre class="output" data-run="F6-18/cub_policy"></pre>
+<pre class="output" data-run="F6-18/cub_radix"></pre>
+<pre class="output" data-run="F6-18/cub_onesweep_atoms"></pre>
+
+<h2 id="F6-18-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Plates do not need relabelling.</b> Plate numbers are non-negative decimal numbers. Real keys can be negative or floating point, whose bit patterns do not sort correctly as unsigned numbers without the transformations of Layer 2.</li>
+<li><b>Helpers putting plates on the shelf do not get in each other's way.</b> On a GPU, where the keys go matters: scattered stores from one warp need many memory transactions, and the "putting in place" step is the expensive one.</li>
+<li><b>"Keep the order they arrived" is not free.</b> Helpers in the hall naturally line up; GPU threads do not. Stability must be built with a scan or a ranking step; an atomic counter gives places in a random order.</li>
+</ul>
+
+<h2 id="F6-18-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> each pass looks right, the final result is not sorted. <b>Cause:</b> an unstable pass (atomic ranking). <b>How to find it:</b> sort key-value pairs whose values are the original positions and compare with <code>std::stable_sort</code>. <b>Fix:</b> rank with a scan.</li>
+<li><b>Symptom:</b> negative numbers come after positive ones. <b>Cause:</b> signed keys sorted as unsigned. <b>Fix:</b> invert the sign bit before and after.</li>
+<li><b>Symptom:</b> negative floats in reverse order. <b>Cause:</b> only the sign bit flipped for negatives. <b>Fix:</b> invert all bits of negative floats.</li>
+<li><b>Symptom:</b> wrong only when <i>n</i> is not a multiple of the tile. <b>Cause:</b> threads past the end counted as 0-keys, or skipped barriers. <b>Fix:</b> count only <code>i &lt; n</code> (Listing 3, line 32) but let every thread reach every barrier.</li>
+<li><b>Symptom:</b> result is in the wrong buffer after an odd number of passes. <b>Cause:</b> ping-pong buffers. <b>Fix:</b> track which buffer holds the result (Listing 3 swaps pointers each pass; 32 is even).</li>
+<li><b>Symptom:</b> pairs sorted, values scrambled. <b>Cause:</b> the value scattered with a different index from its key. <b>Fix:</b> compute <code>dst</code> once and use it for both.</li>
+</ul>
+
+<div class="co transition" id="F6-18-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-16">F6-16</a> (exclusive scans, decoupled look-back), <a href="#F6-17">F6-17</a> (histograms with privatization), SP203 (comparison sorts and <code>std::stable_sort</code>). <b>What carries over:</b> a histogram counts digits; an exclusive scan of counts gives starting positions; stability is the property you already know from <code>std::stable_sort</code>. <sup class="src"><a href="#F6-18-src-D4">D4</a></sup> <b>What changes:</b> no comparisons at all: the sort is a fixed number of linear passes, and the cost is memory traffic per pass, not O(<i>n</i> log <i>n</i>) comparisons; stability, free in a sequential loop, must be engineered on a GPU. <sup class="src"><a href="#F6-18-src-D3">D3</a></sup> <b>What comes next:</b> <a href="#F6-19">F6-19</a> returns to shared memory for its classic use: making both the reads and the writes of a matrix transpose coalesced, without bank conflicts.</p></div>
+
+<h2 id="F6-18-check">Check yourself</h2>
+<ol>
+<li>How many passes does an LSD radix sort of 32-bit keys need with 1-, 4- and 8-bit digits?</li>
+<li>Why must each pass be stable? Give a two-key example where an unstable second pass breaks the result.</li>
+<li>Why are the counts scanned digit-major and not tile-major?</li>
+<li>Apply: transform the 32-bit signed keys −1 and 1 with Listing 2's <code>fromSigned</code> and give the resulting unsigned values in hexadecimal. Which is smaller?</li>
+<li>Explain in your own words why a shared-memory <code>atomicAdd</code> per digit gives every key a unique position but breaks the sort.</li>
+<li>What does <code>__syncthreads_count</code> return, and which SASS instruction implements it in Listing 3?</li>
+<li>Apply: with 8-bit digits and tiles of 1,024 keys, how many entries does the scan of one pass have for 2^24 keys?</li>
+<li>Name one way Listing 2's handling of floats differs from CUB's.</li>
+</ol>
+
+<h2 id="F6-18-lab">Lab</h2>
+<p><b>Goal.</b> E4's sort part: "an LSD radix sort built on your scan", "radix sort for 32-bit keys and key-value pairs", identical to a CPU reference on E4's cases, then "X % of CUB … DeviceRadixSort". <sup class="src"><a href="#F6-18-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–4: g++ 13.3 and nvcc 12.0, no GPU. Steps 5–8: an NVIDIA GPU with CUDA 12.0 and CUB. Folder <code>university/labs/F6-18</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-18</code> from the repository root; read every output.</li>
+<li>Trace the worked example with Listing 1's method for the keys 6 3 6 1 (two bits) by hand.</li>
+<li>Change <code>BITS</code> in Listing 2 to 8 and to 11 (the last pass then has fewer bits; check that the loop still covers all 32 bits). Rerun; all cases must pass.</li>
+<li>Add a <code>descending</code> option to Listing 2 by inverting keys after the type transformation, as the CUB header describes for descending sorts.</li>
+<li>On a GPU: run Listing 3; both must print "pass".</li>
+<li>On a GPU: extend Listing 3 to key-value pairs and to E4's sizes and input kinds.</li>
+<li>On a GPU: replace the 1-bit passes with 4-bit passes following Listing 2: a count kernel (shared-memory histogram, <a href="#F6-17">F6-17</a>), your device scan (<a href="#F6-16">F6-16</a>), and a scatter that ranks stably.</li>
+<li>On a GPU: time your sorts and <code>cub::DeviceRadixSort::SortKeys</code>/<code>SortPairs</code> for 2^20 and 2^26 keys with the CU201 protocol; record the percentage of CUB in your E4 table.</li>
+</ol>
+<p><b>Expected observations.</b> Step 3: 4 passes for 8 bits; for 11 bits, 3 passes (shifts 0, 11, 22), the last digit holding only 10 real bits because the right shift brings in zeros; all cases still pass. Steps 5–8: your measurements; none exist in this build.</p>
+<p><b>Verification.</b> Keys equal <code>std::sort</code>; pairs equal <code>std::stable_sort</code>, in every case.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>A shift by 32 or more → undefined behaviour in C++; the sanitizer reports it. Stop the loop at 32.</li>
+<li>Pairs wrong but keys right → a value moved with a different index (see the mistakes list).</li>
+<li>CUB's <code>SortKeys</code> wants a temporary buffer → call it twice: size query, then sort.</li>
+</ul>
+<p><b>Extension.</b> Sort 64-bit keys, or sort only the low <i>k</i> bits with CUB's <code>begin_bit</code>/<code>end_bit</code> and measure the saving.</p>
+
+<h2 id="F6-18-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> To speed up the scatter, a team replaced the in-tile ranking by a shared-memory <code>atomicAdd</code> on the counter of the key's digit. Their test sorts 8-bit keys with 4-bit digits and checks after each pass that the keys are sorted by that pass's digit: it passes. With 16-bit keys, the final output is not sorted. "Every pass is correct; the bug must be in the last copy."</p>
+<p><b>Evidence pack.</b> A replay of both versions on 100,000 random 16-bit keys (4 passes), where the atomics' order is drawn by a seeded generator (<code>unstable.cpp</code>). For each pass: the number of neighbours out of order by that pass's digit, and by all digits sorted so far.</p>
+<pre class="listing" data-src="F6-18/unstable.cpp"></pre>
+<pre class="output" data-run="F6-18/unstable"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what do the two columns show for each version and pass?</li>
+<li>Hypotheses: the last copy, the scan, the per-pass ranking. Which column rules which out?</li>
+<li>Root cause: why does a pass that is correct "by its digit" destroy the previous passes' work?</li>
+<li>Why did the team's 8-bit test pass?</li>
+<li>Fix and prevention.</li>
+</ol>
+<p><b>Method hints.</b> Look at line 24. What does an unstable pass do to two keys with equal digit 1 but different digit 0?</p>
+
+<h2 id="F6-18-project">Mini-project</h2>
+<p><b>The sort module of the primitives library.</b> <code>sortKeys</code> and <code>sortPairs</code> for <code>uint32_t</code>, <code>int32_t</code> and <code>float</code>, built on your histogram and scan modules, with a stable in-tile ranking; tests on E4's sizes and input kinds including negative zero and NaN; a timing row against <code>cub::DeviceRadixSort</code>.</p>
+<p><b>Rubric.</b> Correct and stable on all cases and all three types (4). Built on the library's own scan and histogram (2). Digit width chosen and justified by measurement (2). Comparison table with CUB (2).</p>
+
+<h2 id="F6-18-summary">Summary</h2>
+<ul>
+<li>LSD radix sort: one stable pass per digit, lowest digit first; correct by induction only if every pass is stable.</li>
+<li>A pass is a histogram per tile, one exclusive scan of digit-major counts, and a scatter.</li>
+<li>The 1-bit split is the simplest pass: a scan of the 0-flags.</li>
+<li>Signed and float keys sort as unsigned after order-preserving bit transformations.</li>
+<li>Wider digits: fewer passes, more counters; CUB's sm_80 policy uses 8-bit digits for its onesweep path.</li>
+<li>On a GPU, stability must be built (scan-based ranking); atomics give unique but unordered places.</li>
+<li>The scatter dominates; local reordering in shared memory makes its stores coalesce.</li>
+</ul>
+
+<h2 id="F6-18-sources">Sources</h2>
+<ol>
+<li id="F6-18-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): synchronization functions (<code>__syncthreads_count</code>). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-18-src-D3">D3 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): the sorting chapter (radix sort, local ranking, coalesced scatter). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-18-src-D4">D4 — Thomas H. Cormen, Charles E. Leiserson, Ronald L. Rivest, Clifford Stein, "Introduction to Algorithms" (tier 3): counting sort, radix sort, stability. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-18-src-C1">C1 — Systems Curriculum (this project), milestone E4 (goal, build and accept quoted). A map, not a source (AH-4).</li>
+<li id="F6-18-src-H1">H1 — CUB 2.0.1 header as installed (libcub-dev 2.0.1-2), read in this build: <code>cub/device/device_radix_sort.cuh</code> (overview, floating-point special cases, transformations, stability; quoted). Tier 1.</li>
+<li id="F6-18-src-R1">R1 — run of Listing 1 (<code>university/labs/F6-18/split_demo.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-18-src-R2">R2 — run of Listing 2 (<code>lsd_sort.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-18-src-R3">R3 — build and run of Listing 3 (<code>radix.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F6-18-src-R4">R4 — run of the forensic replay <code>unstable.cpp</code> (<code>unstable.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-18-src-R6">R6 — CUB header excerpt (<code>cub_radix.log</code>), read only.</li>
+<li id="F6-18-src-R7">R7 — CUB tuning-policy excerpt for compute capability 8.0 (<code>cub_policy.log</code>), read only.</li>
+<li id="F6-18-src-R8">R8 — kernel list of Listing 3's sm_80 binary (<code>cub_kernels.log</code>), cuobjdump and cu++filt from CUDA 12.0; compiled only.</li>
+<li id="F6-18-src-R9">R9 — SASS of <code>countZeros</code> for sm_80 (<code>sass_count.log</code>), CUDA 12.0; compiled only.</li>
+<li id="F6-18-src-R10">R10 — shared- and global-memory atomic instructions of CUB's onesweep kernel in Listing 3's sm_80 binary, counted by kind (<code>cub_onesweep_atoms.log</code>), CUDA 12.0; compiled only. (The filter also counts <code>REDUX</code> lines.)</li>
+</ol>
+
+<h2 id="F6-18-glossary">Glossary links</h2>
+<p><a href="#gl-radix-sort">Radix sort</a> · <a href="#gl-lsd-least-significant-digit-first">LSD (least significant digit first)</a> · <a href="#gl-stable-sort">Stable sort</a> · <a href="#gl-digit-radix-digit">Digit (radix digit)</a> · <a href="#gl-split-1-bit-partition">Split (1-bit partition)</a> · <a href="#gl-scatter">Scatter</a> · <a href="#gl-key-transformation-order-preserving">Key transformation (order-preserving)</a> · <a href="#gl-exclusive-scan">Exclusive scan</a> · <a href="#gl-histogram">Histogram</a></p>
+
+<h2 id="F6-18-next">Next chapter</h2>
+<p>Next: <a href="#F6-19">F6-19 Matrix transpose: tiling, padding and swizzling</a>. Previous: <a href="#F6-17">F6-17 Histograms and privatization</a>. Back to the course: <a href="#CU301">CU301</a>.</p>
+
+<h2 id="F6-18-answers">Answers to Check yourself</h2>
+<ol>
+<li>32, 8 and 4.</li>
+<li>Equal digits in a later pass must keep the order set by earlier passes. Example: keys 01 and 00 (binary). Pass on bit 0 gives 00, 01. Pass on bit 1: both have bit 1 = 0; an unstable pass may output 01, 00, which is unsorted.</li>
+<li>Digit-major order puts all tiles' digit-0 counts first, so the scan places every digit-0 key before every digit-1 key globally, and within a digit puts tile 0 before tile 1 (stability across tiles). Tile-major order would group by tile, not by digit.</li>
+<li>−1 = 0xFFFFFFFF → 0x7FFFFFFF; 1 = 0x00000001 → 0x80000001. 0x7FFFFFFF is smaller, so −1 sorts before 1, as it should.</li>
+<li>The atomic hands out positions 0, 1, 2, … in the order threads reach it, which is not input order. Within one pass the keys are correctly grouped by the digit, but equal-digit keys lose the order the earlier passes gave them, so earlier digits become unsorted.</li>
+<li>The number of threads of the block for which the predicate was non-zero, after a barrier; <code>BAR.RED.POPC</code> (R9).</li>
+<li>2^24 / 1,024 = 16,384 tiles × 256 digit values = 4,194,304 entries.</li>
+<li>CUB treats −0.0 and +0.0 as equal (they keep input order); Listing 2 maps −0.0 to a smaller key than +0.0 (H1, R2).</li>
+</ol>
+<h3 id="F6-18-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Stable version: 0 and 0 in every pass; the final keys start 1 2 4 4 4 5 6 6. Atomic version: 0 out of order by each pass's own digit, but 680, 10,227 and 42,436 out of order by all digits so far after passes 1, 2 and 3; the final keys start 8 4 6 7 5 4 8 4 (R4).</p>
+<p><b>Hypotheses.</b> The first column is 0 everywhere, so the count, scan and grouping of every pass are right; the last copy cannot explain an error that already exists after pass 1. The second column grows from pass 1: the passes destroy each other's order.</p>
+<p><b>Root cause.</b> The atomic ranking (replayed by the shuffle at line 24) makes each pass unstable. Keys with the same current digit end up in arbitrary order, so the order by lower digits is lost; LSD's induction step fails.</p>
+<p><b>Why the 8-bit test passed.</b> Its check after each pass only looked at that pass's digit, which is always right; and with two passes, only the second one could break the first (the team's check never compared full keys).</p>
+<p><b>Fix.</b> Rank with a stable method: a scan per digit or per bit inside the tile, as in Listing 3's <code>blockExclusiveScan</code>. <b>Prevention:</b> test pairs with original positions as values against <code>std::stable_sort</code> (Listing 2), and always check the final full-key order, not a per-pass property.</p>
+<p><b>How the evidence was produced:</b> <code>unstable.cpp</code>, a CPU replay where a seeded shuffle stands in for the order in which atomics happen; no GPU was used. That real atomics produce a different order every run is the scenario's assumption, not a measurement.</p>

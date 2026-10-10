@@ -1,0 +1,291 @@
+<!--meta
+id: F6-15
+title: Warp-level primitives: shuffles and votes
+course: CU301
+level: L3
+prereqs: F6-14; HW301 (F1-57 warps, wavefronts and SIMT execution)
+time: 6–9 hours including the lab
+hardware: Lab extension: an NVIDIA GPU (compute capability 8.0 or later for the reduce instruction) and, for the wave64 steps, an AMD GPU with ROCm. The warp simulator and all compiler evidence (NVIDIA SASS and AMD assembly) run on any computer with g++, nvcc and hipcc (this build: no GPU)
+maps: Curriculum Track E 13.2 topic 5 (warp/wave shuffles) and the HIP portability topic (warp-size-dependent code, 64-bit lane masks on wave64); milestone E3 (no hidden 32-lane assumption)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-15-hook">Story hook</h2>
+<p>Every row in the hall has a habit the head of the hall never planned. When a helper needs a value from the helper beside them, they do not walk to the table, put it down, wait for the bell and pick it up again. They just hold out a hand, and the neighbour passes it over. When the row needs to know "is anyone still peeling?", nobody writes on the table: they all raise or lower a hand at once, and everyone sees the hands.</p>
+<p>It works beautifully in Ravi's hall, where every row has 32 helpers. Then a team from the hall across the street, where rows have 64 helpers, borrows Ravi's recipe card. The card says "pass to the helper 16 places along, then 8, 4, 2, 1". In their long rows that adds up only half of the row. Nothing crashes, the total is just wrong.</p>
+<p>Passing hand to hand is a <b>shuffle</b>; raising hands is a <b>vote</b>. This chapter teaches both, the rules of who gets which value, and how to write them so that they work on 32-lane NVIDIA warps and 64-lane AMD wavefronts alike.</p>
+
+<h2 id="F6-15-able">What you will be able to do</h2>
+<ul>
+<li><b>Use</b> the four shuffles (index, up, down, xor) and predict, lane by lane, what each returns, including at the edges of the warp.</li>
+<li><b>Build</b> warp reduce, warp all-reduce, warp inclusive scan and warp compaction from shuffles and votes.</li>
+<li><b>Explain</b> the <code>mask</code> argument of the <code>_sync</code> functions and why warp-synchronous code without it is unsafe.</li>
+<li><b>Write</b> warp-size independent code that runs correctly on 64-lane wavefronts, with 64-bit ballot masks.</li>
+<li><b>Recognise</b> shuffles and votes in PTX, SASS and AMD assembly.</li>
+</ul>
+
+<div class="co jargon" id="F6-15-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Warp / wavefront</dt><dd><b>Simple words:</b> the group of threads that the hardware runs together, 32 on NVIDIA, 32 or 64 on AMD. <b>Analogy:</b> a row of helpers. <b>Precise:</b> as defined in HW301 (<a href="#F1-57">F1-57</a>); the width is <code>warpSize</code>, which in HIP 5.7 is a compile-time constant <code>__AMDGCN_WAVEFRONT_SIZE</code>. <sup class="src"><a href="#F6-15-src-H3">H3</a></sup></dd>
+<dt>Lane</dt><dd><b>Simple words:</b> a thread's position in its warp, 0 to width − 1. <b>Analogy:</b> a helper's seat number in the row. <b>Precise:</b> <code>threadIdx.x % warpSize</code> for one-dimensional blocks. <sup class="src"><a href="#F6-15-src-D1">D1</a></sup></dd>
+<dt>Warp shuffle</dt><dd><b>Simple words:</b> every lane reads a register value of another lane, all at once. <b>Analogy:</b> passing a value hand to hand along the row. <b>Precise:</b> <code>__shfl_sync</code> (from a given lane), <code>__shfl_up_sync</code> (from <i>self</i> − <i>delta</i>), <code>__shfl_down_sync</code> (from <i>self</i> + <i>delta</i>), <code>__shfl_xor_sync</code> (from <i>self</i> XOR <i>mask</i>), each with an optional <code>width</code> that splits the warp into independent segments. <sup class="src"><a href="#F6-15-src-H1">H1</a></sup> <sup class="src"><a href="#F6-15-src-D1">D1</a></sup></dd>
+<dt>Warp vote (ballot)</dt><dd><b>Simple words:</b> every lane gives a yes or no; the result tells every lane who said yes. <b>Analogy:</b> raising hands. <b>Precise:</b> <code>__ballot_sync(mask, p)</code> returns a bit mask with bit <i>k</i> set when lane <i>k</i> is in <code>mask</code> and its predicate is true; <code>__all_sync</code> and <code>__any_sync</code> reduce it to one bit. The same term as in HW301. <sup class="src"><a href="#F6-15-src-H1">H1</a></sup></dd>
+<dt>Participation mask</dt><dd><b>Simple words:</b> the list of lanes that promise to take part in a warp operation. <b>Analogy:</b> the helpers who agreed to pass hands this round. <b>Precise:</b> the first argument of every <code>_sync</code> warp function; each named lane must execute the same call (with the same mask) before any of them gets the result; <code>__activemask()</code> returns the lanes currently executing, which is not the same as the lanes that should take part. <sup class="src"><a href="#F6-15-src-D1">D1</a></sup> <sup class="src"><a href="#F6-15-src-H1">H1</a></sup></dd>
+<dt>Butterfly (XOR) shuffle</dt><dd><b>Simple words:</b> lanes swap values with a partner whose number differs in one bit. <b>Analogy:</b> helpers swap with the helper opposite in their group of 2, 4, 8, … <b>Precise:</b> <code>__shfl_xor_sync(m, v, k)</code> pairs lane <i>i</i> with lane <i>i</i> XOR <i>k</i>; log₂ width steps give every lane the full reduction (all-reduce). <sup class="src"><a href="#F6-15-src-R1">R1</a></sup></dd>
+<dt>Warp-synchronous programming</dt><dd><b>Simple words:</b> code that assumes the lanes of a warp move in lockstep. <b>Analogy:</b> assuming the whole row always moves in step, without anyone saying "now". <b>Precise:</b> an old practice (implicit synchronisation through shared memory inside a warp) that is unsafe since independent thread scheduling (compute capability 7.0); replace with <code>_sync</code> primitives or <code>__syncwarp()</code>. <sup class="src"><a href="#F6-15-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-15-pictures">The idea in pictures</h2>
+<figure id="F6-15-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-15-f1t F6-15-f1d">
+<title id="F6-15-f1t">Figure 1: which lane each shuffle reads, shown for an 8-lane warp</title>
+<desc id="F6-15-f1d">Three rows of eight lanes numbered 0 to 7. Row one, shfl_down by 2: an arrow goes from lane i plus 2 to lane i for lanes 0 to 5; lanes 6 and 7 have no source lane and keep their own value, marked "own". Row two, shfl_up by 2: an arrow from lane i minus 2 to lane i for lanes 2 to 7; lanes 0 and 1 keep their own. Row three, shfl_xor by 1: lanes swap in pairs, 0 with 1, 2 with 3, 4 with 5, 6 with 7. A note says that the real width is 32 on NVIDIA and 32 or 64 on AMD, and that these edge rules come from the HIP 5.7 header and are simulated in Listing 1.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="24">shfl_down(v, 2): lane i reads lane i + 2</text>
+<g><rect class="sv-b2" x="40" y="40" width="60" height="34"/><text class="sv-t" x="64" y="62">0</text>
+<rect class="sv-b2" x="120" y="40" width="60" height="34"/><text class="sv-t" x="144" y="62">1</text>
+<rect class="sv-b2" x="200" y="40" width="60" height="34"/><text class="sv-t" x="224" y="62">2</text>
+<rect class="sv-b2" x="280" y="40" width="60" height="34"/><text class="sv-t" x="304" y="62">3</text>
+<rect class="sv-b2" x="360" y="40" width="60" height="34"/><text class="sv-t" x="384" y="62">4</text>
+<rect class="sv-b2" x="440" y="40" width="60" height="34"/><text class="sv-t" x="464" y="62">5</text>
+<rect class="sv-b8" x="520" y="40" width="60" height="34"/><text class="sv-ts" x="530" y="62">6 own</text>
+<rect class="sv-b8" x="600" y="40" width="60" height="34"/><text class="sv-ts" x="610" y="62">7 own</text></g>
+<path class="sv-line" d="M230,40 C230,30 70,30 70,40"/><path class="sv-line" d="M310,40 C310,32 150,32 150,40"/>
+<text class="sv-ts" x="680" y="62">2 lanes keep own</text>
+<text class="sv-tb" x="20" y="112">shfl_up(v, 2): lane i reads lane i − 2</text>
+<g><rect class="sv-b8" x="40" y="128" width="60" height="34"/><text class="sv-ts" x="50" y="150">0 own</text>
+<rect class="sv-b8" x="120" y="128" width="60" height="34"/><text class="sv-ts" x="130" y="150">1 own</text>
+<rect class="sv-b5" x="200" y="128" width="60" height="34"/><text class="sv-t" x="224" y="150">2</text>
+<rect class="sv-b5" x="280" y="128" width="60" height="34"/><text class="sv-t" x="304" y="150">3</text>
+<rect class="sv-b5" x="360" y="128" width="60" height="34"/><text class="sv-t" x="384" y="150">4</text>
+<rect class="sv-b5" x="440" y="128" width="60" height="34"/><text class="sv-t" x="464" y="150">5</text>
+<rect class="sv-b5" x="520" y="128" width="60" height="34"/><text class="sv-t" x="544" y="150">6</text>
+<rect class="sv-b5" x="600" y="128" width="60" height="34"/><text class="sv-t" x="624" y="150">7</text></g>
+<path class="sv-line" d="M70,128 C70,118 230,118 230,128"/><path class="sv-line" d="M150,128 C150,120 310,120 310,128"/>
+<text class="sv-tb" x="20" y="200">shfl_xor(v, 1): lanes swap in pairs</text>
+<g><rect class="sv-b3" x="40" y="216" width="60" height="34"/><text class="sv-t" x="64" y="238">0</text>
+<rect class="sv-b3" x="120" y="216" width="60" height="34"/><text class="sv-t" x="144" y="238">1</text>
+<rect class="sv-b3" x="200" y="216" width="60" height="34"/><text class="sv-t" x="224" y="238">2</text>
+<rect class="sv-b3" x="280" y="216" width="60" height="34"/><text class="sv-t" x="304" y="238">3</text>
+<rect class="sv-b3" x="360" y="216" width="60" height="34"/><text class="sv-t" x="384" y="238">4</text>
+<rect class="sv-b3" x="440" y="216" width="60" height="34"/><text class="sv-t" x="464" y="238">5</text>
+<rect class="sv-b3" x="520" y="216" width="60" height="34"/><text class="sv-t" x="544" y="238">6</text>
+<rect class="sv-b3" x="600" y="216" width="60" height="34"/><text class="sv-t" x="624" y="238">7</text></g>
+<path class="sv-line" d="M70,250 C70,264 150,264 150,250"/><path class="sv-line" d="M230,250 C230,264 310,264 310,250"/><path class="sv-line" d="M390,250 C390,264 470,264 470,250"/><path class="sv-line" d="M550,250 C550,264 630,264 630,250"/>
+<text class="sv-ts" x="20" y="296">Drawn with 8 lanes; real widths are 32 (NVIDIA) and 32 or 64 (AMD). Only the first two arrows of each shift are drawn.</text>
+<text class="sv-ts" x="20" y="314">Edge rule ("own"): from the HIP 5.7 header, simulated by Listing 1.</text>
+</svg></div><figcaption><b>Figure 1.</b> Every lane executes the shuffle and receives one value. Lanes whose source lies outside the warp (or outside the <code>width</code> segment) keep their own value, which is why only lane 0 holds the full sum after a <code>shfl_down</code> reduction, while XOR steps give every lane the total. <sup class="src"><a href="#F6-15-src-H3">H3</a></sup> <sup class="src"><a href="#F6-15-src-R1">R1</a></sup></figcaption></figure>
+
+<h2 id="F6-15-layer1">Layer 1 — the kid explanation</h2>
+<p>Helpers in a row can hand things to each other without using the table. "Everyone, take what the person two seats to your right is holding." The two at the end have nobody there, so they keep what they have. And to ask a question of the whole row, everyone raises or lowers a hand at once. The only danger: if your recipe card assumes 32 seats and your row has 64, half the row is left out.</p>
+
+<h2 id="F6-15-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-15-l2-down">Shuffle down: a warp reduction</h3>
+<p>Listing 1 is a simulator of one warp. Its first experiment fills 32 lanes with 1 to 32 and repeats <code>v += shfl_down(v, off)</code> for <code>off</code> = 16, 8, 4, 2, 1. Lane 0 ends with 528 = 32 × 33 / 2. The other lanes hold partial or meaningless values (lane 31 ends with 1,024, its own value doubled five times, because it never had a source). <sup class="src"><a href="#F6-15-src-R1">R1</a></sup> That is fine: only lane 0's result is used, as in <code>warpReduce</code> of Listing 2 (lines 11–15).</p>
+<h3 id="F6-15-l2-xor">Shuffle xor: everyone gets the answer</h3>
+<p>With <code>shfl_xor</code> and masks 16, 8, 4, 2, 1, every lane pairs with a partner and both add; after five steps all 32 lanes hold 528. <sup class="src"><a href="#F6-15-src-R1">R1</a></sup> Use it when every lane needs the result (normalising by a warp's sum, for example); it costs the same five steps.</p>
+<h3 id="F6-15-l2-up">Shuffle up: an inclusive scan</h3>
+<p>For a prefix sum each lane adds the value <i>d</i> lanes below it, for <i>d</i> = 1, 2, 4, 8, 16, but only if such a lane exists (<code>lane &gt;= d</code>). With every lane holding 1, lane <i>i</i> ends with <i>i</i> + 1 (R1, experiment 3). This is the Hillis–Steele scan of <a href="#F6-16">F6-16</a>, done in registers. <sup class="src"><a href="#F6-15-src-R1">R1</a></sup></p>
+<h3 id="F6-15-l2-vote">Votes: ballot and population count</h3>
+<p>Experiment 4 keeps lanes whose value (100 + lane) is a multiple of 3. The ballot is <code>0x24924924</code>: bits 2, 5, 8, …, 29, ten of them. Each kept lane finds its output slot by counting the kept lanes below it, <code>popc(mask &amp; ((1 &lt;&lt; lane) − 1))</code>, and the ten values land in slots 0 to 9 without gaps. <sup class="src"><a href="#F6-15-src-R1">R1</a></sup> That is <em>stream compaction</em> inside a warp with no shared memory and no atomics; <a href="#F6-13">F6-13</a> used the same ballot to aggregate atomics.</p>
+<h3 id="F6-15-l2-width">The width argument</h3>
+<p>All shuffles take an optional <code>width</code> (a power of two up to the warp size) that splits the warp into independent segments. Experiment 5 uses width 16: lane 0 ends with 136 (the sum of 1..16) and lane 16 with 392 (17..32), two reductions in one instruction stream. <sup class="src"><a href="#F6-15-src-R1">R1</a></sup></p>
+
+<h2 id="F6-15-layer3">Layer 3 — the engineer's depth</h2>
+<p>In hall terms: who must hold out a hand, and how long the row really is. Both have precise rules.</p>
+<h3 id="F6-15-l3-mask">The mask and independent thread scheduling</h3>
+<p>The CUDA 12.0 header <code>sm_30_intrinsics.h</code>, read in this build, declares the shuffles as <code>__shfl_down_sync(unsigned mask, T var, unsigned int delta, int width=warpSize)</code> and similar, the votes <code>__ballot_sync(unsigned mask, int pred)</code>, <code>__all_sync</code>, <code>__any_sync</code>, plus <code>__activemask()</code> and <code>__syncwarp(unsigned mask=0xFFFFFFFF)</code>. <sup class="src"><a href="#F6-15-src-H1">H1</a></sup> Since compute capability 7.0, lanes of a warp may be scheduled independently, so the programming guide requires that every lane named in <code>mask</code> executes the same <code>_sync</code> call; the call then acts as a synchronisation point for those lanes. <sup class="src"><a href="#F6-15-src-D1">D1</a></sup> Two consequences:</p>
+<ul>
+<li>A shuffle inside an <code>if</code> that only some lanes enter, with the full mask, is undefined. Shuffle unconditionally, then use the result conditionally (Listing 2, lines 27–28).</li>
+<li>Old code that passed values through shared memory inside a warp without any barrier, relying on lockstep execution, is broken; insert <code>__syncwarp()</code> or use shuffles.</li>
+</ul>
+<p><code>__activemask()</code> only reports which lanes happen to be executing together now; using it as the mask of a shuffle does not make a divergent shuffle meaningful. <sup class="src"><a href="#F6-15-src-D1">D1</a></sup></p>
+<h3 id="F6-15-l3-edges">Edge rules</h3>
+<p>Listing 1's lane selection is copied from the HIP 5.7 header <code>amd_warp_functions.h</code>, read in this build: <code>__shfl_down</code> keeps its own value when <code>(self &amp; (width−1)) + delta &gt;= width</code>; <code>__shfl_up</code> when <code>self − delta</code> lies below the start of the segment; <code>__shfl_xor</code> when the partner lies beyond the segment. <sup class="src"><a href="#F6-15-src-H3">H3</a></sup> CUDA's guide describes the same behaviour for up and down ("does not wrap around"), and wrapping modulo <code>width</code> for <code>__shfl_sync</code> with an out-of-range source lane. <sup class="src"><a href="#F6-15-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That CUDA's edge behaviour matches the HIP header rules simulated here was taken from the programming guide's description (D1, title only), not tested on an NVIDIA GPU; Listing 2's checks avoid the edge cases by using lane 0's result only. Also not checked: what happens on a GPU when a lane named in the mask does not reach the call (undefined behaviour; it may hang or return garbage). Check: run Listing 2 on a GPU, and the "Warp Shuffle Functions" and "Warp Vote Functions" sections of D1 for your toolkit.</p></div>
+<h3 id="F6-15-l3-wave64">64-lane wavefronts: what breaks</h3>
+<p>Many AMD GPUs run 64-lane wavefronts; the <code>gfx90a</code> target used in this build reports <code>.wavefront_size: 64</code> (R5). <sup class="src"><a href="#F6-15-src-R5">R5</a></sup> <sup class="src"><a href="#F6-15-src-D5">D5</a></sup> Experiment 6 of Listing 1 runs CUDA-style code on 64 lanes: <sup class="src"><a href="#F6-15-src-R1">R1</a></sup></p>
+<ul>
+<li>a reduction loop starting at offset 16 (hard-coded) gives lane 0 = 32 instead of 64: the upper half of the wavefront is never added;</li>
+<li>starting at <code>warpSize / 2</code> gives 64;</li>
+<li>a ballot of 64 true lanes copied into a 32-bit variable has a population count of 32 instead of 64.</li>
+</ul>
+<p>In HIP 5.7, <code>__ballot</code> returns <code>unsigned long long</code> and <code>__popcll</code> counts it; there are no <code>_sync</code> variants and no mask argument in that header. <sup class="src"><a href="#F6-15-src-H3">H3</a></sup> Listing 3 is the HIP version: <code>warpSize / 2</code> in the loop, a 64-bit mask, and the host asks the device for its wavefront size (line 43) instead of assuming. Hidden 32s also hide in <code>lane = tid &amp; 31</code>, <code>warp = tid &gt;&gt; 5</code>, <code>0xffffffff</code> masks, and shared arrays sized <code>BLOCK / 32</code>. E3's last criterion, "no hidden 32-lane assumption", is about exactly these lines.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 3 was built for <code>gfx90a</code> and its assembly read (R5), but it was not run: the run stopped at <code>hipGetDevice</code> with <code>hipErrorInvalidDevice</code> (R4). Which AMD families use wave32 or wave64 by default was not checked in this build. Check: the AMD ISA guide for your architecture and <code>prop.warpSize</code> on your device.</p></div>
+<h3 id="F6-15-l3-reduce">A reduction instruction</h3>
+<p><code>__reduce_add_sync(mask, value)</code>, declared for compute capability 8.0 in <code>crt/sm_80_rt.h</code>, reduces 32 integer lanes in one call; Listing 2's <code>hardwareReduce</code> (lines 52–61) uses it, and the PTX and SASS show <code>redux.sync.add.s32</code> / <code>REDUX.SUM.S</code>. <sup class="src"><a href="#F6-15-src-H1">H1</a></sup> <sup class="src"><a href="#F6-15-src-R2">R2</a></sup> It exists for integer types only (in this header), and only on NVIDIA.</p>
+
+<h2 id="F6-15-hardware">How the hardware actually does it</h2>
+<p>On NVIDIA (<code>sm_80</code>), each kind of shuffle is one SASS instruction: <code>SHFL.DOWN</code>, <code>SHFL.UP</code>, <code>SHFL.BFLY</code> (xor; "butterfly"), and the full-index form <code>SHFL.IDX</code>; votes are <code>VOTE.ANY</code> (which, despite the name, also delivers the ballot), and the count is <code>POPC</code> (R3). <sup class="src"><a href="#F6-15-src-R3">R3</a></sup> On AMD (<code>gfx90a</code>), HIP 5.7 builds the shuffles on <code>__builtin_amdgcn_ds_bpermute</code>, which compiles to <code>ds_bpermute_b32</code>, a cross-lane permute that goes through the LDS hardware without allocating LDS: six of them appear in <code>waveTests</code>, one per reduction step for 64 lanes. The ballot is a vector compare that writes a 64-bit scalar mask, and <code>s_bcnt1_i32_b64</code> counts its bits; the kernel metadata says <code>.wavefront_size: 64</code> (R5). <sup class="src"><a href="#F6-15-src-H3">H3</a></sup> <sup class="src"><a href="#F6-15-src-R5">R5</a></sup> So a shuffle costs one instruction on NVIDIA, a permute through the LDS crossbar on AMD; both avoid shared-memory allocation and barriers.</p>
+
+<h2 id="F6-15-worked">Worked example</h2>
+<p><b>Task.</b> Compute, for a warp of 32 lanes holding 1..32, what lanes 0 and 31 hold after the step with offset 16 of a <code>shfl_down</code> reduction, and after all five steps.</p>
+<ol>
+<li>Offset 16: lane 0 reads lane 16 (value 17): 1 + 17 = 18. Lane 31 reads lane 47, outside the warp, so it keeps its own: 32 + 32 = 64. Listing 1 prints 18 and 64. <sup class="src"><a href="#F6-15-src-R1">R1</a></sup></li>
+<li>Offset 8: lane 0 reads lane 8, which after step 1 holds 9 + 25 = 34: 18 + 34 = 52 (printed). Lane 31 doubles again: 128.</li>
+<li>After all five: lane 0 = 528, the sum; lane 31 = 32 × 2^5 = 1,024, meaningless.</li>
+<li>Lesson: only lane 0 is valid. For an all-reduce use xor; for a value in every lane after a down-reduction, broadcast it: <code>__shfl_sync(FULL, v, 0)</code>.</li>
+</ol>
+
+<h2 id="F6-15-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>warp_sim.cpp</code>: a warp simulator for widths 32 and 64.</p>
+<pre class="listing" data-src="F6-15/warp_sim.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined warp_sim.cpp -o warp_sim</code>.</p>
+<pre class="output" data-run="F6-15/warp_sim"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–57</td><td>four shuffles</td><td>Lane-selection rules from the HIP 5.7 header.</td><td>The edges are where bugs live.</td></tr>
+<tr><td>59–66</td><td><code>ballot</code></td><td>A 64-bit mask, one bit per lane.</td><td>Wide enough for wave64.</td></tr>
+<tr><td>85–95</td><td>experiment 1</td><td>Down-reduction; prints lanes 0–7 and 31.</td><td>Only lane 0 is valid.</td></tr>
+<tr><td>113–125</td><td>experiment 4</td><td>Ballot, popc, slot = kept lanes below me.</td><td>Warp compaction.</td></tr>
+<tr><td>134–152</td><td>experiment 6</td><td>Hard-coded 16 vs <code>width / 2</code>; 64-bit mask into 32 bits.</td><td>The two classic wave64 bugs.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>warp_prims.cu</code>: the CUDA primitives with a host check (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-15/warp_prims.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings warp_prims.cu -o warp_prims</code>.</p>
+<pre class="output" data-run="F6-15/warp_prims"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Built for real; the run stopped at the first <code>cudaMalloc</code> (no GPU, R2). Expected, not observed: "32768 warps checked, 0 errors". What would be needed: an NVIDIA GPU and a rerun.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9</td><td><code>FULL</code></td><td>Mask of all 32 lanes.</td><td>Correct only because CUDA warps are 32 wide.</td></tr>
+<tr><td>11–31</td><td>reduce, all-reduce, scan</td><td>Down, xor and up loops from <code>warpSize / 2</code> or 1.</td><td>The three basic patterns.</td></tr>
+<tr><td>43–49</td><td>compaction</td><td>Ballot; slot by popc of lower bits; count by popc.</td><td>No shared memory, no atomics.</td></tr>
+<tr><td>52–61</td><td><code>hardwareReduce</code></td><td><code>__reduce_add_sync</code> on <code>sm_80</code>+.</td><td>One instruction for integer sums.</td></tr>
+<tr><td>92–104</td><td>check</td><td>CPU recomputes every warp's sum, scan and compaction.</td><td>Every output is checked.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>warp_prims_amd.hip</code>: the HIP version for 64-lane wavefronts (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-15/warp_prims_amd.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a warp_prims_amd.hip -o warp_prims_amd</code> (HIP 5.7).</p>
+<pre class="output" data-run="F6-15/warp_prims_amd"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11</td><td><code>warpSize / 2</code></td><td>Six steps on wave64, five on wave32.</td><td>No hard-coded 32.</td></tr>
+<tr><td>22</td><td><code>unsigned long long mask</code></td><td>64-bit ballot.</td><td>A 32-bit variable loses half the lanes.</td></tr>
+<tr><td>43</td><td><code>prop.warpSize</code></td><td>The host asks the device.</td><td>The host check uses the real width.</td></tr>
+</tbody></table></div>
+<p><b>Compiler evidence.</b> Counts of warp instructions in the PTX and SASS of Listing 2 (<code>sm_80</code>), and in the AMD assembly of <code>waveTests</code> (<code>gfx90a</code>):</p>
+<pre class="output" data-run="F6-15/ptx_warp"></pre>
+<pre class="output" data-run="F6-15/sass_warp"></pre>
+<pre class="output" data-run="F6-15/amd_wave"></pre>
+
+<h2 id="F6-15-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Everyone passes at once, and everyone must.</b> In the hall a helper can pass a bowl while the neighbour is busy. A shuffle is one instruction for the whole warp: all lanes named in the mask take part, or the result is undefined.</li>
+<li><b>Hands do not reach further than the row, but they reach any seat.</b> A shuffle can read any lane of the warp (or of the segment), not only neighbours; it cannot reach another warp at all.</li>
+<li><b>Raising hands produces a number.</b> A ballot is not a visual impression but an exact bit mask that every lane receives, and that can be counted and indexed.</li>
+</ul>
+
+<h2 id="F6-15-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> a warp sum is right in lane 0 but code reads it in another lane. <b>Cause:</b> down-reduction leaves only lane 0 valid. <b>Fix:</b> xor-reduction, or broadcast with <code>__shfl_sync(mask, v, 0)</code>.</li>
+<li><b>Symptom:</b> hang or garbage after adding a condition around a shuffle. <b>Cause:</b> lanes in the mask did not reach the call. <b>Fix:</b> shuffle unconditionally; use the value conditionally.</li>
+<li><b>Symptom:</b> correct on NVIDIA, half the answer on AMD. <b>Cause:</b> loop from 16, <code>&amp; 31</code>, <code>&gt;&gt; 5</code>, or a 32-bit ballot variable. <b>Fix:</b> <code>warpSize</code>, 64-bit masks; test on wave64.</li>
+<li><b>Symptom:</b> old reduction code gives wrong results on newer GPUs. <b>Cause:</b> implicit warp-synchronous shared-memory steps without <code>volatile</code> or <code>__syncwarp</code>. <b>Fix:</b> shuffles, or <code>__syncwarp()</code> between steps.</li>
+<li><b>Symptom:</b> wrong scan values in the first lanes. <b>Cause:</b> adding the shuffled value without the <code>lane &gt;= d</code> test. <b>Fix:</b> as Listing 2, line 28.</li>
+</ul>
+
+<div class="co transition" id="F6-15-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> HW301 <a href="#F1-57">F1-57</a> (warps, wavefronts, SIMT, divergence), <a href="#F6-14">F6-14</a> (v5's <code>warpSum</code>). <b>What carries over:</b> a warp executes one instruction for many lanes; divergence costs; the width differs between vendors. <sup class="src"><a href="#F6-15-src-H3">H3</a></sup> <b>What changes:</b> you now program the warp as a unit: lanes exchange registers directly, votes produce exact masks, and correctness depends on every named lane taking part and on not assuming 32. <sup class="src"><a href="#F6-15-src-D1">D1</a></sup> <b>What comes next:</b> <a href="#F6-16">F6-16</a> builds scans for a block and for a whole device from the warp scan of this chapter.</p></div>
+
+<h2 id="F6-15-check">Check yourself</h2>
+<ol>
+<li>After a down-reduction with offsets 16..1, which lanes hold the sum? After an xor-reduction?</li>
+<li>Why must a shuffle with the full mask not be placed inside <code>if (lane &lt; 16)</code>?</li>
+<li>What is the ballot of a 32-lane warp in which only lanes 0 and 31 have a true predicate?</li>
+<li>Give three places where a hidden 32 can appear in CUDA code.</li>
+<li>Apply: with width 8 and 32 lanes holding 1..32, what does lane 8 hold after a down-reduction with offsets 4, 2, 1?</li>
+<li>Why does the AMD assembly of <code>waveTests</code> contain six <code>ds_bpermute_b32</code> while CUDA's loop has five steps?</li>
+<li>In compaction, which slot does lane 17 write to if the ballot is <code>0x24924924</code>?</li>
+<li>Explain in your own words what "warp-synchronous programming" assumed and why the <code>_sync</code> functions with a mask replaced it.</li>
+</ol>
+
+<h2 id="F6-15-lab">Lab</h2>
+<p><b>Goal.</b> Predict and verify shuffle and vote results lane by lane, and make warp code width-independent.</p>
+<p><b>Hardware and software needed.</b> Steps 1–4: g++, nvcc 12.0, hipcc 5.7 (no GPU). Step 5: an NVIDIA GPU. Step 6: an AMD GPU with ROCm. Folder <code>university/labs/F6-15</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-15</code>; read the four outputs.</li>
+<li>Add to Listing 1 an exclusive scan: shuffle up by 1 after the inclusive scan, with lane 0 set to 0. Predict lanes 0–7, then run.</li>
+<li>Add a broadcast: after the down-reduction, every lane reads lane 0 with <code>shflIdx</code>. Check that all lanes hold 528.</li>
+<li>Change Listing 3's loop to start at 16; regenerate <code>amd_wave.out</code> and compare the number of <code>ds_bpermute_b32</code>.</li>
+<li>On an NVIDIA GPU: run Listing 2; then put the scan's shuffle inside the <code>if</code> and run under Compute Sanitizer (synccheck).</li>
+<li>On an AMD GPU: run Listing 3; then change <code>mask</code> to <code>unsigned</code> and record the error count.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: 0, 1, 2, …, 7. Step 3: 528 everywhere. Step 4: five permutes instead of six (one step fewer). Steps 5–6: your observations; none made in this build.</p>
+<p><b>Verification.</b> Steps 2–4 match the predictions; on hardware, 0 errors for the unmodified listings.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>__reduce_add_sync</code> undefined → compile for <code>sm_80</code> or later.</li>
+<li>hipcc: "unknown target" → choose an <code>--offload-arch</code> your HIP supports (<code>gfx90a</code> was used here).</li>
+<li>Different results with and without <code>-G</code> → a mask or divergence error; look for shuffles under conditions.</li>
+</ul>
+<p><b>Extension.</b> Write a warp-level segmented reduction: lanes carry a "segment start" flag; use ballot to find segment boundaries and shuffles to sum within segments.</p>
+
+<h2 id="F6-15-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A reduction library, written and tested on NVIDIA GPUs, is ported to HIP with hipify and run on a 64-wide AMD GPU. Every sum comes out at roughly half the expected value; counts of matching elements (via ballot) are also about half. No error is reported.</p>
+<p><b>Evidence pack.</b> Experiment 6 of Listing 1 (R1); the HIP header's <code>warpSize</code> and <code>__ballot</code> declarations (H3); the AMD metadata line <code>.wavefront_size: 64</code> (R5).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what does experiment 6 print for the hard-coded loop, the width-derived loop, and the two population counts?</li>
+<li>Hypotheses: a hipify translation error; an AMD floating-point difference; a hidden 32-lane assumption. Which evidence decides?</li>
+<li>Root cause: identify the two lines in the original code that cause the two symptoms.</li>
+<li>Fix: rewrite both lines.</li>
+<li>Prevention: what test configuration and what review rule would catch this before porting?</li>
+</ol>
+<p><b>Method hints.</b> "About half" with all-ones input is exactly half. Integers have no rounding.</p>
+
+<h2 id="F6-15-project">Mini-project</h2>
+<p><b>Warp utilities for the primitives library.</b> A header with <code>warpReduce</code>, <code>warpAllReduce</code>, <code>warpInclusiveScan</code>, <code>warpExclusiveScan</code> and <code>warpCompact</code>, templated on the type and written without any hard-coded width; the lane-mask type chosen per platform. Tests on the CPU simulator for widths 32 and 64, and on whatever GPU you have.</p>
+<p><b>Rubric.</b> Correct on both widths in the simulator (4). No literal 32, 31 or 5 in the code (2). Masks correct (2). Tests documented (2).</p>
+
+<h2 id="F6-15-summary">Summary</h2>
+<ul>
+<li>Shuffles read another lane's register: index, up, down, xor; lanes without a source keep their own value.</li>
+<li>Down-reduction: result in lane 0; xor-reduction: in every lane; up: inclusive scan.</li>
+<li>Ballot + popc: counting and compaction inside a warp.</li>
+<li>Every lane in the mask must execute the <code>_sync</code> call; lockstep is not guaranteed.</li>
+<li>Write <code>warpSize</code>, not 32; ballots are 64-bit on wave64.</li>
+<li>NVIDIA: <code>SHFL.*</code>, <code>VOTE</code>, <code>REDUX</code>; AMD: <code>ds_bpermute_b32</code>, 64-bit scalar masks.</li>
+</ul>
+
+<h2 id="F6-15-sources">Sources</h2>
+<ol>
+<li id="F6-15-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): warp shuffle functions, warp vote functions, independent thread scheduling. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-15-src-D5">D5 — AMD, HIP documentation, warp cross-lane functions (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-15-src-H1">H1 — CUDA 12.0 headers as installed (nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>sm_30_intrinsics.h</code> (<code>__shfl_*_sync</code>, <code>__ballot_sync</code>, <code>__activemask</code>, <code>__syncwarp</code>), <code>crt/sm_80_rt.h</code> (<code>__reduce_add_sync</code>). Tier 1.</li>
+<li id="F6-15-src-H3">H3 — HIP 5.7 headers as installed, read in this build: <code>hip/amd_detail/amd_warp_functions.h</code> (<code>warpSize = __AMDGCN_WAVEFRONT_SIZE</code>; <code>__shfl</code>, <code>__shfl_up</code>, <code>__shfl_down</code>, <code>__shfl_xor</code> lane rules on <code>__builtin_amdgcn_ds_bpermute</code>), <code>amd_device_functions.h</code> (<code>__ballot</code> returning <code>unsigned long long</code>). Tier 1.</li>
+<li id="F6-15-src-R1">R1 — run of Listing 1 (<code>university/labs/F6-15/warp_sim.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-15-src-R2">R2 — build and run of Listing 2 (<code>warp_prims.log</code>), CUDA 12.0; untested on hardware, exit code 1; PTX (<code>ptx_warp.log</code>), compiled only.</li>
+<li id="F6-15-src-R3">R3 — SASS of Listing 2, <code>sm_80</code> (<code>sass_warp.log</code>), compiled only.</li>
+<li id="F6-15-src-R4">R4 — build and run of Listing 3 (<code>warp_prims_amd.log</code>), HIP 5.7; untested on hardware, exit code 1.</li>
+<li id="F6-15-src-R5">R5 — AMD assembly of <code>waveTests</code>, <code>gfx90a</code> (<code>amd_wave.log</code>), clang 17.0.6 via hipcc, compiled only.</li>
+</ol>
+
+<h2 id="F6-15-glossary">Glossary links</h2>
+<p><a href="#gl-warp-wavefront">Warp / wavefront</a> · <a href="#gl-lane">Lane</a> · <a href="#gl-warp-shuffle">Warp shuffle</a> · <a href="#gl-warp-vote-ballot">Warp vote (ballot)</a> · <a href="#gl-participation-mask">Participation mask</a> · <a href="#gl-butterfly-xor-shuffle">Butterfly (XOR) shuffle</a> · <a href="#gl-warp-synchronous-programming">Warp-synchronous programming</a></p>
+
+<h2 id="F6-15-next">Next chapter</h2>
+<p>Next: <a href="#F6-16">F6-16 Scans (prefix sums)</a>. Previous: <a href="#F6-14">F6-14 Reductions</a>. Back to the course: <a href="#CU301">CU301</a>.</p>
+
+<h2 id="F6-15-answers">Answers to Check yourself</h2>
+<ol>
+<li>Down: lane 0 only. Xor: every lane.</li>
+<li>Lanes 16–31 are named in the mask but do not execute the call; the result is undefined (and may hang).</li>
+<li><code>0x80000001</code>.</li>
+<li>A loop starting at offset 16; <code>lane = tid &amp; 31</code> or <code>warp = tid &gt;&gt; 5</code>; a mask <code>0xffffffff</code> or a 32-bit ballot variable; arrays sized <code>BLOCK / 32</code>.</li>
+<li>Lane 8 is the first lane of the second segment (lanes 8–15, values 9–16): 9 + 10 + … + 16 = 100.</li>
+<li>On gfx90a <code>warpSize</code> is 64, so the loop from <code>warpSize / 2</code> has six steps (32, 16, 8, 4, 2, 1), each a permute.</li>
+<li>Lane 17 is kept (bit 17 is set: the bits are 2, 5, 8, …, 29). The kept lanes below it are 2, 5, 8, 11 and 14, so it writes to slot 5.</li>
+<li>It assumed that the 32 lanes of a warp always execute in lockstep, so one lane's shared-memory write was visible to the others at the next instruction without any synchronisation. With independent thread scheduling that is no longer guaranteed. The <code>_sync</code> functions name the lanes that must take part (the mask) and synchronise them as part of the operation, so the exchange is correct whatever the scheduler does.</li>
+</ol>
+<h3 id="F6-15-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Hard-coded loop: lane 0 = 32 (expected 64). Width-derived loop: 64. Population count: 64 for the 64-bit mask, 32 for the 32-bit copy (R1).</p>
+<p><b>Hypotheses.</b> hipify translates names, not literals, so it is not the translation itself. Integer sums and counts have no rounding, so it is not floating point. The "exactly half" pattern on a 64-wide device (R5) points to a 32-lane assumption.</p>
+<p><b>Root cause.</b> (1) <code>for (int off = 16; …)</code>: the reduction never adds the upper 32 lanes into lane 0. (2) <code>unsigned mask = __ballot(…)</code>: HIP's <code>__ballot</code> returns <code>unsigned long long</code> (H3), and the conversion to 32 bits drops lanes 32–63.</p>
+<p><b>Fix.</b> <code>for (int off = warpSize / 2; off &gt; 0; off /= 2)</code> and <code>unsigned long long mask = __ballot(p); … __popcll(mask)</code> (Listing 3, lines 11 and 22). <b>Prevention:</b> run the simulator (or CI) at width 64; grep for literal 16, 31, 32, <code>0xffffffff</code> and <code>&gt;&gt; 5</code> in device code; review rule "lane masks have a platform-defined type".</p>
+<p><b>How the evidence was produced:</b> <code>warp_sim.cpp</code> (CPU simulation with the HIP header's rules) and <code>run.sh</code> (AMD assembly); no AMD GPU was used.</p>
