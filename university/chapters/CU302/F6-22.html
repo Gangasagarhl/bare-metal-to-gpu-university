@@ -1,0 +1,309 @@
+<!--meta
+id: F6-22
+title: Shared-memory tiling
+course: CU302
+level: L3
+prereqs: F6-21; F6-20; F6-10 (shared memory); F6-11 (bank conflicts); F6-12 (barriers inside a block); MA201
+time: 8–12 hours including the lab and the forensic lab
+hardware: none for the CPU-emulator correctness test, the compiler reports and the forensic lab (g++ 13.3, nvcc 12.0 in the build container); timing against cuBLAS needs an NVIDIA GPU, untested on hardware in this build
+maps: Curriculum E6 (step 2 of the speed table: shared-memory tiling); 13.2 topic 6 (tiling and GEMM: block tiling); guide 9.2 required diagram "Tiling (GEMM): matrix tiles moving global → shared → registers"
+analogy: F6 — the great kitchen hall (registered: block = a group of rows sharing one table; shared memory = the table in the middle of a row group; global memory = the big pantry far away; registers = each helper's hands)
+-->
+
+<h2 id="F6-22-hook">Story hook</h2>
+<p>In <a href="#F6-21">F6-21</a>, every helper in the great kitchen hall walked to the far pantry for every single jar, even though the helper next to her needed the same jar a moment later. Today the head of one table group, Amara, tries something else.</p>
+<p>She sends each of the 256 helpers at her table on exactly one trip. Each brings back one jar from a small square of the amounts shelf and one jar from a small square of the weights shelf, and puts it on the shared table. When every jar is on the table, everybody stops and checks: "Is the table full?" Then every helper works through one row of amounts and one column of weights, using jars that sixteen other helpers also use. Only when everyone has finished does the table get cleared for the next squares.</p>
+<p>Two trips instead of thirty-two for the same cooking. But there is a rule that must never be broken: everybody waits at the "table full?" check, and everybody waits at the "finished?" check. One helper who leaves early, thinking "my cell is off the edge of the table, I have nothing to do", can leave the whole group waiting forever. This chapter builds Amara's method, measures how much it saves, and shows that waiting forever with real evidence.</p>
+
+<h2 id="F6-22-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> how a shared-memory tile lets each value loaded from global memory be used TILE times, and compute the resulting arithmetic intensity.</li>
+<li><b>Write</b> a tiled SGEMM kernel with correct barriers and zero-filled edges that passes the E6 shape matrix.</li>
+<li><b>Count</b> global loads, shared-memory loads and multiply-adds in the SASS, and say which resource now limits the kernel.</li>
+<li><b>Choose</b> a tile size from its effect on reuse, shared memory, threads per block and occupancy (F6-20).</li>
+<li><b>Diagnose</b> a barrier placed in divergent code from a hang and a partial test log.</li>
+</ul>
+
+<div class="co jargon" id="F6-22-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Tile</dt><dd><b>Simple words:</b> a small square piece of a big matrix that is worked on as a unit. <b>Analogy:</b> the small square of jars brought from one shelf to the table. <b>Precise:</b> a contiguous sub-matrix (here TILE × TILE elements) of A, B or C that a block (or warp, or thread) loads, computes or stores together; the tile sizes of a GEMM kernel decide its data reuse. <sup class="src"><a href="#F6-22-src-D2">D2</a></sup></dd>
+<dt>Shared-memory tiling</dt><dd><b>Simple words:</b> copy a tile once into the block's fast shared memory, then let every thread of the block use it many times. <b>Analogy:</b> each jar is fetched once, put on the table, and used by a whole row or column of helpers. <b>Precise:</b> a loop over K in steps of TILE in which a block cooperatively loads one tile of A and one of B into <code>__shared__</code> arrays, synchronises, accumulates TILE multiply-adds per thread from shared memory, and synchronises again before the next load. <sup class="src"><a href="#F6-22-src-D1">D1</a></sup> <sup class="src"><a href="#F6-22-src-D2">D2</a></sup></dd>
+<dt>Phase (K-step)</dt><dd><b>Simple words:</b> one round of "load the tiles, wait, compute, wait". <b>Analogy:</b> one filling and clearing of the table. <b>Precise:</b> one iteration of the outer <code>k0</code> loop; a tiled kernel runs ⌈K ÷ TILE⌉ phases. <sup class="src"><a href="#F6-22-src-D2">D2</a></sup></dd>
+<dt>Reuse factor</dt><dd><b>Simple words:</b> how many times a value loaded from global memory is used. <b>Analogy:</b> how many helpers cook with one jar before it leaves the table. <b>Precise:</b> the number of multiply-adds performed per operand element loaded from global memory; TILE for this kernel, versus 1 for the naive kernel (ignoring caches). <sup class="src"><a href="#F6-22-src-R2">R2</a></sup></dd>
+<dt>Zero-fill (edge padding)</dt><dd><b>Simple words:</b> threads whose tile position lies outside the matrix put a zero on the table instead of reading memory. <b>Analogy:</b> an empty bowl placed where a jar would be, so the recipe still works. <b>Precise:</b> loading 0.0f into shared memory for tile elements with row ≥ M, column ≥ N or k ≥ K, so that the inner loop needs no bounds checks and the padded terms add exactly zero. <sup class="src"><a href="#F6-22-src-R1">R1</a></sup></dd>
+<dt>Divergent barrier</dt><dd><b>Simple words:</b> a <code>__syncthreads()</code> that some threads of the block never reach. <b>Analogy:</b> one helper leaves before the "table full?" check, and the others wait for her forever. <b>Precise:</b> a block-wide barrier inside a condition that is not uniform across the block; the CUDA Programming Guide allows <code>__syncthreads()</code> in conditional code only if the condition evaluates identically across the whole block, and otherwise the behaviour is not defined (a hang or wrong results). <sup class="src"><a href="#F6-22-src-D1">D1</a></sup></dd>
+</dl></div>
+<p>Terms from earlier chapters used here: <a href="#gl-shared-memory-gpu">shared memory (GPU)</a>, which is not the shared memory between processes of an operating system (F2 and F3 courses); the GPU kernel, which is not the operating-system kernel of F3; <a href="#gl-bank-conflict">bank conflict</a> (F6-11); <a href="#gl-occupancy">occupancy</a> (F6-20); <a href="#gl-arithmetic-intensity">arithmetic intensity</a> (F6-21).</p>
+
+<h2 id="F6-22-pictures">The idea in pictures</h2>
+<p>Figure 1 is the picture every GEMM kernel in this course refines: tiles travel from global memory into shared memory once per phase, and from shared memory into registers, where the multiply-adds happen. The block owns one TILE × TILE tile of C. In each phase it moves along the K dimension: one tile of A from its block row, one tile of B from its block column.</p>
+<figure id="F6-22-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-22-f1t F6-22-f1d">
+<title id="F6-22-f1t">Figure 1: matrix tiles moving from global memory to shared memory to registers</title>
+<desc id="F6-22-f1d">Left part, labelled global memory: matrix A with a horizontal block row highlighted and one TILE by TILE tile in it marked "phase p"; matrix B with a vertical block column highlighted and one tile in it marked "phase p"; matrix C with one tile marked "this block's tile of C". Arrows go from the A tile and the B tile to the middle part, labelled shared memory, which holds two small squares As and Bs, each TILE by TILE, with the note "loaded once per phase: one element per thread, then __syncthreads()". From As a row is highlighted, from Bs a column; arrows go to the right part, labelled registers of one thread, which holds "acc" and "As[ty][k], Bs[k][tx]" and the note "TILE multiply-adds per phase". An arrow labelled "after the last phase" goes from acc back to the C tile in global memory. The data flow is left to right. Not to scale.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="22">global memory (the big pantry)</text>
+<rect class="sv-box" x="20" y="150" width="170" height="110"/><text class="sv-tb" x="24" y="144">A (M × K)</text>
+<rect class="sv-b1" x="20" y="180" width="170" height="30"/>
+<rect class="sv-b2" x="80" y="180" width="30" height="30"/><text class="sv-ts" x="24" y="230">block row of A;</text><text class="sv-ts" x="24" y="246">tile of phase p</text>
+<rect class="sv-box" x="220" y="35" width="110" height="100"/><text class="sv-tb" x="222" y="30">B (K × N)</text>
+<rect class="sv-b1" x="270" y="35" width="30" height="100"/>
+<rect class="sv-b2" x="270" y="75" width="30" height="30"/><text class="sv-ts" x="222" y="152">block column of B</text>
+<rect class="sv-box" x="220" y="160" width="110" height="100"/><text class="sv-tb" x="222" y="276">C (M × N)</text>
+<rect class="sv-b6" x="270" y="180" width="30" height="30"/><text class="sv-ts" x="222" y="292">this block's tile of C</text>
+<line class="sv-dash" x1="350" y1="20" x2="350" y2="320"/>
+<text class="sv-tb" x="370" y="22">shared memory (the table)</text>
+<rect class="sv-b2" x="380" y="70" width="70" height="70"/><text class="sv-t" x="395" y="110">As</text>
+<rect class="sv-b2" x="470" y="70" width="70" height="70"/><text class="sv-t" x="487" y="110">Bs</text>
+<rect class="sv-b3" x="380" y="96" width="70" height="12"/>
+<rect class="sv-b3" x="500" y="70" width="12" height="70"/>
+<text class="sv-ts" x="370" y="160">loaded once per phase:</text>
+<text class="sv-ts" x="370" y="176">one element per thread,</text>
+<text class="sv-ts" x="370" y="192">then __syncthreads()</text>
+<line class="sv-line" x1="110" y1="190" x2="372" y2="110"/><polygon class="sv-head" points="371,104 380,108 373,115"/>
+<line class="sv-line" x1="300" y1="90" x2="462" y2="100"/><polygon class="sv-head" points="461,95 470,100 461,105"/>
+<line class="sv-dash" x1="560" y1="20" x2="560" y2="320"/>
+<text class="sv-tb" x="575" y="22">registers (one thread)</text>
+<rect class="sv-box" x="585" y="70" width="150" height="70"/>
+<text class="sv-t" x="595" y="92">As[ty][k], Bs[k][tx]</text>
+<text class="sv-t" x="595" y="120">acc += a × b</text>
+<line class="sv-line" x1="450" y1="102" x2="577" y2="102"/><polygon class="sv-head" points="577,97 585,102 577,107"/>
+<text class="sv-ts" x="580" y="160">TILE multiply-adds</text>
+<text class="sv-ts" x="580" y="176">per phase</text>
+<line class="sv-line2" x1="660" y1="140" x2="660" y2="300"/><line class="sv-line2" x1="660" y1="300" x2="300" y2="300"/><line class="sv-line2" x1="300" y1="300" x2="300" y2="218"/>
+<polygon class="sv-head" points="295,218 300,210 305,218"/>
+<text class="sv-ts" x="420" y="318">after the last phase: one store of acc to C</text>
+</svg></div><figcaption><b>Figure 1.</b> Shared-memory tiling: global → shared once per phase, shared → registers TILE times. Arrows show data flow. Not to scale. <sup class="src"><a href="#F6-22-src-D2">D2</a></sup> <sup class="src"><a href="#F6-22-src-D1">D1</a></sup></figcaption></figure>
+<p>Figure 2 shows one phase in time for one block. The two barriers split it into three parts; the second barrier is the one that people forget, and the first is the one that people place in an <code>if</code>.</p>
+<figure id="F6-22-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 200" role="img" aria-labelledby="F6-22-f2t F6-22-f2d">
+<title id="F6-22-f2t">Figure 2: one phase of the tiled kernel in time, with its two barriers</title>
+<desc id="F6-22-f2d">A time axis from left to right with three warps of one block drawn as rows. Each warp first does "load: 1 element of A, 1 of B to shared memory", which ends at different times for different warps. A vertical bar labelled "barrier 1: tiles complete (read after write)" follows; all warps wait there until the last one arrives. Then each warp does "compute: TILE multiply-adds from shared memory", again ending at different times. A second vertical bar labelled "barrier 2: everyone finished reading (write after read)" follows. After it the next phase starts with loads. A note says: while this block waits at a barrier, the scheduler can issue warps of other resident blocks.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="200"/>
+<text class="sv-ts" x="10" y="52">warp 0</text><text class="sv-ts" x="10" y="87">warp 1</text><text class="sv-ts" x="10" y="122">warp 2</text>
+<rect class="sv-b2" x="70" y="40" width="150" height="20"/><text class="sv-ts" x="76" y="55">load A, B tile parts</text>
+<rect class="sv-b2" x="70" y="75" width="110" height="20"/>
+<rect class="sv-b2" x="70" y="110" width="200" height="20"/>
+<line class="sv-line2" x1="285" y1="30" x2="285" y2="140"/><text class="sv-ts" x="230" y="160">barrier 1: tiles complete</text><text class="sv-ts" x="230" y="174">(read after write)</text>
+<rect class="sv-b3" x="295" y="40" width="210" height="20"/><text class="sv-ts" x="300" y="55">compute: TILE multiply-adds</text>
+<rect class="sv-b3" x="295" y="75" width="230" height="20"/>
+<rect class="sv-b3" x="295" y="110" width="200" height="20"/>
+<line class="sv-line2" x1="540" y1="30" x2="540" y2="140"/><text class="sv-ts" x="480" y="190">barrier 2: all reads done (write after read)</text>
+<rect class="sv-b2" x="550" y="40" width="120" height="20"/><text class="sv-ts" x="556" y="55">next phase: load</text>
+<rect class="sv-b2" x="550" y="75" width="90" height="20"/>
+<rect class="sv-b2" x="550" y="110" width="160" height="20"/>
+<line class="sv-line" x1="70" y1="20" x2="740" y2="20"/><polygon class="sv-head" points="740,15 750,20 740,25"/><text class="sv-ts" x="680" y="14">time</text>
+</svg></div><figcaption><b>Figure 2.</b> One phase for one block. Bar lengths are illustrative, not measured. While a block waits at a barrier, warps of other resident blocks can be issued (F6-20). <sup class="src"><a href="#F6-22-src-D1">D1</a></sup></figcaption></figure>
+
+<h2 id="F6-22-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Block = a group of rows sharing one table; shared memory = the table; a tile = a small square of jars; one phase = filling the table, cooking, clearing it; <code>__syncthreads()</code> = "everybody stop and check" — first "is the table full?", then "has everybody finished?"</p></div>
+<p>The naive kitchen carried each jar many times. Now each table group carries a square of jars once, puts it on the table, and everybody at the table uses it. A square of 16 by 16 jars is used by 16 helpers each, so the long walks drop by a factor of 16.</p>
+<p>Two stops keep the table honest. Nobody may start cooking before every jar is on the table, or she would cook with an empty bowl. Nobody may bring the next square before everyone has finished with this one, or she would take a jar out from under someone's hands.</p>
+<p>At the edges of the shelves, some places in the square have no jar. The helper for that place puts down an empty bowl (a zero). Then everybody follows the same recipe, and the empty bowls add nothing.</p>
+
+<h2 id="F6-22-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-22-l2-algorithm">The algorithm</h3>
+<p>A block of TILE × TILE threads computes a TILE × TILE tile of C. Thread (<code>tx</code>, <code>ty</code>) owns C[<code>row</code>][<code>col</code>] with <code>row = blockIdx.y·TILE + ty</code> and <code>col = blockIdx.x·TILE + tx</code>, exactly as in the naive kernel. <sup class="src"><a href="#F6-22-src-D1">D1</a></sup> The dot product over K is split into phases of TILE terms. In phase <i>p</i> (starting at <code>k0 = p·TILE</code>), thread (<code>tx</code>, <code>ty</code>) copies A[<code>row</code>][<code>k0 + tx</code>] into <code>As[ty][tx]</code> and B[<code>k0 + ty</code>][<code>col</code>] into <code>Bs[ty][tx]</code>. After a barrier, every thread adds Σ<sub><i>k</i></sub> <code>As[ty][k]·Bs[k][tx]</code> for <i>k</i> = 0 … TILE − 1 to its accumulator. A second barrier protects the tiles from being overwritten by the next phase while slower warps still read them. <sup class="src"><a href="#F6-22-src-D2">D2</a></sup></p>
+<p>The accumulator <code>acc</code> lives in a register for the whole kernel; C is written once at the end. The order of additions changes compared with the naive kernel (phase by phase rather than one long sum), but each output is still a K-term dot product, so the error bound of F6-21 applies unchanged. <sup class="src"><a href="#F6-22-src-D5">D5</a></sup></p>
+
+<h3 id="F6-22-l2-count">Counting the reuse</h3>
+<p>Per phase, each thread issues 2 global loads and does TILE multiply-adds. The naive kernel did 2 global loads per multiply-add; the tiled one does 2 ÷ TILE. In bytes: TILE multiply-adds are 2·TILE FLOP for 8 bytes, so the intensity against global memory is TILE ÷ 4 FLOP/byte: 4 for TILE = 16 and 8 for TILE = 32. F6-21's Listing 4 printed 3.992 and 7.969 at <i>n</i> = 4,096, the small difference being the bytes of C. <sup class="src"><a href="#F6-22-src-R2">R2</a></sup></p>
+<p>The loads did not disappear; they moved. Each multiply-add now needs two operands from shared memory: <code>As[ty][k]</code> and <code>Bs[k][tx]</code>. Shared memory is far faster than global memory, but it is not free: one shared-memory load instruction per multiply-add means the load/store pipeline is as busy as the FMA pipeline. You will see that ratio in the SASS below, and <a href="#F6-23">F6-23</a> attacks it with register tiling.</p>
+
+<h3 id="F6-22-l2-edges">Edges by zero-fill</h3>
+<p>Shapes such as 17 × 13 × 9 do not fill whole tiles. Listing 1 handles them in one place: a thread whose A element is outside (row ≥ M or k ≥ K) stores 0.0f into <code>As</code>, and likewise for <code>Bs</code>. For a valid output element every padded term is 0 × 0 or 0 × (a real value) and adds exactly zero. Threads outside C still load and still reach both barriers; only the final store is guarded. This is the pattern that keeps barriers safe, and the forensic lab shows what happens without it.</p>
+
+<h3 id="F6-22-l2-banks">Bank conflicts</h3>
+<p>In the bank model of <a href="#F6-11">F6-11</a> (successive 4-byte words in successive banks), check the three shared-memory accesses of one warp. <sup class="src"><a href="#F6-22-src-D3">D3</a></sup> With TILE = 32, a warp is one row of threads: one <code>ty</code>, 32 consecutive <code>tx</code>. The store <code>As[ty][tx]</code> and the read <code>Bs[k][tx]</code> touch 32 consecutive words: conflict-free. The read <code>As[ty][k]</code> is one address for the whole warp: a broadcast. With TILE = 16, a warp covers two rows <code>ty</code> and <code>ty + 1</code>: <code>As[ty][k]</code> and <code>As[ty+1][k]</code> are two addresses 16 words apart, in different banks, each broadcast to 16 threads. No padding is needed for this kernel. (It was needed in F6-19's transpose, which read a column.)</p>
+
+<h2 id="F6-22-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F6-22-l3-barriers">Why two barriers, precisely</h3>
+<p><code>__syncthreads()</code> waits until all threads of the block have reached it, and makes the shared- and global-memory accesses made by those threads before the barrier visible to all threads of the block after it. <sup class="src"><a href="#F6-22-src-D1">D1</a></sup> Barrier 1 orders a write (the tile store) before reads by other threads: a read-after-write dependency across threads. Barrier 2 orders reads (the inner loop) before the next phase's writes to the same addresses: a write-after-read dependency. Remove barrier 1 and a fast warp may multiply stale or half-written tiles; remove barrier 2 and a fast warp may overwrite <code>As</code> while a slow warp is still reading it. Both are data races with no compiler error. On a GPU they may pass a test for months; on the university's emulator, which runs every thread as a real <code>std::thread</code> with a real <code>std::barrier</code>, they race for real, and the barrier that some threads skip really hangs. <sup class="src"><a href="#F6-22-src-R1">R1</a></sup> <sup class="src"><a href="#F6-22-src-R5">R5</a></sup></p>
+<p>Why not one barrier with two tile buffers? That is double buffering, the subject of <a href="#F6-24">F6-24</a>; it trades shared memory for one barrier per phase and, more importantly, lets loads overlap computation.</p>
+
+<h3 id="F6-22-l3-choice">Choosing TILE</h3>
+<p>A larger tile raises reuse but costs: TILE = 32 needs 1,024 threads per block and 8,192 bytes of shared memory; TILE = 16 needs 256 threads and 2,048 bytes. The compiler report for <code>sm_80</code> gives 32 registers per thread for both. <sup class="src"><a href="#F6-22-src-R3">R3</a></sup> Residency is decided per block (F6-20): with 1,024-thread blocks, an SM whose thread limit is 2,048 holds at most two blocks, and when both blocks wait at barriers nothing else can issue. Smaller blocks give the scheduler more independent blocks to switch between. Which effect wins is a measurement for your GPU; E6 asks you to record registers and occupancy per step precisely so that you can explain the result. <sup class="src"><a href="#F6-22-src-C1">C1</a></sup> The limits of your GPU (threads, blocks and shared memory per SM) are product facts: take them from <code>cudaGetDeviceProperties</code> on your machine and the vendor documentation (unverified box below).</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The per-SM limits used in this course's examples (2,048 threads per SM is F6-20's <i>example device</i>, not a product) and the maximum shared memory per block (the static limit without opting in to a larger dynamic allocation) differ between GPU generations. Read them from your GPU with <code>cudaGetDeviceProperties</code> (<code>maxThreadsPerMultiProcessor</code>, <code>sharedMemPerBlock</code>, <code>sharedMemPerMultiprocessor</code>), and check the "Compute Capabilities" table of the CUDA C++ Programming Guide for your toolkit version (D1).</p></div>
+
+<h3 id="F6-22-l3-compiler">What the compiler made of it</h3>
+<p>The SASS for <code>sm_80</code> shows, for <code>sgemmTiled&lt;16&gt;</code>: 2 <code>LDG.E</code>, 2 <code>STS</code>, 2 <code>BAR.SYNC</code>, 16 <code>FFMA</code>, 16 <code>LDS</code> and 4 <code>LDS.128</code>; for <code>sgemmTiled&lt;32&gt;</code> the same with 32 <code>FFMA</code>, 32 <code>LDS</code> and 8 <code>LDS.128</code>. <sup class="src"><a href="#F6-22-src-R4">R4</a></sup> Read it as: the inner loop over <code>k</code> was fully unrolled; the row <code>As[ty][0..TILE-1]</code> is the same for all <code>k</code> of one thread and contiguous, so <code>ptxas</code> fetched it four floats at a time with 128-bit <code>LDS.128</code>; the column <code>Bs[k][tx]</code> is strided by TILE words and needed one scalar <code>LDS</code> per <code>k</code>. That is 1.25 shared-memory load instructions per FFMA, against 2 global loads per FFMA before. The 16-byte shared loads are visible in the excerpt: <code>LDS.128 R12, [R0]</code> followed by <code>LDS.128 R8, [R0+0x10]</code> (16 bytes further), while the scalar loads step by <code>0x80</code> = 128 bytes = 32 floats, one row of <code>Bs</code>. <sup class="src"><a href="#F6-22-src-R4">R4</a></sup> <sup class="src"><a href="#F6-22-src-D4">D4</a></sup></p>
+<p>The next limit is therefore instruction issue and shared-memory bandwidth, not DRAM. On a roofline drawn against shared-memory traffic, this kernel's intensity is about 2 FLOP per 4-byte shared load: far below anything the FMA units could use. The cure is to make each value loaded from shared memory feed several multiply-adds, which needs each thread to own several outputs: register tiling.</p>
+
+<h2 id="F6-22-hardware">How the hardware actually does it</h2>
+<p>Shared memory is on-chip storage in each SM, allocated per block for the block's lifetime and accessed with its own instructions (<code>STS</code>, <code>LDS</code>), separate from global loads (<code>LDG</code>). <sup class="src"><a href="#F6-22-src-D1">D1</a></sup> <sup class="src"><a href="#F6-22-src-D4">D4</a></sup> It is divided into banks; a warp's request is served in one pass when its addresses fall into different banks or share an address (broadcast), and in several passes otherwise (F6-11). <sup class="src"><a href="#F6-22-src-D3">D3</a></sup> <code>BAR.SYNC</code> is the SASS instruction behind <code>__syncthreads()</code> in this build: a warp that reaches it stops being eligible to issue until all warps of its block have arrived. <sup class="src"><a href="#F6-22-src-R4">R4</a></sup> Because the scheduler issues only eligible warps (F6-20), the time a block spends at barriers must be covered by other blocks on the same SM — one reason why occupancy still matters for this kernel, even though the next chapters will show it is not the whole story.</p>
+
+<h2 id="F6-22-worked">Worked example</h2>
+<p><b>Task.</b> For <i>n</i> = 4,096 and TILE = 32, compute the number of blocks, phases per block, bytes each block loads from global memory, total global bytes, and the intensity; then the same for TILE = 16; and compare shared-memory load instructions per FFMA from the SASS.</p>
+<ol>
+<li>Blocks: (4,096 ÷ 32)² = 128² = 16,384. Phases per block: 4,096 ÷ 32 = 128.</li>
+<li>Per phase a block loads 2 × 32 × 32 floats = 2,048 floats = 8,192 bytes; per block 128 × 8,192 = 1,048,576 bytes = 1 MiB.</li>
+<li>Total: 16,384 MiB = 16 GiB = 17,179,869,184 bytes, plus C written once: 4,096² × 4 = 67,108,864 bytes. Sum 17,246,978,048 ≈ 1.725 × 10<sup>10</sup> bytes, exactly the "block tile 32 × 32" row of F6-21's Listing 4. <sup class="src"><a href="#F6-22-src-R2">R2</a></sup></li>
+<li>Intensity: 1.374 × 10<sup>11</sup> FLOP ÷ 1.725 × 10<sup>10</sup> bytes = 7.97 FLOP/byte (Listing 4: 7.969).</li>
+<li>TILE = 16: 65,536 blocks × 256 phases × 2,048 bytes = 34,359,738,368, plus C: 3.443 × 10<sup>10</sup> bytes; intensity 3.99 (Listing 4: 3.992). Halving the tile doubles the global traffic.</li>
+<li>Shared-memory loads per FFMA from the SASS: (16 + 4) ÷ 16 = 1.25 for TILE = 16 and (32 + 8) ÷ 32 = 1.25 for TILE = 32. The tile size changes global reuse, not shared-memory reuse. <sup class="src"><a href="#F6-22-src-R4">R4</a></sup></li>
+</ol>
+
+<h2 id="F6-22-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>gemm_tiled.cuh</code>: the kernel.</p>
+<pre class="listing" data-src="F6-22/gemm_tiled.cuh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–9</td><td><code>template &lt;int TILE&gt;</code></td><td>The tile size is a compile-time constant.</td><td>Shared arrays need constant sizes; the inner loop can be fully unrolled.</td></tr>
+<tr><td>11–12</td><td><code>__shared__ float As[TILE][TILE]</code></td><td>Two tiles per block in shared memory.</td><td>2 × TILE² × 4 bytes: 2,048 for 16, 8,192 for 32 (compiler report).</td></tr>
+<tr><td>13–16</td><td><code>tx</code>, <code>ty</code>, <code>row</code>, <code>col</code></td><td>Same output mapping as the naive kernel.</td><td>x is the column: coalesced loads of B and stores of C.</td></tr>
+<tr><td>18</td><td><code>for (int k0 = 0; k0 &lt; K; k0 += TILE)</code></td><td>One iteration per phase.</td><td>⌈K ÷ TILE⌉ phases; K need not be a multiple of TILE.</td></tr>
+<tr><td>20</td><td><code>As[ty][tx] = (row &lt; M &amp;&amp; k0 + tx &lt; K) ? … : 0.0f</code></td><td>Each thread copies one A element or a zero.</td><td>A warp reads 32 (or 2 × 16) consecutive floats of a row of A: coalesced.</td></tr>
+<tr><td>21</td><td><code>Bs[ty][tx] = (k0 + ty &lt; K &amp;&amp; col &lt; N) ? … : 0.0f</code></td><td>Each thread copies one B element or a zero.</td><td>Consecutive <code>tx</code> read consecutive columns: coalesced.</td></tr>
+<tr><td>22</td><td><code>__syncthreads()</code></td><td>Barrier 1.</td><td>No thread reads a tile element before it is written.</td></tr>
+<tr><td>23–25</td><td>inner <code>k</code> loop</td><td>TILE multiply-adds from shared memory.</td><td>The reuse: each loaded element is used by TILE threads.</td></tr>
+<tr><td>26</td><td><code>__syncthreads()</code></td><td>Barrier 2.</td><td>No thread overwrites a tile another thread is still reading.</td></tr>
+<tr><td>28–30</td><td>guarded store</td><td>Only threads inside C write.</td><td>The only bounds check that may skip work, because it is after the last barrier.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>sgemm_tiled.cu</code>: E6 steps 1–2 in the harness of F6-21 (naive, tiled 16, tiled 32).</p>
+<pre class="listing" data-src="F6-22/sgemm_tiled.cu"></pre>
+<div class="tw"><table>
+<thead><tr><th>Part</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>includes</td><td><code>../F6-21/gemm_harness.cuh</code></td><td>Reuses the harness and the naive kernel.</td><td>Every step of the speed table is measured the same way.</td></tr>
+<tr><td><code>launchTiled&lt;TILE&gt;</code></td><td><code>dim3 block(TILE, TILE)</code>, grid rounded up</td><td>One block per C tile.</td><td>The rounded-up grid is why edges need zero-fill.</td></tr>
+<tr><td><code>runE6({...})</code></td><td>name, kernel, threads per block, launcher</td><td>Shapes, resources, speed.</td><td>The threads per block feed the occupancy query.</td></tr>
+</tbody></table></div>
+<p>Runs in this build (default build; <code>sm_80</code> build with cuBLAS from <code>run.sh</code>); both stop at the first runtime call because the container has no GPU:</p>
+<pre class="output" data-run="F6-22/sgemm_tiled"></pre>
+<pre class="output" data-run="F6-22/build_sm80"></pre>
+<p><b>Listing 3</b> — <code>check_tiled.cpp</code>: the kernel source, unchanged, on the CPU emulator of F6-21 (<code>cuda_shim.hpp</code>, <code>emu_test.hpp</code>), for TILE = 8 and 16 (TILE = 32 means 1,024 operating-system threads per block on the CPU: correct but slow, so the emulator test uses smaller tiles; the GPU harness tests 16 and 32).</p>
+<pre class="listing" data-src="F6-22/check_tiled.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>2–4</td><td>shim, kernel, test</td><td>Compiles the CUDA kernel as host C++.</td><td>Same bytes as the GPU build: the test checks the real kernel.</td></tr>
+<tr><td>6–11</td><td><code>launch(dim3(...), dim3(TILE, TILE), sgemmTiled&lt;TILE&gt;, ...)</code></td><td>The emulator's equivalent of <code>&lt;&lt;&lt; &gt;&gt;&gt;</code>.</td><td>Blocks run as TILE² real threads with a real barrier.</td></tr>
+<tr><td>16–17</td><td><code>emuTestAll</code></td><td>The emulator's shape matrix with the F6-21 bound.</td><td>Includes 17 × 13 × 9, 127 × 129 × 65 and K = 1.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F6-22/check_tiled"></pre>
+<p>The compiler's view (<code>sm_80</code>, compiled only): registers and shared memory per kernel, then the SASS instruction mix and the first loads of the unrolled inner loop. <sup class="src"><a href="#F6-22-src-R3">R3</a></sup> <sup class="src"><a href="#F6-22-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F6-22/resources"></pre>
+<pre class="output" data-run="F6-22/sass_tiled"></pre>
+<p>Build command for the GPU run, as <code>run.sh</code> used it: <code>nvcc -std=c++17 -O2 -lineinfo -arch=sm_80 -DUSE_CUBLAS sgemm_tiled.cu -lcublas</code> (replace <code>sm_80</code> by your GPU's compute capability).</p>
+
+<h2 id="F6-22-breaks">Where the analogy breaks</h2>
+<ul>
+<li>In the kitchen, the table is a visible place and helpers can see whether a jar is there. On a GPU nothing tells a thread that a shared-memory element is "not yet written": it reads whatever bits are there. Only the barrier makes the order safe; there is no error message when it is missing.</li>
+<li>The story's "everybody waits" sounds as if the whole hall stops. Only the warps of one block wait at its barrier; warps of other blocks on the same SM keep issuing, which is how barrier time is hidden (F6-20).</li>
+<li>Helpers at a table can pass jars hand to hand freely. Shared memory has banks: some access patterns are served in one pass and others take several (F6-11), and the table has a fixed size per SM that limits how many groups can sit down at once.</li>
+</ul>
+
+<h2 id="F6-22-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Early return before the barriers.</b> Symptom: hang, or wrong results only for shapes that are not tile multiples (see the forensic lab: 64³ passes, 127 × 129 × 65 never finishes on the emulator). Cause: <code>if (row &gt;= M || col &gt;= N) return;</code> before the loop. Find it: emulator hang or Compute Sanitizer's <code>synccheck</code> tool on a GPU (check its documentation, D6). Fix: zero-fill and guard only the final store.</li>
+<li><b>Missing second barrier.</b> Symptom: rare wrong results that change with block scheduling. Find it: the emulator (threads really race) or <code>racecheck</code> on a GPU (D6). Fix: barrier after the inner loop.</li>
+<li><b>Bounds check on only one index of the tile load.</b> Symptom: passes square shapes, fails 17 × 13 × 9 or reads out of bounds. Find it: the emulator under AddressSanitizer reports the bad read with the line. Fix: check row and k for A, k and column for B.</li>
+<li><b>Transposed thread mapping.</b> Symptom: correct, slower than naive. Cause: <code>tx</code> used for rows, so neither tile load is coalesced. Fix: x is the column, as in F6-21.</li>
+<li><b>TILE = 32 with extra shared arrays.</b> Symptom: launch fails with a resource error. Cause: threads × registers or shared memory per block above the device limits. Find it: the error check after the launch; the compiler report. Fix: smaller tile or fewer registers.</li>
+</ul>
+
+<div class="co transition" id="F6-22-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-21">F6-21</a> built the naive kernel and showed its 0.25 FLOP per byte requested; <a href="#F6-10">F6-10</a> and <a href="#F6-12">F6-12</a> introduced shared memory and barriers. <b>What carries over:</b> the output mapping, the harness, the error bound, the shape matrix and coalescing rules are unchanged. <sup class="src"><a href="#F6-22-src-D2">D2</a></sup> <b>What changes:</b> threads now cooperate, so a thread that skips a barrier breaks the whole block; global loads per multiply-add fall by a factor of TILE, and shared-memory loads become the next limit. <sup class="src"><a href="#F6-22-src-R4">R4</a></sup> <b>What comes next:</b> <a href="#F6-23">F6-23</a> gives each thread a small tile of outputs in registers, so that each shared-memory load feeds several multiply-adds, and loads 16 bytes per instruction.</p></div>
+
+<h2 id="F6-22-check">Check yourself</h2>
+<ol>
+<li>What is the reuse factor of a value loaded from global memory in <code>sgemmTiled&lt;TILE&gt;</code>, and the resulting intensity in FLOP per byte (ignoring C)?</li>
+<li>Explain in your own words what each of the two barriers protects against. Give the name of each dependency.</li>
+<li>Which statement about zero-fill is correct? (a) It is needed only when K is not a multiple of TILE. (b) It lets every thread reach both barriers and keeps padded terms at exactly zero. (c) It makes the kernel faster for all shapes. (d) It can be replaced by an early return for threads outside C.</li>
+<li>Predict, then check in <code>sass_tiled.out</code>: how many shared-memory load instructions per FFMA does <code>sgemmTiled&lt;32&gt;</code> execute, and why are some of them 128-bit?</li>
+<li>Apply it to a new case: a rectangular block tile of 32 rows × 64 columns with BK = 16, one output per thread. How many threads per block, how many bytes of shared memory, and what intensity against global memory?</li>
+<li>Why does the warp's read <code>As[ty][k]</code> not cause a bank conflict?</li>
+<li>A colleague proposes TILE = 64 with one output per thread. What stops it?</li>
+<li>The emulator test of the forensic kernel passed 64³ and 128 × 32 × 48 but hung on 127 × 129 × 65. What property of the first two shapes hid the bug?</li>
+</ol>
+
+<h2 id="F6-22-lab">Lab</h2>
+<p><b>Goal.</b> Add the shared-memory step to your E6 speed table and explain its gain from the counts. E6 builds the steps "naive; shared-memory tiling; 1-D then 2-D register tiling; vectorized loads; double buffering; tuned tile sizes per GPU; edge handling" and requires "register usage and occupancy … recorded per step". <sup class="src"><a href="#F6-22-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–3: none (this build: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>Cuda compilation tools, release 12.0, V12.0.140</code>). Steps 4–6: an NVIDIA GPU with the CUDA Toolkit and cuBLAS recorded in your dossier, or a cloud GPU instance. <b>Safety:</b> none beyond normal computer use.</p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-22</code>. Expect "all shapes ok" in <code>check_tiled.out</code> and the instruction mix above in <code>sass_tiled.out</code>.</li>
+<li>Delete the second <code>__syncthreads()</code> in a copy of Listing 1 and run the emulator test several times. Record whether and where it fails. Then delete the first barrier instead and repeat.</li>
+<li>Instantiate <code>sgemmTiled&lt;8&gt;</code> for <code>sm_80</code> and compare its registers and instruction mix with TILE = 16 and 32.</li>
+<li>On a GPU: build Listing 2 with the command above, run, and copy the shape results, resources and speed table into your E6 log, with the GPU name, driver and toolkit versions printed by the tools.</li>
+<li>Profile <code>tiled16</code> and <code>tiled32</code> at <i>n</i> = 2,048: record DRAM bytes, shared-memory load instructions and the main warp stall reasons.</li>
+<li>Write two sentences explaining the speed difference between naive, tiled16 and tiled32 from your evidence.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: emulator passes all shapes; 2 global loads and TILE FFMAs per phase in the SASS; 1.25 shared loads per FFMA; GPU runs stop with <code>cudaErrorNoDevice</code>. On a GPU (untested here): both tiled kernels pass all shapes and are faster than naive; the profiler shows far fewer DRAM bytes and a high share of shared-memory instructions.</p>
+<p><b>Verification.</b> "ALL CHECKS PASSED" from the harness on your GPU, including "matches cuBLAS" at all three sizes. Compute Sanitizer's memcheck, racecheck and synccheck tools report no errors on the 127 × 129 × 65 shape (tool names from the Compute Sanitizer documentation, D6).</p>
+<p><b>Troubleshooting.</b> Emulator run seems stuck → a barrier is skipped (the 20 s time limit of <code>forensic_tidy.timeout</code> stops it; the log records exit code 124). A launch error printed by the check after the launch (its name comes from <code>cudaGetErrorName</code>) → compare threads per block, threads × registers and shared memory with your GPU's limits. Results differ from cuBLAS only at <i>n</i> = 4,096 → check the bound uses this K and both partners (harness <code>partners = 2</code>).</p>
+<p><b>Extension.</b> Make TILE a pair (BM, BN) with BK separate, keep one output per thread, and measure 32 × 8 and 8 × 32 block shapes.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 2 was built twice (default target; <code>sm_80</code> with cuBLAS); both runs stop with <code>cudaErrorNoDevice</code>. Correctness evidence comes from the CPU emulator running the same kernel source; nothing in this chapter is a GPU timing.</p></div>
+
+<h2 id="F6-22-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Tomás tidied Listing 1 before a code review: "threads outside C have nothing to compute, so they should leave at once". His version passed the team's quick test on a 64 × 64 × 64 problem. The nightly test run on the emulator never finished and was stopped by its time limit. The log is all there is.</p>
+<p><b>Evidence pack.</b> (1) The tidy kernel, <code>tiled_early_return.cuh</code>:</p>
+<pre class="listing" data-src="F6-22/tiled_early_return.cuh"></pre>
+<p>(2) The nightly run's output and its run record (note the exit code) <sup class="src"><a href="#F6-22-src-R5">R5</a></sup>:</p>
+<pre class="output" data-run="F6-22/forensic_tidy"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which shapes finished, which did not, and what does the exit code in the run record mean?</li>
+<li>Give two hypotheses (for example "an infinite loop in the k0 loop" and "a barrier some threads never reach") and say which line of the log or the code rules each in or out.</li>
+<li>Prove the root cause: for 127 × 129 × 65 with TILE = 16, which block is the first to contain threads that return early, and how many threads of that block reach the first <code>__syncthreads()</code>?</li>
+<li>Why did 64³ and 128 × 32 × 48 pass? State the condition on M and N under which the bug is invisible.</li>
+<li>Give a fix and a test that would have caught the bug in the quick test.</li>
+</ol>
+<p><b>Method hints.</b> Compare with Listing 1 line by line. Then count, for the first incomplete block, how many threads satisfy <code>row &gt;= M || col &gt;= N</code>. On a GPU the same bug is undefined behaviour: it may hang, or it may produce wrong numbers silently, which is why the emulator's honest hang is useful evidence.</p>
+
+<h2 id="F6-22-project">Mini-project</h2>
+<p><b>E6 log, version 2.</b> Add the tiled steps to your MP3 GEMM repository: TILE as a template parameter, the emulator test for TILE ∈ {8, 16} in CI, and a short "speed table explained" note that, for each step, gives the global loads per FFMA and shared loads per FFMA from the SASS, the registers and occupancy from the harness and (once you have GPU access) the measured time and percentage of cuBLAS. <sup class="src"><a href="#F6-22-src-C1">C1</a></sup></p>
+<p><b>Rubric.</b> Tiled kernel passes all shapes in CI (2). SASS counts per step recorded by a script, not by hand (2). Barrier misuse test: a deliberately broken variant that CI expects to fail or time out (2). Occupancy and registers per step (2). Explanation connects each speed change to a counted resource (2).</p>
+
+<h2 id="F6-22-summary">Summary</h2>
+<ul>
+<li>A block loads one TILE × TILE tile of A and one of B per phase into shared memory; each value is then used TILE times.</li>
+<li>Global intensity rises from 0.25 to TILE ÷ 4 FLOP per byte: 4 for TILE = 16, 8 for TILE = 32 (F6-21's Listing 4: 3.992 and 7.969 at <i>n</i> = 4,096).</li>
+<li>Two barriers per phase: after the load (read after write) and after the compute (write after read).</li>
+<li>Edges are handled by zero-fill so every thread reaches every barrier; only the final store is guarded.</li>
+<li>An early return before a barrier hangs the emulator on non-multiple shapes; on a GPU it is undefined behaviour.</li>
+<li>The SASS shows 1.25 shared-memory loads per FFMA: shared memory and issue, not DRAM, are the next limit.</li>
+</ul>
+
+<h2 id="F6-22-sources">Sources</h2>
+<ol>
+<li id="F6-22-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): shared memory (the matrix multiplication example with shared memory), <code>__syncthreads()</code> semantics and its rule for conditional code, compute capabilities table. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F6-22-src-D2">D2 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3; curriculum item 64): the tiled matrix multiplication chapter. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-22-src-D3">D3 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): shared memory, bank conflicts, the shared-memory matrix multiplication example. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-22-src-D4">D4 — NVIDIA, "CUDA Binary Utilities" (tier 1): <code>cuobjdump</code>, SASS instruction overview (<code>LDS</code>, <code>STS</code>, <code>BAR</code>, <code>FFMA</code>, <code>LDG</code>). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-22-src-D5">D5 — Nicholas J. Higham, "Accuracy and Stability of Numerical Algorithms" (tier 3): error of inner products in any summation order. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-22-src-D6">D6 — NVIDIA, "Compute Sanitizer" documentation (tier 1): memcheck, racecheck, synccheck. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-22-src-C1">C1 — Systems Curriculum (this project), milestone E6 (goal, build steps and acceptance tests quoted), local file <code>SYSTEMS_CURRICULUM.html</code>. A map, not a source (AH-4).</li>
+<li id="F6-22-src-R1">R1 — run of Listing 3 (<code>university/labs/F6-22/check_tiled.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with ASan and UBSan, exit code 0.</li>
+<li id="F6-22-src-R2">R2 — run of F6-21 Listing 4 (<code>university/labs/F6-21/intensity.log</code>), same compiler, exit code 0.</li>
+<li id="F6-22-src-R3">R3 — <code>ptxas -v</code> report for <code>sm_80</code> (<code>resources.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>, compiled only.</li>
+<li id="F6-22-src-R4">R4 — SASS of Listing 1 for <code>sm_80</code> (<code>sass_tiled.log</code>), same toolkit, compiled only.</li>
+<li id="F6-22-src-R5">R5 — run of the forensic program (<code>forensic_tidy.log</code>), same g++, stopped by its 20 s time limit (exit code 124).</li>
+<li id="F6-22-src-R6">R6 — builds and runs of Listing 2 (<code>sgemm_tiled.log</code>, <code>build_sm80.log</code>); untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+</ol>
+
+<h2 id="F6-22-glossary">Glossary links</h2>
+<p><a href="#gl-tile">Tile</a> · <a href="#gl-shared-memory-tiling">Shared-memory tiling</a> · <a href="#gl-phase-k-step">Phase (K-step)</a> · <a href="#gl-reuse-factor">Reuse factor</a> · <a href="#gl-zero-fill-edge-padding">Zero-fill (edge padding)</a> · <a href="#gl-divergent-barrier">Divergent barrier</a> · <a href="#gl-shared-memory-gpu">Shared memory (GPU)</a> · <a href="#gl-bank-conflict">Bank conflict</a> · <a href="#gl-arithmetic-intensity">Arithmetic intensity</a> · <a href="#gl-occupancy">Occupancy</a></p>
+
+<h2 id="F6-22-next">Next chapter</h2>
+<p><a href="#F6-23">F6-23 Register tiling and vectorised loads</a>. Previous: <a href="#F6-21">F6-21</a>. Back to the course: <a href="#CU302">CU302</a>.</p>
+
+<h2 id="F6-22-answers">Answers to Check yourself</h2>
+<ol>
+<li>TILE: each element of an A tile is used by the TILE threads of its row of the block, each B element by the TILE threads of its column. Intensity 2·TILE FLOP per 8 bytes = TILE ÷ 4 FLOP/byte.</li>
+<li>Barrier 1 (after the loads) makes sure every tile element is written before anyone reads it: read after write. Barrier 2 (after the inner loop) makes sure everyone has finished reading before the next phase overwrites the tiles: write after read.</li>
+<li>(b). (a) is false: rows beyond M and columns beyond N also need it. (c) is false: it adds a comparison per load; its purpose is correctness. (d) is false: that is exactly the forensic bug.</li>
+<li>(32 + 8) ÷ 32 = 1.25. The row <code>As[ty][0..31]</code> is contiguous and the same for all k of a thread, so <code>ptxas</code> loads it four floats per <code>LDS.128</code>; the column of <code>Bs</code> is strided and needs scalar loads.</li>
+<li>32 × 64 = 2,048 threads per block. Compare that with <code>maxThreadsPerBlock</code> of your GPU (Layer 3 unverified box): the harness's <code>tiled32</code> step already uses 1,024, and a block above the limit fails to launch with an error that the launch check prints. Many outputs per thread (F6-23) avoid the problem. Shared memory: (32 × 16 + 16 × 64) × 4 = 6,144 bytes. Intensity against global memory: BM·BN ÷ (2(BM + BN)) = 2,048 ÷ 192 ≈ 10.7 FLOP/byte (F6-21's formula).</li>
+<li>All threads of the warp with the same <code>ty</code> read the same address, which is a broadcast; with TILE = 16 the two rows of the warp are 16 words apart, in different banks.</li>
+<li>64 × 64 = 4,096 threads per block: four times the <code>tiled32</code> block; check it against <code>maxThreadsPerBlock</code> of your GPU, and note that with one output per thread the reuse per shared-memory load does not improve at all. It also needs 32 KiB of static shared memory. Larger tiles are built with several outputs per thread (F6-23).</li>
+<li>Both have M and N that are multiples of 16, so no thread has <code>row &gt;= M</code> or <code>col &gt;= N</code>, nobody returns early, and every thread reaches every barrier.</li>
+</ol>
+<h3 id="F6-22-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>64³ and 128 × 32 × 48 printed "ok"; 127 × 129 × 65 printed "starting" and nothing more. The run record shows exit code 124: the run was stopped by the 20 s limit, not by a crash.</li>
+<li>An infinite <code>k0</code> loop is ruled out because the loop bound is the same as in Listing 1, which finished this shape in <code>check_tiled.out</code>. A skipped barrier is ruled in by the code: the early <code>return</code> precedes both <code>__syncthreads()</code> calls.</li>
+<li>N = 129: the blocks with <code>blockIdx.x</code> = 8 cover columns 128–143. In block (8, 0), only <code>tx</code> = 0 has <code>col</code> = 128 &lt; 129; 15 of 16 columns return. So 16 threads (one column of 16 rows) reach the first barrier and 240 do not; the emulator's <code>std::barrier</code> of 256 waits forever. (Blocks run in order x first, so block (8, 0) is the first incomplete one.)</li>
+<li>M and N multiples of TILE = 16 (K does not matter: it only affects the loads, which have their own checks).</li>
+<li>Return to Listing 1: zero-fill the loads, guard only the store. Add a shape with M and N not multiples of the tile (17 × 13 × 9) to the quick test.</li>
+</ol>
+<p>How the evidence was produced: <code>forensic_tidy.cpp</code> runs the tidy kernel on the emulator with output unbuffered and a 20 s limit (<code>forensic_tidy.timeout</code>); the fault was introduced by moving the bounds check to an early return. Wrong answers: "the emulator is too slow" (the same shape finished in Listing 3's run with the correct kernel); "K = 65 is not a multiple of 16" (K is handled by the loads' own checks and is irrelevant to the barrier).</p>
