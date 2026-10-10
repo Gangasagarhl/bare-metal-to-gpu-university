@@ -173,3 +173,83 @@ in text only.
   grouped line ranges as "you do not need every detail yet").
 - SVG figures use `<polygon class="sv-head">` arrowheads, only `sv-*` classes, and one "✓"
   character in F9-07 Figure 1.
+
+## Owner rulings applied
+
+Applied on 2026-10-10 in the verification pass (rulings in `university/OWNER_RULINGS.md`).
+
+- **F9-07 decision (1): which kit, if any.** Ruling **D1**: the reference kit is the one named in
+  `build/KIT.md`. That file did not exist in the repository during this pass, so Part B names no kit:
+  it now says the reference kit is used only if it meets the stated requirements (battery-powered,
+  designed for the learners' age, two driven wheels, a floor light sensor, a physical power switch),
+  otherwise the teacher or parent records a kit that does.
+- **F9-07 decision (2): is Part B offered?** Rulings **B2** and **C3**: Part B stays optional and
+  supervised; RB101 can be completed in the simulator alone (Part A and the course project need no
+  hardware); every Part B step stays marked "untested on hardware" with what is needed to test it.
+- **F9-07 decision (3): how the kit is programmed.** Decided by verifier: the kit must accept a
+  program equivalent to F9-05 Listing 1 with a speed limit; recorded in the Part B box.
+- **Status of chapters with hardware steps.** Ruling **C4**: F9-07 is "internally checked · hardware
+  steps untested"; F9-01 to F9-06 have no hardware steps.
+- **Sources marked "title only".** Rulings **C1/C2**: every source was searched for; the ones that
+  could be opened are cited with edition and sections; the books that could not be opened (Make:
+  Electronics, Probabilistic Robotics, Code, A Tour of C++, Real-Time Systems) were replaced by
+  openable sources or their claims moved into "Not verified" boxes.
+- **Teaching simulators.** Ruling **A2** (with **D2**): every chapter now says its text simulator is
+  the course's own teaching tool and names the real tool it stands for (Gazebo, cited from the Gazebo
+  Jetty documentation).
+- **Analogy mappings** (bicycle, body with senses and muscles). Ruling **A3**: approved as written.
+- **Exercise values** (gains, thresholds, speed limit 5, step limits). Ruling **A4**: they are
+  simulator values and are labelled "simulator units" in the listings and text; no change needed.
+- **Recorded runs.** Ruling **A5**: all 16 listings re-run; only the `.log` date lines changed, so the
+  recorded `.out`/`.log` files were restored.
+- **Glossary terms shared with other courses** (Program, Loop, Condition, Sensor, Simulator, Log,
+  Feedback, Control loop, Gain, Encoder). Ruling **A7**: the first course in build order keeps the
+  canonical wording; RB101's entries stay as proposals for the Integrator's merge. "Error (control)"
+  keeps its qualified name.
+- **Committed keys** (ruling A8): none in RB101. **Licence** (ruling A10): RB101 lab files carry no
+  `LicenseRef-Uni-Lab` placeholder; they fall under MIT with all university lab code; no header was
+  added because it would shift the line numbers that every line table quotes.
+- **E-stop default** (ruling D4): applies to RB403's robot image; F9-07's simulated stop is already
+  latched and checked first in every round; no change.
+- **Builder accepting non-.cpp `data-src`** (F9-06 `grid_world.hpp`, `grid_sim.in`). Decided by
+  verifier: `build.py` ran with no PROBLEM line for F9-06, so the builder accepts them; nothing to
+  change.
+
+## Verification pass
+
+Source Researcher, Fact-Checker, Diagram, Editor and Accessibility pass, 2026-10-10.
+
+- **Opened (15 documents):** D1 Åström and Murray, "Feedback Systems", Second Edition, PDF
+  v3.1.5 (2020-07-24), §1.1, 1.3, 1.5, 1.6, 1.8, 2.3, 10.1, 11.1, 11.5; D2 Lynch and Park, "Modern
+  Robotics", preprint Dec 30, 2019 (Chapter 1) and the official video-supplement pages 13.1, 13.3.1,
+  13.3.4, 13.4; D3 Thrun, "Probabilistic Algorithms in Robotics", CMU-CS-00-126 (replaces the
+  Probabilistic Robotics book); D5 Nisan and Schocken, "The Elements of Computing Systems" 2nd ed.,
+  Chapter 5 (replaces Petzold); D6 C++ working draft (replaces A Tour of C++); D7 Zephyr "Watchdog"
+  (replaces Liu); D8 gpiozero 2.0.1.post3; D9 MathWorks "Mobile Robot Kinematics Equations" R2026b;
+  D10 NIST/SEMATECH e-Handbook §2.1.1.3, 2.1.1.4, 2.3.1; D11 Vishay TCRT5000 datasheet 83760 Rev.
+  1.7; D12 TI SLAA907D; D13 ST VL53L0X DS11555 Rev 6; D14 Gazebo Jetty documentation; D15 Pololu
+  0J19; S1 the authoring guide. Dossiers: `university/_dossiers/F9-01…F9-07.dossier.html`.
+  D-ids are now unit-wide (the same id means the same document in every RB101 chapter).
+- **Checked:** about 128 tagged claims and boxes across the seven chapters (QA records
+  `university/qa/F9-0*.json`). **Corrected:** 36 items. The most important:
+  F9-05 Figure 1 had its compare signs the wrong way round (target +, measured −), which with
+  "steer = − gain × error" would steer away from the line; signs, caption, description and the
+  "Error (control)" definition now say error = measured − target, with a note on Feedback Systems'
+  e = r − y convention. F9-02's worked example said "four" floor readings but listed seven.
+  F9-04's watchdog now "resets the computer" (Zephyr), not "stops the motors". Several "the
+  computer's pins cannot power a motor" sentences were reworded to what gpiozero documents.
+- **Left unverified (4 boxes):** F9-03 encoder counts per turn; F9-03 motor internals, gearbox and
+  battery run-down (Make: Electronics not openable); F9-06 simulator features beyond those on the
+  Gazebo pages opened; F9-07 Part B (untested on hardware). The F9-05 "row of line sensors" claim
+  was confirmed (Pololu 0J19) and is no longer conceptual.
+- **Diagrams:** all 8 figures checked (title, desc, caption, labels, no colour-only meaning). F9-02
+  bars and F9-05 Figure 2 points re-measured against the run outputs; F9-06 grid re-checked cell by
+  cell against `grid_world.hpp`.
+- **Edit and accessibility:** Layer 1 averages 7.9–11.0 words per sentence; long sentences added in
+  this pass were split; one "simply" removed. Glossary `glossary.json` synced with the corrected
+  Jargon boxes and their sources.
+- **Labs:** all 16 listings re-run with `run_lab.sh` (exit 0, identical output); recorded files kept
+  (A5). No lab code changed, so no prose quoting output changed.
+- **Still open:** the reference kit file (`build/KIT.md`) for F9-07 Part B; a supervised kit trial;
+  an official encoder datasheet and an openable copy of "Make: Electronics" to clear the F9-03 boxes;
+  the Gazebo physics/noise/rendering pages to clear the F9-06 box.
