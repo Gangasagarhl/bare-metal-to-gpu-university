@@ -34,6 +34,8 @@ Owner decisions are collected in each course's `university/chapters/<COURSE>/NOT
 
 ## Verification pass (owner delegated, 2026-10-10)
 
+**Handover (2026-10-10):** current state, the agent prompts and lessons are in `build/verify/HANDOVER.md`. Read it first.
+
 Rulings: `university/OWNER_RULINGS.md`. Briefs: `build/verify/VERIFY_BRIEF.md` (one unit per
 agent: dossiers in `university/_dossiers/`, QA in `university/qa/`) and `build/verify/EXAM_BRIEF.md`
 (one course per agent, after the course is verified: `chapters/<C>/EXAMS.html`,
