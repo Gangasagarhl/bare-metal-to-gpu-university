@@ -1,0 +1,362 @@
+<!--meta
+id: F5-47
+title: A cluster service layer: membership, consensus, scheduling
+course: DS403
+level: L4–L5
+prereqs: F5-44, F5-46; DS302 (F5-15 to F5-21: consensus, Raft in a simulator); F5-11 (failure detection)
+time: 16–24 hours including the lab and the forensic lab; the project is MP2 (one to two semesters)
+hardware: none required: three emulated PCs in QEMU 8.2.2 (TCG) running the DS403 kernel, joined by the lab switch with a timed partition; untested on hardware
+maps: guide 11.6 MP2 "A small distributed OS service layer with consensus" (milestones 1–3 seeded here); course exam P "design review of the learner's cluster layer"; course forensic "Split brain"; goal 1 "distributed computers in servers"; Raft paper (pending verification)
+analogy: F5 — friends in different towns (registered: pizza vote = consensus; friend who writes the order = leader; shared notebook = replicated log; phone lines between towns down = network partition; organiser assigning chores = cluster scheduler)
+-->
+
+<h2 id="F5-47-hook">Story hook</h2>
+<p>The book club now has a lock: only one friend at a time may hold the club's only key to the storeroom. On Friday the phone lines between Amara's town and the other two go down. Amara cannot reach anyone, so she decides she is in charge now and gives herself the key. In the other two towns, Bao also cannot reach Amara, so <i>he</i> decides he is in charge and gives the key to Chidi. Both "leaders" tell their friend "yes, the key is yours". On Monday the lines come back, Amara's notebook overwrites Bao's, and Chidi learns that the key he was promised was never his. Nobody did anything wrong by their own rules; the rules were wrong.</p>
+<p>That is <b>split brain</b>, and it is the most expensive failure a cluster service layer can have, because every part of the system works and still breaks a promise. This chapter builds the layer that prevents it in your own kernel: a small Raft for agreement, a replicated state machine holding a lock table and a job table, and a scheduler on top that places jobs and restarts them when a node leaves. Then it runs the same partition against the friends' rule above and shows the broken promise in the logs.</p>
+
+<h2 id="F5-47-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> why membership views must not decide who may write, and why a majority must.</li>
+<li><b>Implement</b> Raft leader election and log replication in a freestanding kernel over raw Ethernet, and <b>read</b> terms, votes, commits and truncations from three nodes' logs.</li>
+<li><b>Build</b> a replicated state machine (compare-and-set lock and a job table) and a scheduler that submits, places and restarts jobs through the log.</li>
+<li><b>Demonstrate</b> under a network partition that only the majority side commits, that the minority's client gets "outcome unknown", and that a lowest-id-leader design breaks safety.</li>
+<li><b>Defend</b> a cluster-layer design in a design review against the MP2 rubric.</li>
+</ul>
+
+<div class="co jargon" id="F5-47-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Cluster service layer</dt><dd><b>Simple words:</b> the shared services that make many machines act as one cluster: who is in, what is agreed, what runs where. <b>Analogy:</b> the club's list of members, its notebook of decisions, and its organiser. <b>Precise:</b> in this course, membership (F5-44), a consensus-replicated state machine holding locks and the job table, and a scheduler driven by that state machine, running in every node's kernel. <sup class="src"><a href="#F5-47-src-G1">G1</a></sup></dd>
+<dt>Log index (replicated log)</dt><dd><b>Simple words:</b> the position of a command in the shared list of commands. <b>Analogy:</b> the line number in the club notebook. <b>Precise:</b> a position, counted from 1, in the log that Raft replicates; an entry is identified by its index and the term in which a leader created it, and two logs that hold an entry with the same index and term are identical up to that index. <sup class="src"><a href="#F5-47-src-D1">D1</a></sup></dd>
+<dt>Log truncation (conflict)</dt><dd><b>Simple words:</b> a follower throwing away entries that the leader does not have. <b>Analogy:</b> crossing out lines you wrote in your copy of the notebook while you could not reach the friend who keeps the real one. <b>Precise:</b> when an append from the current leader carries an entry whose term differs from the follower's entry at the same index, the follower deletes that entry and all after it; only uncommitted entries can be deleted this way. <sup class="src"><a href="#F5-47-src-D1">D1</a></sup></dd>
+<dt>Outcome unknown</dt><dd><b>Simple words:</b> the honest answer when a request timed out: it may or may not have happened. <b>Analogy:</b> "I posted the letter; I never heard back." <b>Precise:</b> the result a client must report when it received no commit confirmation in time; the command may later be committed (by this or a later leader) or discarded, so the client must not assume either and must check or retry idempotently. <sup class="src"><a href="#F5-47-src-D2">D2</a></sup></dd>
+<dt>Cluster scheduler (replicated)</dt><dd><b>Simple words:</b> the part that decides which node runs each job, with its decisions written in the shared log. <b>Analogy:</b> the organiser assigning chores, writing each assignment in the notebook. <b>Precise:</b> a leader-side loop that proposes JOB_ASSIGN entries for submitted jobs and for jobs whose node left the view; workers start a job only when the assignment is applied, and report completion through the log, so that every node agrees on each job's state. <sup class="src"><a href="#F5-47-src-D3">D3</a></sup></dd>
+<dt>Naive leader rule (lowest live id)</dt><dd><b>Simple words:</b> "whoever has the lowest number among the nodes I can see is in charge." <b>Analogy:</b> "the friend with the oldest membership card who answers the phone decides." <b>Precise:</b> a leader-selection rule computed from each node's own membership view, with no majority requirement; under a partition every side elects a leader and accepts writes. <sup class="src"><a href="#F5-47-src-R4">R4</a></sup></dd>
+<dt>Design review</dt><dd><b>Simple words:</b> a meeting where engineers examine a design before (or while) it is built, looking for what can go wrong. <b>Analogy:</b> the club reading the new rules aloud and asking "what if the phones are down?" <b>Precise:</b> a structured review of a written design against requirements and failure scenarios, with named reviewers, recorded findings and a decision; in this university, the R1–R4 gates of mega projects and the P exam of DS403. <sup class="src"><a href="#F5-47-src-G1">G1</a></sup></dd>
+</dl></div>
+<p>Terms from earlier chapters used here without redefinition: <a href="#gl-consensus">consensus</a>, <a href="#gl-term-raft">term (Raft)</a>, <a href="#gl-follower-candidate-leader">follower, candidate, leader</a>, <a href="#gl-election-timeout">election timeout</a>, <a href="#gl-committed-entry">committed entry</a>, <a href="#gl-replicated-state-machine">replicated state machine</a>, <a href="#gl-majority-quorum">majority quorum</a>, <a href="#gl-split-brain">split brain</a>, <a href="#gl-compare-and-swap-cas">compare-and-swap</a>, <a href="#gl-fencing-token">fencing token</a>, <a href="#gl-scheduler">scheduler</a>, <a href="#gl-membership-view">membership view</a>, <a href="#gl-cluster">cluster</a>.</p>
+
+<h2 id="F5-47-pictures">The idea in pictures</h2>
+<p>Figure 1 is the layer as built: three services in every node's kernel, each using the one below.</p>
+<figure id="F5-47-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F5-47-f1t F5-47-f1d">
+<title id="F5-47-f1t">Figure 1: the cluster service layer in one node and its Raft roles</title>
+<desc id="F5-47-f1d">Left: a stack inside one node's kernel. From bottom to top: e1000 driver and DS403 messages; membership (heartbeats, views); Raft (terms, votes, log, commit); state machine (lock table and job table); scheduler and workers (submit, place, restart, done). Arrows show that the scheduler proposes entries to Raft and that Raft applies committed entries to the state machine; a dashed arrow shows that the scheduler reads the membership view only to propose re-placements. Right: the three Raft roles as a state diagram. Follower goes to candidate when its election timeout expires; candidate goes to leader when it receives votes from a majority; candidate goes back to follower when it sees a leader or a higher term; leader goes to follower when it sees a higher term; candidate starts a new election on timeout.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="20" y="24">one node's kernel</text>
+<rect class="sv-b5" x="20" y="36" width="300" height="40"/><text class="sv-ts" x="30" y="60">scheduler + worker: submit, place, restart, done</text>
+<rect class="sv-b4" x="20" y="88" width="300" height="40"/><text class="sv-ts" x="30" y="112">state machine: lock table, job table</text>
+<rect class="sv-b1" x="20" y="140" width="300" height="40"/><text class="sv-ts" x="30" y="164">Raft: term, vote, log, commit index</text>
+<rect class="sv-b3" x="20" y="192" width="300" height="40"/><text class="sv-ts" x="30" y="216">membership: heartbeats, views (F5-44)</text>
+<rect class="sv-b2" x="20" y="244" width="300" height="40"/><text class="sv-ts" x="30" y="268">DS403 messages over the e1000 (F5-44)</text>
+<path class="sv-line" d="M300,76 L300,134"/><polygon class="sv-head" points="300,140 294,128 306,128"/><text class="sv-ts" x="226" y="134">propose</text>
+<path class="sv-line" d="M120,140 L120,134"/>
+<path class="sv-line" d="M120,140 L120,134 M120,134 L120,134"/>
+<path class="sv-line2" d="M140,140 L140,134"/><polygon class="sv-head" points="140,128 134,140 146,140"/><text class="sv-ts" x="150" y="134">apply</text>
+<path class="sv-dash" d="M330,212 L340,212 L340,56 L326,56"/><polygon class="sv-head" points="320,56 332,50 332,62"/><text class="sv-ts" x="346" y="140">views:</text><text class="sv-ts" x="346" y="156">hints only</text>
+<text class="sv-tb" x="430" y="24">Raft roles</text>
+<rect class="sv-b3" x="430" y="120" width="100" height="40"/><text class="sv-tb" x="446" y="145">follower</text>
+<rect class="sv-b6" x="560" y="40" width="110" height="40"/><text class="sv-tb" x="576" y="65">candidate</text>
+<rect class="sv-b1" x="630" y="200" width="100" height="40"/><text class="sv-tb" x="652" y="225">leader</text>
+<path class="sv-line" d="M500,120 L560,72"/><polygon class="sv-head" points="566,66 552,70 560,80"/>
+<text class="sv-ts" x="420" y="96">timeout: vote</text><text class="sv-ts" x="420" y="110">for myself</text>
+<path class="sv-line" d="M640,80 L676,194"/><polygon class="sv-head" points="678,200 670,188 682,186"/>
+<text class="sv-ts" x="672" y="130">majority</text><text class="sv-ts" x="672" y="146">of votes</text>
+<path class="sv-line2" d="M570,80 L520,118"/><polygon class="sv-head" points="514,122 522,110 528,120"/>
+<text class="sv-ts" x="536" y="112">sees leader or</text><text class="sv-ts" x="536" y="126">higher term</text>
+<path class="sv-line2" d="M630,226 L520,160"/><polygon class="sv-head" points="514,156 528,158 522,168"/>
+<text class="sv-ts" x="520" y="208">sees a higher term</text>
+<path class="sv-line" d="M670,48 C710,20 720,70 674,66"/><text class="sv-ts" x="690" y="34">timeout:</text><text class="sv-ts" x="690" y="48">new term</text>
+</svg></div><figcaption><b>Figure 1.</b> Left: the DS403 cluster service layer in one node. The scheduler never changes the job table directly: it proposes log entries, and every node applies committed entries in log order. The membership view is used only as a hint for which jobs need re-placing; it never decides who may write. Right: the three Raft roles and their transitions. <sup class="src"><a href="#F5-47-src-D1">D1</a></sup> <sup class="src"><a href="#F5-47-src-R2">R2</a></sup></figcaption></figure>
+
+<p>Figure 2 is the partition run of the lab: node 1 is cut off from nodes 2 and 3 for ten seconds, and both sides try to take the same lock.</p>
+<figure id="F5-47-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F5-47-f2t F5-47-f2d">
+<title id="F5-47-f2t">Figure 2: the Raft partition run, node by node</title>
+<desc id="F5-47-f2d">Three lanes, node 1 at the top, nodes 2 and 3 below, time to the right. A shaded band marks the partition, from 6.0 to 16.0 seconds on the switch's clock, separating node 1 from nodes 2 and 3. Before it, node 1 is leader of term 1 and all logs hold index 1, a NOOP. During it, node 2 times out at its tick 634 and becomes leader of term 2 with node 3's vote, appending NOOP at index 2. At tick 900 node 3 asks for CAS lock from empty to n3: node 2 appends it at index 3, commits it with node 3, and node 3 is told OK. At tick 900 node 1, still believing it leads term 1, appends CAS lock from empty to n1 at its index 2, cannot commit it, and at tick 1200 reports outcome UNKNOWN. After the partition heals, node 1 sees term 2, becomes follower, truncates its index 2 and applies index 2 NOOP and index 3 CAS to n3. Final state on all three nodes: lock = n3.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<rect class="sv-b8" x="250" y="30" width="330" height="260"/>
+<text class="sv-ts" x="300" y="22">partition 6.0–16.0 s: {1} | {2,3}</text>
+<text class="sv-tb" x="10" y="70">node 1</text><text class="sv-tb" x="10" y="170">node 2</text><text class="sv-tb" x="10" y="250">node 3</text>
+<path class="sv-line" d="M70,64 L740,64"/><path class="sv-line" d="M70,164 L740,164"/><path class="sv-line" d="M70,244 L740,244"/>
+<path class="sv-dash" d="M250,110 L580,110"/>
+<rect class="sv-b1" x="80" y="44" width="150" height="18"/><text class="sv-ts" x="84" y="58">leader, term 1; [1]=NOOP</text>
+<rect class="sv-b6" x="300" y="72" width="170" height="30"/><text class="sv-ts" x="304" y="86">t=900 [2]=CAS ''-&gt;n1 (t1)</text><text class="sv-ts" x="304" y="99">not committed</text>
+<text class="sv-ts" x="480" y="90">t=1200 UNKNOWN</text>
+<rect class="sv-b4" x="590" y="72" width="160" height="34"/><text class="sv-ts" x="594" y="86">term 2: truncate [2],</text><text class="sv-ts" x="594" y="100">apply [2] NOOP, [3] CAS</text>
+<rect class="sv-b1" x="280" y="144" width="190" height="18"/><text class="sv-ts" x="284" y="158">t=635 leader, term 2; [2]=NOOP</text>
+<rect class="sv-b4" x="380" y="172" width="190" height="18"/><text class="sv-ts" x="384" y="186">t=848 [3]=CAS ''-&gt;n3, commit</text>
+<text class="sv-ts" x="280" y="226">t=665 votes for node 2</text>
+<rect class="sv-b5" x="380" y="250" width="190" height="18"/><text class="sv-ts" x="384" y="264">t=900 asks; t=904 told OK</text>
+<path class="sv-line2" d="M440,250 L440,196"/><polygon class="sv-head" points="440,190 434,202 446,202"/>
+<text class="sv-tb" x="600" y="306">final on all three: lock=n3</text>
+<text class="sv-ts" x="70" y="322">ticks are each node's own; the band is drawn on the switch's clock (not to scale)</text>
+</svg></div><figcaption><b>Figure 2.</b> The Raft partition run (R3). Node 1 remains "leader of term 1" through the partition because nothing tells it otherwise, but it cannot reach a majority, so its entry is never committed and its client hears "outcome UNKNOWN". The majority side elects node 2 for term 2, commits node 3's request, and after healing node 1 discards its uncommitted entry. Only one client was told OK. <sup class="src"><a href="#F5-47-src-D1">D1</a></sup> <sup class="src"><a href="#F5-47-src-R3">R3</a></sup></figcaption></figure>
+
+<h2 id="F5-47-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The club fixes its rules. Decisions are written in a shared notebook, and a line counts only when more than half of the friends have copied it into their own notebooks. One friend writes the order for everyone (the leader), but only after more than half voted for them in a numbered round (the term). If the phone lines are down, the friends who are cut off can still write in their own notebook, but the line never counts, because they cannot reach more than half. When the lines come back, they cross out what never counted. The organiser who assigns chores writes each chore in the same notebook, so everyone agrees who does what. Mapping: pizza vote = election; friend who writes the order = leader; shared notebook = replicated log; "more than half copied it" = committed; round number = term; lines down = partition; organiser = scheduler.</p></div>
+<p>Amara, alone in her town, can still <i>try</i> to give herself the key. She writes it in her notebook and waits. Nobody else copies it, so she has to say "I don't know if this worked". That honest "I don't know" is what keeps the club from promising one key to two people.</p>
+
+<h2 id="F5-47-layer2">Layer 2 — the student explanation</h2>
+<p><b>The rule that matters.</b> A view says "whom I can hear". A majority says "enough nodes that no other group can also have enough". Two groups that each hold more than half of the nodes would share a node, and that node only votes once per term. That is the whole reason a majority, not a view, must decide: in <code>quorum.cpp</code> every way of cutting three, four or five nodes into two groups lets at most one side decide under the majority rule, and lets both sides decide under the lowest-id rule (R1). <sup class="src"><a href="#F5-47-src-D1">D1</a></sup> <sup class="src"><a href="#F5-47-src-D2">D2</a></sup></p>
+<p><b>Raft in the kernel.</b> The lab's <code>raft.cc</code> follows the algorithm you simulated in <a href="#DS302">DS302</a> (<a href="#F5-18">F5-18</a> to <a href="#F5-21">F5-21</a>), now in a freestanding kernel over raw Ethernet:</p>
+<ul>
+<li>A follower that hears no leader within its election timeout (100 + 30 × node id + up to 39 ticks, randomised) starts an election: new term, votes for itself, broadcasts a vote request with its last log index and term.</li>
+<li>A node grants at most one vote per term, and only to a candidate whose log is at least as up to date as its own.</li>
+<li>A candidate with votes from a majority becomes leader, appends a NOOP entry, and sends append messages every 20 ticks to every follower.</li>
+<li>A follower accepts an append only if its log matches the leader's at the previous index; otherwise it reports where it stands and the leader backs up.</li>
+<li>The leader commits the highest index stored on a majority, but only if that entry is from its own term; every node applies committed entries in order.</li>
+</ul>
+<p><sup class="src"><a href="#F5-47-src-D1">D1</a></sup></p>
+<p><b>The state machine and its clients.</b> Committed entries are applied to a small state machine (<code>sm.cc</code>): a key-value table with compare-and-set, used as a lock, and a job table. A node with a command broadcasts it; only the leader appends it. The client waits up to 300 ticks for the commit; if none arrives it says "outcome UNKNOWN" and does not pretend.</p>
+<p><b>The scheduler.</b> Jobs are entries too. Node 2 submits four jobs; the leader proposes a JOB_ASSIGN for each, choosing the least-loaded node in its view; a worker starts a job only when its JOB_ASSIGN is <i>applied</i> on that worker; when it finishes, it sends the result to the leader, which appends JOB_DONE. When the leader's view loses a node that holds an assigned job, it proposes a new JOB_ASSIGN for that job. In the run, node 3 halts at its tick 700, before its job 3 finishes; the leader (node 1) notices at its tick 724, re-assigns job 3 to node 2 at index 12, and node 2 completes it: all four results agree with Python on the host (R2).</p>
+<p><b>Membership is still useful.</b> It decides <i>hints</i>: which node to place a job on, which jobs look orphaned. It never decides who may write: that is the log's job. A wrong hint costs a job run twice; a wrong write decision costs a broken promise.</p>
+
+<h2 id="F5-47-layer3">Layer 3 — the engineer's depth</h2>
+<p><b>Reading the partition run.</b> Every claim of Raft's safety argument shows up in the logs (R3):</p>
+<ul>
+<li><b>Election safety.</b> Node 1 is leader of term 1, node 2 of term 2: never two leaders in one term. Two leaders <i>at once</i> are allowed and happen (node 1 still believes it leads during the partition).</li>
+<li><b>Commit needs a majority.</b> Node 1 appends <code>CAS lock ''-&gt;n1</code> at index 2 in term 1 and waits; its append messages are dropped by the switch ("DROPPED for n2", "DROPPED for n3"), so <code>match_idx</code> never reaches 2 and nothing commits. Its client reports UNKNOWN at tick 1200.</li>
+<li><b>Leader completeness, log matching.</b> On healing, node 1 receives term 2 appends, steps down, finds that its index 2 has term 1 where the leader's has term 2, truncates one entry, and applies index 2 (NOOP) and index 3 (<code>CAS lock ''-&gt;n3</code>). All three final states: <code>lock=n3</code>.</li>
+<li><b>Exactly one OK.</b> Of the two clients, only node 3 was told OK. The acceptance check counts it (R5).</li>
+</ul>
+<p><sup class="src"><a href="#F5-47-src-D1">D1</a></sup></p>
+<p><b>Why the NOOP.</b> A new leader cannot conclude that an entry from an earlier term is committed by counting replicas: the Raft paper shows a scenario where such an entry, stored on a majority, is later overwritten. The rule is therefore to commit only entries of the current term, which commits earlier ones by the log-matching property; appending a NOOP at the start of each term makes that happen at once instead of waiting for the next client command. <sup class="src"><a href="#F5-47-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The section numbers in <code>raft.cc</code>'s comments (5.1 terms, 5.2 election, 5.3 replication, 5.4.1 election restriction, 5.4.2 committing entries from previous terms) and the description of the "figure 8" overwrite scenario behind the current-term commit rule are from memory of the extended Raft paper (Ongaro and Ousterhout). The Source Researcher must check them against the paper before the comments and this paragraph are published as references.</p></div>
+<p><b>What the lab's Raft leaves out, on purpose.</b> MP2's milestones ask for each of these; DS302 covered the theory:</p>
+<div class="tw"><table>
+<thead><tr><th>Missing piece</th><th>Why it matters</th><th>What goes wrong without it</th></tr></thead>
+<tbody>
+<tr><td>Persistence of term, vote and log before replying</td><td>A node that restarts must not vote twice in a term or forget acknowledged entries</td><td>Two leaders in one term after a crash and restart; lost committed entries</td></tr>
+<tr><td>Membership changes (joint consensus or single-server changes)</td><td>The set of voters must change without two disjoint majorities</td><td>Adding or removing nodes naively can create two majorities</td></tr>
+<tr><td>Snapshots and log compaction</td><td>The log is 128 entries here</td><td>"raft: log full" and a stopped cluster</td></tr>
+<tr><td>Client sessions (request ids remembered by the state machine)</td><td>A retried command must apply once</td><td>A retry after UNKNOWN may apply twice (two job submissions)</td></tr>
+<tr><td>Linearizable reads (read index or leader lease)</td><td>A deposed leader does not know it is deposed</td><td>Node 1 in the partition would serve stale reads from its own state</td></tr>
+<tr><td>Pre-vote and check-quorum</td><td>A node rejoining after a partition with a higher term disrupts a healthy leader</td><td>Needless elections after every heal</td></tr>
+</tbody></table></div>
+<p><sup class="src"><a href="#F5-47-src-D1">D1</a></sup> <sup class="src"><a href="#F5-47-src-D2">D2</a></sup></p>
+<p><b>The scheduler's real problem: zombie workers.</b> The leader re-placed job 3 because node 3 left its <i>view</i>. In the lab node 3 had halted, so the job ran once. If node 3 had only been partitioned, it would have kept running job 3 while node 2 ran it again: at-least-once execution. For a job that counts primes that is harmless; for a job that writes to storage it is not. Two defences exist. Make jobs idempotent (write results under the job id, last writer identical). Or fence: every JOB_ASSIGN carries its log index as a fencing token, and storage rejects writes with a token lower than one it has seen (<a href="#gl-fencing-token">fencing token</a>). The <code>assigned_at_index</code> field in <code>sm.h</code>'s job record is there for exactly that extension. <sup class="src"><a href="#F5-47-src-D2">D2</a></sup> <sup class="src"><a href="#F5-47-src-D3">D3</a></sup></p>
+<p><b>Timeouts and the lab's numbers.</b> Heartbeats every 20 ticks; election timeouts 130–169 ticks for node 1, 160–199 for node 2, 190–229 for node 3; suspicion after 50 ticks in the membership layer. The per-node offset is a deliberate bias that makes the first election predictable in the lab (node 1 timed out at its tick 163 and won within one tick in both runs); production code randomises without bias. The election timeout must be well above the heartbeat period and the message delay, or followers will start elections against a healthy leader. <sup class="src"><a href="#F5-47-src-D1">D1</a></sup></p>
+<div class="co note"><span class="lbl">Note</span><p><b>Impossibility, in one sentence.</b> No deterministic protocol can guarantee that consensus is always reached in an asynchronous system in which even one process may crash (the FLP result); Raft and Paxos keep safety always and get liveness only when timing is good enough, which is why the lab's minority client hears UNKNOWN rather than a wrong OK. <sup class="src"><a href="#F5-47-src-D4">D4</a></sup> <sup class="src"><a href="#F5-47-src-D5">D5</a></sup></p></div>
+<p><b>Cluster managers in practice.</b> Large cluster managers keep their state in a small consensus-replicated store and run scheduling as a separate service that reads and writes it, much as this lab does at toy scale; they add admission control, priorities, resource vectors instead of "load", and preemption. <sup class="src"><a href="#F5-47-src-D3">D3</a></sup> Treat this sentence as a pointer to the Borg paper, not as a description of any system; the Source Researcher must confirm it.</p>
+
+<h2 id="F5-47-hardware">How the hardware actually does it</h2>
+<p>The layer runs on the same hardware path as F5-44: three emulated PCs, a polled e1000, the polled PIT clock and the lab switch. Two hardware facts shape it. First, every node's clock is separate and counts from its own boot, so all Raft timing is local (timeouts measured on one node's clock); Raft's safety does not depend on clocks at all, only its liveness does. Second, the lab has no stable storage: the kernel has no disk driver in this course, so term, vote and log live in RAM and a restarted node would be a new node. On real machines the persistence step (write and flush to an SSD before answering a vote or an append) usually dominates the latency of a commit. <sup class="src"><a href="#F5-47-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The statement that persistence dominates commit latency on real machines is from general experience, not from a measurement in this build. MP2's performance evidence must measure it on the learner's own system (for example with an NVMe flush in the learner's OS from MP1, or <code>fsync</code> on a Linux virtual machine) before any number is claimed.</p></div>
+<p>The partition is made by <code>labswitch</code>: between 6,000 and 16,000 ms on the host's clock it drops every frame between group {1} and group {2,3} and logs each kind of message dropped, rate-limited to one line per 2 s per kind (R3). Real partitions are messier: one-way loss, partial connectivity (node 2 hears node 1 but node 3 does not), and long delays rather than clean cuts. A layer that only passes clean-cut tests has not been tested.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> All runs are QEMU 8.2.2 TCG on one host with a simulated network (R2–R4). No real network, real NIC, real switch failure or real disk was tested.</p></div>
+
+<h2 id="F5-47-worked">Worked example</h2>
+<p><b>Question.</b> For a cluster of <i>n</i> nodes cut into two groups, in how many cuts can each side decide, under the majority rule and under the lowest-id rule? What does that say about choosing <i>n</i>?</p>
+<p><b>Step 1: count the cuts.</b> Put node 1 in group A to count each cut once. Group A is node 1 plus any subset of the other <i>n</i> − 1 nodes, except all of them (then B would be empty): 2<sup><i>n</i>−1</sup> − 1 cuts. For <i>n</i> = 3: 3; for 4: 7; for 5: 15.</p>
+<p><b>Step 2: the majority rule.</b> A side decides if it has more than <i>n</i>/2 nodes. Two sides cannot both have more than half, so "both decide" is 0 for every <i>n</i>. For odd <i>n</i> one side always has a majority; for even <i>n</i> an equal split leaves nobody able to decide: for <i>n</i> = 4 the cuts {1,2}|{3,4}, {1,3}|{2,4} and {1,4}|{2,3}.</p>
+<p><b>Step 3: the lowest-id rule.</b> Every non-empty side elects its own lowest id: both sides decide in every cut.</p>
+<p><b>Step 4: run it.</b></p>
+<p><b>Listing 4</b> — <code>quorum.cpp</code></p>
+<pre class="listing" data-src="F5-47/quorum.cpp"></pre>
+<pre class="output" data-run="F5-47/quorum"></pre>
+<p><b>Step 5: conclude.</b> The program agrees with the hand count. A fourth node buys no extra tolerance (a majority of 4 is 3, so it tolerates one failure, like 3 nodes) and adds three cuts where nobody can decide; this is why consensus clusters use odd sizes. The lowest-id rule is unsafe in every cut, not only in unlucky ones. <sup class="src"><a href="#F5-47-src-D1">D1</a></sup> <sup class="src"><a href="#F5-47-src-R1">R1</a></sup></p>
+
+<h2 id="F5-47-code">Code walk-through</h2>
+<p>The lab folder <code>university/labs/F5-47/</code> adds <code>sm.h</code>/<code>sm.cc</code> (state machine), <code>raft.h</code>/<code>raft.cc</code>, <code>naive.h</code>/<code>naive.cc</code> (the forensic design) and <code>f547_main.cc</code> to the F5-44 kernel.</p>
+<pre class="output" data-run="F5-47/build"></pre>
+
+<p><b>Listing 1</b> — <code>sm.h</code>: what the cluster agrees on.</p>
+<pre class="listing" data-src="F5-47/sm.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>7</td><td><code>Kind</code></td><td>NOOP, SET, CAS, and three job commands.</td><td>Scheduling decisions are commands like any other.</td></tr>
+<tr><td>9–16</td><td><code>Entry</code></td><td>Term, kind, requesting node and request id, two numbers, three short strings.</td><td>Fixed size: eight entries fit in one append frame.</td></tr>
+<tr><td>18–19</td><td><code>Job</code></td><td>State, node, duration, result, index of the assignment.</td><td>The index is the fencing token of the extension.</td></tr>
+<tr><td>22</td><td><code>sm_apply</code></td><td>Applies one entry; returns the command's result.</td><td>Deterministic: every node computes the same result.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>raft.cc</code>: election, replication, clients, scheduler.</p>
+<pre class="listing" data-src="F5-47/raft.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–20</td><td>state</td><td>Term, vote, leader, role, log, commit and apply indexes, per-follower next and match.</td><td>All in RAM: no persistence (see Layer 3).</td></tr>
+<tr><td>42</td><td><code>reset_deadline</code></td><td>Election timeout 100 + 30 × id + rand % 40 ticks.</td><td>Biased per node to make the first election repeatable; production code should not bias.</td></tr>
+<tr><td>44–51</td><td><code>become_follower</code></td><td>Adopts a term; forgets the vote if the term changed; restarts the timer if it was not a follower.</td><td>Without the timer reset a deposed leader started an election at once (a bug found while building the lab).</td></tr>
+<tr><td>63–71</td><td><code>send_append</code></td><td>Previous index and term, commit index, up to 8 entries from <code>next_idx</code>.</td><td>An empty append is the heartbeat.</td></tr>
+<tr><td>82–102</td><td><code>apply_committed</code></td><td>Applies in order; answers clients; starts jobs assigned to this node.</td><td>Jobs start on apply, never on proposal.</td></tr>
+<tr><td>104–127</td><td><code>leader_scheduler</code></td><td>Places submitted jobs and jobs whose node left the view; one proposal per job until applied.</td><td>The view is a hint; the decision is a log entry.</td></tr>
+<tr><td>129–147</td><td><code>worker_tick</code></td><td>When a job's time is up, reports the result; resends every 100 ticks until JOB_DONE is applied.</td><td>A report can be lost; resending makes it at-least-once, and lines 304–306 make it apply once.</td></tr>
+<tr><td>175–185</td><td>election</td><td>On timeout: new term, vote for self, broadcast the last log index and term.</td><td>The up-to-date check needs both.</td></tr>
+<tr><td>193–198</td><td>commit rule</td><td>Highest index on a majority, only if from the current term.</td><td>The current-term condition is the safety rule behind the NOOP.</td></tr>
+<tr><td>203–207</td><td>client timeout</td><td>Reports UNKNOWN after the wait.</td><td>Never "failed": the entry may still commit.</td></tr>
+<tr><td>213</td><td>higher term</td><td>Any Raft message with a higher term makes this node a follower.</td><td>How node 1 stepped down after the heal.</td></tr>
+<tr><td>218–224</td><td>vote</td><td>One vote per term, only for an up-to-date log.</td><td>Election restriction: a leader holds every committed entry.</td></tr>
+<tr><td>253–257</td><td>consistency check</td><td>Refuses an append whose previous entry does not match.</td><td>The leader then backs up (lines 281–283).</td></tr>
+<tr><td>258–266</td><td>conflicts</td><td>Truncates from the first conflicting entry, then appends.</td><td>The "truncating 1 entries" line in the run.</td></tr>
+<tr><td>287–293</td><td>client command</td><td>Only a leader appends it; others ignore it.</td><td>A client on the minority side reaches only a leader that cannot commit.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>naive.cc</code>: the split-brain design, kept for the forensic lab.</p>
+<pre class="listing" data-src="F5-47/naive.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–22</td><td><code>lowest</code></td><td>The lowest id in this node's view.</td><td>Each side of a partition computes its own answer.</td></tr>
+<tr><td>24–38</td><td><code>apply_and_tell</code></td><td>Applies at once, broadcasts, answers OK.</td><td>OK before anyone else has the entry.</td></tr>
+<tr><td>54–60</td><td>"I win"</td><td>When the view grows and I lead it, push my whole table.</td><td>Overwrites the other side's acknowledged writes.</td></tr>
+<tr><td>72–73</td><td>restore</td><td>Followers replace their table with the leader's.</td><td>The line "adopting leader's lock=n1 (mine was n3)".</td></tr>
+</tbody></table></div>
+<p><code>f547_main.cc</code> runs either design with the same membership code, and two scenarios: <code>sched</code> (node 2 submits four jobs at tick 300) and <code>split</code> (nodes 1 and 3 each try <code>CAS lock '' -&gt; n1</code> or <code>n3</code> at tick 900).</p>
+
+<h2 id="F5-47-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Friends know when the phones are down; nodes do not.</b> Node 1 kept believing it led term 1 for the whole partition. Nothing in Raft tells a deposed leader it is deposed until it hears a higher term.</li>
+<li><b>Crossing out a line in a notebook is visible; truncating a log entry is not.</b> The client who sent the truncated command is not told; it only knows "outcome unknown". The truncation shows in one log line on one node.</li>
+<li><b>Friends vote once per pizza; nodes vote once per term, and terms are only numbers.</b> A node that comes back with a higher term can force an election although nothing was wrong (the missing pre-vote of Layer 3).</li>
+</ul>
+
+<h2 id="F5-47-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Elections forever after a heal.</b> Cause: a deposed leader or candidate that does not restart its timer when it becomes a follower; it times out at once and starts another term. Found while building the lab; fixed in <code>become_follower</code> (line 48).</li>
+<li><b>Two leaders in the same term.</b> Cause: votes not reset on a new term, or granted to two candidates. Find it: grep "LEADER for term" across all node logs; each term must appear at most once.</li>
+<li><b>Committed entries lost.</b> Cause: committing an earlier term's entry by counting replicas. Find it: a scenario test that crashes leaders in sequence. Fix: the current-term condition (line 197) and the NOOP.</li>
+<li><b>Jobs start twice.</b> Cause: starting on proposal rather than on apply, or re-placing a job from a stale view while the original worker is alive. Fix: start on apply; fencing tokens or idempotent jobs.</li>
+<li><b>Client says "failed" and retries.</b> Cause: treating a timeout as failure. Fix: report UNKNOWN; make retries idempotent with client sessions.</li>
+<li><b>The test passes because the race never happened.</b> Fault-injection runs must check that the fault occurred (the forensic step's log says "the race did not happen this time" and fails the run if so).</li>
+</ul>
+
+<div class="co transition" id="F5-47-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F5-44">F5-44</a> built membership and showed that views are opinions; <a href="#F5-46">F5-46</a> built a file service with one server, retries and caches; <a href="#DS302">DS302</a> simulated Raft. <b>What carries over:</b> the kernel, the e1000, the message header (its <code>term</code> field now carries Raft terms), bounded waits, request ids, "unknown" as an honest answer. <b>What changes:</b> most dangerous first: decisions now require a majority, so a minority side must refuse to promise anything; leaders can be deposed without knowing it; and jobs can run twice when a slow node is mistaken for a dead one. <sup class="src"><a href="#F5-47-src-D1">D1</a></sup> <b>What comes next:</b> the course's practical exam (a design review of your cluster layer) and MP2, which turns this lab into a tested, observable service; <a href="#DS402">DS402</a>'s reliability practice and the course page <a href="#DS403">DS403</a> describe both.</p></div>
+
+<h2 id="F5-47-check">Check yourself</h2>
+<ol>
+<li>Explain in your own words why a membership view must not decide who may write, and why a majority can.</li>
+<li>In the partition run, why did node 1 not step down when the partition started? When and why did it step down?</li>
+<li>The commit rule only commits entries from the current term. What does the leader's NOOP have to do with it?</li>
+<li>From the scheduler run: at which log index was job 3 re-assigned, by which node, and why did node 2 not start job 3 before that entry was applied?</li>
+<li>Apply it to a new case: five nodes, partition {1,2} | {3,4,5}, node 1 is leader of term 4. Describe what each side does for the next few seconds and which clients can be told OK.</li>
+<li>A client hears "outcome UNKNOWN" for <code>CAS lock '' -&gt; n1</code>. What must it do before trying again, and why is a blind retry wrong?</li>
+<li>Predict, then run: in <code>run.sh</code>, change the split run's partition to <code>1 2</code> versus <code>3</code> (groups {1,2} and {3}). Which client is told OK, and what is the final lock?</li>
+<li>Why do consensus clusters use 3 or 5 nodes rather than 4?</li>
+<li>Name three pieces MP2 requires that the lab's Raft does not have, and the failure each prevents.</li>
+<li>Node 3 in the scheduler run was halted. If instead it had been partitioned for 600 ticks and then healed, what would have happened to job 3, and how would fencing tokens help?</li>
+</ol>
+
+<h2 id="F5-47-lab">Lab</h2>
+<p><b>Goal.</b> Run the cluster service layer on three nodes of your kernel, show the scheduler restarting a job after a node leaves, and show that under a partition only the majority side commits.</p>
+<p><b>Course lab (card, quoted).</b> "Your kernel on three QEMU nodes sharing a 9P or custom remote file service." <sup class="src"><a href="#F5-47-src-C1">C1</a></sup> Completed in F5-46; this chapter's lab adds consensus and scheduling to the same three-node cluster.</p>
+<p><b>Hardware and software needed.</b> As F5-44. Untested on hardware.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F5-47</code>. It compiles and runs <code>quorum.cpp</code>, then <code>run.sh</code> builds <code>f547.elf</code> and runs three clusters: <code>sched</code>, <code>split</code> (Raft with a partition from 6 s to 16 s) and <code>splitbrain</code> (the naive design with the same partition).</li>
+<li>In the scheduler run, follow job 3 from submission to completion across all three logs.</li>
+<li>In the partition run, mark the term, role and log of each node before, during and after the partition (Figure 2), and find each "DROPPED" line that explains why node 1 could not commit.</li>
+<li>Read <code>accept.out</code>.</li>
+</ol>
+<p><b>Expected observations</b> (measured on the build machine: Linux x86_64 cloud container without KVM, QEMU 8.2.2 TCG, on 2026-10-10; tick values will differ on yours):</p>
+<pre class="output" data-run="F5-47/sched_n1"></pre>
+<pre class="output" data-run="F5-47/sched_n2"></pre>
+<pre class="output" data-run="F5-47/sched_n3"></pre>
+<pre class="output" data-run="F5-47/split_n1"></pre>
+<pre class="output" data-run="F5-47/split_n2"></pre>
+<pre class="output" data-run="F5-47/split_n3"></pre>
+<pre class="output" data-run="F5-47/split_switch"></pre>
+<p>Node 3's final state in the scheduler run shows every job still "assigned": it halted before any JOB_DONE was applied. The switch's dropped counts show the partition doing its job in both directions.</p>
+<p><b>Verification.</b></p>
+<pre class="output" data-run="F5-47/accept"></pre>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>No leader ever: check that every node's <code>nodes=</code> is 3 and that heartbeats arrive (views reach {1,2,3}); a node that cannot be heard cannot vote.</li>
+<li>Repeated elections with no partition: the election timeout is too close to the heartbeat period or to message delay; with TCG on a busy host, raise the base timeout.</li>
+<li>The split run commits on node 1: the partition did not happen; the switch's first line must show the groups and "partition STARTS".</li>
+<li>"raft: log full": the log has 128 entries and no compaction; shorten the run or add snapshots.</li>
+</ul>
+<p><b>Extension.</b> Add persistence to a RAM-disk stand-in and a restart scenario; then add client sessions so that a retried <code>JOB_SUBMIT</code> applies once, and show it with a test that drops the first CLIENT_REP.</p>
+
+<h2 id="F5-47-forensic">Forensic lab</h2>
+<p><b>Scenario: "Split brain"</b> (the course's forensic lab). A storage team uses the cluster's lock service so that only one node writes a shared volume. After a ten-second network incident, the volume is corrupted. Both node 1's and node 3's write services hold log lines saying they were granted the lock. The lock service's maintainer says: "Impossible: the lock table shows only one holder."</p>
+<p><b>Evidence pack</b> (the real forensic run: the same kernel with <code>mode=naive</code> on all three nodes, the same partition; logs from a partitioned three-node cluster of your OS):</p>
+<pre class="output" data-run="F5-47/splitbrain_n1"></pre>
+<pre class="output" data-run="F5-47/splitbrain_n2"></pre>
+<pre class="output" data-run="F5-47/splitbrain_n3"></pre>
+<pre class="output" data-run="F5-47/splitbrain_switch"></pre>
+<pre class="output" data-run="F5-47/splitbrain_check"></pre>
+<p>This run is recorded as an <b>expected failure</b>: the safety violation is the point of the lab, and <code>run.sh</code> fails if it does <i>not</i> happen.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which clients were told OK, by which node, at which tick? What did the lock table say on each node immediately before the partition healed, and immediately after?</li>
+<li>When did each node's view change, and what leader did each node believe in during the partition?</li>
+<li>Give two hypotheses for "two holders, one entry in the table", and the evidence that decides.</li>
+<li>Which rule in which file allowed two leaders, and which other rule erased the evidence?</li>
+<li>Was the maintainer's statement true? Why is the final table the least useful piece of evidence here?</li>
+<li>Propose a fix, a test that would have caught this before production, and one change to the storage side that would have prevented the corruption even with the bug.</li>
+</ol>
+<p><b>Method hints.</b> Build a timeline per node of view, believed leader and lock value. Count OKs, not final states. Ask of every "OK": how many nodes had the entry when it was sent?</p>
+<p><b>Grading rubric</b> (guide 11.2): observation 20 %; hypotheses 20 %; evidence-based conclusion 30 %; fix and verification 20 %; prevention and communication 10 %.</p>
+
+<h2 id="F5-47-project">Mini-project: MP2 core</h2>
+<p>The course project is the core of mega project MP2. Its specification, quoted from the authoring guide (11.6): <sup class="src"><a href="#F5-47-src-G1">G1</a></sup></p>
+<div class="co note"><span class="lbl">Note</span><p><b>MP2 A small distributed OS service layer with consensus.</b> Prereqs: DS302, DS402, DS403. <b>Milestones:</b> "Raft library passing deterministic fault-injection tests and a linearizability check." "A replicated key-value service with membership changes." "Cluster membership and a job scheduler on top (submit, place, restart on failure)." "Runs on three or more nodes of the learner's own OS (from MP1) or on Linux virtual machines as a fallback (documented)." "Observability: metrics, logs, traces; an SLO and a game-day incident." <b>Deliverables:</b> "Code, test harness, a written protocol specification, an incident post-mortem, demo." <b>Rubric:</b> "Safety under faults (35 %); test rigour (20 %); performance evidence (15 %); operability (15 %); defence (15 %)." <b>Gates:</b> "R1 protocol design; R2 after milestone 2; R3 game-day readiness; R4."</p></div>
+<p><b>What DS403 asks for (MP2 core).</b> Milestones 1 to 3 on three nodes of your own kernel, starting from this lab:</p>
+<ol>
+<li><b>Deterministic fault injection.</b> Move <code>raft.cc</code> behind an interface so that the same code runs in the kernel and in a host test harness with a simulated network and clock (seeded, so every failing run can be replayed). Inject: message loss, delay, duplication, reordering, partitions (including one-way), node crash and restart. Check after every step: at most one leader per term; committed entries never change; all applied prefixes agree.</li>
+<li><b>Linearizability check.</b> Record every client operation's invocation and response (or UNKNOWN) and check the history against a sequential key-value model; UNKNOWN operations may be placed anywhere after their invocation or omitted.</li>
+<li><b>Persistence and membership changes.</b> Term, vote and log written before replying (a RAM-disk or virtio-blk device in your kernel); add and remove a node with single-server changes, tested with the harness.</li>
+<li><b>Scheduler.</b> Submit, place, restart on failure, as in the lab, plus client sessions (exactly-once submission) and fencing tokens on job outputs.</li>
+<li><b>Evidence.</b> A protocol specification (message formats, state, invariants), the test report, and measured commit latency and throughput on your setup, labelled with the machine.</li>
+</ol>
+<p><b>Rubric.</b> MP2's rubric applies as quoted, scored on milestones 1–3: safety under faults 35 % (no invariant violation in the harness over the agreed number of seeds, and a split-brain test that fails on <code>naive.cc</code> and passes on yours); test rigour 20 %; performance evidence 15 %; operability 15 % (logs that let a reviewer reconstruct Figure 2 from your run); defence 15 % (the P exam below).</p>
+<p><b>Practical exam P: design review of your cluster layer.</b> Per the course card ("P: design review of the learner's cluster layer") and the practical-exam rules (11.4: build, measure or diagnose on a real or emulated system within a time limit, documentation allowed): you bring your protocol specification and a running three-node cluster; reviewers choose two failure scenarios from a list you have not seen (for example: a one-way partition; a leader that pauses for 500 ticks; a disk that loses the last write; a node that rejoins with an old log) and you predict, then run, then explain. Suggested marking: correct predictions with reasons 30 %; the run's evidence matches the explanation 30 %; invariants stated precisely and checked 20 %; honest limits and next steps 20 %. The Exam Writer sets the final form in the course key.</p>
+
+<h2 id="F5-47-summary">Summary</h2>
+<ul>
+<li>Views are opinions; only a majority can decide, because two majorities always share a node, and a node votes once per term.</li>
+<li>Raft: randomised election timeouts, one vote per term for an up-to-date log, append with a consistency check, commit by majority from the current term, apply in order.</li>
+<li>Under the lab's partition the minority leader kept its title but could not commit; its client heard UNKNOWN, the majority committed, and the minority's uncommitted entry was truncated on healing.</li>
+<li>A scheduler whose decisions are log entries keeps every node in agreement on each job; re-placing on view changes gives at-least-once execution, so jobs need idempotence or fencing.</li>
+<li>The lowest-id leader rule lets both sides decide in every cut; in the forensic run two clients were told OK and one acknowledged write was erased.</li>
+<li>The lab's Raft lacks persistence, membership changes, snapshots, client sessions and linearizable reads; MP2 adds them with deterministic fault-injection tests.</li>
+</ul>
+
+<h2 id="F5-47-sources">Sources</h2>
+<ol>
+<li id="F5-47-src-D1">D1 — Diego Ongaro, John Ousterhout, "In Search of an Understandable Consensus Algorithm" (the Raft paper; extended version) (tier 2). <i>Title only — not opened during this build; the Source Researcher must confirm the version and section numbers (dossier gate G1 open).</i></li>
+<li id="F5-47-src-D2">D2 — Martin Kleppmann, "Designing Data-Intensive Applications" (tier 3; edition to be recorded): leaders and the truth defined by the majority, fencing tokens, linearizability, the uncertainty of timeouts. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-47-src-D3">D3 — Abhishek Verma and co-authors, "Large-scale cluster management at Google with Borg" (tier 2; venue and year to be recorded). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-47-src-D4">D4 — Michael J. Fischer, Nancy A. Lynch, Michael S. Paterson, "Impossibility of Distributed Consensus with One Faulty Process" (FLP) (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-47-src-D5">D5 — Leslie Lamport, "Paxos Made Simple" (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-47-src-G1">G1 — University Authoring Guide (this project), section 11.6 (MP2, quoted), section 11.4 (exams), section 11.2 (forensic rubric), section 5 course card DS403. A map, not a source.</li>
+<li id="F5-47-src-C1">C1 — University Authoring Guide, section 5 course card DS403: lab and forensic text quoted. A map, not a source.</li>
+<li id="F5-47-src-R1">R1 — <code>quorum.cpp</code>: <code>quorum.log</code>; g++ 13.3.0 with AddressSanitizer and UBSan; exit code 0.</li>
+<li id="F5-47-src-R2">R2 — scheduler run: <code>sched_n1.log</code> … <code>sched_n3.log</code>, <code>sched_switch.log</code>; QEMU 8.2.2 TCG; exit codes 33. Untested on hardware.</li>
+<li id="F5-47-src-R3">R3 — Raft partition run: <code>split_n1.log</code> … <code>split_n3.log</code>, <code>split_switch.log</code> (partition {1} | {2,3} from 6,000 to 16,000 ms).</li>
+<li id="F5-47-src-R4">R4 — naive (split-brain) run: <code>splitbrain_n1.log</code> … <code>splitbrain_n3.log</code>, <code>splitbrain_switch.log</code>, <code>splitbrain_check.log</code> (result: expected-fail).</li>
+<li id="F5-47-src-R5">R5 — acceptance checks: <code>accept.log</code>; build: <code>build.log</code>.</li>
+</ol>
+
+<h2 id="F5-47-glossary">Glossary links</h2>
+<p><a href="#gl-cluster-service-layer">Cluster service layer</a> · <a href="#gl-log-index-replicated-log">Log index</a> · <a href="#gl-log-truncation-conflict">Log truncation</a> · <a href="#gl-outcome-unknown">Outcome unknown</a> · <a href="#gl-cluster-scheduler-replicated">Cluster scheduler (replicated)</a> · <a href="#gl-naive-leader-rule-lowest-live-id">Naive leader rule</a> · <a href="#gl-design-review">Design review</a> · <a href="#gl-split-brain">Split brain</a> · <a href="#gl-majority-quorum">Majority quorum</a> · <a href="#gl-fencing-token">Fencing token</a></p>
+
+<h2 id="F5-47-next">Next chapter</h2>
+<p>This is the last chapter of <a href="#DS403">DS403</a>. Continue with the course's practical exam and MP2, or with <a href="#DS402">DS402</a> for operating such a layer reliably.</p>
+
+<h2 id="F5-47-answers">Answers to Check yourself</h2>
+<ol>
+<li>A view is computed by each node from what it hears, so during a partition different groups have different, non-overlapping views and each can believe it is "the cluster". A majority cannot be held by two disjoint groups; since every decision needs votes or acknowledgements from a majority, and a node votes once per term, two conflicting decisions would need one node to support both.</li>
+<li>Nothing told it: Raft has no message that says "you are deposed", and node 1 heard nothing at all. It stepped down at its tick 1300, after the heal, when it received an append with term 2 (a higher term).</li>
+<li>A leader may only commit entries of its own term by counting; earlier entries become committed indirectly. The NOOP is an entry of the new term, so committing it (at once) commits everything before it, instead of waiting for a client command.</li>
+<li>Index 12, by node 1 (the leader), at its tick 724, after node 3 left its view. Node 2 starts a job only when the JOB_ASSIGN naming it is applied (index 12 applied on node 2 at its tick 790), so a proposal that never commits never starts a job.</li>
+<li>Node 1 stays leader of term 4 on the minority side and cannot commit; its clients time out with UNKNOWN. On the majority side {3,4,5} one node times out, wins term 5 with three votes and commits; its clients can be told OK. After healing, node 1 and 2 adopt term 5 and truncate uncommitted term-4 entries.</li>
+<li>Find out what happened: read the lock (through the leader, linearizably) and see whether it is n1 already. A blind retry of CAS '' -&gt; n1 would fail if the first one committed, and the client would wrongly conclude it lost; with client sessions the state machine would recognise the retry and return the first answer.</li>
+<li>Node 1 is now on the majority side {1,2}, stays leader of term 1 and commits its own CAS: node 1 is told OK; node 3 alone cannot reach a leader (its request goes nowhere, or to itself as a candidate that never wins) and reports UNKNOWN; final lock = n1 on all nodes. Run it to check.</li>
+<li>A majority of 4 is 3, so 4 nodes tolerate one failure, like 3, while adding a node that can fail and three cuts (2|2) in which nobody can decide. 5 nodes tolerate two failures.</li>
+<li>Any three of: persistence (prevents double voting and lost entries after restart); membership changes (prevents two majorities during reconfiguration); snapshots (prevents an unbounded log); client sessions (prevents double application of retries); linearizable reads (prevents stale reads from a deposed leader); pre-vote (prevents disruptive elections after a heal).</li>
+<li>The leader would re-assign job 3 to node 2 when node 3 left its view; node 3, unaware, would finish its copy and send JOB_DONE after healing; the leader would ignore it if job 3 were already done, or commit whichever result arrived first. The job ran twice. With fencing tokens, the job's output store would accept writes only with the token of the latest assignment (index 12) and reject node 3's (index 8).</li>
+</ol>
+<h3 id="F5-47-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Node 1's own client was told OK at its tick 900 (node 1 applied <code>CAS lock ''-&gt;n1</code> as leader of {1}). Node 3's client asked at its tick 900 and was told OK at its tick 905 by node 2 (leader of {2,3}), which had applied <code>CAS lock ''-&gt;n3</code> at its tick 828 (each node counts its own ticks). Before the heal node 1's table said lock=n1, nodes 2 and 3 said lock=n3. After the heal all three say lock=n1: nodes 2 and 3 log "adopting leader's lock=n1 (mine was n3)". <code>splitbrain_check.out</code>: 2 OKs.</li>
+<li>Node 1: view {1,3} at 488, {1} at 491, back to {1,2} at 1139 and {1,2,3} at 1142; it believed itself leader throughout. Node 2: {2,3} at 435, believed itself leader ("that is me") until 1111. Node 3: {2,3} at 492, believed node 2 until 1177. Two leaders for the whole partition.</li>
+<li>(a) The lock service granted the lock twice (safety bug); (b) the storage clients ignored a refusal or used a stale lock. The logs show both OKs coming from the lock service itself (lines "client: request 1 ... OK"), and the switch shows the CLIENT and CLIENT_REP of nodes 3 and 2 inside group B while node 1's frames were dropped: (a).</li>
+<li><code>naive.cc</code> lines 49–53: the leader is the lowest id in <i>my</i> view, with no majority, so each side of the partition had one. Lines 54–60 and 72–73: when a view grows, its leader pushes its whole table and the others replace theirs, erasing node 3's acknowledged lock.</li>
+<li>True of the final table and irrelevant: the table records the winner of the merge, not the promises made. The evidence of the violation is in the per-node logs (two OKs during the partition) and in the "adopting ... (mine was n3)" lines.</li>
+<li>Fix: replace the naive design with majority-based consensus (the lab's Raft), where node 1's request would get UNKNOWN. Test: the lab's partition scenario with an assertion "at most one OK per lock key per epoch", run in CI with the partition verified to have happened. Storage side: fencing tokens: the lock grant carries a monotonically increasing token (the log index), and the volume rejects writes with a token lower than the highest it has seen, so a stale holder cannot corrupt it even if granted wrongly.</li>
+</ol>
+<p><b>Alternative wrong answers.</b> "Clock skew between the nodes": nothing in either design uses clocks for safety, and the logs agree on order within each node. "The switch duplicated a message": the switch only forwards or drops; its table shows no extra frames. "Node 3's client misread the reply": node 2's log shows it applied the CAS and sent the reply. <b>How the evidence was produced:</b> the kernel booted with <code>mode=naive scen=split</code> on all three nodes and <code>labswitch</code> partitioning {1} from {2,3} between 6,000 and 16,000 ms (<code>run.sh</code> step 5).</p>

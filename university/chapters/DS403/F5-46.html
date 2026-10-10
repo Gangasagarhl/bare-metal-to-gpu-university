@@ -1,0 +1,334 @@
+<!--meta
+id: F5-46
+title: Your OS on many machines: network boot and remote file systems
+course: DS403
+level: L4
+prereqs: F5-44 (cluster kernel, membership); F5-45 (9P); F5-09 (remote procedure calls); OS304 (VFS)
+time: 14–20 hours including the lab and the forensic lab
+hardware: none required: three emulated PCs in QEMU 8.2.2 (TCG), each with a virtio-net boot NIC (iPXE ROM shipped with QEMU) on QEMU's user-mode network and an e1000 cluster NIC on the lab switch; TShark 4.2.2 to decode the boot capture; untested on hardware
+maps: Curriculum C9 (network boot uses DHCP and TFTP; the e1000 driver); section 7.1 row "9P and virtio-fs" (the shape of the protocol); course lab "three QEMU nodes sharing a 9P or custom remote file service"; goal 1 "distributed computers in servers"
+analogy: F5 — friends in different towns (registered: letters = message passing; phoning = RPC; phone lines between towns down = network partition); proposed: network boot = a new friend who arrives with nothing and is posted the club's rulebook; cache revalidation = phoning the library to ask "is page 3 still edition 2?" before reading your photocopy (see NOTES.md)
+-->
+
+<h2 id="F5-46-hook">Story hook</h2>
+<p>A new friend, Emeka, joins the club. He moves into an empty house in a fourth town: no books, no rulebook, not even the club's address. He shouts out of the window "is anyone there who can help a new member?", and the town's post office answers with an address for him and a note: "your rulebook is at the club's post box, ask for <i>n4.ipxe</i>". He asks; the rulebook arrives in small envelopes, one at a time, each acknowledged before the next is sent. Now Emeka knows how to be a member.</p>
+<p>Then the real work starts. The club's shared notebook lives at Amara's house. Bao writes a line in it by letter. Chidi adds another. Bao had made a photocopy of the page earlier and reads the photocopy again: it does not show Chidi's line. Later Amara's house is closed for good, and Bao still reads his photocopy as if nothing had happened.</p>
+<p>This chapter does both halves on your own kernel: three machines that arrive with nothing and load the kernel over the network, and a remote file service shaped like 9P that they share. Then it breaks the cache on purpose, because the photocopy is where remote file systems get interesting.</p>
+
+<h2 id="F5-46-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> each step of a network boot (DHCP, TFTP, a boot script, a Multiboot kernel) and <b>read</b> it in a packet capture.</li>
+<li><b>Boot</b> three QEMU nodes over the network with iPXE and give each its own kernel command line.</li>
+<li><b>Implement</b> a remote file service with fids, tags, retries and per-file versions, server and client, over raw Ethernet.</li>
+<li><b>Choose and justify</b> a client cache policy, and <b>show</b> by experiment the difference between a validated cache and a naive one.</li>
+<li><b>Reason</b> about retries: which file operations are safe to repeat, and what a timeout tells you.</li>
+</ul>
+
+<div class="co jargon" id="F5-46-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Network boot (PXE)</dt><dd><b>Simple words:</b> starting a computer with a program it loads over the network instead of from its own disk. <b>Analogy:</b> the new friend is posted the club's rulebook. <b>Precise:</b> a boot in which firmware on the network card (PXE, or a replacement such as iPXE) obtains an address and the name of a boot file by DHCP, downloads the file by TFTP (or another protocol), and runs it. <sup class="src"><a href="#F5-46-src-D1">D1</a></sup></dd>
+<dt>TFTP</dt><dd><b>Simple words:</b> a very small protocol for downloading a file, one block at a time. <b>Analogy:</b> the rulebook sent in numbered envelopes, each acknowledged before the next. <b>Precise:</b> the Trivial File Transfer Protocol over UDP: a read request names the file; the server sends numbered data blocks, each acknowledged before the next (lock-step); a block shorter than the block size ends the transfer; options such as block size and transfer size can be negotiated. <sup class="src"><a href="#F5-46-src-D3">D3</a></sup></dd>
+<dt>iPXE</dt><dd><b>Simple words:</b> open-source network boot firmware that can run small boot scripts. <b>Analogy:</b> a helpful neighbour who fetches the rulebook and hands it over. <b>Precise:</b> a network boot program, shipped as option ROMs with QEMU, that performs DHCP, fetches files by TFTP and other protocols, runs scripts that start with <code>#!ipxe</code>, and can load Multiboot kernels with a command line. <sup class="src"><a href="#F5-46-src-D4">D4</a></sup></dd>
+<dt>Boot file</dt><dd><b>Simple words:</b> the name of the first file a network-booting machine should fetch. <b>Analogy:</b> "ask for <i>n4.ipxe</i>". <b>Precise:</b> the file name a DHCP server gives a client (the "file" field or a boot-file-name option), interpreted relative to the TFTP server. <sup class="src"><a href="#F5-46-src-D2">D2</a></sup></dd>
+<dt>Remote file system</dt><dd><b>Simple words:</b> files kept on one machine and used from others as if they were local. <b>Analogy:</b> the club notebook at Amara's house, written by letter. <b>Precise:</b> a file service in which clients send file operations to a server by RPC; its design is described by its naming, its state (stateful or stateless server), its caching and the consistency guarantees it gives to concurrent clients. <sup class="src"><a href="#F5-46-src-D7">D7</a></sup></dd>
+<dt>Client cache (file system)</dt><dd><b>Simple words:</b> a copy of file data kept on the client to save trips to the server. <b>Analogy:</b> a photocopy of a notebook page. <b>Precise:</b> client-side storage of file data or attributes, used instead of a server request; its correctness depends on when the client checks that the copy is still current (revalidation) or on the server telling the client when it is not (callbacks, leases). <sup class="src"><a href="#F5-46-src-D7">D7</a></sup></dd>
+<dt>Revalidation</dt><dd><b>Simple words:</b> asking the server whether your copy is still the newest before you use it. <b>Analogy:</b> phoning the library: "is page 3 still edition 2?" <b>Precise:</b> a small request (here a stat) that returns the file's current version, compared with the cached version; on a match the cache is used, otherwise the data is fetched again. It costs one round trip per use and fails when the server is unreachable. <sup class="src"><a href="#F5-46-src-D7">D7</a></sup></dd>
+<dt>Close-to-open consistency</dt><dd><b>Simple words:</b> after one client closes a file it changed, any client that opens the file afterwards sees the change. <b>Analogy:</b> once Bao has posted his page back, anyone who borrows the notebook next sees his writing. <b>Precise:</b> a weaker guarantee than one-copy (UNIX) semantics in which writes are flushed on close and caches are revalidated on open; concurrent readers and writers of an open file may see different data. <sup class="src"><a href="#F5-46-src-D7">D7</a></sup> <sup class="src"><a href="#F5-46-src-D10">D10</a></sup></dd>
+<dt>Stateful server</dt><dd><b>Simple words:</b> a server that remembers what each client is doing. <b>Analogy:</b> Amara remembers which friend has which bookmark. <b>Precise:</b> a server that keeps per-client state between requests (open files, fids, locks, cache promises); it allows short requests and server-driven cache invalidation, but its state is lost when it crashes and must be rebuilt or invalidated, and clients that crash leave state behind. <sup class="src"><a href="#F5-46-src-D7">D7</a></sup></dd>
+</dl></div>
+<p>Terms from earlier chapters used here without redefinition: <a href="#gl-dhcp">DHCP</a>, <a href="#gl-multiboot">Multiboot</a>, <a href="#gl-fid">fid</a>, <a href="#gl-tag-9p">tag (9P)</a>, <a href="#gl-qid">qid</a>, <a href="#gl-idempotent-operation">idempotent operation</a>, <a href="#gl-at-least-once-and-at-most-once">at-least-once and at-most-once</a>, <a href="#gl-stale-read">stale read</a>, <a href="#gl-remote-procedure-call-rpc">remote procedure call</a>, <a href="#gl-membership-view">membership view</a>.</p>
+
+<h2 id="F5-46-pictures">The idea in pictures</h2>
+<p>Figure 1 is the boot of node 2 as the capture of its boot NIC recorded it: four DHCP messages, two TFTP read requests, and then the kernel, which from that moment uses a different NIC.</p>
+<figure id="F5-46-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 360" role="img" aria-labelledby="F5-46-f1t F5-46-f1d">
+<title id="F5-46-f1t">Figure 1: network boot of node 2, from the packet capture</title>
+<desc id="F5-46-f1d">A message sequence diagram with two lifelines: node 2's boot NIC running iPXE on the left, and QEMU's user-mode network (DHCP and TFTP server at 10.0.2.2) on the right. Messages from top to bottom with times from the capture: at 0.000 s DHCP Discover and Offer; at 1.027 s a second Discover and Offer; at 3.068 s DHCP Request and ACK, giving address 10.0.2.15 and boot file n2.ipxe; at 3.163 s TFTP read request for n2.ipxe with option acknowledgement blksize 1428, tsize 86; at 3.219 s TFTP read request for f546.elf, option acknowledgement tsize 19760, then data blocks. At the bottom, iPXE loads the Multiboot kernel with the command line from the script and jumps to it; the kernel prints "loaded by iPXE" and switches to the e1000 cluster NIC.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="360"/>
+<rect class="sv-b1" x="60" y="16" width="200" height="34"/><text class="sv-tb" x="72" y="38">node 2 boot NIC (iPXE)</text>
+<rect class="sv-b2" x="480" y="16" width="230" height="34"/><text class="sv-tb" x="492" y="38">QEMU user net, 10.0.2.2</text>
+<path class="sv-dash" d="M160,50 L160,320"/><path class="sv-dash" d="M595,50 L595,320"/>
+<text class="sv-ts" x="10" y="76">0.000 s</text>
+<path class="sv-line" d="M160,72 L589,72"/><polygon class="sv-head" points="595,72 583,66 583,78"/><text class="sv-ts" x="280" y="66">DHCP Discover (broadcast)</text>
+<path class="sv-line" d="M595,90 L166,90"/><polygon class="sv-head" points="160,90 172,84 172,96"/><text class="sv-ts" x="280" y="104">DHCP Offer</text>
+<text class="sv-ts" x="10" y="128">1.027 s</text>
+<path class="sv-line2" d="M160,124 L589,124"/><polygon class="sv-head" points="595,124 583,118 583,130"/><text class="sv-ts" x="280" y="118">Discover again, Offer again</text>
+<text class="sv-ts" x="10" y="160">3.068 s</text>
+<path class="sv-line" d="M160,156 L589,156"/><polygon class="sv-head" points="595,156 583,150 583,162"/><text class="sv-ts" x="280" y="150">DHCP Request</text>
+<path class="sv-line" d="M595,174 L166,174"/><polygon class="sv-head" points="160,174 172,168 172,180"/><text class="sv-ts" x="230" y="190">DHCP ACK: 10.0.2.15, boot file n2.ipxe</text>
+<text class="sv-ts" x="10" y="214">3.163 s</text>
+<path class="sv-line" d="M160,210 L589,210"/><polygon class="sv-head" points="595,210 583,204 583,216"/><text class="sv-ts" x="250" y="204">TFTP RRQ n2.ipxe (blksize 1432)</text>
+<path class="sv-line" d="M595,226 L166,226"/><polygon class="sv-head" points="160,226 172,220 172,232"/><text class="sv-ts" x="250" y="242">OACK blksize 1428, tsize 86; 1 data block</text>
+<text class="sv-ts" x="10" y="266">3.219 s</text>
+<path class="sv-line" d="M160,262 L589,262"/><polygon class="sv-head" points="595,262 583,256 583,268"/><text class="sv-ts" x="250" y="256">TFTP RRQ f546.elf</text>
+<path class="sv-line" d="M595,278 L166,278"/><polygon class="sv-head" points="160,278 172,272 172,284"/><text class="sv-ts" x="250" y="294">OACK tsize 19760; 14 data blocks, each ACKed</text>
+<rect class="sv-b4" x="40" y="314" width="400" height="34"/><text class="sv-ts" x="50" y="335">iPXE runs "kernel f546.elf node=2 ...", "boot": Multiboot entry</text>
+<text class="sv-ts" x="460" y="335">kernel then uses the e1000 cluster NIC</text>
+</svg></div><figcaption><b>Figure 1.</b> The network boot of node 2 in the lab, drawn from the real capture (R3): times are seconds from the first DHCP Discover on QEMU's packet dump of the boot NIC. The kernel itself never speaks DHCP or TFTP in this lab: iPXE does, then hands over a loaded Multiboot image. 15 TFTP data packets in total: 1 for the 86-byte script and 14 for the 19,760-byte kernel. <sup class="src"><a href="#F5-46-src-D1">D1</a></sup> <sup class="src"><a href="#F5-46-src-D4">D4</a></sup> <sup class="src"><a href="#F5-46-src-R3">R3</a></sup></figcaption></figure>
+
+<p>Figure 2 is the file-service part of the same run: node 2 creates and writes <code>notes</code>, node 3 appends to it, and node 2's validated cache notices the change.</p>
+<figure id="F5-46-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 380" role="img" aria-labelledby="F5-46-f2t F5-46-f2d">
+<title id="F5-46-f2t">Figure 2: DFS requests and the cache check in the lab run</title>
+<desc id="F5-46-f2d">Three lifelines: node 2 (client, writer), node 1 (server) and node 3 (client, appender). Node 2 at its tick 200: attach, read the root directory, walk motd, read motd, create notes, write 18 bytes; the server records notes version 1, length 18; node 2 reads notes and keeps a cached copy at version 1. Node 3 at its tick 400: attach, walk notes (version 1, length 18), read it, write 22 bytes at offset 18; the server records version 2, length 40; node 3's create of notes again is refused with "file exists". Node 2 at its tick 600: stat notes returns version 2, which differs from the cached version 1, so node 2 reads again and receives 40 bytes. The server halts at its tick 900; node 2's read at tick 1000 is sent three times, 100 ticks apart, and fails with "server unreachable".</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="380"/>
+<rect class="sv-b1" x="40" y="12" width="150" height="30"/><text class="sv-tb" x="52" y="32">node 2 (writer)</text>
+<rect class="sv-b5" x="305" y="12" width="150" height="30"/><text class="sv-tb" x="317" y="32">node 1 (server)</text>
+<rect class="sv-b3" x="570" y="12" width="150" height="30"/><text class="sv-tb" x="582" y="32">node 3 (appender)</text>
+<path class="sv-dash" d="M115,42 L115,370"/><path class="sv-dash" d="M380,42 L380,330"/><path class="sv-dash" d="M645,42 L645,370"/>
+<path class="sv-line" d="M115,66 L374,66"/><polygon class="sv-head" points="380,66 368,60 368,72"/><text class="sv-ts" x="130" y="60">t=200 attach, ls, walk, read motd</text>
+<path class="sv-line" d="M115,92 L374,92"/><polygon class="sv-head" points="380,92 368,86 368,98"/><text class="sv-ts" x="130" y="86">create notes; write 18 bytes</text>
+<rect class="sv-b6" x="388" y="82" width="150" height="22"/><text class="sv-ts" x="394" y="98">notes v1, 18 bytes</text>
+<path class="sv-line" d="M380,118 L121,118"/><polygon class="sv-head" points="115,118 127,112 127,124"/><text class="sv-ts" x="130" y="134">read notes: 18 bytes</text>
+<rect class="sv-b4" x="10" y="140" width="96" height="22"/><text class="sv-ts" x="14" y="156">cache: v1</text>
+<path class="sv-line" d="M645,178 L386,178"/><polygon class="sv-head" points="380,178 392,172 392,184"/><text class="sv-ts" x="420" y="172">t=400 walk notes (v1, 18)</text>
+<path class="sv-line" d="M645,204 L386,204"/><polygon class="sv-head" points="380,204 392,198 392,210"/><text class="sv-ts" x="420" y="198">write 22 bytes at 18</text>
+<rect class="sv-b6" x="222" y="196" width="150" height="22"/><text class="sv-ts" x="228" y="212">notes v2, 40 bytes</text>
+<path class="sv-line2" d="M645,232 L386,232"/><polygon class="sv-head" points="380,232 392,226 392,238"/><text class="sv-ts" x="420" y="248">create notes again: file exists</text>
+<path class="sv-line" d="M115,268 L374,268"/><polygon class="sv-head" points="380,268 368,262 368,274"/><text class="sv-ts" x="130" y="262">t=600 stat notes</text>
+<path class="sv-line" d="M380,286 L121,286"/><polygon class="sv-head" points="115,286 127,280 127,292"/><text class="sv-ts" x="130" y="300">v2 != v1: read again, 40 bytes</text>
+<rect class="sv-b6" x="330" y="324" width="100" height="22"/><text class="sv-ts" x="336" y="340">halts t=900</text>
+<path class="sv-dash" d="M115,358 L330,358"/><text class="sv-ts" x="130" y="352">t=1000 read: 3 tries, 100 ticks apart</text>
+<text class="sv-ts" x="130" y="374">error -110: server unreachable</text>
+</svg></div><figcaption><b>Figure 2.</b> DFS in the lab run (R2). Tick values are each node's own clock. The validated cache costs one stat round trip at tick 600 and returns node 3's line; the naive cache of the forensic run skips that round trip and returns the old 18 bytes. Not to scale. <sup class="src"><a href="#F5-46-src-R2">R2</a></sup> <sup class="src"><a href="#F5-46-src-R5">R5</a></sup></figcaption></figure>
+
+<h2 id="F5-46-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>A new friend with an empty house shouts "help, I am new!" (DHCP Discover). The post office answers with an address and the name of a rulebook to ask for (Offer and ACK with a boot file). The rulebook comes in numbered envelopes; each one is acknowledged before the next is sent (TFTP). The rulebook's first page says "now read the big book, and you are member number 2" (the iPXE script with the kernel and its command line).</p><p>The club notebook lives at Amara's house (the server). Friends write to it by letter (RPC). A friend may keep a photocopy (cache), but a careful friend phones first: "is the notebook still at edition 1?" (revalidation). A careless friend reads the photocopy forever (naive cache). Mapping: post office = DHCP server; envelopes = TFTP blocks; notebook = file on the server; photocopy = client cache; edition = qid version.</p></div>
+<p>When Amara's house closes for good, the careful friend's phone call fails, so he knows something is wrong. The careless friend never phones, so he never notices. Being careful costs a phone call every time; being careless costs being wrong without knowing it.</p>
+
+<h2 id="F5-46-layer2">Layer 2 — the student explanation</h2>
+<p><b>Why network boot.</b> In a cluster you want every node to run the same kernel, and to change it in one place. Network boot gives you that: the nodes' firmware fetches the kernel from a server at every start, so updating the server's copy updates the cluster at the next reboot. It also means a node needs no disk to start. <sup class="src"><a href="#F5-46-src-D1">D1</a></sup></p>
+<p><b>The boot chain in the lab.</b> Each node has two NICs. The first is a virtio-net card on QEMU's user-mode network, whose built-in DHCP and TFTP servers play the role of the boot server; QEMU's iPXE ROM on that card boots it. The DHCP answer names the boot file <code>n2.ipxe</code> (one per node). That file is an iPXE script of three lines: <code>#!ipxe</code>, <code>kernel f546.elf node=2 nodes=3 role=writer server=1 cache=valid life=1500</code>, <code>boot</code>. iPXE fetches <code>f546.elf</code> from the same TFTP server, loads it as a Multiboot image with that command line, and jumps to it. The kernel prints the boot loader's name from the Multiboot information ("iPXE 1.21.1+git-20220113.fbbdc3") and then uses its second NIC, the e1000 on the lab switch, for everything else. <sup class="src"><a href="#F5-46-src-D4">D4</a></sup> <sup class="src"><a href="#F5-46-src-D5">D5</a></sup> <sup class="src"><a href="#F5-46-src-R2">R2</a></sup></p>
+<p><b>The file service.</b> DFS ("DS403 file service") borrows 9P's shape from <a href="#F5-45">F5-45</a>: attach, walk, create, open, read, write, stat, clunk; client-chosen fids; tags that match replies to requests; a qid made of a path number that is never reused and a version that grows by one at every change. Unlike 9P it uses a fixed-layout request and reply (Listing 1) that fits in one Ethernet frame, and it carries at most 512 bytes of data per message. One node (node 1) runs the server with a flat directory in RAM; the others are clients.</p>
+<p><b>Retries.</b> On the lab switch frames are not lost unless a partition is configured, but the client is written for a network that loses them: it waits 100 ticks for the reply with its tag, sends again, and gives up after three attempts with "server unreachable". Every retry is the at-least-once behaviour of <a href="#F5-09">F5-09</a>: if the first request arrived and only its reply was lost, the server executes it twice. Whether that matters depends on the operation (Layer 3).</p>
+<p><b>The cache.</b> The client keeps up to four small files it has read. Before using a cached copy, the validated client asks the server for the file's current version with a stat; if it equals the cached version the copy is used, otherwise the file is read again. The naive client never asks. The run shows both: at tick 600 the validated node 2 notices that <code>notes</code> went from version 1 to 2 and reads node 3's line; the naive node 2 of the forensic run returns the old 18 bytes, and even after the server has halted it keeps returning them without an error (R2, R5).</p>
+
+<h2 id="F5-46-layer3">Layer 3 — the engineer's depth</h2>
+<p><b>Reading the boot capture.</b> The capture (R3) shows two DHCP Discover/Offer pairs about one second apart before the Request at 3.068 s, then two TFTP read requests 56 ms apart. The client asked for a block size of 1,432 bytes and QEMU's server answered with 1,428; the client also asked for the transfer size (tsize=0), and the server filled in 86 for the script and 19,760 for the kernel. With 1,428-byte blocks the kernel needs ⌈19,760 / 1,428⌉ = 14 blocks, the script 1: the 15 data packets counted. The block-size and transfer-size options are extensions to basic TFTP, whose blocks are 512 bytes. <sup class="src"><a href="#F5-46-src-D3">D3</a></sup> <sup class="src"><a href="#F5-46-src-R3">R3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Explanations of the capture that go beyond what it shows come from memory, not from documents read in this build: that iPXE repeats DHCP Discover while it waits for possible ProxyDHCP offers before sending its Request; that TFTP's default block size is 512 bytes and that the blksize and tsize options are defined in separate RFCs from the base protocol; that a block shorter than the negotiated size ends a transfer; that QEMU's user-mode network gives guests 10.0.2.15 and itself 10.0.2.2 by default; and that the DHCP "file" field or option 67 carries the boot file name. The Source Researcher must check them against the PXE specification, the DHCP and TFTP RFCs, iPXE's and QEMU's documentation (D1–D5).</p></div>
+<p><b>What network boot costs and risks.</b> Every node depends on the boot server at start-up: if it is down, nothing boots. TFTP is lock-step, so its time grows with the number of blocks times the round trip (Worked example). Plain TFTP and DHCP have no authentication: anyone on the boot network can answer first and hand your nodes a different kernel. Real clusters therefore isolate the boot network, sign or check boot images (iPXE can verify images; UEFI Secure Boot is another layer), and use faster protocols for large images. <sup class="src"><a href="#F5-46-src-D1">D1</a></sup> <sup class="src"><a href="#F5-46-src-D4">D4</a></sup></p>
+<div class="co safety"><span class="lbl">Safety</span><p>Never run a DHCP or TFTP server on a network you do not own: a second DHCP server can take over other people's machines' addresses and boot settings. The lab uses QEMU's private user-mode network, which no other machine can see.</p></div>
+<p><b>Design choices of DFS, one by one.</b></p>
+<div class="tw"><table>
+<thead><tr><th>Choice</th><th>DFS</th><th>Alternative</th><th>What the choice buys and costs</th></tr></thead>
+<tbody>
+<tr><td>Server state</td><td>Stateful: fid table per client</td><td>Stateless: every request names the file by a durable handle (the original NFS design)</td><td>Short requests and a place for per-client promises; a server restart loses every fid, and crashed clients leak fids.</td></tr>
+<tr><td>Name space</td><td>One flat directory, one server</td><td>Per-process name spaces (F5-45), many servers</td><td>Simple; one server is a single point of failure, as the run shows.</td></tr>
+<tr><td>Cache validation</td><td>Stat on every use of a cached file</td><td>Time-based (trust for <i>n</i> seconds), callbacks or leases from the server</td><td>Always current while the server is reachable; one round trip per use; no use at all when the server is gone.</td></tr>
+<tr><td>Write policy</td><td>Write-through: every write goes to the server at once</td><td>Write-back on close (close-to-open), or delayed</td><td>No lost writes in the client; more messages; no batching.</td></tr>
+<tr><td>Delivery</td><td>At-least-once: up to three tries, same tag</td><td>At-most-once with a server reply cache keyed by (client, tag)</td><td>Simple; non-idempotent requests may run twice.</td></tr>
+<tr><td>Transport</td><td>One request per Ethernet frame, 512 data bytes</td><td>9P over a reliable stream (TCP), large msize</td><td>No fragmentation code; many messages for large files.</td></tr>
+</tbody></table></div>
+<p><b>Which operations survive a retry?</b> A retry repeats a request whose first copy may have been executed. Read, stat, walk and attach change nothing (or re-establish the same fid) and are safe to repeat. Write at an explicit offset leaves the same bytes in the file, but DFS increments the version twice, so a cache would see one extra change: harmless here, visible in the logs. Create is not safe: if the first create succeeded and its reply was lost, the retry gets "file exists", and the client reports failure for an operation that succeeded. Clunk repeated gets "unknown fid". The fix used by real protocols is a server-side reply cache keyed by client and request id, which turns at-least-once into at-most-once for as long as the cache remembers. <sup class="src"><a href="#F5-46-src-D7">D7</a></sup> <sup class="src"><a href="#F5-46-src-D9">D9</a></sup> The append in this lab is a write at the offset the client saw at walk time (18); two concurrent appenders that both saw 18 would overwrite each other, which is why some protocols have an append mode in which the server picks the offset.</p>
+<p><b>Consistency, in the words of the textbooks.</b> One-copy (UNIX) semantics means every read sees the last write by anyone. Close-to-open semantics, used by NFS clients, revalidates on open and flushes on close. Session semantics (as in AFS) make changes visible to others only after close; the server promises to call back clients whose cached copies it has invalidated. <sup class="src"><a href="#F5-46-src-D7">D7</a></sup> <sup class="src"><a href="#F5-46-src-D10">D10</a></sup> DFS's validated cache gives one-copy semantics for single reads while the server is reachable, because each use asks the server; it pays one round trip per read for it, which is what callbacks and leases exist to avoid.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The characterisations of NFS (stateless server in its original versions, file handles, close-to-open consistency in its clients, a duplicate-request cache in servers) and AFS (whole-file caching, session semantics, callbacks) are from memory. Check them against D7 and D10 before teaching them as facts; later NFS versions are stateful and differ in many details.</p></div>
+<p><b>Failure handling and membership.</b> In the run node 2 removes node 1 from its view at its tick 961, but its read at tick 1000 still sends three requests over 300 ticks before giving up (R2). The client does not consult membership; it trusts its own timeout. Using the view to fail fast ("server not in view: fail at once") is attractive and dangerous: views can be wrong (F5-44's forensic lab), and a client that fails fast during a false suspicion turns a short delay into an error. The opposite trap is the naive cache: it hides the server's death completely, which in F5-44's terms is failure transparency of the worst kind: the client is wrong and does not know.</p>
+
+<h2 id="F5-46-hardware">How the hardware actually does it</h2>
+<p><b>Two NICs per node.</b> Each emulated PC has a virtio-net card with <code>bootindex=1</code> attached to <code>-netdev user</code>, and an e1000 attached to <code>-netdev dgram</code> with <code>romfile=</code> empty, so that only the virtio card offers a boot ROM. SeaBIOS (QEMU's BIOS) runs the virtio card's option ROM, which is iPXE; iPXE does DHCP and TFTP using the virtio card, loads the kernel, and leaves the card alone. The kernel never touches the virtio-net card; it drives the e1000 exactly as in F5-44. <sup class="src"><a href="#F5-46-src-D4">D4</a></sup> <sup class="src"><a href="#F5-46-src-D5">D5</a></sup> <sup class="src"><a href="#F5-46-src-R2">R2</a></sup></p>
+<p><b>Seeing what the firmware did.</b> iPXE's messages went to the emulated screen, not to the serial port, so the lab cannot log them directly. Two independent pieces of evidence replace them: QEMU's <code>filter-dump</code> object writes every frame of the boot NIC's network to a pcap file, decoded by TShark (R3); and the kernel prints the Multiboot boot-loader name that iPXE filled in (R2). <sup class="src"><a href="#F5-46-src-D6">D6</a></sup></p>
+<p><b>On real hardware.</b> A real cluster would use the NIC's own PXE ROM or iPXE flashed or chain-loaded, a real DHCP server configured with per-machine entries (by MAC address), and a TFTP or HTTP server, on a dedicated boot network. The kernel's e1000 driver would need to match the real card's model and the Intel manual (F5-44). None of this was tested.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The boot timings (about 3.2 s from the first Discover to the TFTP requests) are one emulated run on one host and depend on iPXE's DHCP timeouts, not on network speed. Real PXE ROMs, real DHCP servers and real switches (spanning-tree delays on a port that has only now come up are a classic cause of PXE timeouts, from memory) can behave very differently.</p></div>
+
+<h2 id="F5-46-worked">Worked example</h2>
+<p><b>Question.</b> How long does lock-step TFTP take to deliver the lab's kernel, and a 20 MiB kernel with initial RAM disk, if one block plus its acknowledgement takes one round trip <i>r</i>? And how many DFS messages does it take to read a 1 MiB file?</p>
+<p><b>Step 1: blocks.</b> The lab's kernel: ⌈19,760 / 1,428⌉ = 14 blocks (the capture agrees). A 20 MiB image: 20 × 1,048,576 = 20,971,520 bytes; ⌈20,971,520 / 1,428⌉ = 14,686 blocks. With the basic 512-byte blocks it would be 40,960 blocks.</p>
+<p><b>Step 2: time.</b> Lock-step means one block per round trip: time ≈ blocks × <i>r</i>. For <i>r</i> = 0.5 ms (an illustrative value, not a measurement): 14 blocks take about 7 ms; 14,686 blocks take about 7.3 s; 40,960 blocks of 512 bytes take about 20.5 s. Bandwidth hardly enters: the round trip does. This is why large network boots use protocols with windows (HTTP over TCP, or TFTP's windowsize option where supported). <sup class="src"><a href="#F5-46-src-D3">D3</a></sup></p>
+<p><b>Step 3: DFS message sizes.</b> A request is <code>DfsT</code>: 2 + 1 + 4 + 4 + 4 + 2 + 28 + 512 = 557 bytes; a reply <code>DfsR</code>: 2 + 1 + 1 + 4 + 4 + 4 + 2 + 512 = 530 bytes. With the 12-byte DS403 header and the 14-byte Ethernet header the frames are 583 and 556 bytes, under the 1,514-byte maximum. Every request carries 512 data bytes even when it carries none: an easy optimisation the lab skips for clarity.</p>
+<p><b>Step 4: a 1 MiB read.</b> 1,048,576 / 512 = 2,048 reads, each a round trip, plus walk, open and clunk: 2,051 round trips; with a validated cache, one more stat per cached use. At an illustrative 1 ms per round trip that is about 2 s for one megabyte, against milliseconds for a protocol that streams; this is why DS403's DFS is for small files only and real protocols negotiate large messages (9P's msize) and keep several requests in flight (9P's tags). <sup class="src"><a href="#F5-46-src-D8">D8</a></sup></p>
+
+<h2 id="F5-46-code">Code walk-through</h2>
+<p>The lab folder <code>university/labs/F5-46/</code> adds three files to the F5-44 kernel (<code>dfs.h</code>, <code>dfs_server.cc</code>, <code>dfs_client.cc</code>) and its own <code>f546_main.cc</code>; <code>run.sh</code> uses F5-44's <code>lablib.sh</code> with <code>NETBOOT</code> set, which writes one iPXE script per node and adds the boot NIC.</p>
+<pre class="output" data-run="F5-46/build"></pre>
+
+<p><b>Listing 1</b> — <code>dfs.h</code>: the protocol.</p>
+<pre class="listing" data-src="F5-46/dfs.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8</td><td><code>DfsOp</code></td><td>Eight operations named after 9P's.</td><td>Same shape as F5-45, own encoding.</td></tr>
+<tr><td>10–19</td><td><code>DfsT</code></td><td>Tag, operation, fid, new fid, offset, count, a name, up to 512 data bytes.</td><td>Fixed layout: no parsing code, but every request is 557 bytes.</td></tr>
+<tr><td>21–30</td><td><code>DfsR</code></td><td>Tag, operation, error, qid path and version, length, count, data.</td><td>The version is what makes cache validation possible.</td></tr>
+<tr><td>32–33</td><td>error codes</td><td>Negative numbers with Linux's errno values.</td><td>Familiar values make logs easier to read (−110 = timed out).</td></tr>
+<tr><td>40–41</td><td>comment</td><td>Each client call is an RPC with retries.</td><td>States the at-least-once behaviour where callers will read it.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>dfs_server.cc</code>: the server.</p>
+<pre class="listing" data-src="F5-46/dfs_server.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>6–10</td><td>tables</td><td>16 files with qpath, version, length, data; 64 fids keyed by (client, fid).</td><td>Fids are per client: two clients may both use fid 1.</td></tr>
+<tr><td>19–25</td><td><code>new_fid</code></td><td>Reuses a fid that already exists for this client.</td><td>Makes a repeated attach or walk harmless.</td></tr>
+<tr><td>67</td><td>length check</td><td>Ignores messages of the wrong size.</td><td>Never trust a message from the wire.</td></tr>
+<tr><td>73–75</td><td>unknown fid</td><td>Every operation except attach needs a known fid.</td><td>After a server restart every client gets "unknown fid".</td></tr>
+<tr><td>88–96</td><td><code>D_CREATE</code></td><td>Refuses a name that exists; creates with version 0.</td><td>Not idempotent: a retried create reports "file exists".</td></tr>
+<tr><td>102–112</td><td>reading the root</td><td>Lists names one per line.</td><td>A directory read; 9P returns stat records instead.</td></tr>
+<tr><td>115–121</td><td>reading a file</td><td>Clamps offset and count, returns the qid with the data.</td><td>The reply's version lets the client cache it.</td></tr>
+<tr><td>124–135</td><td><code>D_WRITE</code></td><td>Bounds check, copy, extend length, version + 1, log.</td><td>Every change makes a new version; a repeated write makes two.</td></tr>
+<tr><td>144</td><td>reply</td><td>Always answers, with the request's tag.</td><td>The tag is how the client recognises its answer.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>dfs_client.cc</code>: RPC with retries, and the cache.</p>
+<pre class="listing" data-src="F5-46/dfs_client.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–11</td><td><code>WAIT</code>, <code>TRIES</code></td><td>100 ticks per attempt, three attempts.</td><td>A dead server costs 300 ticks per call (R2).</td></tr>
+<tr><td>19</td><td>new tag per call</td><td>Retries reuse the tag.</td><td>A late reply to attempt 1 still matches; a reply to an older call does not.</td></tr>
+<tr><td>24–31</td><td>wait loop</td><td>Keeps heartbeats going; drops messages that are not this reply.</td><td>Without <code>member_tick</code> a waiting client would be suspected by the others.</td></tr>
+<tr><td>101–107</td><td>naive cache</td><td>Returns the copy without asking.</td><td>The forensic bug.</td></tr>
+<tr><td>108–119</td><td>validated cache</td><td>Stat; on equal versions use the copy, else fetch.</td><td>One round trip per use; fails if the server is gone.</td></tr>
+<tr><td>126–137</td><td>fill the cache</td><td>Remembers whole small files read from offset 0, with their version.</td><td>Only whole files: a partial copy would need ranges.</td></tr>
+</tbody></table></div>
+<p><code>f546_main.cc</code> (in the lab folder) gives node 1 the server role and runs scripted clients: node 2 writes at tick 200, re-reads at 600 and reads again at 1000; node 3 appends at tick 400. The server dumps its table at tick 880 and halts at 900.</p>
+
+<h2 id="F5-46-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A friend's photocopy is visibly old paper; a cached file looks new.</b> Nothing on the bytes says how old they are. Only a version compared with the server's tells you, and only while you can reach the server.</li>
+<li><b>The post office will not send a rulebook to a stranger who pretends to be Emeka; DHCP and TFTP will.</b> Network boot without signed images trusts whoever answers first.</li>
+<li><b>A letter asking "add this line" is one request; a retried RPC is two.</b> The library notices a duplicate letter; a server without a reply cache does not.</li>
+</ul>
+
+<h2 id="F5-46-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>The node boots the wrong NIC, or none.</b> Cause: both NICs offer a boot ROM, or the boot NIC lacks <code>bootindex</code>. Fix: <code>romfile=</code> empty on the cluster NIC, <code>bootindex=1</code> on the boot NIC. Check with the boot-loader name the kernel prints.</li>
+<li><b>No boot messages anywhere.</b> Firmware writes to the screen, and the lab has none. Fix: capture the boot network (<code>filter-dump</code>) and decode it; print the Multiboot boot-loader name from the kernel.</li>
+<li><b>iPXE fetches nothing or the wrong file.</b> Cause: a URL in the script that points at a different server, or a typo in the script's first line. Fix: keep the script relative to the TFTP server (<code>kernel f546.elf …</code>) and check the read requests in the capture.</li>
+<li><b>Old data after another node's write.</b> Cause: a cache that never revalidates. Find it: compare the server's version in its log with the client's "from the cache (version …)" line. This is the forensic lab.</li>
+<li><b>"file exists" for a file the client is sure it created once.</b> Cause: a retried create whose first copy succeeded. Fix: a reply cache on the server, or a create that succeeds when the existing file was made by the same client and tag.</li>
+<li><b>Other nodes suspect a client while it waits.</b> Cause: a blocking RPC that stops sending heartbeats. Fix: keep the membership loop running inside waits (Listing 3, line 25).</li>
+<li><b>Appends from two clients overwrite each other.</b> Cause: both write at the offset they last saw. Fix: an append mode where the server picks the offset, or a lock (F5-47).</li>
+</ul>
+
+<div class="co transition" id="F5-46-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F5-44">F5-44</a> gave the cluster membership and raw-Ethernet messages; <a href="#F5-45">F5-45</a> gave the shape of a file protocol and a real 9P session. <b>What carries over:</b> tags matched to replies, fids as server state, qid versions, bounded waits, keeping heartbeats alive inside waits. <b>What changes:</b> most dangerous first: the service now depends on one server, so its failure is every client's failure; retries make some operations run twice; caches can be wrong silently; and the nodes now load their kernel from the network, so the boot server joins the list of things that must be up and trusted. <sup class="src"><a href="#F5-46-src-D7">D7</a></sup> <b>What comes next:</b> <a href="#F5-47">F5-47</a> removes the single decider: a replicated log decides what the cluster's state is, a leader schedules jobs, and a partition shows why a majority, not a view, must decide.</p></div>
+
+<h2 id="F5-46-check">Check yourself</h2>
+<ol>
+<li>List the steps of the lab's network boot in order, naming the protocol and the program that performs each.</li>
+<li>Explain in your own words why the naive cache returned data after the server had halted, and why that is worse than an error.</li>
+<li>The capture shows tsize=19760 for <code>f546.elf</code>. How many TFTP data packets carry it, with blksize 1428? How many with 512-byte blocks?</li>
+<li>For each DFS operation (attach, walk, create, read, write, stat, clunk), say whether a retry after a lost reply is harmless, visible but harmless, or wrong.</li>
+<li>Apply it to a new case: the server crashes and restarts at once (empty fid table, same files). What does node 2's next read return, and what must the client do to recover?</li>
+<li>Why does the client call <code>member_tick()</code> inside <code>rpc()</code>? What would F5-44's membership show without it during a 300-tick timeout?</li>
+<li>Predict, then run: if node 3 appended at tick 700 instead of 400, what would node 2's read at tick 600 return in the validated run, and what would the server's final table show?</li>
+<li>Name two ways a real file system avoids paying one stat round trip per cached read, and what each assumes.</li>
+<li>Why must the cluster NIC's option ROM be disabled (<code>romfile=</code>) in this lab?</li>
+</ol>
+
+<h2 id="F5-46-lab">Lab</h2>
+<p><b>Goal.</b> Boot three nodes of your kernel over the network and share files between them through your own remote file service; show the boot in a packet capture and the file sharing in three logs.</p>
+<p><b>Course lab (card, quoted).</b> "Your kernel on three QEMU nodes sharing a 9P or custom remote file service." <sup class="src"><a href="#F5-46-src-C2">C2</a></sup> This chapter completes it with a custom, 9P-shaped service; F5-45 showed the real 9P side.</p>
+<p><b>Curriculum milestone reused: C9.</b> The e1000 driver from C9 carries the cluster traffic; the C9 acceptance tests (DHCP in your own kernel, TCP, HTTP) are not run here, and DHCP and TFTP are performed by iPXE, not by your kernel (see F5-44 for the quoted C9 text). <sup class="src"><a href="#F5-46-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> As F5-44, plus QEMU's iPXE option ROM for virtio-net (shipped with the distribution's QEMU package) and TShark to decode the capture. Untested on hardware.</p>
+<p><b>Safety.</b> QEMU's user-mode network is private to each QEMU process; do not replace it with a bridge to a real network without the safety box above in mind.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F5-46</code>. <code>run.sh</code> builds <code>f546.elf</code> into a TFTP directory, writes <code>n1.ipxe</code> to <code>n3.ipxe</code>, and starts the switch and three nodes, each booting from its virtio-net card.</li>
+<li>Read <code>netboot.out</code> and match it to Figure 1.</li>
+<li>Read the three node logs side by side and draw your own version of Figure 2 with the real tick values.</li>
+<li>Read <code>accept.out</code>.</li>
+</ol>
+<p><b>Expected observations</b> (measured on the build machine: Linux x86_64 cloud container without KVM, QEMU 8.2.2 TCG, on 2026-10-10; tick values and times will differ on yours):</p>
+<pre class="output" data-run="F5-46/netboot"></pre>
+<pre class="output" data-run="F5-46/dfs_n1"></pre>
+<pre class="output" data-run="F5-46/dfs_n2"></pre>
+<pre class="output" data-run="F5-46/dfs_n3"></pre>
+<pre class="output" data-run="F5-46/dfs_switch"></pre>
+<p>The switch's log is rate-limited: "+6 similar" on the line at 15,630 ms counts the six requests of node 2's tick-200 burst that were not printed one by one; the line itself is node 2's stat at its tick 600, and the line at 20,174 ms is its first try at tick 1000. Node 1 sent 90 heartbeats against 150 from the others because it halted at tick 900.</p>
+<p><b>Verification.</b></p>
+<pre class="output" data-run="F5-46/accept"></pre>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>A node's log is empty and QEMU times out: the boot NIC did not boot. Check that the virtio-net option ROM exists in QEMU's data directory and that <code>bootindex=1</code> is set.</li>
+<li>The kernel prints "loaded by" with an empty name: it was started with <code>-kernel</code>, not by iPXE; check that <code>NETBOOT</code> was set.</li>
+<li>The capture is empty: the <code>filter-dump</code> object must name the boot NIC's netdev (<code>b0</code>).</li>
+<li>Clients print "no reply" while the server is up: the server's role or node number is wrong on its command line; read the iPXE script.</li>
+</ul>
+<p><b>Extension.</b> Add a reply cache to the server keyed by (client, tag) so that a retried create returns the first answer; prove it with a run in which <code>labswitch</code> drops the first DFS reply (add a drop rule) and the client still reports success.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Network boot, the file service and the cache behaviour were run only in QEMU 8.2.2 (TCG) on one host with QEMU's user-mode network and the lab switch (R2, R3). Real PXE firmware, DHCP servers and switches were not tested.</p></div>
+
+<h2 id="F5-46-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> After a "performance fix" to the DFS client, a user on node 2 says the shared notes "lost" node 3's line, and later that the file service "kept working perfectly" during an outage that the operators know took the server down. Both statements come from node 2's logs.</p>
+<p><b>Evidence pack</b> (the real forensic run: the same netbooted cluster with node 2's client started with <code>cache=naive</code>):</p>
+<pre class="output" data-run="F5-46/stale_n2"></pre>
+<pre class="output" data-run="F5-46/stale_n1"></pre>
+<pre class="output" data-run="F5-46/stale_n3"></pre>
+<pre class="output" data-run="F5-46/stale_switch"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what did node 2 read at its ticks 600 and 1000, and what did the server hold at those times?</li>
+<li>Did node 3's line get lost? Use the server's file table.</li>
+<li>Which log lines show where node 2's answers came from? Which messages are missing from the switch log compared with the healthy run?</li>
+<li>Give two hypotheses for "the line was lost" and the evidence that decides between them.</li>
+<li>Root cause: which setting, in which file, and which code path?</li>
+<li>Why is "kept working perfectly during the outage" the more dangerous symptom? Propose a fix and a test.</li>
+</ol>
+<p><b>Method hints.</b> For every read on node 2, ask: did a message go to the server? Count the DFS messages in both switch logs. Compare versions, not contents.</p>
+
+<p><b>Grading rubric</b> (guide 11.2): observation 20 % (anomalies found and described with file, tick and value); hypotheses 20 % (at least two before concluding); evidence-based conclusion 30 % (root cause proven from the evidence, competing hypotheses ruled out with evidence); fix and verification 20 %; prevention and communication 10 % (a test, monitor or design change, and a short clear write-up).</p>
+
+<h2 id="F5-46-project">Mini-project</h2>
+<p><b>Leases for DFS.</b> Replace per-read validation with leases: when the server sends file data it also grants a lease of <i>L</i> ticks during which it promises not to change the file without first telling the lease holder (or waiting for the lease to expire). The client uses its cache without asking while its lease is valid. Implement it for writes from other clients, measure the number of DFS messages with and without leases for a read-mostly workload, and write down what happens when the lease holder is partitioned from the server.</p>
+<p><b>Rubric.</b> Correct: no stale read in a test where another client writes while a lease is held, shown by logs (3). Message counts measured and compared, with the workload stated (2). Partition behaviour explained and demonstrated with <code>labswitch</code>'s partition window, including the clock assumption leases make (3). Code style and comments (2).</p>
+
+<h2 id="F5-46-summary">Summary</h2>
+<ul>
+<li>Network boot: DHCP gives an address and a boot file name, TFTP fetches files in lock-step blocks, iPXE runs a script and loads a Multiboot kernel with its command line.</li>
+<li>The lab's capture shows the whole chain; 15 TFTP data blocks carried the 86-byte script and the 19,760-byte kernel.</li>
+<li>Network boot makes the boot server a dependency and, without signed images, a trust problem.</li>
+<li>DFS borrows 9P's shape: fids, tags, qids with versions; it uses a fixed layout in one Ethernet frame.</li>
+<li>Retries give at-least-once delivery: reads and stats are safe to repeat, creates are not; a reply cache gives at-most-once.</li>
+<li>A cache validated by version is correct while the server is reachable and costs a round trip per use; a naive cache is fast and silently wrong, even after the server is gone.</li>
+<li>Do not trust a remote file service that never reports an error.</li>
+</ul>
+
+<h2 id="F5-46-sources">Sources</h2>
+<ol>
+<li id="F5-46-src-D1">D1 — Intel, "Preboot Execution Environment (PXE) Specification" (tier 1; version to be recorded). <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F5-46-src-D2">D2 — IETF RFC 2131, "Dynamic Host Configuration Protocol", and the DHCP options RFC (number to be recorded) (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-46-src-D3">D3 — The TFTP specification ("The TFTP Protocol (Revision 2)") and its option extensions for block size and transfer size (IETF RFCs; numbers to be recorded by the Source Researcher) (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-46-src-D4">D4 — iPXE project documentation (tier 2): scripting (<code>#!ipxe</code>, <code>kernel</code>, <code>boot</code>), Multiboot support, image verification. <i>Title only — not opened during this build; the script used was accepted by the iPXE build shipped with QEMU 8.2.2 (R2), which is the only evidence.</i></li>
+<li id="F5-46-src-D5">D5 — QEMU project documentation for QEMU 8.2 (tier 2): user-mode networking with <code>tftp=</code> and <code>bootfile=</code>, <code>-object filter-dump</code>, <code>bootindex</code>, <code>romfile</code>. <i>Title only — not opened during this build; the options were accepted by the installed QEMU 8.2.2 (R2).</i></li>
+<li id="F5-46-src-D6">D6 — The Multiboot Specification (version to be recorded): the boot-loader-name field of the information structure. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-46-src-D7">D7 — Maarten van Steen, Andrew S. Tanenbaum, "Distributed Systems" (tier 3; edition to be recorded): distributed file systems (NFS, stateful and stateless servers, client caching, file-sharing semantics), RPC failure semantics. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-46-src-D8">D8 — Plan 9 Programmer's Manual, section 5 (9P: version and msize, tags) (tier 1; edition to be recorded). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-46-src-D9">D9 — Martin Kleppmann, "Designing Data-Intensive Applications" (tier 3; edition to be recorded): unreliable networks, timeouts, idempotence and duplicate suppression. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-46-src-D10">D10 — John H. Howard and co-authors, "Scale and Performance in a Distributed File System" (AFS) (tier 2; venue and year to be recorded); Russel Sandberg and co-authors, "Design and Implementation of the Sun Network Filesystem" (tier 2). Not in the guide's F5 registry; proposed in this course's notes. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-46-src-C1">C1 — Systems Curriculum (this project), milestone C9 (local file <code>SYSTEMS_CURRICULUM.html</code>). A map, not a source (AH-4).</li>
+<li id="F5-46-src-C2">C2 — University Authoring Guide (this project), section 5 course card DS403: lab text quoted. A map, not a source.</li>
+<li id="F5-46-src-R1">R1 — build of <code>f546.elf</code> and <code>labswitch</code>: <code>build.log</code>; g++ 13.3.0, GNU ld; exit code 0.</li>
+<li id="F5-46-src-R2">R2 — netbooted DFS run: <code>dfs_n1.log</code> … <code>dfs_n3.log</code>, <code>dfs_switch.log</code>; QEMU 8.2.2 TCG with the distribution's iPXE ROM; exit codes 33 (planned halts). Untested on hardware.</li>
+<li id="F5-46-src-R3">R3 — boot capture of node 2: <code>netboot.log</code>; QEMU <code>filter-dump</code>, TShark 4.2.2.</li>
+<li id="F5-46-src-R4">R4 — acceptance checks: <code>accept.log</code>.</li>
+<li id="F5-46-src-R5">R5 — forensic run with <code>cache=naive</code> on node 2: <code>stale_n1.log</code> … <code>stale_n3.log</code>, <code>stale_switch.log</code>.</li>
+</ol>
+
+<h2 id="F5-46-glossary">Glossary links</h2>
+<p><a href="#gl-network-boot-pxe">Network boot (PXE)</a> · <a href="#gl-tftp">TFTP</a> · <a href="#gl-ipxe">iPXE</a> · <a href="#gl-boot-file">Boot file</a> · <a href="#gl-remote-file-system">Remote file system</a> · <a href="#gl-client-cache-file-system">Client cache (file system)</a> · <a href="#gl-revalidation">Revalidation</a> · <a href="#gl-close-to-open-consistency">Close-to-open consistency</a> · <a href="#gl-stateful-server">Stateful server</a> · <a href="#gl-dhcp">DHCP</a> · <a href="#gl-stale-read">Stale read</a></p>
+
+<h2 id="F5-46-next">Next chapter</h2>
+<p><a href="#F5-47">F5-47 A cluster service layer: membership, consensus, scheduling</a>. Back to the course: <a href="#DS403">DS403</a>.</p>
+
+<h2 id="F5-46-answers">Answers to Check yourself</h2>
+<ol>
+<li>SeaBIOS runs the virtio-net card's iPXE ROM; iPXE does DHCP (Discover, Offer, Request, ACK) with QEMU's user-mode network and learns its address and the boot file <code>n2.ipxe</code>; iPXE fetches the script by TFTP; the script's <code>kernel</code> line makes iPXE fetch <code>f546.elf</code> by TFTP and record the command line; <code>boot</code> starts it as a Multiboot kernel; the kernel then initialises the e1000 and joins the cluster.</li>
+<li>The naive client found <code>notes</code> in its cache and returned it without sending any message, so whether the server was alive never mattered. An error would have told the user the data might be old; silent old data leads to decisions based on the wrong file, and nobody looks for a problem.</li>
+<li>⌈19,760 / 1,428⌉ = 14 packets; ⌈19,760 / 512⌉ = 39 packets (38 full blocks and one of 304 bytes).</li>
+<li>Attach: harmless (the server reuses the fid). Walk: harmless (same fid, same file). Read and stat: harmless. Write at an offset: visible but harmless here (same bytes, version + 2). Create: wrong (the retry reports "file exists" for a create that succeeded). Clunk: wrong report (the retry gets "unknown fid" for a clunk that succeeded).</li>
+<li>"unknown fid" (error −9), because the new server has no fid table entries. The client must notice that error, attach again, walk again to rebuild its fids, and treat its cache versions with suspicion (a restarted server that kept files and versions on disk would let it keep them; DFS's RAM server would also have lost the files).</li>
+<li>So that the waiting node keeps sending heartbeats and keeps receiving others'; otherwise after 50 ticks the other nodes would remove it from their views and, at the end of the wait, add it again: a false suspicion caused by the client's own blocking.</li>
+<li>At tick 600 the file would still be version 1, so the stat would match and the cached 18 bytes would be correct; the final table would still show version 2 and 40 bytes, and node 2's tick-1000 read would fail because the server has gone. (Check by editing <code>f546_main.cc</code> line 77.)</li>
+<li>Callbacks or leases (the server promises to notify the client before the file changes; assumes the server can reach the client, or that clocks run at similar rates for lease expiry), and time-based trust (use the cache for <i>n</i> seconds; assumes stale data for up to <i>n</i> seconds is acceptable). Close-to-open revalidation on open only is a third answer.</li>
+<li>So that SeaBIOS does not try to boot from the e1000 (or spend time in its ROM) and boots from the virtio card that has <code>bootindex=1</code>; the kernel then has the e1000 to itself.</li>
+</ol>
+<h3 id="F5-46-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>At tick 600 node 2 read 18 bytes ("hello from node 2") although the server had held version 2 (40 bytes) since node 3's append at the server's tick 435. At tick 1000 it read the same 18 bytes although the server had halted at its tick 900 (node 2's view dropped node 1 at tick 969).</li>
+<li>No: the server's final table shows <code>notes</code> version 2, length 40, with both lines; node 3's stat also returned version 2.</li>
+<li>Node 2's lines "read 'notes' from the cache (version 1, not checked)" at ticks 600 and 1000. The healthy switch log has DFS lines at about 15.6 s, 20.2 s and 22.3 s, node 2's requests at its ticks 600 and 1000 (stat and read, then the retries to the dead server); the forensic switch log has no DFS line after node 3's requests at 14.9 s: node 2 sent nothing.</li>
+<li>(a) Node 3's write was lost or overwritten at the server; (b) node 2 never asked the server. The server's table (version 2, 40 bytes) rules out (a); the absent DFS messages and the "not checked" lines confirm (b).</li>
+<li>Node 2 was started with <code>cache=naive</code> (its iPXE script's command line, see <code>stale_n2.log</code>), which sets <code>naive</code> in <code>dfs_client.cc</code>; <code>dfs_read</code> then takes the branch at lines 102–107 and returns the cached copy without validation.</li>
+<li>Because the user, and every program, believed the service healthy while it served data from a server that no longer existed: no error, no alert, no reason to look. Fix: remove the naive mode, or bound it with a lease or a maximum age, and always fail with an error when validation is impossible. Test: the lab's acceptance checks already include "with the server gone, a read fails with an error (no hang)" and "node 2 reads node 3's line after the change"; run them in every configuration that can ship.</li>
+</ol>
+<p><b>Alternative wrong answers.</b> "Node 3's append failed": the server logged version 2, length 40, and node 3's stat confirmed it. "The switch dropped node 2's requests": its table shows 0 dropped, and node 2 logged no request or retry. "The server was still up at tick 1000": node 1 logged its halt at tick 900 and node 2's view dropped it at 969. <b>How the evidence was produced:</b> the same netbooted cluster with node 2's iPXE script carrying <code>cache=naive</code> (<code>run.sh</code> step 5).</p>
