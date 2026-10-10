@@ -1,0 +1,311 @@
+<!--meta
+id: F8-13
+title: Tensor parallelism
+course: DG403
+level: L4
+prereqs: F8-12 Data parallelism; F8-01 Passing bowls around a table: collectives; MA201 (matrix multiplication); CU302 (GEMM tiling, recommended)
+time: 10–14 hours including the lab
+hardware: none for the listings: MPI processes on one Linux computer stand in for GPUs (this build: g++ 13.3.0, Open MPI 4.1.6, no GPU). The real-hardware extension needs two or more GPUs in one machine with a fast GPU-to-GPU link, or a cloud multi-GPU instance
+maps: Curriculum milestone F7 (optional) "Tensor and pipeline parallelism toy", part 1 (tensor parallelism; goal and acceptance test reused); Track F 14.1 row "Parallelism strategies"; course card DG403 (guide 5.13)
+analogy: F8 — the great kitchen hall (registered: a chain of kitchen halls with a delivery service). Proposed in NOTES.md: "tensor parallelism = every hall prepares a slice of every plate, and the slices are combined before the plate leaves"
+-->
+
+<h2 id="F8-13-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>The festival orders a soup so large that no single kitchen hall can hold its pot. Every bowl must contain the same thirty-two vegetables, chopped and seasoned in a fixed way. Kofi has an idea: the four halls each take eight of the vegetables. Every hall receives the same stock, prepares its eight vegetables for every bowl, and seasons them on its own. At the end, the four partial bowls are poured together into one, and every hall gets the finished soup back for the next course.</p>
+<p>Lina points out the catch. The seasoning (a pinch of salt for each vegetable) works on each vegetable alone, so each hall can season its own. But if a hall split the stock instead of the vegetables, it would have to taste the whole soup before seasoning, and the halls would have to pour together twice. Which way you cut the work decides how often the carts must run.</p>
+</div>
+
+<h2 id="F8-13-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> tensor (intra-layer) parallelism for a two-matrix MLP block: column-parallel then row-parallel, and why this order needs one all-reduce in the forward pass and one in the backward pass.</li>
+<li><b>Implement</b> the block with MPI and prove with runs that its outputs and gradients match the single-process block within a tolerance, on 1, 2 and 4 ranks (milestone F7, part 1).</li>
+<li><b>Show</b> why splitting the first matrix the other way is wrong without an extra all-reduce before the nonlinearity.</li>
+<li><b>Count</b> the communication and memory of tensor parallelism and compare it with data parallelism for the same block.</li>
+<li><b>Diagnose</b> a wrong result caused by a dimension that does not divide by the number of ranks.</li>
+</ul>
+
+<div class="co jargon" id="F8-13-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Tensor parallelism</dt><dd><b>Simple words:</b> splitting the numbers of one layer over several GPUs, so that each GPU computes part of every result. <b>Analogy:</b> every hall prepares its share of the vegetables for every bowl. <b>Precise:</b> intra-layer model parallelism: the weight matrices of a layer are partitioned across a group of N devices, each device computes the part of the layer's output that its partition determines, and collectives (all-reduce, or reduce-scatter and all-gather) combine the parts where the mathematics requires a sum or the whole tensor. <sup class="src"><a href="#F8-13-src-D1">D1</a></sup></dd>
+<dt>Column-parallel linear layer</dt><dd><b>Simple words:</b> each GPU holds some columns of the weight matrix and computes the matching columns of the output. <b>Analogy:</b> each hall prepares its own eight vegetables. <b>Precise:</b> for Y = X A with A = [A<sub>0</sub> … A<sub>N−1</sub>] split by columns, device r computes Y<sub>r</sub> = X A<sub>r</sub>; the input X must be present on every device; the output is split by columns, and an element-wise function can be applied to each Y<sub>r</sub> without communication. <sup class="src"><a href="#F8-13-src-D1">D1</a></sup></dd>
+<dt>Row-parallel linear layer</dt><dd><b>Simple words:</b> each GPU holds some rows of the weight matrix, multiplies its part of the input, and the GPUs add their results. <b>Analogy:</b> the four partial bowls poured together. <b>Precise:</b> for Z = Y B with B split by rows to match Y split by columns, device r computes the partial product Y<sub>r</sub> B<sub>r</sub>, and Z = Σ<sub>r</sub> Y<sub>r</sub> B<sub>r</sub> is formed by an all-reduce (or a reduce-scatter if the next operation can work on a split result). <sup class="src"><a href="#F8-13-src-D1">D1</a></sup></dd>
+<dt>Tensor-parallel group</dt><dd><b>Simple words:</b> the set of GPUs that share the pieces of the same layers. <b>Analogy:</b> the halls that pour into the same bowl. <b>Precise:</b> the communicator over which a tensor-parallel layer's collectives run; in a job that also uses data and pipeline parallelism, every GPU belongs to one tensor-parallel group, one pipeline group and one data-parallel group, each a separate communicator. <sup class="src"><a href="#F8-13-src-D1">D1</a></sup> <sup class="src"><a href="#F8-13-src-D2">D2</a></sup></dd>
+</dl></div>
+
+<h2 id="F8-13-pictures">The idea in pictures</h2>
+<p>Figure 1 is the MLP block Z = tanh(X A) B on two ranks, as Listing 1 computes it.</p>
+<figure id="F8-13-fig1"><div class="svgbox">
+<svg viewBox="0 0 780 320" role="img" aria-labelledby="F8-13-f1t F8-13-f1d">
+<title id="F8-13-f1t">Figure 1: a column-parallel then row-parallel MLP block on two ranks</title>
+<desc id="F8-13-f1d">On the left, the input X (4 by 8) is copied to rank 0 and rank 1. Rank 0 holds the left half of A (columns 0 to 15) and the top half of B (rows 0 to 15); rank 1 holds the right half of A and the bottom half of B. Each rank computes H r equals tanh of X times A r, a 4 by 16 block, with no communication, then the partial output Z r equals H r times B r, a 4 by 8 matrix. An all-reduce adds Z 0 and Z 1, and both ranks receive Z. A note says: forward needs one all-reduce, at the end; backward needs one all-reduce, for the gradient of X.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="320"/>
+<rect class="sv-b3" x="20" y="130" width="80" height="50" rx="4"/><text class="sv-tb" x="34" y="152">X</text><text class="sv-ts" x="34" y="170">4 × 8</text>
+<line class="sv-line" x1="100" y1="150" x2="150" y2="80"/><polygon class="sv-head" points="142,82 152,77 149,88"/>
+<line class="sv-line" x1="100" y1="160" x2="150" y2="230"/><polygon class="sv-head" points="143,222 152,232 148,221"/>
+<text class="sv-ts" x="96" y="200">copy</text>
+<rect class="sv-b1" x="155" y="40" width="430" height="90" rx="6"/>
+<text class="sv-tb" x="165" y="60">rank 0</text>
+<text class="sv-ts" x="165" y="82">A columns 0–15 (8 × 16)</text>
+<text class="sv-ts" x="165" y="102">H₀ = tanh(X A₀): 4 × 16, no communication</text>
+<text class="sv-ts" x="165" y="122">B rows 0–15 (16 × 8) → partial Z₀ = H₀ B₀: 4 × 8</text>
+<rect class="sv-b2" x="155" y="190" width="430" height="90" rx="6"/>
+<text class="sv-tb" x="165" y="210">rank 1</text>
+<text class="sv-ts" x="165" y="232">A columns 16–31 (8 × 16)</text>
+<text class="sv-ts" x="165" y="252">H₁ = tanh(X A₁): 4 × 16, no communication</text>
+<text class="sv-ts" x="165" y="272">B rows 16–31 (16 × 8) → partial Z₁ = H₁ B₁: 4 × 8</text>
+<line class="sv-line" x1="585" y1="85" x2="625" y2="150"/><polygon class="sv-head" points="616,146 627,154 625,141"/>
+<line class="sv-line" x1="585" y1="235" x2="625" y2="170"/><polygon class="sv-head" points="617,175 627,166 625,179"/>
+<rect class="sv-b5" x="630" y="130" width="130" height="50" rx="6"/><text class="sv-tb" x="642" y="152">all-reduce</text><text class="sv-ts" x="642" y="170">Z = Z₀ + Z₁</text>
+<text class="sv-ts" x="20" y="306">forward: one all-reduce, at the end · backward: one all-reduce, for the gradient of X</text>
+</svg>
+</div><figcaption><b>Figure 1.</b> The Megatron-LM arrangement for an MLP block, with the sizes of Listing 1 (h = 8, f = 32, N = 2). Arrows are data flow. <sup class="src"><a href="#F8-13-src-D1">D1</a></sup> <sup class="src"><a href="#F8-13-src-R1">R1</a></sup></figcaption></figure>
+<p>Figure 2 shows why the cut must be by columns first. Cutting A by rows makes each rank hold part of every pre-activation sum, and tanh of a part is not a part of tanh.</p>
+<figure id="F8-13-fig2"><div class="svgbox">
+<svg viewBox="0 0 780 250" role="img" aria-labelledby="F8-13-f2t F8-13-f2d">
+<title id="F8-13-f2t">Figure 2: the right cut and the wrong cut of the first matrix</title>
+<desc id="F8-13-f2d">Left panel, right cut: matrix A drawn as a rectangle divided by a vertical line into column blocks A0 and A1; each rank computes complete pre-activations for its own columns, so tanh can be applied locally. Right panel, wrong cut: matrix A divided by a horizontal line into row blocks; each rank computes X0 A0 and X1 A1, which are partial sums of every pre-activation; the correct result needs tanh of X0 A0 plus X1 A1, which requires an all-reduce of a 4 by 32 tensor before tanh. Applying tanh to each part and adding afterwards gives a wrong answer; Listing 1 measured a largest error of 0.607 on 2 ranks and 0.836 on 4 ranks.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="250"/>
+<text class="sv-tb" x="30" y="30">right cut: A by columns</text>
+<rect class="sv-b1" x="40" y="50" width="120" height="80" rx="3"/><rect class="sv-b2" x="160" y="50" width="120" height="80" rx="3"/>
+<line class="sv-line2" x1="160" y1="44" x2="160" y2="136"/>
+<text class="sv-ts" x="80" y="94">A₀</text><text class="sv-ts" x="210" y="94">A₁</text>
+<text class="sv-ts" x="30" y="160">each rank: whole sums for its columns</text>
+<text class="sv-ts" x="30" y="180">tanh applied locally: no communication</text>
+<text class="sv-tb" x="420" y="30">wrong cut: A by rows</text>
+<rect class="sv-b1" x="430" y="50" width="240" height="40" rx="3"/><rect class="sv-b2" x="430" y="90" width="240" height="40" rx="3"/>
+<line class="sv-line2" x1="424" y1="90" x2="676" y2="90"/>
+<text class="sv-ts" x="540" y="74">A₀</text><text class="sv-ts" x="540" y="114">A₁</text>
+<text class="sv-ts" x="420" y="160">each rank: part of every sum (X₀A₀ or X₁A₁)</text>
+<text class="sv-ts" x="420" y="180">needs tanh(X₀A₀ + X₁A₁): an all-reduce of 4 × 32</text>
+<text class="sv-ts" x="420" y="200">before tanh; tanh(X₀A₀) + tanh(X₁A₁) is wrong</text>
+<text class="sv-ts" x="420" y="225">measured error: 0.607 (N = 2), 0.836 (N = 4)</text>
+</svg>
+</div><figcaption><b>Figure 2.</b> The order of the cuts decides the communication. The measured errors are from the "wrong split" line of R1. <sup class="src"><a href="#F8-13-src-D1">D1</a></sup> <sup class="src"><a href="#F8-13-src-R1">R1</a></sup></figcaption></figure>
+
+<h2 id="F8-13-layer1">Layer 1 — the kid explanation</h2>
+<p>Some models are so big that one layer does not fit on one GPU, or takes too long on one GPU. Then you can cut the layer itself into pieces. Each GPU keeps a piece of the layer's numbers and does its part of every multiplication. At certain points the GPUs must add their parts together, and that costs a trip over the links between them. A clever cut needs only one such trip for each direction through the layer. A careless cut needs more trips, or gives the wrong answer.</p>
+
+<h2 id="F8-13-layer2">Layer 2 — the student explanation</h2>
+<h3>Two matrices, two cuts</h3>
+<p>The halls slice the vegetables, not the stock. The block in this chapter is the MLP of a transformer layer, simplified: Z = φ(X A) B, with X of size b × h (b tokens, model width h), A of size h × f, B of size f × h, and φ an element-wise nonlinearity (GeLU in the Megatron-LM paper; tanh in Listing 1, which changes nothing about the argument because both act on each element alone). <sup class="src"><a href="#F8-13-src-D1">D1</a></sup></p>
+<p>Matrix multiplication can be cut in two natural ways. Cut A by columns, A = [A<sub>0</sub> A<sub>1</sub> … A<sub>N−1</sub>]: then X A = [X A<sub>0</sub> … X A<sub>N−1</sub>], so rank r can compute its block of columns of the result from the full X and its own A<sub>r</sub>, and apply φ to it, because φ works element by element: φ(X A) = [φ(X A<sub>0</sub>) … φ(X A<sub>N−1</sub>)]. No communication so far. Now cut B by rows to match: B = [B<sub>0</sub>; B<sub>1</sub>; …], each B<sub>r</sub> of size (f/N) × h. Then H B = Σ<sub>r</sub> H<sub>r</sub> B<sub>r</sub>: each rank computes its partial product, and one all-reduce adds them. That is the column-parallel then row-parallel arrangement of the Megatron-LM paper, and it is why the paper's MLP needs one all-reduce in the forward pass. <sup class="src"><a href="#F8-13-src-D1">D1</a></sup> <sup class="src"><a href="#F8-13-src-R1">R1</a></sup></p>
+<p>The other order fails. Cut A by rows (and X by columns to match): rank r computes X<sub>r</sub> A<sub>r</sub>, which is a part of every pre-activation sum. φ of a part is not a part of φ: tanh(a) + tanh(b) ≠ tanh(a + b). Applying φ locally and adding afterwards is wrong; R1 measured the error at 0.607 on 2 ranks and 0.836 on 4 ranks, for values whose size is about 1. The correct alternative all-reduces the b × f pre-activation before φ (four times more data than the b × h output with f = 4h) and then still needs a second collective after B. <sup class="src"><a href="#F8-13-src-R1">R1</a></sup></p>
+<h3>The backward pass</h3>
+<p>Backpropagation through the block, with the loss gradient dZ the same on every rank (every rank holds the whole Z after the all-reduce):</p>
+<ul>
+<li>dH<sub>r</sub> = dZ B<sub>r</sub><sup>T</sup> and dU<sub>r</sub> = dH<sub>r</sub> ⊙ φ′(U<sub>r</sub>): local, because rank r owns B<sub>r</sub> and U<sub>r</sub>.</li>
+<li>dB<sub>r</sub> = H<sub>r</sub><sup>T</sup> dZ and dA<sub>r</sub> = X<sup>T</sup> dU<sub>r</sub>: local, and exactly the slices of the full weight gradients that rank r owns. No communication for the weight gradients inside the group.</li>
+<li>dX = dU A<sup>T</sup> = Σ<sub>r</sub> dU<sub>r</sub> A<sub>r</sub><sup>T</sup>: a sum over ranks, so one all-reduce. It is the mirror image of the forward pass: the "copy X to every rank" at the entrance becomes an all-reduce in backward, and the all-reduce at the exit becomes a copy (identity) in backward.</li>
+</ul>
+<p>The Megatron-LM paper names these two operators f (identity forward, all-reduce backward) and g (all-reduce forward, identity backward), and applies the same idea to self-attention by giving each rank a subset of the attention heads, so that a transformer layer needs two all-reduces forward and two backward. Listing 1 implements the MLP only. <sup class="src"><a href="#F8-13-src-D1">D1</a></sup></p>
+<h3>The acceptance test</h3>
+<p>Milestone F7 asks you to "split one layer's matrix multiply across GPUs (tensor parallelism)" and accepts when "outputs match the single-GPU model within tolerance". <sup class="src"><a href="#F8-13-src-M1">M1</a></sup> R1 shows, on 1, 2 and 4 ranks: the output Z, the input gradient dX and the weight-gradient slices dA<sub>r</sub> all match the single-process block with a largest difference of at most 2.86 × 10<sup>−6</sup>, within the stated tolerance of 10<sup>−5</sup>; on 1 rank the difference is 0. As in F8-12, the nonzero differences come from the different order of floating-point additions. <sup class="src"><a href="#F8-13-src-R1">R1</a></sup> <sup class="src"><a href="#F8-13-src-D7">D7</a></sup></p>
+
+<h2 id="F8-13-layer3">Layer 3 — the engineer's depth</h2>
+<h3>All-reduce, or reduce-scatter plus all-gather</h3>
+<p>An all-reduce can be performed as a reduce-scatter followed by an all-gather; the ring algorithm of F8-02 does exactly that. Milestone F7 asks for a version "using all-gather and reduce-scatter". Listing 1 computes the output both ways: <code>MPI_Allreduce</code>, and <code>MPI_Reduce_scatter_block</code> (each rank receives the summed rows for its share of the b tokens) followed by <code>MPI_Allgather</code>. R1 shows identical errors for the two on every run. <sup class="src"><a href="#F8-13-src-D2">D2</a></sup> <sup class="src"><a href="#F8-13-src-L1">L1</a></sup> <sup class="src"><a href="#F8-13-src-R1">R1</a></sup></p>
+<p>Why split it? Between the end of one MLP block and the start of the next, a transformer applies operations that work on each token separately (a residual addition, layer normalisation, dropout). If those run on the reduce-scattered result (each rank holding b/N tokens), each rank does 1/N of that work and stores 1/N of those activations; the all-gather then rebuilds the full X for the next column-parallel layer. The bytes moved are the same as one all-reduce. Work by the Megatron-LM authors calls this sequence parallelism.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not opened in this build: the name "sequence parallelism" and its use of reduce-scatter and all-gather around the token-wise operations of a transformer layer come from V. A. Korthikanti et al., "Reducing Activation Recomputation in Large Transformer Models". Check that paper's sections on sequence parallelism and activation memory before citing it; it is not in the guide's source registry.</p></div>
+<h3>What it costs: communication on the critical path</h3>
+<p>Compare tensor parallelism with data parallelism for the same block (Listing 2 counts it; R2). With width h, a micro-batch of T tokens, v bytes per value and N GPUs:</p>
+<ul>
+<li><b>Memory of weights per GPU:</b> data parallelism keeps all 8h<sup>2</sup> MLP weights on every GPU; tensor parallelism keeps 8h<sup>2</sup>/N. That is the point of it.</li>
+<li><b>Computation per GPU:</b> 1/N of the block's multiplications, for every token.</li>
+<li><b>Communication:</b> one all-reduce of T × h values in forward and one in backward, <i>per micro-batch</i>, in every block. Data parallelism instead all-reduces the block's gradient (8h<sup>2</sup> values) once per step.</li>
+</ul>
+<p>The decisive difference is not the byte count but the dependency. A data-parallel gradient all-reduce can overlap with the backward pass of earlier layers (F8-12). A tensor-parallel all-reduce cannot overlap with its own block: the next layer needs Z before it can start, and the backward pass needs dX before the previous layer's backward can start. Tensor-parallel communication sits on the critical path of every layer, so it needs the fastest links available. The Megatron-LM paper used tensor parallelism inside a server whose GPUs are joined by fast direct links, and data parallelism across servers. <sup class="src"><a href="#F8-13-src-D1">D1</a></sup> <sup class="src"><a href="#F8-13-src-R2">R2</a></sup> The general rule that follows from the model, not from any vendor claim: put the tensor-parallel group on the fastest, lowest-latency links you have (F8-04's topology matrix tells you which), and keep N small enough that each GPU's share of a GEMM is still large enough to run efficiently.</p>
+<h3>Divisibility and shapes</h3>
+<p>The cut requires f (and, for attention, the number of heads) to divide by N. If it does not, a real implementation must either refuse or handle uneven pieces explicitly; silently rounding down drops columns. Listing 1 refuses unless told not to (R4); the forensic lab shows what the unchecked version computes. <sup class="src"><a href="#F8-13-src-R4">R4</a></sup> <sup class="src"><a href="#F8-13-src-R3">R3</a></sup></p>
+<h3>Groups inside a larger job</h3>
+<p>In a job that combines strategies, the world of P GPUs is factored, for example P = N<sub>TP</sub> × N<sub>PP</sub> × N<sub>DP</sub>, and each GPU joins three communicators. The tensor-parallel all-reduce runs only inside its group; the data-parallel gradient all-reduce runs across groups, over replicas of the same shard of weights. With MPI, such groups are built with <code>MPI_Comm_split</code>; NCCL and RCCL create one communicator per group. Assigning ranks so that each tensor-parallel group sits inside one server is the job of the launcher and the rank-to-GPU mapping (F8-17). <sup class="src"><a href="#F8-13-src-D1">D1</a></sup> <sup class="src"><a href="#F8-13-src-D2">D2</a></sup> <sup class="src"><a href="#F8-13-src-D3">D3</a></sup></p>
+
+<h2 id="F8-13-hardware">How the hardware actually does it</h2>
+<p>In the halls, the pour-together happens many times per meal, so the halls must be next door to each other. On a GPU, each rank's share of the block is an ordinary GEMM on its slice of the weights, computed with the tiling of CU302 and, on GPUs that have them, matrix units (Tensor Cores on NVIDIA, Matrix Cores on AMD). Smaller slices mean smaller GEMMs; below some size a GEMM can no longer keep the whole GPU busy, which is one practical limit on N. <sup class="src"><a href="#F8-13-src-D6">D6</a></sup> The all-reduce of activations is executed by the collective library over the GPU-to-GPU links; inside one machine those are the links F8-04 measured, and their latency matters as much as their bandwidth because the messages are moderate in size and on the critical path. <sup class="src"><a href="#F8-13-src-D3">D3</a></sup> <sup class="src"><a href="#F8-13-src-D4">D4</a></sup></p>
+<p>Nothing in this build ran on a GPU; no GEMM efficiency or link latency is quoted. Measure both on your hardware before choosing N.</p>
+
+<h2 id="F8-13-worked">Worked example</h2>
+<p>A block with h = 1,024, a micro-batch of T = 2,048 tokens per GPU, values of 2 bytes (16-bit), N = 4 GPUs (the "example-1" line of R2; invented sizes).</p>
+<ol>
+<li>Weights: A and B together hold 2 × h × 4h = 2 × 1,024 × 4,096 = 8,388,608 values; × 2 bytes = 16,777,216 bytes = 16 MiB. With tensor parallelism each GPU holds 16 / 4 = 4 MiB.</li>
+<li>One activation tensor: T × h × 2 bytes = 2,048 × 1,024 × 2 = 4,194,304 bytes = 4 MiB.</li>
+<li>Bytes each GPU sends in one ring all-reduce of S bytes: 2 (N − 1)/N × S = 1.5 × 4 MiB = 6 MiB. Forward and backward: 12 MiB per micro-batch, on the critical path.</li>
+<li>Data parallelism instead: one all-reduce of the 16 MiB gradient per step; each GPU sends 1.5 × 16 = 24 MiB, which can overlap with the backward pass.</li>
+<li>With N = 8 (second line of R2): weights 2 MiB per GPU; tensor-parallel traffic 2 × 1.75 × 4 = 14 MiB per micro-batch; the traffic barely changes with N, while each GPU's computation halves. Communication becomes a larger share as N grows.</li>
+</ol>
+<p>R2 prints the same values: 16.00 MiB, 4.00 MiB per GPU, 12.00 MiB per micro-batch, 24.00 MiB per step; and for N = 8, 2.00 MiB and 14.00 MiB. <sup class="src"><a href="#F8-13-src-R2">R2</a></sup> If a step has several micro-batches (F8-14), multiply the tensor-parallel traffic by their number; the data-parallel traffic does not grow.</p>
+
+<h2 id="F8-13-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>tp_mlp.cc</code>: a tensor-parallel MLP block, forward and backward, checked against the single-process block.</p>
+<pre class="listing" data-src="F8-13/tp_mlp.cc"></pre>
+<p><b>Build and run</b> (by <code>run.sh</code>): <code>mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -DOMPI_SKIP_MPICXX tp_mlp.cc -o tp_mlp</code>, then <code>mpirun --allow-run-as-root --oversubscribe -np 4 ./tp_mlp</code> (also 1 and 2). The flags are explained in F8-12.</p>
+<p>On 1 rank:</p>
+<pre class="output" data-run="F8-13/tp_np1"></pre>
+<p>On 2 ranks:</p>
+<pre class="output" data-run="F8-13/tp_np2"></pre>
+<p>On 4 ranks:</p>
+<pre class="output" data-run="F8-13/tp_np4"></pre>
+<p>With <code>ffn=30</code> on 4 ranks, the check refuses (R4):</p>
+<pre class="output" data-run="F8-13/tp_refuse"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">16–19</td><td><code>kB</code>, <code>kH</code>, <code>Mat</code></td><td>4 tokens, width 8; matrices as row-major vectors.</td><td>Tiny sizes make the reference computation instant on every rank.</td></tr>
+<tr><td class="n">29–36</td><td><code>randomMat</code></td><td>Deterministic matrices from a hash and a seed.</td><td>Every rank builds the same X, A, B, T without communication.</td></tr>
+<tr><td class="n">39–54</td><td><code>matmul</code></td><td>C = A B with optional transposes.</td><td>The backward pass needs A<sup>T</sup> and B<sup>T</sup> products.</td></tr>
+<tr><td class="n">56–68</td><td><code>columns</code>, <code>rowsOf</code></td><td>Cut a column block or a row block out of a matrix.</td><td>The two cuts of Layer 2.</td></tr>
+<tr><td class="n">93–97</td><td>divisibility check</td><td>Refuses unless f and b divide by N; <code>check=off</code> skips it.</td><td>The forensic lab's bug is what happens without it.</td></tr>
+<tr><td class="n">98–99</td><td><code>fr</code>, <code>c0</code></td><td>This rank owns hidden columns c0 to c0 + fr − 1.</td><td>The partition of A's columns and B's rows.</td></tr>
+<tr><td class="n">104–113</td><td>reference</td><td>The whole block, forward and backward, on one process.</td><td>The milestone's "single-GPU model".</td></tr>
+<tr><td class="n">116–119</td><td>local forward</td><td>H<sub>r</sub> = tanh(X A<sub>r</sub>), partial Z<sub>r</sub> = H<sub>r</sub> B<sub>r</sub>.</td><td>No communication until here.</td></tr>
+<tr><td class="n">121</td><td><code>MPI_Allreduce</code> on Z</td><td>Adds the partial outputs.</td><td>Operator g: the one forward all-reduce.</td></tr>
+<tr><td class="n">125–129</td><td>local backward</td><td>dZ, dH<sub>r</sub>, dU<sub>r</sub>, dA<sub>r</sub>.</td><td>Weight-gradient slices need no communication.</td></tr>
+<tr><td class="n">130–131</td><td>dX and its all-reduce</td><td>Partial dX<sub>r</sub> = dU<sub>r</sub> A<sub>r</sub><sup>T</sup>, then summed.</td><td>Operator f in backward: the one backward all-reduce.</td></tr>
+<tr><td class="n">135–140</td><td>reduce-scatter + all-gather</td><td>The same Z built in two steps.</td><td>The milestone's "using all-gather and reduce-scatter".</td></tr>
+<tr><td class="n">142–146</td><td>wrong split</td><td>A by rows, tanh on partial sums, then a sum.</td><td>Demonstrates Figure 2 numerically.</td></tr>
+<tr><td class="n">148–162</td><td>report</td><td>Largest differences, floats all-reduced, MATCH or DIFFERENT.</td><td>The acceptance test with a stated tolerance.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>tp_cost.cpp</code>: counting weights, work and traffic for one block.</p>
+<pre class="listing" data-src="F8-13/tp_cost.cpp"></pre>
+<p>Input <code>tp_cost.in</code> (invented sizes):</p>
+<pre class="listing" data-src="F8-13/tp_cost.in"></pre>
+<p><b>Build command</b> (by <code>run_lab.sh</code>): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined tp_cost.cpp -o tp_cost</code>; run with <code>./tp_cost &lt; tp_cost.in</code>.</p>
+<pre class="output" data-run="F8-13/tp_cost"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">15</td><td><code>weights</code></td><td>2 × h × 4h values.</td><td>The MLP's two matrices; biases are negligible.</td></tr>
+<tr><td class="n">16</td><td><code>flops</code></td><td>2 operations (a multiply and an add) per weight per token.</td><td>Divided by N per GPU.</td></tr>
+<tr><td class="n">17</td><td><code>act</code></td><td>T × h × bytes.</td><td>The tensor that is all-reduced in tensor parallelism.</td></tr>
+<tr><td class="n">18</td><td><code>ring</code></td><td>2 (N − 1)/N.</td><td>Bytes sent per byte all-reduced with a ring (F8-02).</td></tr>
+<tr><td class="n">19–29</td><td>output</td><td>Memory per GPU, work per GPU, tensor-parallel and data-parallel traffic.</td><td>Puts the two strategies side by side for the same block.</td></tr>
+</tbody></table></div>
+
+<h2 id="F8-13-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Pouring partial bowls is adding numbers.</b> The "partial bowls" are partial sums of matrix products; nothing in a soup is a sum that must be complete before seasoning, which is the whole reason the column cut must come first. Use the algebra, not the soup, to decide where communication is needed.</li>
+<li><b>The halls receive the same stock for free in the story.</b> In tensor parallelism, giving every rank the full input X is not free: in backward, that copy turns into an all-reduce of dX.</li>
+<li><b>Real halls could prepare an uneven number of vegetables.</b> A tensor-parallel layer with an uneven split needs explicit handling; the simple formulas assume f divides by N.</li>
+<li><b>The halls' pour happens once per meal; the all-reduce happens in every layer for every micro-batch.</b> The frequency, not the volume, is what puts tensor parallelism on the fastest links.</li>
+</ul>
+
+<h2 id="F8-13-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Wrong output only for some N.</b> Symptom: matches for N = 2, not for N = 4 (forensic lab). Cause: a dimension that does not divide by N, rounded down. Find it: print each rank's slice bounds and check that they cover 0 … f − 1 exactly once. Fix: refuse, or pad and handle uneven slices.</li>
+<li><b>Applying the nonlinearity to partial sums.</b> Symptom: large errors (R1's "wrong split" line). Cause: the first matrix cut by rows. Fix: column-parallel first, row-parallel second.</li>
+<li><b>Gradients of X are 1/N of the truth.</b> Symptom: earlier layers learn too slowly with tensor parallelism. Cause: the backward all-reduce of dX was forgotten (the f operator treated as identity in both directions). Find it: compare dX with the reference, as Listing 1 does.</li>
+<li><b>Weight gradients all-reduced inside the group.</b> Symptom: tensor-parallel weights drift or are N times too large. Cause: treating the tensor-parallel group as a data-parallel group. Fix: weight gradients are all-reduced only across replicas of the same shard (the data-parallel group).</li>
+<li><b>Hangs when combining strategies.</b> Cause: a collective called on the wrong communicator (world instead of the tensor-parallel group) by some ranks. Find it: log the communicator name with every collective. F8-16 shows how to detect the hang.</li>
+<li><b>Different dropout masks across a tensor-parallel group</b> where the computation requires the same values on every rank (for example on the replicated input), or the same mask where independent ones are required. Cause: random-number seeds not organised per group. Fix: seed per data-parallel replica and per tensor-parallel rank deliberately, and document which regions use which seed.</li>
+</ul>
+
+<div class="co transition" id="F8-13-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F8-12 kept the whole model on every GPU and communicated gradients once per step, overlapped with the backward pass. <b>What carries over:</b> the same collectives (all-reduce, reduce-scatter, all-gather) and their ring cost; every rank must call them in the same order; results are equal to the single-GPU model within a tolerance. <sup class="src"><a href="#F8-13-src-D2">D2</a></sup> <b>What changes:</b> communication moves from gradients to activations, from once per step to twice per block per micro-batch, and from overlappable to the critical path; correctness now depends on cutting matrices in the right order. <sup class="src"><a href="#F8-13-src-D1">D1</a></sup> <b>What comes next:</b> F8-14 splits the model the other way, by layers, and meets a different cost: GPUs that wait for each other at the start and end of every step.</p></div>
+
+<h2 id="F8-13-check">Check yourself</h2>
+<ol>
+<li>Show with block matrices why X [A<sub>0</sub> A<sub>1</sub>] needs no communication but [H<sub>0</sub> H<sub>1</sub>] [B<sub>0</sub>; B<sub>1</sub>] needs a sum.</li>
+<li>Explain in your own words why the input X must be present on every rank, and what that becomes in the backward pass.</li>
+<li>Which statement is true for the column-then-row MLP on N ranks: (a) the weight gradients dA<sub>r</sub> must be all-reduced inside the group; (b) the forward pass needs two all-reduces; (c) the weight gradients need no communication inside the group; (d) the backward pass needs no communication?</li>
+<li>Using R2's formulas, how many MiB does each GPU send per micro-batch for h = 2,048, T = 1,024, 2-byte values, N = 2?</li>
+<li>Apply to a new case: a block uses ReLU instead of tanh. Does anything in the communication pattern change? Why?</li>
+<li>Predict, then run: what does Listing 1 print with <code>-np 2 ./tp_mlp ffn=34</code>? And with <code>ffn=34 check=off</code> on 4 ranks?</li>
+<li>Why is tensor parallelism placed inside a server and data parallelism across servers, rather than the other way round?</li>
+<li>A colleague proposes tensor parallelism across 64 GPUs to save memory. Name two costs that grow with N while the work per GPU shrinks.</li>
+</ol>
+
+<h2 id="F8-13-lab">Lab</h2>
+<p><b>Goal.</b> Split one layer's matrix multiply across ranks (tensor parallelism) and show that outputs and gradients match the single-process model within a stated tolerance, using all-reduce and using reduce-scatter plus all-gather (milestone F7, part 1).</p>
+<p><b>Hardware and software.</b> Part A: any Linux computer with g++ and Open MPI (this build: g++ 13.3.0, Open MPI 4.1.6, no GPU). Part B: two or more GPUs in one machine with NCCL or RCCL, or a cloud multi-GPU instance; <span class="tag">untested in this build</span>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F8-13</code>. You should see the outputs above.</li>
+<li>Write your tolerance down first, then read R1's numbers. Which quantity has the largest difference, and why might the backward quantities differ more than the forward ones?</li>
+<li>Add the bias vectors of a real MLP (b<sub>1</sub> of length f, b<sub>2</sub> of length h). Decide which rank adds b<sub>2</sub> (hint: if every rank adds it before the all-reduce, it is added N times). Extend the reference and the check.</li>
+<li>Make the block two layers deep (two MLP blocks in sequence) and verify that the communication per forward pass is two all-reduces, not three.</li>
+<li>Part B: port the block to CUDA or HIP with cuBLAS/hipBLAS (or your own GEMM from CU302) and NCCL/RCCL on 2 and 4 GPUs. Measure the time of the GEMMs and of the all-reduce for T from 256 to 8,192 tokens, and plot the communication share.</li>
+</ol>
+<p><b>Expected observations.</b> Steps 1–2: MATCH on 1, 2 and 4 ranks; identical errors for all-reduce and reduce-scatter plus all-gather (R1). Step 3: adding b<sub>2</sub> on every rank gives an error close to (N − 1) × |b<sub>2</sub>|. Part B: the communication share falls as T grows if the link is fast, and stays high on a slow link.</p>
+<p><b>Verification.</b> Milestone F7 acceptance, first half, verbatim: "Outputs match the single-GPU model within tolerance". <sup class="src"><a href="#F8-13-src-M1">M1</a></sup></p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"refusing: ffn … not divisible" → choose f and b divisible by the number of ranks (R4).</li>
+<li>Large errors after your change → print each rank's c0 and fr; check that every hidden column is owned exactly once.</li>
+<li>Reduce-scatter result in the wrong rows → <code>MPI_Reduce_scatter_block</code> gives rank r the r-th block of the buffer; the buffer must be laid out with the blocks in rank order.</li>
+</ul>
+<p><b>Extension.</b> Implement the attention part with heads split across ranks (one all-reduce after the output projection). Or replace the forward all-reduce by reduce-scatter, apply a token-wise operation (for example a residual add) on b/N tokens, and all-gather before the next block.</p>
+
+<h2 id="F8-13-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "Tensor parallelism 4 is worse than 2." Selin's team moved a model from 2-way to 4-way tensor parallelism to fit a wider MLP (f = 30 in the scaled-down reproduction). Training at 4-way diverges from the 2-way run immediately, and no error is reported. The team had switched off a check "because it rejected our new width". They reproduced the problem with the block alone.</p>
+<p><b>Evidence pack.</b> The block run at 2-way and at 4-way with the team's settings <sup class="src"><a href="#F8-13-src-R3">R3</a></sup>:</p>
+<pre class="output" data-run="F8-13/tp_ffn30_np2"></pre>
+<pre class="output" data-run="F8-13/tp_ffn30_np4"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which quantities differ from the reference at 4-way, and which header line differs between the two runs?</li>
+<li>Hypotheses: list at least three (floating-point order; a communication bug; a partitioning bug; different random data) and the evidence for each.</li>
+<li>Root cause: exactly which hidden columns are computed by nobody at 4-way?</li>
+<li>The "wrong split" line is large in both runs. Is it evidence for this fault?</li>
+<li>Fix: give two correct ways to support f = 30 on 4 ranks.</li>
+<li>Prevention: what test would have caught this before training started?</li>
+</ol>
+<p><b>Method hints.</b> Multiply the columns per rank by the number of ranks and compare with f. Then ask which quantities depend on the missing columns.</p>
+
+<h2 id="F8-13-project">Mini-project</h2>
+<p><b>A tensor-parallel transformer layer, toy size.</b> Extend Listing 1 to a full toy transformer layer: attention with H heads split across N ranks (each rank computes its heads, then a row-parallel output projection and one all-reduce), the MLP block, residual connections and a layer normalisation computed on every rank. Check forward and backward against a single-process implementation. Report the number of all-reduces per layer forward and backward, and the bytes per micro-batch.</p>
+<p><b>Rubric</b> (10 points): forward and backward match the reference within a stated tolerance for N = 1, 2, 4 (4); the all-reduce count is correct and logged (2); uneven head counts are refused with a clear message (1); a short note relating the measured bytes to the formula of Listing 2 (2); clean code with a line-by-line explanation of the attention cut (1).</p>
+
+<h2 id="F8-13-summary">Summary</h2>
+<ul>
+<li>Tensor parallelism splits the weights of each layer across a group of GPUs; each GPU computes part of every output.</li>
+<li>For an MLP block, cut the first matrix by columns and the second by rows: one all-reduce forward (on the output), one backward (on the input gradient); weight gradients need no communication inside the group.</li>
+<li>Cutting the first matrix by rows puts a nonlinearity between partial sums: wrong unless an extra, larger all-reduce is added (R1: errors up to 0.836).</li>
+<li>All-reduce equals reduce-scatter plus all-gather; splitting it lets token-wise operations run on 1/N of the tokens.</li>
+<li>Tensor-parallel traffic is per micro-batch and on the critical path, so it belongs on the fastest links; memory per GPU for weights falls as 1/N.</li>
+<li>Dimensions must divide by N; a silent round-down produced a wrong block at 4-way (R3).</li>
+</ul>
+
+<h2 id="F8-13-sources">Sources</h2>
+<ol>
+<li id="F8-13-src-D1">D1 — Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, Bryan Catanzaro, "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism", 2019 (tier 5; curriculum item 85): model-parallel MLP and self-attention, the f and g operators, placement within servers. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-13-src-D2">D2 — MPI Forum, "MPI: A Message-Passing Interface Standard", chapter "Collective Communication" (all-reduce, reduce-scatter, all-gather) and chapter on groups and communicators (communicator splitting) (tier 1; curriculum item 77). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-13-src-D3">D3 — NVIDIA, NCCL documentation (communicator creation, collective operations) (tier 1; guide 4.6). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-13-src-D4">D4 — AMD, RCCL documentation (tier 1; guide 4.6). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-13-src-D6">D6 — David B. Kirk, Wen-mei W. Hwu, "Programming Massively Parallel Processors" (tier 3; guide 3.1), chapters on matrix multiplication and tiling. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-13-src-D7">D7 — IEEE, "IEEE Standard for Floating-Point Arithmetic" (IEEE 754), operations and rounding (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-13-src-M1">M1 — Systems Curriculum (repository file <code>SYSTEMS_CURRICULUM.html</code>), milestone F7 (goal, build and acceptance test quoted verbatim) and section 14.1 row "Parallelism strategies". A map, not a source for technical claims (AH-4).</li>
+<li id="F8-13-src-L1">L1 — Open MPI 4.1.6 header in the build container (tier 4, opened): <code>/usr/lib/x86_64-linux-gnu/openmpi/include/mpi.h</code> lines 1331 (<code>MPI_Allgather</code>), 1345 (<code>MPI_Allreduce</code>), 1759 (<code>MPI_Reduce_scatter_block</code>), 527 (<code>MPI_IN_PLACE</code>).</li>
+<li id="F8-13-src-R1">R1 — lab runs of Listing 1 on 1, 2 and 4 processes: <code>F8-13/tp_np1.out</code>, <code>tp_np2.out</code>, <code>tp_np4.out</code> with logs (Open MPI 4.1.6, g++ 13.3.0, exit code 0).</li>
+<li id="F8-13-src-R2">R2 — lab run of Listing 2 on <code>tp_cost.in</code>: <code>F8-13/tp_cost.out</code>, <code>tp_cost.log</code> (g++ 13.3.0 with ASan and UBSan, exit code 0); invented sizes.</li>
+<li id="F8-13-src-R3">R3 — lab runs of Listing 1 with <code>ffn=30 check=off</code> on 2 and 4 processes (forensic evidence): <code>F8-13/tp_ffn30_np2.out</code>, <code>tp_ffn30_np4.out</code> with logs (exit code 0).</li>
+<li id="F8-13-src-R4">R4 — lab run of Listing 1 with <code>ffn=30</code> on 4 processes: <code>F8-13/tp_refuse.out</code>, <code>tp_refuse.log</code> (exit code 2, expected: the check refuses).</li>
+</ol>
+
+<h2 id="F8-13-glossary">Glossary links</h2>
+<p><a href="#gl-tensor-parallelism">Tensor parallelism</a> · <a href="#gl-column-parallel-linear-layer">Column-parallel linear layer</a> · <a href="#gl-row-parallel-linear-layer">Row-parallel linear layer</a> · <a href="#gl-tensor-parallel-group">Tensor-parallel group</a> · <a href="#gl-data-parallelism">Data parallelism</a> · <a href="#gl-collective">Collective</a> · <a href="#gl-nccl-rccl">NCCL / RCCL</a></p>
+
+<h2 id="F8-13-next">Next chapter</h2>
+<p>Next: <a href="#F8-14">F8-14 Pipeline parallelism and the bubble</a>. Previous: <a href="#F8-12">F8-12 Data parallelism</a>. Back to the course: <a href="#DG403">DG403</a>. Related: <a href="#F8-02">F8-02</a> (ring and tree algorithms), <a href="#F8-04">F8-04</a> (topology). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackF">Track F</a>.</p>
+
+<h2 id="F8-13-answers">Answers to Check yourself</h2>
+<ol>
+<li>X [A<sub>0</sub> A<sub>1</sub>] = [X A<sub>0</sub> X A<sub>1</sub>]: each block of the result uses only X and one A<sub>r</sub>. [H<sub>0</sub> H<sub>1</sub>] [B<sub>0</sub>; B<sub>1</sub>] = H<sub>0</sub> B<sub>0</sub> + H<sub>1</sub> B<sub>1</sub>: every element of the result is a sum of contributions from both ranks, so they must be added.</li>
+<li>Each rank multiplies the whole X by its columns of A, so it needs all of X. In backward, the gradient with respect to X receives a contribution from every rank's columns (dX = Σ<sub>r</sub> dU<sub>r</sub> A<sub>r</sub><sup>T</sup>), so the copy becomes an all-reduce.</li>
+<li>(c). (a) is wrong: dA<sub>r</sub> is exactly the slice rank r owns. (b) one forward all-reduce. (d) dX needs one.</li>
+<li>Activation: 1,024 × 2,048 × 2 bytes = 4 MiB; ring factor 2 × 1/2 = 1; two all-reduces: 8 MiB per micro-batch.</li>
+<li>No. ReLU, like tanh and GeLU, is element-wise, so it can be applied to each column block separately; only its derivative in backward changes.</li>
+<li>With 2 ranks, 34 divides by 2 (17 columns each) and b = 4 divides by 2: MATCH. On 4 ranks with the check off: 34 / 4 = 8 columns each, 32 used, columns 32 and 33 dropped: DIFFERENT. A check run while writing this chapter gave MATCH and DIFFERENT; run it to confirm.</li>
+<li>Tensor-parallel all-reduces happen in every layer for every micro-batch and cannot overlap with their own layer, so they need the lowest latency and highest bandwidth, found inside a server; data-parallel all-reduces happen once per step and can overlap, so they tolerate the slower network between servers.</li>
+<li>The share of communication per GPU (traffic per micro-batch stays about the same while the GEMM per GPU shrinks), the number of ranks in every critical-path collective (more α terms, 2 (N − 1) per ring), and GEMMs too small to use each GPU efficiently; also a group that no longer fits inside one server's fast links.</li>
+</ol>
+<h3 id="F8-13-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>At 4-way, Z, dX and the dA slices differ from the reference (0.908, 5.64, 1.68), and the verdict is DIFFERENT. The header says "split into 7 columns per rank" at 4-way versus 15 at 2-way.</li>
+<li>Floating-point order: no, errors of order 1 are far too large (order 10<sup>−6</sup> is expected). Communication bug: unlikely, because the same code matches at 2-way with the same f. Different data: no, the matrices are deterministic. Partitioning bug: yes, the column counts do not cover f.</li>
+<li>30 / 4 rounds down to 7; ranks own columns 0–6, 7–13, 14–20, 21–27. Columns 28 and 29 of A (and rows 28 and 29 of B) are computed by nobody.</li>
+<li>No. That line demonstrates a different, deliberate mistake (A cut by rows, h = 8, which divides by 2 and by 4) computed over all 30 columns; it is large in every run (0.601 at 2-way, 0.88 at 4-way) and does not depend on the column partition. The diagnosis rests on Z, dX and dA.</li>
+<li>Pad f to 32 with zero columns in A and zero rows in B (the result is unchanged), or give the first f mod N ranks one extra column and handle uneven slices in every collective that depends on them (the reduce-scatter then needs per-rank counts).</li>
+<li>Keep the divisibility check on, and add a unit test that runs the block with N = 1 and N = 4 (or every N planned) against the reference before a long run; it fails here with DIFFERENT.</li>
+</ol>
+<p>How the evidence was produced: Listing 1 run with <code>ffn=30 check=off</code> on 2 and 4 processes; the outputs are unedited.</p>

@@ -1,0 +1,375 @@
+<!--meta
+id: F4-08
+title: MSI, MSI-X and the IOMMU
+course: DR302
+level: L4
+prereqs: DR301 (F4-01 to F4-07); OS303; F3-24 (interrupts) and F3-21 (page tables) recommended
+time: 10–12 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with TCG, q35 machine, QEMU's edu and qemu-xhci devices, intel-iommu). A spare PC with VT-d is optional and untested in this build.
+maps: Curriculum Track C, milestone C7 (MSI and MSI-X, then the IOMMU)
+analogy: F4 — the school and its visitors (a note pushed into the office's mail slot instead of a doorbell; the storeroom gatekeeper with a list of shelves per delivery truck)
+-->
+
+<h2 id="F4-08-hook">Story hook</h2>
+<p>A school's storeroom has one big door. For years every delivery truck backed up to it and unloaded wherever the driver's note said: "shelf 412, 4 boxes". Nobody checked the note. Then one morning a note with a typo sent four boxes of paint onto the shelf where the exam papers were kept. Nobody had done anything malicious; one wrong number was enough.</p>
+<p>The school hired a gatekeeper. Now every truck has a list, made by the office, of the shelves it may use. The gatekeeper translates the driver's shelf numbers into real shelves, and a truck whose note names a shelf that is not on its list is stopped at the door. The gatekeeper writes the truck's number, the shelf and the reason into a log book and rings the office.</p>
+<p>The same week the school replaced its doorbells. A bell only says "someone is at a door"; the office then had to walk round to find out which one. The new system has visitors push a small written note through the office's mail slot: "class 4B, please". The office knows at once who wants what.</p>
+<p>This chapter builds both: message-signalled interrupts (the notes) and an IOMMU (the gatekeeper). Every DR301 driver you wrote used a wired interrupt line and gave devices raw physical addresses. By the end of this chapter, a device that writes to a wrong address leaves a fault record in a log instead of a corrupted page.</p>
+
+<h2 id="F4-08-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the path of a wired (INTx) interrupt through the IOAPIC and of a message-signalled interrupt (MSI) straight to the local APIC, and say why the handler must acknowledge the device before the end-of-interrupt for a level-triggered line.</li>
+<li><b>Program</b> the MSI capability (address, data, enable) and an MSI-X table entry, mask and unmask an entry, and read its pending bit.</li>
+<li><b>Parse</b> the ACPI DMAR table, set up a VT-d root table, context entries and a three-level second-level page table, and switch translation on.</li>
+<li><b>Write</b> a DMA mapping API that every driver uses, so a device can reach only the buffers it was given.</li>
+<li><b>Decode</b> a VT-d fault record (source ID, address, reason) and trace it back to a driver bug.</li>
+<li><b>Judge</b> which C7 acceptance tests the lab meets in QEMU and which remain open.</li>
+</ul>
+
+<div class="co jargon" id="F4-08-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>MSI (message-signalled interrupt)</dt><dd><b>Simple words:</b> a device asks for attention by writing a small value to a special address instead of raising a wire. <b>Analogy:</b> a note pushed through the office's mail slot. <b>Precise:</b> a PCI capability (ID 05h) holding a message address, a message data value and an enable bit; to interrupt, the function performs a posted memory write of the data to the address. On x86 the address selects a local APIC and the data carries the vector. <sup class="src"><a href="#F4-08-src-D1">D1</a></sup> <sup class="src"><a href="#F4-08-src-D3">D3</a></sup> <sup class="src"><a href="#F4-08-src-L1">L1</a></sup></dd>
+<dt>MSI-X</dt><dd><b>Simple words:</b> MSI with a table of many messages, one per event source. <b>Analogy:</b> a pad of pre-addressed notes, one per class. <b>Precise:</b> a PCI capability (ID 11h) pointing into a BAR at a table of 16-byte entries (address, data, vector control with a mask bit) and a pending bit array (PBA). <sup class="src"><a href="#F4-08-src-D2">D2</a></sup> <sup class="src"><a href="#F4-08-src-L1">L1</a></sup></dd>
+<dt>IOAPIC and GSI</dt><dd><b>Simple words:</b> the chip that turns interrupt wires into vectors; each of its inputs has a system-wide number. <b>Analogy:</b> the switchboard in the corridor that knows which classroom each bell wire comes from. <b>Precise:</b> an I/O APIC has redirection entries, one per input, holding vector, trigger mode, polarity, mask and destination; ACPI numbers its inputs as global system interrupts (GSIs). <sup class="src"><a href="#F4-08-src-D3">D3</a></sup> <sup class="src"><a href="#F4-08-src-D5">D5</a></sup></dd>
+<dt>IOMMU</dt><dd><b>Simple words:</b> a translator between the addresses devices use and real memory, which can also say no. <b>Analogy:</b> the storeroom gatekeeper with a list of shelves per truck. <b>Precise:</b> a DMA remapping unit that translates each DMA request's address through page tables selected by the requester's ID, and blocks and reports requests without a valid translation. Intel's version is VT-d. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup></dd>
+<dt>IOVA (I/O virtual address)</dt><dd><b>Simple words:</b> the address a device is told to use for a buffer. <b>Analogy:</b> the shelf number written on the driver's note. <b>Precise:</b> an address in a DMA domain's address space, translated by the IOMMU to a physical address; without an IOMMU it equals the physical address. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup></dd>
+<dt>DMA domain</dt><dd><b>Simple words:</b> one set of mappings shared by the devices put in it. <b>Analogy:</b> one list of allowed shelves. <b>Precise:</b> in VT-d, the address space named by a domain ID in a context entry, with its own second-level page tables. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup></dd>
+<dt>Fault record</dt><dd><b>Simple words:</b> the IOMMU's note about a request it refused. <b>Analogy:</b> the gatekeeper's log book line. <b>Precise:</b> a 128-bit register holding the faulting page address, the requester's source ID, the read/write type and a fault reason code, with a "fault" bit the software clears by writing 1. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-08-pictures">The idea in pictures</h2>
+<p>Figure 1 follows one interrupt from a device to the handler and back, once over a wire and once as a message. Figure 2 follows one DMA write through the IOMMU, and a second one that the IOMMU refuses.</p>
+<figure id="F4-08-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 340" role="img" aria-labelledby="F4-08-f1t F4-08-f1d">
+<title id="F4-08-f1t">Figure 1: two ways an interrupt reaches the CPU</title>
+<desc id="F4-08-f1d">Top path: a PCI device raises its INTx pin; the wire goes to an IOAPIC input (a GSI); the IOAPIC&#x27;s redirection entry for that input holds the vector, trigger mode, polarity and destination; the IOAPIC sends the vector to the local APIC. Bottom path: a device with MSI performs an ordinary memory write of the data value (the vector, 0x40 in the lab) to address 0xFEE00000 plus the destination APIC ID shifted left by 12; the local APIC receives it directly, with no IOAPIC. In both paths the local APIC sets the vector in its request register, the CPU looks up the IDT entry for the vector, the stub calls intr_dispatch and the driver&#x27;s handler. The handler reads and clears the device&#x27;s interrupt cause; then the dispatcher writes the local APIC&#x27;s EOI register. For a level-triggered line the device must be acknowledged before the EOI, or the interrupt fires again at once.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="340"/>
+<rect class="sv-b4" x="10" y="30" width="180" height="92" rx="6"/>
+<text class="sv-tb" x="20" y="50">PCI device (INTx)</text>
+<text class="sv-ts" x="20" y="67">pin INTA# held at its</text>
+<text class="sv-ts" x="20" y="84">active level until the</text>
+<text class="sv-ts" x="20" y="101">driver clears the cause</text>
+<rect class="sv-b2" x="240" y="30" width="190" height="92" rx="6"/>
+<text class="sv-tb" x="250" y="50">IOAPIC input = GSI</text>
+<text class="sv-ts" x="250" y="67">redirection entry:</text>
+<text class="sv-ts" x="250" y="84">vector, edge or level,</text>
+<text class="sv-ts" x="250" y="101">polarity, destination</text>
+<rect class="sv-b4" x="10" y="205" width="225" height="92" rx="6"/>
+<text class="sv-tb" x="20" y="225">PCI device (MSI)</text>
+<text class="sv-ts" x="20" y="242">memory write:</text>
+<text class="sv-tm" x="20" y="259">address 0xFEE00000 | id&lt;&lt;12</text>
+<text class="sv-tm" x="20" y="276">data = vector (0x40)</text>
+<rect class="sv-b1" x="480" y="120" width="160" height="100" rx="6"/>
+<text class="sv-tb" x="490" y="140">local APIC</text>
+<text class="sv-ts" x="490" y="157">request register</text>
+<text class="sv-ts" x="490" y="174">in-service register</text>
+<text class="sv-ts" x="490" y="191">EOI register (+0xB0)</text>
+<rect class="sv-b3" x="690" y="30" width="180" height="80" rx="6"/>
+<text class="sv-tb" x="700" y="50">CPU</text>
+<text class="sv-ts" x="700" y="67">IDT[vector] -&gt; stub</text>
+<text class="sv-ts" x="700" y="84">-&gt; intr_dispatch</text>
+<rect class="sv-b5" x="690" y="160" width="180" height="120" rx="6"/>
+<text class="sv-tb" x="700" y="180">driver handler</text>
+<text class="sv-ts" x="700" y="197">1. read the cause</text>
+<text class="sv-ts" x="700" y="214">2. clear it in the</text>
+<text class="sv-ts" x="700" y="231">   device (ack)</text>
+<text class="sv-ts" x="700" y="248">3. dispatcher: EOI</text>
+<line class="sv-line" x1="190" y1="76" x2="229" y2="76"/>
+<polygon class="sv-head" points="240,76 229,81 229,71"/>
+<text class="sv-ts" x="196" y="68">wire</text>
+<line class="sv-line" x1="430" y1="76" x2="535" y2="116"/>
+<polygon class="sv-head" points="545,120 533,121 537,111"/>
+<text class="sv-ts" x="455" y="88">vector message</text>
+<line class="sv-line" x1="235" y1="245" x2="469" y2="192"/>
+<polygon class="sv-head" points="480,190 470,197 468,188"/>
+<text class="sv-ts" x="250" y="255">posted memory write (no wire)</text>
+<line class="sv-line" x1="640" y1="150" x2="683" y2="94"/>
+<polygon class="sv-head" points="690,85 687,97 679,91"/>
+<text class="sv-ts" x="650" y="112">vector</text>
+<line class="sv-line" x1="780" y1="110" x2="780" y2="149"/>
+<polygon class="sv-head" points="780,160 775,149 785,149"/>
+<line class="sv-line" x1="690" y1="255" x2="647" y2="208"/>
+<polygon class="sv-head" points="640,200 651,205 644,212"/>
+<text class="sv-ts" x="652" y="245">EOI</text>
+<line class="sv-line" x1="780" y1="280" x2="780" y2="325"/>
+<polyline class="sv-line" points="780,325 100,325"/>
+<line class="sv-line" x1="100" y1="325" x2="100" y2="308"/>
+<polygon class="sv-head" points="100,297 105,308 95,308"/>
+<text class="sv-ts" x="290" y="320">ack in the device (write-1-to-clear)</text>
+</svg></div><figcaption><b>Figure 1.</b> Interrupt flow: device → interrupt controller → CPU → handler → acknowledge, for a wired line and for MSI. Arrows show the direction of each signal or write. Message format and APIC registers: D3; MSI capability: D1; the vectors are the lab's (R1). <sup class="src"><a href="#F4-08-src-D1">D1</a></sup> <sup class="src"><a href="#F4-08-src-D3">D3</a></sup> <sup class="src"><a href="#F4-08-src-R1">R1</a></sup></figcaption></figure>
+<figure id="F4-08-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 380" role="img" aria-labelledby="F4-08-f2t F4-08-f2d">
+<title id="F4-08-f2t">Figure 2: a DMA write translated by the VT-d IOMMU, and a blocked one</title>
+<desc id="F4-08-f2d">Left: the edu device at 00:01.0 issues a DMA write to I/O virtual address 0x802000. The request carries the source ID 0x0008 (bus 0, device 1, function 0). Middle: the VT-d remapping unit at 0xFED90000 uses the bus number to index the root table, the device and function to index the context table; the context entry names domain 1 and the domain&#x27;s page table. Bits 38 to 30, 29 to 21 and 20 to 12 of the address select entries in the level 3, level 2 and level 1 tables; the level 1 entry gives the physical page 0x15b000 and the read and write permission bits. A cache, the IOTLB, keeps recent translations. Right: RAM. The mapped page receives the data. The canary page at 0x15a000 has no entry in this domain. Bottom: a write to an address with no entry is not performed; the unit stores a fault record with the source ID, the address and the reason, and signals a fault event as an MSI to vector 0x42; the kernel reads and clears the record.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="380"/>
+<rect class="sv-b4" x="10" y="40" width="170" height="110" rx="6"/>
+<text class="sv-tb" x="20" y="60">edu 00:01.0</text>
+<text class="sv-ts" x="20" y="77">DMA write to</text>
+<text class="sv-tm" x="20" y="94">IOVA 0x802000</text>
+<text class="sv-ts" x="20" y="111">source ID 0x0008</text>
+<text class="sv-ts" x="20" y="128">(bus 0, dev 1, fn 0)</text>
+<rect class="sv-box" x="230" y="20" width="420" height="230" rx="6"/>
+<text class="sv-tb" x="240" y="40">VT-d remapping unit (registers at 0xFED90000)</text>
+<rect class="sv-b2" x="245" y="50" width="120" height="60" rx="6"/>
+<text class="sv-tb" x="255" y="70">root table</text>
+<text class="sv-ts" x="255" y="87">[bus 0]</text>
+<rect class="sv-b2" x="385" y="50" width="250" height="60" rx="6"/>
+<text class="sv-tb" x="395" y="70">context entry [dev 1, fn 0]</text>
+<text class="sv-ts" x="395" y="87">domain 1, table 0x11a000</text>
+<rect class="sv-b1" x="245" y="130" width="390" height="64" rx="6"/>
+<text class="sv-tb" x="255" y="150">second-level page table (3 levels, 39-bit)</text>
+<text class="sv-tm" x="255" y="167">L3[bits 38:30] -&gt; L2[29:21] -&gt; L1[20:12] -&gt; page</text>
+<rect class="sv-b3" x="245" y="205" width="390" height="36" rx="6"/>
+<text class="sv-tb" x="255" y="228">IOTLB: cached translations (flush after unmap)</text>
+<line class="sv-line" x1="365" y1="80" x2="374" y2="80"/>
+<polygon class="sv-head" points="385,80 374,85 374,75"/>
+<line class="sv-line" x1="510" y1="110" x2="510" y2="119"/>
+<polygon class="sv-head" points="510,130 505,119 515,119"/>
+<rect class="sv-b5" x="700" y="40" width="170" height="80" rx="6"/>
+<text class="sv-tb" x="710" y="60">RAM page 0x15b000</text>
+<text class="sv-ts" x="710" y="77">mapped, read/write</text>
+<text class="sv-ts" x="710" y="94">data arrives</text>
+<rect class="sv-b8" x="700" y="140" width="170" height="85" rx="6"/>
+<text class="sv-tb" x="710" y="160">RAM page 0x15a000</text>
+<text class="sv-ts" x="710" y="177">(canary) not in</text>
+<text class="sv-ts" x="710" y="194">domain 1: untouched</text>
+<line class="sv-line" x1="180" y1="95" x2="234" y2="82"/>
+<polygon class="sv-head" points="245,80 235,87 233,78"/>
+<line class="sv-line" x1="635" y1="160" x2="693" y2="93"/>
+<polygon class="sv-head" points="700,85 697,97 689,90"/>
+<text class="sv-ts" x="640" y="112">translated</text>
+<rect class="sv-b6" x="230" y="290" width="420" height="80" rx="6"/>
+<text class="sv-tb" x="240" y="310">fault path: no entry or no write permission</text>
+<text class="sv-ts" x="240" y="327">fault record at +0x220: source ID, address, reason</text>
+<text class="sv-ts" x="240" y="344">fault event = MSI to vector 0x42 -&gt; kernel log</text>
+<line class="sv-dash" x1="440" y1="250" x2="440" y2="279"/>
+<polygon class="sv-head" points="440,290 435,279 445,279"/>
+<text class="sv-ts" x="710" y="245">write to 0x15a000 blocked:</text>
+<text class="sv-ts" x="710" y="262">not performed (R2)</text>
+</svg></div><figcaption><b>Figure 2.</b> DMA through the IOMMU (data flow left to right, fault path dashed). The addresses are those of the lab's IOMMU run (R2). Table formats and the fault record: D4, from memory, pending verification. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup> <sup class="src"><a href="#F4-08-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F4-08-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>A doorbell tells the office "someone, somewhere". A note through the mail slot says who and what. The storeroom gatekeeper holds a list for every truck: "truck 1 may unload on shelves 800 and 802, and nowhere else". A truck that tries shelf 15A is stopped and written into the log book.</p></div>
+<p>Devices interrupt the processor in two ways. Older ones pull a wire to a switchboard, which tells the processor a number. Newer ones send a tiny message, written like any other memory write, that already contains the number. Devices also copy data into memory by themselves. Without a guard they can write anywhere. The IOMMU is the guard: the kernel tells it which pieces of memory each device may use, and it stops and reports everything else.</p>
+
+<h2 id="F4-08-layer2">Layer 2 — the student explanation</h2>
+<h3>Wired interrupts and their limits</h3>
+<p>In DR301 every driver used a line interrupt. On the q35 machine the 8259 pair is still there but parked and masked; the lab kernel uses the IOAPIC instead. The ACPI MADT names the local APIC (at 0xFEE00000), one IOAPIC (at 0xFEC00000, GSI base 0, 24 entries) and five interrupt source overrides, for example ISA IRQ 0 to GSI 2 and ISA IRQ 9 to GSI 9, level, active high (R1). <sup class="src"><a href="#F4-08-src-D5">D5</a></sup> <sup class="src"><a href="#F4-08-src-R1">R1</a></sup> A PCI function's INTx pin reaches some IOAPIC input; which one, the firmware describes in AML (the subject of <a href="#F4-11">F4-11</a>). Lines are shared, they need the routing information, and a level-triggered line stays asserted until the driver clears the cause inside the device.</p>
+<h3>MSI: the interrupt as a memory write</h3>
+<p>A function with the MSI capability is given an address and a data value. When it has something to report it writes the data to the address. On x86 the address has the form 0xFEE00000 with the destination APIC ID in bits 19:12, and the data holds the vector in bits 7:0 with fixed delivery and edge trigger when the upper bits are zero. <sup class="src"><a href="#F4-08-src-D3">D3</a></sup> The local APIC picks the write off the bus; no IOAPIC and no routing table are involved. In the lab the edu device's capability read 0x0080 before (64-bit capable, disabled) and 0x0081 after enabling, with address 0xFEE00000 and data 0x0040; five interrupt requests produced five interrupts on vector 0x40 (R1). <sup class="src"><a href="#F4-08-src-R1">R1</a></sup></p>
+<p>MSI's limits: one address and one data value, and at most 32 vectors that must be consecutive and aligned (the "multiple message" fields). MSI-X lifts both: a table in device memory with one entry per interrupt source, each with its own address, data and a mask bit, plus a pending bit array that records interrupts that arrived while an entry was masked. <sup class="src"><a href="#F4-08-src-D2">D2</a></sup> QEMU's xHCI controller offers 16 entries in BAR0 at offset 0x3000 with the PBA at 0x3800; with entry 0 masked a command completion set PBA bit 0 and no interrupt arrived; unmasking delivered it (R1). <sup class="src"><a href="#F4-08-src-R1">R1</a></sup></p>
+<h3>DMA without a guard</h3>
+<p>Bus-mastering devices read and write memory on their own. In DR301 the kernel handed them physical addresses. The lab's "stray" test tells QEMU's edu device (a teaching device with a DMA engine and an interrupt register) <sup class="src"><a href="#F4-08-src-D6">D6</a></sup> to copy 4096 bytes to the physical address of a canary page that no driver gave it. Without an IOMMU the copy happens: 4080 of 4096 canary bytes changed (R1; 16 bytes happened to be equal). <sup class="src"><a href="#F4-08-src-R1">R1</a></sup></p>
+<h3>The IOMMU and the mapping API</h3>
+<p>With VT-d on, each DMA request is translated. The request carries the requester's bus, device and function (the source ID); the IOMMU looks up a root table entry by bus and a context entry by device and function, which names a domain and its page table; the address the device used (the IOVA) walks that page table like a virtual address walks the CPU's. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup> The driver no longer passes physical addresses. It calls <code>dma::map(device, buffer, length, device_writes)</code> and gives the device what comes back. In the lab's IOMMU run the source buffer at physical 0x15c000 became IOVA 0x800000 and the destination at 0x15b000 became 0x802000; the round trip still matched byte for byte, and the stray write now produced a fault record ("source 00:01.0 write at IOVA 0x15a000, reason 5") while 0 canary bytes changed (R2). <sup class="src"><a href="#F4-08-src-R2">R2</a></sup></p>
+
+<h2 id="F4-08-layer3">Layer 3 — the engineer's depth</h2>
+<h3>The MSI capability</h3>
+<p>The capability's message control word has the enable bit (bit 0), "multiple message capable" (bits 3:1), "multiple message enable" (bits 6:4), "64-bit address" (bit 7) and "per-vector masking" (bit 8). The address low dword follows at offset 4; for a 64-bit capability the high dword is at 8 and the data at 0Ch, otherwise the data is at 8. <sup class="src"><a href="#F4-08-src-D1">D1</a></sup> These offsets and masks were checked in this build against Linux's <code>&lt;linux/pci_regs.h&gt;</code>: 24 of 24 values match (R5). <sup class="src"><a href="#F4-08-src-L1">L1</a></sup> <sup class="src"><a href="#F4-08-src-R5">R5</a></sup> Two rules from the specifications matter for drivers: with MSI or MSI-X enabled the function must not use INTx, and software sets the command register's "interrupt disable" bit to make sure; and the message must be programmed before enable is set. <sup class="src"><a href="#F4-08-src-D1">D1</a></sup></p>
+<h3>MSI-X: table, PBA and the safe enable order</h3>
+<p>Message control bits 10:0 hold the table size minus one, bit 14 is "function mask" and bit 15 is "enable"; the table offset/BIR dword says which BAR (bits 2:0) and where (the rest) the table lives, and the PBA dword the same for the pending bits. Each entry has address low, address high, data and vector control, whose bit 0 masks the entry. <sup class="src"><a href="#F4-08-src-D2">D2</a></sup> <sup class="src"><a href="#F4-08-src-L1">L1</a></sup> Entries come out of reset in an undefined or masked state depending on the device, so the driver enables MSI-X with the function mask set, masks every entry, clears the function mask, and unmasks each entry only after programming it. A masked entry that has an event to send sets its PBA bit; unmasking it with the bit set makes the device send the message. <sup class="src"><a href="#F4-08-src-D2">D2</a></sup></p>
+<p>The design question MSI-X answers is "one interrupt per what?". NVMe gives one vector per completion queue and pins each queue to a CPU; a NIC gives one per receive and transmit queue; xHCI one per interrupter. The vector then identifies the event source without reading a shared status register, and the destination APIC ID in each entry spreads the work across CPUs. <sup class="src"><a href="#F4-08-src-D2">D2</a></sup></p>
+<h3>VT-d: the DMAR table and the register set</h3>
+<p>The ACPI DMAR table lists DMA remapping hardware units (DRHD structures) with their register base and the devices each unit covers: either "all PCI devices of this segment" (the INCLUDE_PCI_ALL flag) or an explicit list of device scopes. QEMU's table in this build had one unit at 0xFED90000 with INCLUDE_PCI_ALL = 0 and seven scopes: the IOAPIC and the endpoints 00.0, 01.0, 02.0, 1f.0, 1f.2 and 1f.3 (R2). <sup class="src"><a href="#F4-08-src-D4">D4</a></sup> <sup class="src"><a href="#F4-08-src-R2">R2</a></sup> A driver must check that every device it attaches is in some unit's scope; a device outside every scope is not translated at all.</p>
+<p>The capability register says what the unit supports. In R2: CAP = 0xd2008c22260206 and ECAP = 0xf00f4a, which the kernel decodes as SAGAW 0x2 (only the 39-bit, 3-level table format), MGAW 39, 2<sup>16</sup> domains, caching mode 0, one fault-recording register at offset 0x220 and the IOTLB registers at 0xf0. <sup class="src"><a href="#F4-08-src-R2">R2</a></sup> The field positions are from memory of D4 (box below). "Caching mode 0" matters: with caching mode 1 (common for virtual IOMMUs) the hardware may cache not-present entries, and software must invalidate after <em>adding</em> a mapping too, not only after removing one. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup></p>
+<h3>Root, context and second-level tables</h3>
+<p>The root table is a 4 KiB page of 256 16-byte entries, one per bus; a present root entry points to a context table of 256 entries, one per device and function (index = device × 8 + function). A context entry holds the present bit, the translation type, the second-level page-table pointer, the address width (AW = 1 for 39 bits, three levels) and the domain ID. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup> In R2 the edu device's entry reads <code>0x0000000000000101_000000000011a001</code>: present, table at 0x11a000, AW 1, domain 1. <sup class="src"><a href="#F4-08-src-R2">R2</a></sup> Second-level entries are 64 bits: bit 0 read, bit 1 write, bits 51:12 the next table or the page. An entry with neither read nor write set is not present; there is no separate present bit. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup> That is why the stray write is reported as reason 5 ("write to a page without write permission") rather than as a separate "not mapped" reason, and why QEMU's own message says "slpte permission error ... slpte=0x0" (R2). <sup class="src"><a href="#F4-08-src-R2">R2</a></sup></p>
+<h3>Turning translation on, and invalidation</h3>
+<p>The order in the lab: write the root table address to RTADDR, set SRTP in GCMD and wait for RTPS in GSTS; invalidate the context cache globally (CCMD with ICC); invalidate the IOTLB globally (the IOTLB register at ECAP.IRO + 8); set TE and wait for TES. R2 shows GSTS = 0xc0000000 (TES and RTPS) after the last step. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup> <sup class="src"><a href="#F4-08-src-R2">R2</a></sup> GCMD bits are not "sticky": each write must carry every command bit that should stay on, so the driver writes TE together with whatever is already on. Every unmap must be followed by an IOTLB invalidation before the memory is reused, or the device can still reach the page through the cached translation; the lab's <code>dma::unmap</code> does a global invalidation, which is correct but slow (domain-selective and page-selective invalidations exist for production use). <sup class="src"><a href="#F4-08-src-D4">D4</a></sup></p>
+<h3>Fault reporting</h3>
+<p>FSTS bit 1 (PPF) says a fault record is pending; the record holds, in bits 127:64, F (bit 127), the type T (bit 126, 1 = read), the reason in bits 103:96 and the source ID in bits 79:64, and the faulting page in bits 63:12. The software clears F by writing 1 to it. FECTL, FEDATA and FEADDR turn fault events into an MSI. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup> With a single fault-recording register (R2), faults that arrive while the record is still pending are not recorded; QEMU says so on its console ("New fault is not recorded due to compression of faults", R2). Read and clear records promptly, in the fault handler.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The VT-d register offsets (CAP 08h, ECAP 10h, GCMD 18h, GSTS 1Ch, RTADDR 20h, CCMD 28h, FSTS 34h, FECTL 38h, FEDATA 3Ch, FEADDR 40h), the CAP and ECAP field positions, the root, context and second-level entry formats, the fault-record layout and the reason codes in <code>vtd.h</code> and <code>vtd.cc</code> are from the author's memory of D4, which was not opened in this build. They are confirmed only by QEMU 8.2.2's intel-iommu model behaving as expected (translation works, the stray write is refused, the record decodes to the right device and page, R2). The MSI message format (D3) is confirmed the same way (R1). The MSI and MSI-X capability offsets are confirmed by <code>&lt;linux/pci_regs.h&gt;</code> (R5). Nothing here ran on real VT-d hardware.</p></div>
+
+<h2 id="F4-08-hardware">How the hardware actually does it</h2>
+<p>An MSI is an ordinary PCI Express memory write transaction; the root complex recognises the 0xFEE address range as interrupt messages and forwards them to the processor's local APICs instead of to DRAM. <sup class="src"><a href="#F4-08-src-D2">D2</a></sup> <sup class="src"><a href="#F4-08-src-D3">D3</a></sup> Because it is a posted write travelling the same path as the device's data writes, PCI ordering rules mean the interrupt cannot overtake the data the device wrote before it: when the handler runs, the DMA data is in memory. A wired interrupt has no such guarantee, which is why drivers using INTx read a device register (a read flushes posted writes) before trusting the data. <sup class="src"><a href="#F4-08-src-D2">D2</a></sup></p>
+<p>The IOMMU sits in the root complex on the path from the PCI hierarchy to memory. It sees every inbound request with its requester ID, which the PCI Express link layer attaches to each transaction; this is also its weakness: devices behind a PCI-to-PCI bridge (conventional PCI) may all appear with the bridge's ID and share one context entry. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup> Interrupt messages also pass through the IOMMU; VT-d can remap them too (interrupt remapping, not built in this lab), so that a device cannot inject an arbitrary vector by writing to 0xFEE00000. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup></p>
+<p>The IOTLB is to the IOMMU what the TLB is to the CPU: translations cached near the walker. Real units also cache context entries and intermediate page-table entries, and some devices cache translations themselves (ATS); each cache needs its own invalidation. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup></p>
+
+<h2 id="F4-08-worked">Worked example</h2>
+<p><b>Task.</b> (1) Build the MSI message for vector 0x40 to APIC 0, for vector 0x41 to APIC 0 and for vector 0x42 to APIC 3. (2) Split the IOVAs 0x804000, 0x805000 and 0x4c0123456 into the three table indices of a 39-bit domain. (3) Decode the raw fault record R2 printed.</p>
+<p><b>Step 1.</b> Address = 0xFEE00000 | (APIC ID &lt;&lt; 12); data = vector. APIC 3 gives 0xFEE00000 | 0x3000 = 0xFEE03000. <sup class="src"><a href="#F4-08-src-D3">D3</a></sup></p>
+<p><b>Step 2.</b> Index L3 = bits 38:30, L2 = bits 29:21, L1 = bits 20:12, offset = bits 11:0. 0x804000 = 8 MiB + 16 KiB: L3 = 0, L2 = 0x804000 &gt;&gt; 21 = 4, L1 = (0x804000 &gt;&gt; 12) &amp; 0x1FF = 0x804 &amp; 0x1FF = 4. For 0x805000, L1 = 5. For 0x4c0123456, write the address as 19 × 2<sup>30</sup> + 0x123456 (19 × 0x40000000 = 0x4c0000000): L3 = 19; 0x123456 is below 2<sup>21</sup>, so L2 = 0; L1 = 0x123456 &gt;&gt; 12 = 0x123 = 291; offset 0x456.</p>
+<p><b>Step 3.</b> High dword pair 0x80ffff0500000008: bit 127 (top bit of the high quadword) = 1, so the record is valid; bit 126 = 0, a write; bits 103:96 = byte 4 of the high quadword = 0x05, reason 5; bits 79:64 = 0x0008 = bus 0, device 1, function 0 (0x0008 &gt;&gt; 3 = 1). Low quadword 0x15a000: the page. <sup class="src"><a href="#F4-08-src-D4">D4</a></sup></p>
+<p><b>Check by program.</b> Listing 3 does the same arithmetic; its run is R4.</p>
+<pre class="output" data-run="F4-08/vtd_decode"></pre>
+<p>The program agrees with every hand result. Splitting the address into a multiple of 2<sup>30</sup> plus a remainder first is the safe way to do it by hand; shifting the whole 36-bit value by 21 and masking is where hand arithmetic slips. R2's own walk of IOVA 0x804000 (L3 = 0, L2 = 4, L1 = 4, page 0x15b000) and of 0x805000 (L1 entry 5 = 0, not present) matches. <sup class="src"><a href="#F4-08-src-R2">R2</a></sup> <sup class="src"><a href="#F4-08-src-R4">R4</a></sup></p>
+
+<h2 id="F4-08-code">Code walk-through</h2>
+<p>The lab kernel is a set of files in <code>university/labs/F4-08/</code> on top of DR301's base (<code>../F4-01</code> for boot, serial and <code>kprintf</code>, <code>../F4-02</code> for PCI and ACPI). <code>intr.cc</code> is the interrupt layer every DR302 chapter uses (IDT, local APIC, IOAPIC from the MADT, a 1 kHz tick); <code>vtd.cc</code> is the VT-d driver; <code>edu.cc</code> and <code>xhci_core.cc</code> drive the test devices; <code>f408_main.cc</code> runs the tests. Three listings follow.</p>
+<p><b>Listing 1</b> — <code>msi.cc</code>: MSI and MSI-X.</p>
+<pre class="listing" data-src="F4-08/msi.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">8–13</td><td><code>msi_message</code></td><td>Builds address 0xFEE00000 | APIC ID &lt;&lt; 12 and data = vector.</td><td>The only x86-specific part; on Arm the address would be the GIC's doorbell (ITS).</td></tr>
+<tr><td class="n">18–19</td><td><code>find_cap(..., CAP_MSI)</code></td><td>Walks the capability list from DR301's <code>pci.cc</code>.</td><td>No capability, no MSI: the caller falls back to INTx or polling.</td></tr>
+<tr><td class="n">22–28</td><td>address, then data at 0Ch or 08h</td><td>Writes the message, choosing the data offset by the 64-bit flag.</td><td>Writing the data at 08h of a 64-bit capability puts it in the high address: the classic MSI bug.</td></tr>
+<tr><td class="n">29–30</td><td><code>(flags &amp; ~MSI_QSIZE) | MSI_ENABLE</code></td><td>Asks for one vector and enables.</td><td>The message is complete before enable is set.</td></tr>
+<tr><td class="n">32</td><td><code>CMD_INTX_DISABLE | CMD_MASTER</code></td><td>Silences the INTx pin; allows the device to master the bus.</td><td>An MSI is a bus-master write: without bus mastering no interrupt arrives.</td></tr>
+<tr><td class="n">63–67</td><td>table and PBA from BIR and offset</td><td>Finds the BAR and offset of the table and of the PBA.</td><td>The BIR selects one of six BARs; the low 3 bits are not part of the offset.</td></tr>
+<tr><td class="n">70–72</td><td>enable with mask-all, mask each, unmask function</td><td>The safe enable order.</td><td>No entry can fire with a half-written message.</td></tr>
+<tr><td class="n">78–85</td><td><code>program</code></td><td>Writes one entry's address and data.</td><td>One vector per event source, each with its own destination.</td></tr>
+<tr><td class="n">87–92</td><td><code>mask</code></td><td>Read-modify-write of vector control bit 0.</td><td>The other bits are reserved and must be preserved.</td></tr>
+<tr><td class="n">94–97</td><td><code>pending</code></td><td>Reads the entry's bit in the PBA.</td><td>Shows an event that arrived while masked (R1).</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>dma.cc</code>: the DMA mapping API.</p>
+<pre class="listing" data-src="F4-08/dma.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">8</td><td><code>g_next_iova[256]</code></td><td>One IOVA allocator per device and function on bus 0.</td><td>A lab simplification: a real allocator frees and reuses ranges and covers every bus.</td></tr>
+<tr><td class="n">22–27</td><td><code>attach</code></td><td>Gives the device its own domain once; IOVAs start at 8 MiB.</td><td>Starting far from the kernel's physical addresses makes a driver that bypasses the API fail visibly.</td></tr>
+<tr><td class="n">31–32</td><td>identity mode</td><td>Returns the physical address.</td><td>The same driver code works with and without an IOMMU.</td></tr>
+<tr><td class="n">34–37</td><td>page loop</td><td>Maps every page the buffer touches, with or without write permission.</td><td>A device that only reads a buffer gets a read-only mapping.</td></tr>
+<tr><td class="n">38</td><td><code>next += 4096</code></td><td>Leaves an unmapped guard page.</td><td>An overrun by one page faults instead of reaching the next buffer.</td></tr>
+<tr><td class="n">39</td><td><code>iova_page | (phys &amp; 0xFFF)</code></td><td>Keeps the offset inside the page.</td><td>Buffers need not be page-aligned.</td></tr>
+<tr><td class="n">45–47</td><td><code>unmap</code> then <code>flush_iotlb</code></td><td>Removes the entries and invalidates.</td><td>Without the flush the device could still use a cached translation.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>vtd_decode.cpp</code>: the worked example's arithmetic on the host (input <code>vtd_decode.in</code>; run R4 above).</p>
+<pre class="listing" data-src="F4-08/vtd_decode.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">18–24</td><td><code>msi</code></td><td>Same formula as Listing 1 line 12.</td><td>A second implementation to compare against.</td></tr>
+<tr><td class="n">25–34</td><td><code>iova</code></td><td>Three 9-bit indices and a 12-bit offset.</td><td>512 eight-byte entries fill one 4 KiB table: 9 bits per level.</td></tr>
+<tr><td class="n">35–47</td><td><code>fault</code></td><td>Splits the 128-bit record into its fields.</td><td>The forensic lab needs exactly this decoding.</td></tr>
+</tbody></table></div>
+<p><b>Build commands</b> (as run): the kernel files are compiled with <code>g++ -m32 -std=c++20 -ffreestanding -fno-exceptions -fno-rtti -mgeneral-regs-only -O2 -Wall -Wextra -Wpedantic -Werror</code> and linked with DR301's <code>kernel.ld</code> (R6) <sup class="src"><a href="#F4-08-src-R6">R6</a></sup>; host programs with the university's <code>run_lab.sh</code> flags (<code>-fsanitize=address,undefined</code>). The MSI/MSI-X constants check against Linux's header:</p>
+<pre class="output" data-run="F4-08/msicheck"></pre>
+<p><b>Run without an IOMMU</b> (R1):</p>
+<pre class="output" data-run="F4-08/msi"></pre>
+<p><b>Run with QEMU's intel-iommu</b> (R2). Lines starting with <code>qemu-system-x86_64:</code> are QEMU's own messages on its standard error.</p>
+<pre class="output" data-run="F4-08/iommu"></pre>
+
+<h2 id="F4-08-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The note is not addressed to "the office".</b> An MSI goes to one local APIC, chosen by the address; with several CPUs each entry can name a different one. The single office of the analogy hides the main reason MSI-X exists: spreading interrupts across processors.</li>
+<li><b>The gatekeeper does not read the note's content.</b> The IOMMU checks addresses and permissions, never data. A device allowed to write a buffer can write anything into it, including a malicious network packet or a forged structure; the IOMMU only limits <em>where</em>.</li>
+<li><b>The list is cached, and the cache does not update itself.</b> A gatekeeper who memorised yesterday's list keeps applying it until told to forget. After removing a mapping the kernel must invalidate the IOTLB; the analogy's "the list was changed, so the truck is stopped" is wrong without that step.</li>
+<li><b>Interrupt notes pass the same gate.</b> MSIs are memory writes through the IOMMU; without interrupt remapping a device can write any vector to 0xFEE00000. Notes and deliveries are one mechanism, not two.</li>
+</ul>
+
+<h2 id="F4-08-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> MSI enabled, no interrupt ever arrives. <b>Cause:</b> bus mastering off (an MSI is a bus-master write), or the data written at 08h in a 64-bit capability. <b>Find it:</b> print the capability after enabling (Listing 1's <code>msi::print</code>, R1 shows the good state: address 0xfee00000, data 0x0040). <b>Fix:</b> set the command register's master bit; choose the data offset by bit 7.</li>
+<li><b>Symptom:</b> an interrupt storm right after enabling MSI-X. <b>Cause:</b> entries left unmasked with reset contents (address 0, data 0) or programmed after the function was enabled. <b>Find it:</b> dump each entry. <b>Fix:</b> the order in Listing 1 lines 70–72.</li>
+<li><b>Symptom:</b> a level-triggered line interrupts again and again. <b>Cause:</b> the handler did not clear the cause in the device before the EOI. <b>Find it:</b> the vector's count races upward (<code>intr::count</code>). <b>Fix:</b> read and acknowledge the device (edu's IRQ_ACK in <code>edu_irq</code>) before returning.</li>
+<li><b>Symptom:</b> with the IOMMU on, the first DMA faults at address 0x15b000 although the buffer is mapped. <b>Cause:</b> the driver passed the physical address, not the IOVA. <b>Find it:</b> the fault record's address is a physical address, not one of the domain's IOVAs (the lab's IOVAs start at 0x800000). <b>Fix:</b> use the value <code>dma::map</code> returns.</li>
+<li><b>Symptom:</b> after unmap, the device can still write the old buffer (on real hardware or with caching mode 1). <b>Cause:</b> missing IOTLB invalidation. <b>Find it:</b> write a test that unmaps, then asks for DMA to the old IOVA; it must fault. <b>Fix:</b> invalidate after every unmap; with caching mode 1, after every map too.</li>
+<li><b>Symptom:</b> translation enabled, every device faults with "context entry not present". <b>Cause:</b> the context cache was not invalidated after the root table was installed, or the device is outside every DRHD scope. <b>Find it:</b> print the scopes (R2 lists them). <b>Fix:</b> the order in Layer 3; attach only devices in scope.</li>
+</ul>
+
+<div class="co transition" id="F4-08-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> DR301's drivers used one wired interrupt line per device through the PIC or IOAPIC and gave devices physical addresses (<a href="#F4-03">F4-03</a>, <a href="#F4-07">F4-07</a>). <b>What carries over:</b> the capability walk of <a href="#F4-02">F4-02</a>, the handler-then-EOI rhythm, write-1-to-clear status bits, and the CPU page tables of <a href="#F3-21">F3-21</a>: the IOMMU's tables are the same idea for devices. <b>What changes:</b> interrupts become memory writes with a vector inside, there can be one per queue, and every DMA address now comes from a mapping call; a wrong address is a logged fault, not silent corruption. <b>What comes next:</b> every later DR302 driver (xHCI, e1000, HD Audio) uses this chapter's interrupt layer and mapping API, and each lab has a run with the IOMMU on.</p></div>
+
+<h2 id="F4-08-check">Check yourself</h2>
+<ol>
+<li>Which two values does an MSI capability hold, and what does the device do with them?</li>
+<li>Compute the MSI address and data for vector 0x51 delivered to APIC ID 2.</li>
+<li>Why must a handler for a level-triggered INTx line clear the device's cause before the EOI, while an MSI handler need not worry about the line staying active?</li>
+<li>In R1, PBA bit 0 was 1 while entry 0 was masked and 0 after unmasking. Explain both values.</li>
+<li>Which three table lookups does VT-d perform for a DMA request from 00:01.0 to IOVA 0x802000, before the page-table walk?</li>
+<li>The fault record in R2 has reason 5 although the canary page was never mapped at all. Why not a "not present" reason?</li>
+<li>A colleague proposes skipping the IOTLB invalidation in <code>dma::unmap</code> "because QEMU works without it". Give two reasons to refuse.</li>
+<li>Multiple choice: the DMAR table in R2 has INCLUDE_PCI_ALL = 0. What follows? (a) No device is translated. (b) Only devices in the listed scopes are translated by that unit. (c) Every device is translated by that unit anyway.</li>
+<li>Why do the lab's IOVAs start at 8 MiB instead of equalling the physical addresses?</li>
+</ol>
+
+<h2 id="F4-08-lab">Lab</h2>
+<p><b>Goal.</b> Milestone C7: "Message-signalled interrupts for all PCI drivers; DMA remapping with Intel VT-d in QEMU so that devices can only reach buffers you map." Build: "MSI/MSI-X allocation API used by NVMe, virtio and xHCI; VT-d driver with per-device I/O page tables and a DMA mapping API all drivers must use." <sup class="src"><a href="#F4-08-src-D7">D7</a></sup></p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2 (<code>-machine q35</code>, <code>-device edu</code>, <code>-device qemu-xhci</code>, <code>-device intel-iommu</code>), g++ 13.3 and GNU ld 2.42 as recorded in the logs. Run <code>university/labs/run_lab.sh university/labs/F4-08</code> from the repository root (well under a minute).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>In QEMU nothing can be damaged. On a real machine, a driver that programs a wrong DMA address with the IOMMU off can overwrite any memory, including file-system caches that are later written to disk: test DMA drivers on the spare PC only, with disks you can erase disconnected, as the curriculum's safety box on drivers says. <sup class="src"><a href="#F4-08-src-D7">D7</a></sup></p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In <code>msi.out</code> find the capability before and after enabling; decode both control words by hand.</li>
+<li>Compare <code>msi.out</code> and <code>iommu.out</code> line by line: which lines differ, and why? (Expected: the DMAR lines, the IOVAs, the stray write's outcome, the fault counter.)</li>
+<li>Decode <code>iommu.out</code>'s CAP value with the field positions of Layer 3 and check each decoded value the kernel printed.</li>
+<li>Change <code>dma::map</code> to map buffers read-only even when <code>device_writes</code> is true. Predict which test fails and with which reason code; run and compare.</li>
+<li>Remove the <code>flush_iotlb</code> call from <code>dma::unmap</code> and run the forensic build. Does the result change in QEMU? Write down why that does not prove the flush unnecessary (Layer 3, caching mode).</li>
+<li>Milestone step (untested in this build): convert the DR301 NVMe driver (<a href="#F4-07">F4-07</a>) to one MSI-X vector per queue using <code>msix::setup</code> and <code>msix::program</code>, and to <code>dma::map</code> for every PRP address; run its tests with <code>-device intel-iommu</code>.</li>
+</ol>
+<p><b>Expected observations</b> (measured in QEMU 8.2.2 with TCG in the build container): MSI on vector 0x40 with five of five interrupts; factorial 3628800 with an interrupt; the DMA round trip identical in both modes (fnv1a 0x400abdc5); without IOMMU the canary changes (4080 of 4096 bytes); with it, one DMAR fault record for 00:01.0 at 0x15a000, reason 5, and 0 bytes changed; MSI-X NOOP completions with one interrupt each; the masked completion sets the PBA bit (R1, R2).</p>
+<p><b>Verification</b> (the milestone's acceptance tests, verbatim): "NVMe uses one MSI-X vector per queue; interrupt counters per CPU show the distribution." — not done here (step 6; see the box). "With QEMU's emulated Intel IOMMU enabled, all storage and network tests pass" — the DR302 USB storage (<a href="#F4-09">F4-09</a>), network (<a href="#F4-10">F4-10</a>) and audio (<a href="#F4-12">F4-12</a>) labs each have a run with intel-iommu that passes; DR301's storage labs were not rerun with it. "a test driver that programs an unmapped DMA address produces a reported DMA remapping fault instead of memory corruption." — R2: the fault record and "canary bytes changed: 0 of 4096". <sup class="src"><a href="#F4-08-src-D7">D7</a></sup> <sup class="src"><a href="#F4-08-src-R2">R2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not tested in this build</span><p>Two acceptance items are open: NVMe with one MSI-X vector per queue (the lab shows MSI-X on xHCI instead) and per-CPU interrupt counters (the lab kernel runs on one CPU). DR301's AHCI, virtio and NVMe labs were not rerun with intel-iommu. Interrupt remapping, page-selective invalidation and caching mode 1 were not exercised. Nothing ran on real hardware.</p></div>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>QEMU prints "detected slpte permission error" but the kernel prints no DMAR fault → the fault event MSI is not programmed (FEDATA/FEADDR) or FECTL's interrupt mask bit is still set → read FSTS by polling → program the fault event registers (<code>vtd::fault_irq</code>).</li>
+<li>Every edu DMA times out with the IOMMU on → the device was not attached (no context entry) and DMA is blocked → look for the "vtd: 00:01.0 -&gt; domain" line → call <code>dma::attach</code> before mapping.</li>
+<li>"New fault is not recorded due to compression of faults" on QEMU's console → a fault arrived while the only record was pending → expected for back-to-back faults; clear records in the handler promptly. It appeared in R2 and R3.</li>
+</ul>
+<p><b>Extension.</b> Allocate a second MSI-X vector for xHCI's interrupter 1 and route it to a different vector; then add page-selective IOTLB invalidation and measure, with the PIT clock, the cost of a thousand map/unmap pairs with global versus page-selective invalidation (QEMU timings only; say so).</p>
+
+<h2 id="F4-08-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "DMA to nowhere." A colleague's receive path for the edu device "works on machines without an IOMMU". On the test machine with VT-d on, every received payload is wrong and the console shows DMAR faults. The colleague says the IOMMU driver must be broken: "the buffer is mapped, I can see the map call".</p>
+<p><b>Evidence pack.</b> The kernel log of the test machine, from a real run of the forensic build (R3): <sup class="src"><a href="#F4-08-src-R3">R3</a></sup></p>
+<pre class="output" data-run="F4-08/forensic"></pre>
+<p>Also available: <code>f408_main.cc</code> (the receive path is the function compiled with <code>-DF408_FREE_TOO_EARLY</code>), <code>dma.cc</code> (Listing 2) and the working run R2.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Decode the first fault record: which device, which address, read or write, which reason?</li>
+<li>Compare the fault's IOVA and time with the "mapped rx buffer" and "buffer released" lines. State at least two hypotheses before reading the code.</li>
+<li>Prove which hypothesis holds from the log alone, then confirm it in the source.</li>
+<li>Why does the same code "work" without an IOMMU, and why is that worse than the fault?</li>
+<li>Give the fix and a test that would catch the bug even without an IOMMU.</li>
+</ol>
+<p><b>Method hints.</b> Line up the three timestamps of request 1. Ask what state the IOVA was in at each moment. The IOMMU's answer is about the state of the mapping when the device wrote, not when the driver called <code>map</code>.</p>
+<p>Grading follows the forensic rubric of guide 11.2 (observation 20 %, hypotheses 20 %, evidence-based conclusion 30 %, fix and verification 20 %, prevention and communication 10 %).</p>
+
+<h2 id="F4-08-project">Mini-project</h2>
+<p>Write <code>dma_debug</code>: a checking layer under the mapping API, enabled by a build flag. It records every live mapping (device, IOVA, length, direction, caller), refuses to unmap a range that was never mapped or is still owned by an in-flight request, reports mappings never unmapped when a driver detaches, and poisons a buffer (fills it with a pattern) when it is unmapped so that a late DMA becomes visible even without an IOMMU. Demonstrate it on the forensic build.</p>
+<p><b>Rubric.</b> Correct bookkeeping for overlapping and repeated mappings (30 %); each misuse class detected with a clear message naming the caller (30 %); poisoning catches the forensic bug with the IOMMU off (20 %); a short note on its run-time cost measured in QEMU (10 %); code style and tests (10 %).</p>
+
+<h2 id="F4-08-summary">Summary</h2>
+<ul>
+<li>MSI turns an interrupt into a memory write of a vector to an APIC address; no IOAPIC, no routing table, no shared line (R1).</li>
+<li>MSI-X adds a table of independently masked messages and a pending bit array; enable with the function mask set and unmask entries only after programming them (R1).</li>
+<li>Level-triggered lines need the device acknowledged before the EOI; MSIs are edge-like messages.</li>
+<li>VT-d translates each DMA by source ID → root entry → context entry (domain) → three-level page table; entries with neither R nor W are not present (R2).</li>
+<li>Drivers obtain device addresses only from a mapping API; unmap must be followed by an IOTLB invalidation.</li>
+<li>With the IOMMU on, a stray DMA becomes a fault record (source, address, reason) instead of corrupted memory (R1 versus R2).</li>
+<li>The register layouts used here are from memory and confirmed only against QEMU; the MSI/MSI-X constants match Linux's header (R5).</li>
+</ul>
+
+<h2 id="F4-08-sources">Sources</h2>
+<ol>
+<li id="F4-08-src-D1">PCI-SIG, "PCI Local Bus Specification" (curriculum C7 reading: MSI capability structure; command register interrupt-disable bit). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F4-08-src-D2">PCI-SIG, "PCI Express Base Specification" (curriculum C7 reading: MSI-X capability and table structure; ordering of posted writes; requester ID). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F4-08-src-D3">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3 (curriculum C7 reading: APIC; message signalled interrupts, message address and data format). Intel 82093AA I/O APIC datasheet for the redirection entries. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-08-src-D4">Intel, "Intel Virtualization Technology for Directed I/O Architecture Specification" (curriculum C7 reading: root and context tables, second-level translation, invalidation, fault reporting; the ACPI DMAR table it defines). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F4-08-src-D5">UEFI Forum, "Advanced Configuration and Power Interface (ACPI) Specification": MADT, interrupt source override structures, global system interrupts. <i>Title only — not opened during this build; the Source Researcher must confirm the version and section (dossier gate G1 open).</i></li>
+<li id="F4-08-src-D6">QEMU documentation: the "edu" educational PCI device (register map) and the intel-iommu device. <i>Title only — not opened during this build; the Source Researcher must confirm the version and pages (dossier gate G1 open).</i></li>
+<li id="F4-08-src-D7">This project's Systems Curriculum: milestone C7 (goal, reading, build, acceptance tests) and the safety box on drivers (opened in this build; the project's own page; a map, not a technical source).</li>
+<li id="F4-08-src-L1">L1 — Linux UAPI header <code>&lt;linux/pci_regs.h&gt;</code> as installed in the build container (opened in this build by <code>msicheck.cpp</code>; tier 4): <code>PCI_CAP_ID_MSI</code>, <code>PCI_MSI_*</code>, <code>PCI_MSIX_*</code>.</li>
+<li id="F4-08-src-R1">R1 — lab run, step <code>msi</code>: <code>university/labs/F4-08/msi.out</code>, <code>msi.log</code> (QEMU 8.2.2, q35, TCG, no IOMMU; exit code 33 = pass).</li>
+<li id="F4-08-src-R2">R2 — lab run, step <code>iommu</code>: <code>iommu.out</code>, <code>iommu.log</code> (the same with intel-iommu).</li>
+<li id="F4-08-src-R3">R3 — lab run, step <code>forensic</code>: <code>forensic.out</code>, <code>forensic.log</code> (built with <code>-DF408_FREE_TOO_EARLY</code>).</li>
+<li id="F4-08-src-R4">R4 — lab run of <code>vtd_decode.cpp</code> with <code>vtd_decode.in</code>: <code>vtd_decode.out</code>, <code>vtd_decode.log</code>.</li>
+<li id="F4-08-src-R5">R5 — lab run of <code>msicheck.cpp</code>: <code>msicheck.out</code>, <code>msicheck.log</code> (24 constants against L1).</li>
+<li id="F4-08-src-R6">R6 — lab run, step <code>build</code>: <code>build.out</code>, <code>build.log</code>.</li>
+</ol>
+
+<h2 id="F4-08-glossary">Glossary links</h2>
+<p><a href="#gl-msi-message-signalled-interrupt">MSI (message-signalled interrupt)</a> · <a href="#gl-msi-x">MSI-X</a> · <a href="#gl-pending-bit-array-pba">Pending bit array (PBA)</a> · <a href="#gl-ioapic">IOAPIC</a> · <a href="#gl-global-system-interrupt-gsi">Global system interrupt (GSI)</a> · <a href="#gl-iommu">IOMMU</a> · <a href="#gl-iova-i-o-virtual-address">IOVA (I/O virtual address)</a> · <a href="#gl-dma-domain">DMA domain</a> · <a href="#gl-dmar-table">DMAR table</a> · <a href="#gl-context-entry">Context entry</a> · <a href="#gl-iotlb">IOTLB</a> · <a href="#gl-fault-record-vt-d">Fault record (VT-d)</a> · <a href="#gl-dma-mapping-api">DMA mapping API</a> · <a href="#gl-end-of-interrupt-eoi">End-of-interrupt (EOI)</a></p>
+
+<h2 id="F4-08-next">Next chapter</h2>
+<p>Next: <a href="#F4-09">F4-09 USB: xHCI, enumeration, HID, mass storage</a>, the first driver that uses MSI-X and the mapping API from the start. Back to the course: <a href="#DR302">DR302</a>. Earlier steps this chapter builds on: <a href="#F4-02">F4-02</a> (capabilities), <a href="#F4-03">F4-03</a> (interrupt handling) and <a href="#F4-07">F4-07</a> (NVMe queues).</p>
+
+<h2 id="F4-08-answers">Answers to Check yourself</h2>
+<ol>
+<li>A message address and a message data value (plus control bits). To interrupt, the device performs a memory write of the data to the address.</li>
+<li>Address 0xFEE00000 | (2 &lt;&lt; 12) = 0xFEE02000; data 0x0051.</li>
+<li>A level-triggered line stays asserted as long as the device's cause is set; after the EOI the APIC sees it still active and delivers it again. An MSI is a single write: once sent, nothing stays asserted, so there is no repeated delivery (the handler still clears the device's cause so the device can signal the next event).</li>
+<li>The completion event happened while entry 0 was masked: the device could not send the message and set the pending bit instead. On unmasking, the device sent the pending message (the vector count went from 3 to 4) and cleared the bit.</li>
+<li>Root table indexed by bus 0 → context table indexed by device 1, function 0 → the context entry gives domain 1 and the second-level table at 0x11a000.</li>
+<li>VT-d second-level entries have no separate present bit: an entry with R = W = 0 is "not present", so a write to it is reported as a write without write permission (reason 5).</li>
+<li>Real hardware and IOMMUs with caching mode 1 may keep the old translation, so the device can still write freed memory; and the test in QEMU only shows that this model did not cache that entry at that moment, not that the specification allows skipping the invalidation.</li>
+<li>(b).</li>
+<li>So that a driver that bypasses the API and passes a physical address fails at once with a fault, instead of working by accident because IOVA and physical address coincide.</li>
+</ol>
+<h3 id="F4-08-forensic-key">Forensic answer key</h3>
+<p><b>Observation.</b> Request 1: mapped at IOVA 0x802000 at t = 115 ms; "buffer released" at t = 116 ms; DMAR fault at t = 216 ms for 00:01.0, write, IOVA 0x802000, reason 5; payload fnv1a 0x76efddc5 instead of 0x01fbddc5. Request 2 repeats the pattern at IOVA 0x804000. The raw record high 0x80ffff0500000008 decodes as valid, write, reason 5, source 0x0008 (00:01.0).</p>
+<p><b>Root cause.</b> The driver unmaps the receive buffer immediately after starting the DMA (<code>f408_main.cc</code>, <code>edu_receive_buggy</code>: <code>dma::unmap</code> right after <code>edu::dma_start</code>), so when the device writes, about 100 ms later, the IOVA has no entry and the IOMMU blocks the write. The log alone proves it: the fault's IOVA equals the mapped IOVA, and "released" precedes the fault. Ruled out: "the IOMMU driver is broken" (R2's mapped transfers succeed with the same API); "wrong IOVA passed" (the addresses match exactly).</p>
+<p><b>Injection.</b> Built with <code>-DF408_FREE_TOO_EARLY</code>, which compiles the receive path shown above.</p>
+<p><b>Fix.</b> Unmap only after the completion (IRQ_DMA_DONE) has been observed; verify by rerunning: no fault, payload fnv1a equals the source.</p>
+<p><b>Why it "works" without an IOMMU.</b> Unmap is a no-op in identity mode, so the device writes the buffer, which by then may belong to someone else: silent corruption of reused memory, far worse than a logged fault.</p>
+<p><b>Prevention.</b> The mini-project's <code>dma_debug</code> (refuse to unmap a range owned by an in-flight request; poison on unmap); a test that runs every driver with the IOMMU on.</p>
+<p><b>Wrong answers.</b> "Reason 5 means the mapping was read-only": the mapping existed with write permission while it existed; it was removed. "The IOTLB was stale": a stale IOTLB would let the write through, not block it.</p>

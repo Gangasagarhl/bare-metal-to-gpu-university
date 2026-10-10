@@ -1,0 +1,329 @@
+<!--meta
+id: F8-11
+title: Overlapping communication with computation
+course: DG402
+level: L4
+prereqs: F8-10; F8-07 (non-blocking operations); F8-08; DG401 (F8-06 NCCL and RCCL in a data-parallel training step); CU303 (streams and events)
+time: 12–16 hours including the lab, the forensic lab and the exam practice
+hardware: for the full lab, two nodes with GPUs and a network (RDMA for the performance part), NCCL or RCCL, and Nsight Systems or the ROCm Systems Profiler; the stand-in lab, the model and the forensic lab need only one Linux computer with Open MPI, g++ and nvcc (this build: one machine with 4 shared CPUs, no GPU)
+maps: Curriculum Track F, milestone F6 (overlap communication with computation): goal, build and acceptance test; MP5 milestone "Overlap with a training step (F6)"; DG402 exam P "explain a two-node timeline"
+analogy: F8 — a chain of kitchen halls with a delivery service between them (new mappings proposed in NOTES.md: gradient bucket = a crate packed as soon as one course is finished; overlap = the delivery van leaving while the kitchen is still cooking the next course; MPI progress = somebody has to go out and wave the van on; exposed communication = the time the kitchen stands idle waiting for the last van)
+-->
+
+<h2 id="F8-11-hook">Story hook</h2>
+<p>Every evening the kitchen halls in both buildings cook the same menu, course by course, from dessert back to starter, and at the end every hall must have the combined tasting notes of all halls for every course. Until now, the halls cooked all eight courses, then packed eight crates of notes, then waited while the vans drove them across town and back. The cooks stood idle for the whole delivery.</p>
+<p>Ravi had the obvious idea: as soon as dessert is finished, pack its crate and send the van; cook the next course while the van is on the road. By the time the starter is done, most crates are already back. Only the last crate still has to make the trip while the kitchen waits.</p>
+<p>The first evening they tried it, nothing changed. The crates were packed early and left by the door, but nobody waved the vans on; they sat there until the kitchen was done and someone finally went outside. The second evening a cook went out between every dish to wave the vans on. The crates flowed, but that cook's dishes took longer. And whatever they did, the starter's crate, the biggest of all, could only leave at the very end.</p>
+
+<h2 id="F8-11-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> how gradient buckets let the all-reduce of a data-parallel step run during the backward pass, and what part of the communication stays exposed.</li>
+<li><b>Build</b> an overlapped schedule with non-blocking collectives and a trace of when each bucket starts and completes, on CPU with MPI and on GPU with streams and events.</li>
+<li><b>Explain</b> why non-blocking operations need progress, and recognise a schedule in which no communication happens until the final wait.</li>
+<li><b>Predict</b> step time and hidden communication with a timeline model, and compare the measured saving with the hidden time as milestone F6 requires.</li>
+<li><b>Read</b> a two-node timeline and explain every gap in it (the DG402 exam task).</li>
+</ul>
+
+<div class="co jargon" id="F8-11-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Communication-computation overlap</dt><dd><b>Simple words:</b> moving data at the same time as calculating, so the total time is less than the two added up. <b>Analogy:</b> the van drives across town while the kitchen cooks the next course. <b>Precise:</b> running communication operations concurrently with computation that does not depend on them, so that step time approaches max(compute, communication) rather than their sum; it needs independent work, hardware that can do both at once, and a software path that lets the communication advance while the computation runs. <sup class="src"><a href="#F8-11-src-D2">D2</a></sup> <sup class="src"><a href="#F8-11-src-C1">C1</a></sup></dd>
+<dt>Non-blocking collective (MPI)</dt><dd><b>Simple words:</b> a group operation that you start with one call and finish with another, with other work in between. <b>Analogy:</b> handing the crate to the depot and getting a ticket; you collect the result later with the ticket. <b>Precise:</b> MPI's <code>MPI_I…</code> collectives (here <code>MPI_Iallreduce</code>) return a request immediately; the operation is complete only after a successful <code>MPI_Test…</code> or <code>MPI_Wait…</code> on it, and the buffer must not be touched until then; all ranks must start collectives on a communicator in the same order. <sup class="src"><a href="#F8-11-src-D1">D1</a></sup></dd>
+<dt>MPI progress</dt><dd><b>Simple words:</b> the library actually doing the steps of an operation you have started. <b>Analogy:</b> someone has to go out and wave the van on. <b>Precise:</b> the execution of the internal steps (sends, receives, reductions) of pending non-blocking operations; depending on the library, transport and configuration, it happens only inside MPI calls on the calling thread, or also in a progress thread or in network hardware. Listing 1's <code>notest</code> schedule shows a case where it happened only in the final wait (R1). <sup class="src"><a href="#F8-11-src-D1">D1</a></sup> <sup class="src"><a href="#F8-11-src-R1">R1</a></sup></dd>
+<dt>Exposed communication</dt><dd><b>Simple words:</b> the part of the communication time that the computation does not cover, so it adds to the step time. <b>Analogy:</b> the time the kitchen stands idle waiting for the last van. <b>Precise:</b> step time minus the time of the computation the communication could have overlapped (here the backward pass); hidden communication is total communication minus exposed communication. Listing 3 prints both. <sup class="src"><a href="#F8-11-src-R3">R3</a></sup></dd>
+</dl></div>
+
+<h2 id="F8-11-pictures">The idea in pictures</h2>
+<p>Figure 1 is the timeline of one step on one rank: serial at the top, overlapped below, in the shape that Nsight Systems or the ROCm Systems Profiler would show for a GPU. Figure 2 shows the three CPU schedules of Listing 1 as measured, bucket by bucket.</p>
+<figure id="F8-11-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F8-11-f1t F8-11-f1d">
+<title id="F8-11-f1t">Figure 1: serial and overlapped timelines of one data-parallel step</title>
+<desc id="F8-11-f1d">Two timelines, each with a compute row and a communication row. Serial: the compute row holds backward kernels for layers 7 down to 0, from 0 to 13 ms; then the communication row holds the eight all-reduces one after the other from 13 to 28.76 ms, during which the compute row is empty. Overlapped: the compute row is the same, from 0 to 13 ms; in the communication row each layer's all-reduce starts when its layer finishes: layer 7's at 2 ms, layer 6's at 4 ms and so on, so most of them run under the compute row; layer 0's large all-reduce starts at 13 ms when the backward pass ends and runs to 19.74 ms, exposed. Brackets mark the exposed communication: 15.76 ms in the serial case, 6.74 ms in the overlapped case. Values from Listing 3 with invented teaching parameters.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<text class="sv-tb" x="16" y="20">Serial (Listing 3, TN-2): step 28.76 ms</text>
+<text class="sv-ts" x="16" y="44">compute</text><text class="sv-ts" x="16" y="66">comm</text>
+<rect class="sv-b5" x="90" y="34" width="40" height="14"/><text class="sv-ts" x="104" y="45">7</text>
+<rect class="sv-b5" x="130" y="34" width="40" height="14"/><text class="sv-ts" x="144" y="45">6</text>
+<rect class="sv-b5" x="170" y="34" width="40" height="14"/><text class="sv-ts" x="184" y="45">5</text>
+<rect class="sv-b5" x="210" y="34" width="40" height="14"/><text class="sv-ts" x="224" y="45">4</text>
+<rect class="sv-b5" x="250" y="34" width="30" height="14"/><text class="sv-ts" x="259" y="45">3</text>
+<rect class="sv-b5" x="280" y="34" width="30" height="14"/><text class="sv-ts" x="289" y="45">2</text>
+<rect class="sv-b5" x="310" y="34" width="20" height="14"/><text class="sv-ts" x="314" y="45">1</text>
+<rect class="sv-b5" x="330" y="34" width="20" height="14"/><text class="sv-ts" x="334" y="45">0</text>
+<rect class="sv-b3" x="350" y="56" width="34" height="14"/><rect class="sv-b3" x="384" y="56" width="34" height="14"/><rect class="sv-b3" x="418" y="56" width="34" height="14"/><rect class="sv-b3" x="452" y="56" width="34" height="14"/><rect class="sv-b3" x="486" y="56" width="17" height="14"/><rect class="sv-b3" x="503" y="56" width="17" height="14"/><rect class="sv-b3" x="520" y="56" width="9" height="14"/><rect class="sv-b3" x="529" y="56" width="135" height="14"/>
+<text class="sv-ts" x="590" y="67">0</text>
+<line class="sv-line2" x1="350" y1="80" x2="664" y2="80"/><text class="sv-ts" x="420" y="96">exposed 15.76 ms (all of it)</text>
+<text class="sv-tb" x="16" y="128">Overlapped: step 19.74 ms</text>
+<text class="sv-ts" x="16" y="152">compute</text><text class="sv-ts" x="16" y="174">comm</text>
+<rect class="sv-b5" x="90" y="142" width="40" height="14"/><text class="sv-ts" x="104" y="153">7</text>
+<rect class="sv-b5" x="130" y="142" width="40" height="14"/><text class="sv-ts" x="144" y="153">6</text>
+<rect class="sv-b5" x="170" y="142" width="40" height="14"/><text class="sv-ts" x="184" y="153">5</text>
+<rect class="sv-b5" x="210" y="142" width="40" height="14"/><text class="sv-ts" x="224" y="153">4</text>
+<rect class="sv-b5" x="250" y="142" width="30" height="14"/><text class="sv-ts" x="259" y="153">3</text>
+<rect class="sv-b5" x="280" y="142" width="30" height="14"/><text class="sv-ts" x="289" y="153">2</text>
+<rect class="sv-b5" x="310" y="142" width="20" height="14"/><text class="sv-ts" x="314" y="153">1</text>
+<rect class="sv-b5" x="330" y="142" width="20" height="14"/><text class="sv-ts" x="334" y="153">0</text>
+<rect class="sv-b3" x="130" y="164" width="34" height="14"/><text class="sv-ts" x="142" y="175">7</text>
+<rect class="sv-b3" x="170" y="164" width="34" height="14"/><text class="sv-ts" x="182" y="175">6</text>
+<rect class="sv-b3" x="210" y="164" width="34" height="14"/><text class="sv-ts" x="222" y="175">5</text>
+<rect class="sv-b3" x="250" y="164" width="34" height="14"/><text class="sv-ts" x="262" y="175">4</text>
+<rect class="sv-b3" x="284" y="164" width="17" height="14"/><text class="sv-ts" x="288" y="175">3</text>
+<rect class="sv-b3" x="310" y="164" width="17" height="14"/><text class="sv-ts" x="314" y="175">2</text>
+<rect class="sv-b3" x="330" y="164" width="9" height="14"/>
+<rect class="sv-b3" x="350" y="164" width="135" height="14"/><text class="sv-ts" x="412" y="175">0</text>
+<line class="sv-line2" x1="350" y1="188" x2="485" y2="188"/><text class="sv-ts" x="356" y="204">exposed 6.74 ms: layer 0's bucket</text>
+<line class="sv-dash" x1="350" y1="26" x2="350" y2="214"/><text class="sv-ts" x="356" y="226">backward pass ends (13.00 ms)</text>
+<text class="sv-ts" x="16" y="244">Compute row: backward kernels per layer (7 → 0). Comm row: all-reduce of each layer's bucket, one channel, first ready first served. 1 px ≈ 0.05 ms.</text>
+</svg></div><figcaption><b>Figure 1.</b> The two schedules of Listing 3 drawn from its output (R3); parameters are invented teaching values (TN-2). On a GPU the compute row is the compute stream and the comm row the communication stream or the library's kernels. <sup class="src"><a href="#F8-11-src-R3">R3</a></sup> <sup class="src"><a href="#F8-11-src-C1">C1</a></sup></figcaption></figure>
+
+<figure id="F8-11-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F8-11-f2t F8-11-f2d">
+<title id="F8-11-f2t">Figure 2: measured bucket traces of Listing 1 on two CPU processes</title>
+<desc id="F8-11-f2d">Three rows of eight bucket bars on a common time axis from 0 to 45 ms, each bar from the bucket's start time to its completion time, with a vertical mark at the end of the backward pass. Serial: all bars after the backward pass ends at 31.9 ms, one after the other, to 40.3 ms. Overlap: bars start at 3.2, 8.0, 12.5, 16.8, 20.9, 25.2, 29.4 and 33.6 ms and each completes about 3 to 4 ms later; seven complete before the backward pass ends at 33.82 ms, the last at 35.2 ms. Notest: bars start at similar times (3.1 to 33.0 ms) but all stretch until 42.7 ms, the last until 44.4 ms, long after the backward pass ended at 34.28 ms.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<text class="sv-ts" x="16" y="20">ms →</text><text class="sv-ts" x="96" y="20">0</text><text class="sv-ts" x="236" y="20">10</text><text class="sv-ts" x="376" y="20">20</text><text class="sv-ts" x="516" y="20">30</text><text class="sv-ts" x="656" y="20">40</text>
+<text class="sv-tb" x="16" y="50">serial</text>
+<rect class="sv-b3" x="547" y="40" width="29" height="10"/><rect class="sv-b3" x="576" y="40" width="14" height="10"/><rect class="sv-b3" x="590" y="40" width="13" height="10"/><rect class="sv-b3" x="603" y="40" width="11" height="10"/><rect class="sv-b3" x="614" y="40" width="13" height="10"/><rect class="sv-b3" x="627" y="40" width="11" height="10"/><rect class="sv-b3" x="638" y="40" width="14" height="10"/><rect class="sv-b3" x="652" y="40" width="12" height="10"/>
+<line class="sv-dash" x1="547" y1="30" x2="547" y2="64"/><text class="sv-ts" x="420" y="74">backward ends 31.9; step 40.29</text>
+<text class="sv-tb" x="16" y="114">overlap</text>
+<rect class="sv-b1" x="145" y="96" width="52" height="8"/><rect class="sv-b1" x="212" y="106" width="45" height="8"/><rect class="sv-b1" x="275" y="96" width="36" height="8"/><rect class="sv-b1" x="335" y="106" width="36" height="8"/><rect class="sv-b1" x="393" y="96" width="32" height="8"/><rect class="sv-b1" x="453" y="106" width="32" height="8"/><rect class="sv-b1" x="512" y="96" width="31" height="8"/><rect class="sv-b1" x="570" y="106" width="23" height="8"/>
+<line class="sv-dash" x1="573" y1="88" x2="573" y2="124"/><text class="sv-ts" x="420" y="138">backward ends 33.82; 7 of 8 done; step 35.17</text>
+<text class="sv-tb" x="16" y="184">notest</text>
+<rect class="sv-b4" x="143" y="160" width="455" height="6"/><rect class="sv-b4" x="191" y="168" width="407" height="6"/><rect class="sv-b4" x="251" y="176" width="347" height="6"/><rect class="sv-b4" x="311" y="184" width="287" height="6"/><rect class="sv-b4" x="373" y="192" width="225" height="6"/><rect class="sv-b4" x="436" y="200" width="162" height="6"/><rect class="sv-b4" x="496" y="208" width="102" height="6"/><rect class="sv-b4" x="562" y="216" width="160" height="6"/>
+<line class="sv-dash" x1="580" y1="152" x2="580" y2="226"/><text class="sv-ts" x="300" y="240">backward ends 34.28; nothing done until the final wait (42.7, 44.4); step 44.41</text>
+</svg></div><figcaption><b>Figure 2.</b> Start-to-completion bars of the eight 2 MiB all-reduces of Listing 1, drawn from R1 (14 px per ms; rank 0's trace of the median repetition). Measured on one shared 4-CPU container; the shapes, not the milliseconds, are the lesson. <sup class="src"><a href="#F8-11-src-R1">R1</a></sup></figcaption></figure>
+
+<h2 id="F8-11-layer1">Layer 1 — the kid explanation</h2>
+<p>If you wait until all the cooking is done before you send any crates, the cooks stand around while the vans drive. If you send each crate as soon as its course is ready, the vans drive while the cooks keep cooking, and most of the waiting disappears.</p>
+<p>Two things can still go wrong. First, a crate left by the door goes nowhere until someone waves the van on. If everyone is busy cooking and nobody goes out, the crates all leave at the very end, and you gained nothing. Second, the last course cooked is always followed by its own delivery: nothing is left to cook while that van is on the road. If the last course has the biggest crate, that waiting time cannot be hidden.</p>
+<p>So a good plan sends crates early, makes sure someone waves the vans on without slowing the cooking much, and thinks about which crate comes last.</p>
+
+<h2 id="F8-11-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F8-11-l2-why">Why the gradients can travel early</h3>
+<p>In a data-parallel step (<a href="#F8-06">F8-06</a>) every replica computes gradients in the backward pass, from the last layer to the first, and then all-reduces them. Layer 7's gradient is final as soon as layer 7's backward is done; nothing computed later changes it. So its all-reduce can start then, while layers 6 to 0 are still being computed. Collecting the gradients of one or several layers into a buffer that is all-reduced as a unit is gradient bucketing (<a href="#F8-06">F8-06</a>); milestone F6 asks for "Gradient buckets launched as soon as they are ready, on a separate communication stream." <sup class="src"><a href="#F8-11-src-C1">C1</a></sup> <sup class="src"><a href="#F8-11-src-D2">D2</a></sup></p>
+<h3 id="F8-11-l2-model">The timeline model</h3>
+<p>Listing 3 schedules one step on two lanes: compute (backward layers in order) and one communication channel that serves buckets first-come, first-served. Each all-reduce costs α + bytes/β. Serial starts all communication at the end of the backward pass; overlap starts bucket k when its layer is done and the channel is free. Its parameters are invented teaching values labelled TN-2 (AH-22): α = 30 µs, 10 GB/s effective all-reduce bandwidth, eight layers whose backward times and gradient sizes are in <code>timeline_model.in</code>, with a 64 MiB bucket for layer 0 (think of an embedding table at the input). <sup class="src"><a href="#F8-11-src-R3">R3</a></sup></p>
+<pre class="output" data-run="F8-11/timeline_model"></pre>
+<p>Read the drawing: digits are layer ids, one character is 0.5 ms. Serially, 13.00 ms of backward plus 15.76 ms of communication gives 28.76 ms, all communication exposed. Overlapped, the buckets of layers 7 to 1 run under the compute row; only layer 0's 64 MiB bucket (6.74 ms) remains, because it becomes ready when there is nothing left to compute. Step 19.74 ms; 57 % of the communication hidden. <sup class="src"><a href="#F8-11-src-R3">R3</a></sup> Two lessons follow. The saving (9.02 ms) equals the hidden communication (15.76 − 6.74 = 9.02 ms) exactly, because the model assumes overlap is free. And the floor of the step time is backward + the last bucket's all-reduce, which is why bucket order and size matter.</p>
+<h3 id="F8-11-l2-cpu">What a CPU stand-in shows</h3>
+<p>Listing 1 runs the schedule for real on two MPI processes: eight "layers" whose backward is a loop of square roots, eight 2 MiB buckets, and three schedules: <code>serial</code> (compute, then blocking <code>MPI_Allreduce</code> per bucket), <code>overlap</code> (<code>MPI_Iallreduce</code> as soon as a layer is done, <code>MPI_Testsome</code> between slices of the next layer's compute, <code>MPI_Waitsome</code> at the end) and <code>notest</code> (like overlap, with no MPI call during compute). It records when each bucket started and when rank 0 saw it complete. The gradients are small integers stored as floats, so all three schedules must produce identical results: the hash <code>f733972caa922325</code> is the same in all three (R1). <sup class="src"><a href="#F8-11-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F8-11/overlap_mpi"></pre>
+<ul>
+<li><b>serial:</b> the buckets run after the backward pass ended at 31.90 ms, from 31.9 to 40.3 ms; 8.38 ms after the backward pass; step 40.29 ms.</li>
+<li><b>overlap:</b> buckets start between 3.2 and 33.6 ms and complete 1.6 to 3.7 ms later; 7 of 8 complete before the backward pass ends; only 1.35 ms after it; step 35.17 ms. The trace shows real overlap.</li>
+<li><b>notest:</b> buckets start at the same moments, but seven complete together at 42.7 ms and the last at 44.4 ms: nothing finished until the final wait; 10.13 ms after the backward pass; step 44.41 ms, the worst of the three.</li>
+</ul>
+<p>Now the honest part. Did overlap save time? Compare not only step times but the pure compute time each run measured: 31.89, 26.85 and 25.17 ms. The compute differs by several milliseconds between runs on this shared 4-CPU machine, so step times alone are not a fair comparison. Step minus compute is 8.40 ms (serial), 8.32 ms (overlap) and 19.24 ms (notest). In overlap mode about 7 ms of communication was hidden (8.38 − 1.35 ms after the backward pass), but the backward pass itself ended 6.97 ms after its own compute time (33.82 − 26.85): on a CPU, the same cores that compute also copy and add the buckets, inside the MPI calls. The communication moved; it did not disappear. <sup class="src"><a href="#F8-11-src-R1">R1</a></sup> That is exactly why milestone F6's acceptance test asks for a step-time saving "close to the hidden communication time": the saving equals the hidden time only if communicating does not slow the computation.</p>
+
+<h2 id="F8-11-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: a van only saves time if it is driven by someone other than a cook, and someone must wave it on. Engineering version: overlap needs separate hardware for the communication and a progress mechanism for it.</p>
+<h3 id="F8-11-l3-progress">Progress</h3>
+<p>The MPI Standard defines when a non-blocking operation is complete, not which thread does its work. <sup class="src"><a href="#F8-11-src-D1">D1</a></sup> In this build, a non-blocking all-reduce through Open MPI's <code>libnbc</code>-style schedule advanced only when the process called into MPI: <code>notest</code> shows every bucket completing in the final <code>MPI_Waitsome</code> (R1). <code>overlap</code> calls <code>MPI_Testsome</code> 16 times per layer, which gave the library chances to advance the schedules; seven buckets finished during the backward pass. <sup class="src"><a href="#F8-11-src-R1">R1</a></sup> Other ways to get progress: a progress thread inside the library (when built and enabled), a dedicated communication thread in your program that calls <code>MPI_Test</code> in a loop, or offload to network hardware. On GPUs, NCCL and RCCL run collectives as GPU kernels on their own stream, and the GPU executes them concurrently with the compute stream's kernels if resources allow; the host does not drive each step. <sup class="src"><a href="#F8-11-src-D3">D3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Not established in this build: which Open MPI component carried <code>MPI_Iallreduce</code> here (the coll component list is in <a href="#F8-10">F8-10</a> R4; the selection was not logged); whether this Open MPI build offers an asynchronous progress thread and how to enable it; how much of the 6.97 ms by which the overlapped backward pass exceeded its compute time was spent in <code>MPI_Testsome</code>, how much in the eight <code>MPI_Iallreduce</code> start calls, and how much was interference from the other process and other jobs (in <code>notest</code>, with only the start calls, the gap was 9.11 ms, so the start calls and interference are not negligible); and the statement that NCCL/RCCL collectives are GPU kernels that take some of the GPU's compute resources. Lab step 2 asks you to time the start calls separately.</p></div>
+<h3 id="F8-11-l3-gpu">The GPU schedule</h3>
+<p>Listing 2 is the overlapped schedule for GPUs with an MPI that is not GPU-aware (this build's, <a href="#F8-08">F8-08</a>). The compute stream runs backward kernels, last layer first, and records an event after each. A second stream, the copy stream, waits on each event (<code>cudaStreamWaitEvent</code>) and copies the bucket to pinned host memory, then records a second event. The host thread polls those events with <code>cudaEventQuery</code>; when a bucket is on the host it starts <code>MPI_Iallreduce</code>, and it keeps calling <code>MPI_Testsome</code>; when a reduction is complete it copies the result back on the copy stream. Both streams are created with <code>cudaStreamNonBlocking</code> (0x01 in the CUDA 12.0 header) and the events with <code>cudaEventDisableTiming</code> (0x02), which makes them cheaper to record and query. <sup class="src"><a href="#F8-11-src-H1">H1</a></sup> With a GPU-aware MPI or with NCCL/RCCL, the copies disappear and the collective takes device pointers on a communication stream (<a href="#F8-06">F8-06</a>). Three rules hold in every version:</p>
+<ol>
+<li>The communication must wait for the gradient: an event recorded after the producing kernel, waited on by the communication stream (or queried by the host).</li>
+<li>Every rank starts the bucket collectives in the same order; Listing 2 keeps a single counter <code>next</code> from the last bucket to the first.</li>
+<li>Nothing reads or writes a bucket between the start and the completion of its collective; the optimiser step waits for all of them.</li>
+</ol>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 2 was compiled with nvcc 12.0 and Open MPI 4.1.6's flags and run on 2 processes; it stopped at <code>cudaGetDeviceCount</code> with <code>cudaErrorNoDevice</code> and called <code>MPI_Abort</code> (R2). <sup class="src"><a href="#F8-11-src-R2">R2</a></sup> Its stream, event and copy logic has never executed. The API names were checked by the compiler against the installed headers; the flag values were read in the headers (H1).</p></div>
+<h3 id="F8-11-l3-buckets">Bucket size and order</h3>
+<p>Small buckets start early and leave little exposed at the end, but each pays α and has its own start and completion overhead. Large buckets amortise α but start late and leave a large tail. Training frameworks use a bucket size of a few megabytes to tens of megabytes as a configurable parameter and fill buckets in reverse layer order; the PyTorch DDP paper describes the design and measures the trade-off. <sup class="src"><a href="#F8-11-src-D2">D2</a></sup> In Listing 3's model the exposed time is at least the last-ready bucket's all-reduce: splitting layer 0's 64 MiB bucket into smaller pieces does not help, because none of them is ready before the backward pass ends. What helps is less data in the last bucket, or work to overlap it with (for example the next step's forward pass, if the framework allows it).</p>
+<h3 id="F8-11-l3-twonode">Two nodes</h3>
+<p>On two nodes the all-reduce of each bucket is the hierarchical one of <a href="#F8-10">F8-10</a>, and its cost is dominated by the network for large buckets. The overlapped schedule's floor, backward + last bucket, grows with the network's α and β. The non-overlapped baseline for the milestone is the data-parallel step of <a href="#F8-06">F8-06</a> (milestone F3), run on 2 nodes. Measure both with a profiler that shows all processes on one time axis (Nsight Systems or the ROCm Systems Profiler) and read the timeline, not only the step time. <sup class="src"><a href="#F8-11-src-D4">D4</a></sup></p>
+
+<h2 id="F8-11-hardware">How the hardware actually does it</h2>
+<p>On a GPU node, overlap is possible because different parts of the hardware do different jobs. The backward kernels run on the GPU's streaming multiprocessors (CUs on AMD). Copies between GPU and host run on the GPU's copy engines (DMA engines), which work independently of the multiprocessors. Network transfers are done by the network adapter's DMA, reading and writing host or (with GPUDirect RDMA, <a href="#F8-09">F8-09</a>) GPU memory. The reduction arithmetic of an all-reduce runs on the GPU's multiprocessors (NCCL/RCCL kernels) or on the CPU (staged MPI). <sup class="src"><a href="#F8-11-src-D3">D3</a></sup> <sup class="src"><a href="#F8-11-src-D4">D4</a></sup> So on a GPU, overlap is close to free for the data movement and costs a share of the GPU's compute and memory bandwidth for the reductions; on the CPU of this build, every part of the communication ran on the same cores as the computation, which is what R1 shows. Interference is real on GPUs too: the communication kernels and the backward kernels compete for multiprocessors and memory bandwidth, so the profiler timeline, not the model, decides how much was hidden.</p>
+
+<h2 id="F8-11-worked">Worked example</h2>
+<p><b>Listing 3 by hand</b> (TN-2; 1 MiB = 1,048,576 bytes; 10 GB/s = 10,000,000 bytes per ms):</p>
+<ol>
+<li>All-reduce times: 16 MiB: 0.03 + 16 × 1.048576/10 = 1.7077 ms; 8 MiB: 0.8689 ms; 4 MiB: 0.4494 ms; 64 MiB: 6.7409 ms. Total 4 × 1.7077 + 2 × 0.8689 + 0.4494 + 6.7409 = 15.759 ms (R3: 15.76).</li>
+<li>Backward ends: layers 7–4 at 2, 4, 6, 8 ms; layers 3, 2 at 9.5, 11 ms; layers 1, 0 at 12, 13 ms.</li>
+<li>Overlap: bucket 7 runs 2.00–3.71; 6: 4.00–5.71; 5: 6.00–7.71; 4: 8.00–9.71; 3: ready at 9.5 but the channel is busy until 9.71, so 9.71–10.58; 2: 11.00–11.87; 1: 12.00–12.45; 0: 13.00–19.74.</li>
+<li>Step 19.74 ms; exposed 19.74 − 13.00 = 6.74 ms; hidden 15.76 − 6.74 = 9.02 ms = 57 %.</li>
+</ol>
+<p><b>Listing 1's numbers as the milestone would read them.</b> Hidden communication: 8.38 − 1.35 = 7.03 ms (time after the backward pass, serial minus overlap). Measured saving: 40.29 − 35.17 = 5.12 ms in step time, but the compute time also differed by 5.04 ms between the two runs, so the saving that can be attributed to overlap is near zero. The acceptance test would fail on this machine, and the trace says why: the backward pass grew by about what was hidden.</p>
+<p><b>What would pass.</b> On GPUs, if the communication runs on copy engines and the network, the backward pass should not grow by more than the cost of the reduction kernels. Predict with Listing 3 using your measured backward times per layer (from the profiler) and your measured all-reduce α and β (from <a href="#F8-10">F8-10</a>), then compare: saving ≈ hidden time within a stated tolerance.</p>
+
+<h2 id="F8-11-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>overlap_mpi.cc</code>: three schedules with a per-bucket trace on CPU processes. Build and run (from <code>overlap_mpi.log</code>): <code>mpic++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -DOMPI_SKIP_MPICXX overlap_mpi.cc -o overlap_mpi</code>; <code>mpirun --allow-run-as-root --oversubscribe -np 2 ./overlap_mpi</code>. Output in Layer 2 (R1).</p>
+<pre class="listing" data-src="F8-11/overlap_mpi.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>32–41</td><td><code>computeSlice</code></td><td>Stand-in backward: costs time, yields integers 0–16.</td><td>Exact float sums make every schedule's result identical (hash).</td></tr>
+<tr><td>66–79</td><td><code>collect</code></td><td><code>MPI_Testsome</code> or <code>MPI_Waitsome</code>; records completion times.</td><td>Completed requests become <code>MPI_REQUEST_NULL</code>, so each is recorded once.</td></tr>
+<tr><td>88–96</td><td>backward loop</td><td>Layers last to first, 16 slices each; in overlap mode a test after each slice.</td><td>The test is the progress opportunity.</td></tr>
+<tr><td>97–101</td><td><code>MPI_Iallreduce</code></td><td>Starts the bucket as soon as its layer is done.</td><td>Same order on every rank.</td></tr>
+<tr><td>104–110</td><td>serial</td><td>Blocking all-reduce per bucket after the backward pass.</td><td>The non-overlapped baseline.</td></tr>
+<tr><td>112–114</td><td>final wait</td><td><code>MPI_Waitsome</code> until no request is pending.</td><td>In <code>notest</code>, all progress happens here.</td></tr>
+<tr><td>142–152</td><td>median repetition</td><td>7 timed steps; slowest rank per step; shows the median one.</td><td>Robust against noise; the trace shown belongs to a real step.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>overlap_streams.cc</code>: the GPU schedule with streams, events and pinned host buckets for a non-GPU-aware MPI. Built with <code>nvcc -x cu -std=c++17 -O2 -lineinfo -Werror all-warnings -DOMPI_SKIP_MPICXX $(mpicxx --showme:compile) overlap_streams.cc -o overlap_streams -L/usr/lib/x86_64-linux-gnu/openmpi/lib -lmpi</code> (from <code>overlap_streams.log</code>).</p>
+<pre class="listing" data-src="F8-11/overlap_streams.cc"></pre>
+<pre class="output" data-run="F8-11/overlap_streams"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>21–28</td><td><code>cudaCheck</code></td><td>Prints the error and calls <code>MPI_Abort</code>.</td><td>One failing rank must stop all ranks, not leave them in a collective (R2 shows it).</td></tr>
+<tr><td>52–55</td><td>two streams</td><td>Compute and copy, both non-blocking.</td><td>Separate queues let copies run beside kernels.</td></tr>
+<tr><td>61–66</td><td>buffers, events</td><td>Device buckets, pinned host buckets, two events per bucket.</td><td>Pinned memory is needed for asynchronous copies (<a href="#F8-08">F8-08</a>).</td></tr>
+<tr><td>71–79</td><td>enqueue</td><td>Kernel; record "ready"; copy stream waits; D2H; record "copied".</td><td>The dependency of rule 1, without blocking the host.</td></tr>
+<tr><td>88–99</td><td>host loop, start</td><td>Polls the next bucket's event; starts its all-reduce.</td><td>Order fixed by <code>next</code>: rule 2.</td></tr>
+<tr><td>100–111</td><td>host loop, complete</td><td><code>MPI_Testsome</code>; H2D copy of finished buckets.</td><td>Progress and return path.</td></tr>
+<tr><td>116–125</td><td>check</td><td>One element against the exact expected sum.</td><td>Minimal correctness check; extend it in the lab.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>timeline_model.cpp</code> with <code>timeline_model.in</code>: the two schedules in the alpha-beta model, drawn as text. Built by <code>run_lab.sh</code> with sanitizers; output in Layer 2 (R3).</p>
+<pre class="listing" data-src="F8-11/timeline_model.cpp"></pre>
+<pre class="listing" data-src="F8-11/timeline_model.in"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>33–45</td><td><code>drawRow</code></td><td>One character per <code>ms_per_char</code>; digits are layer ids.</td><td>A timeline you can read in a terminal.</td></tr>
+<tr><td>53–57</td><td>compute spans</td><td>Layers back to back.</td><td>The backward pass is assumed unaffected by communication.</td></tr>
+<tr><td>58–65</td><td>channel</td><td>Start = max(ready, channel free); one bucket at a time.</td><td>FIFO on one channel, like one communication stream.</td></tr>
+<tr><td>63</td><td>duration</td><td>α + MiB × 1.048576 / GB/s, in ms.</td><td>The only cost formula.</td></tr>
+<tr><td>68–75</td><td>step, exposed, hidden</td><td>Step = max(backward end, channel free).</td><td>The quantities milestone F6 compares.</td></tr>
+</tbody></table></div>
+
+<h2 id="F8-11-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Vans have their own drivers; on a CPU, communication does not.</b> In this build the "van" was driven by the same cores as the cooking (R1). The analogy suggests overlap is always free; it is free only when separate hardware moves the data.</li>
+<li><b>Waving the van on is not one act.</b> A non-blocking all-reduce is many internal steps, each needing progress; a single test call may advance only one of them.</li>
+<li><b>One road.</b> The model has one communication channel; real libraries can run several collectives concurrently on several channels or adapters, and the timeline may show them overlapping each other too.</li>
+<li><b>Courses are not independent.</b> In a real network, a layer's backward needs the activations and weights of that layer; the order of computation is fixed, and the gradient of the first layer is always the last one ready. The kitchen could reorder courses; training cannot.</li>
+</ul>
+
+<h2 id="F8-11-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>All buckets complete at the end; no gain</td><td>No progress during compute</td><td>Per-bucket completion trace (R1 <code>notest</code>)</td><td>Test calls, a progress thread, or a library that progresses on its own</td></tr>
+<tr><td>Overlap "works" but step time barely improves</td><td>Communication runs on the same resources as compute</td><td>Compute time per run; profiler timeline (R1 <code>overlap</code>)</td><td>Move data with DMA engines and the network; keep reductions small</td></tr>
+<tr><td>Hang or wrong results with some layer orders</td><td>Ranks start bucket collectives in different orders</td><td>Log the bucket id at each start on every rank</td><td>A fixed order on all ranks</td></tr>
+<tr><td>Wrong gradients only with overlap</td><td>Communication started before the gradient kernel finished, or buffer reused too early</td><td>Compare with the serial schedule bit for bit (hash)</td><td>Event dependency; wait before the optimiser step</td></tr>
+<tr><td>Large exposed tail</td><td>Big last-ready bucket</td><td>Timeline: what runs after the backward pass</td><td>Shrink or move the data in the last bucket; overlap with the next forward</td></tr>
+<tr><td>Saving larger than the hidden time</td><td>Compute differed between runs, not overlap</td><td>Compare pure compute times (R1)</td><td>Median of many steps; same machine state</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F8-11-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F8-06">F8-06</a> built a data-parallel step with an all-reduce after the backward pass; <a href="#F8-07">F8-07</a> introduced non-blocking operations; <a href="#F8-10">F8-10</a> built and modelled the two-node all-reduce. <b>What carries over:</b> buckets, the alpha-beta model, exact checks with integers, request handling with <code>MPI_Test…</code>/<code>MPI_Wait…</code>, and streams and events from CU303. <sup class="src"><a href="#F8-11-src-D1">D1</a></sup> <b>What changes:</b> communication and computation now share a timeline, so the question becomes how much is hidden, which depends on progress, on which hardware moves the bytes, and on the order and size of the buckets; step time alone can mislead (R1). <sup class="src"><a href="#F8-11-src-R1">R1</a></sup> <sup class="src"><a href="#F8-11-src-R3">R3</a></sup> <b>What comes next:</b> <a href="#F8-12">F8-12</a> (DG403) builds data parallelism at scale on these pieces, before tensor and pipeline parallelism split the model itself.</p></div>
+
+<h2 id="F8-11-check">Check yourself</h2>
+<ol>
+<li>Why can layer 7's gradient be all-reduced before layer 6's backward has started, and why can layer 0's never be hidden behind the backward pass?</li>
+<li>Explain in your own words what "progress" is and how R1's <code>notest</code> trace shows its absence.</li>
+<li>Which statement is true? (a) A non-blocking collective always runs in the background. (b) The step-time saving from overlap always equals the hidden communication. (c) All ranks must start bucket collectives in the same order. (d) Smaller buckets always reduce the step time.</li>
+<li>Compute by hand the overlapped step of Listing 3 if layer 0's gradient were 16 MiB instead of 64 MiB.</li>
+<li>Predict, then run: set <code>comm_GBps</code> to 2.5 in <code>timeline_model.in</code>. What fraction is hidden, and what limits it now?</li>
+<li>Apply to a new case: a model whose largest gradients are in its last layers (computed first in the backward pass). Is it easier or harder to hide its communication than TN-2's model? Why?</li>
+<li>In R1, why are the three hashes identical, and what would a different hash in <code>overlap</code> mode tell you?</li>
+<li>Why does Listing 2 call <code>MPI_Abort</code> on a CUDA error instead of returning from <code>main</code>?</li>
+</ol>
+
+<h2 id="F8-11-lab">Lab</h2>
+<p><b>Goal.</b> Milestone F6: "Hide gradient communication behind the backward pass." Build: "Gradient buckets launched as soon as they are ready, on a separate communication stream." <sup class="src"><a href="#F8-11-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–4: one Linux computer with Open MPI, g++ and nvcc; this build used <code>mpirun (Open MPI) 4.1.6</code>, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> and <code>Cuda compilation tools, release 12.0, V12.0.140</code> (from the logs), on 4 shared CPUs without a GPU. Steps 5–8: two nodes with GPUs, a network, NCCL or RCCL (or a GPU-aware MPI), your data-parallel step from <a href="#F8-06">F8-06</a>, and Nsight Systems or the ROCm Systems Profiler. Folder <code>university/labs/F8-11</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F8-11</code>. Compare <code>overlap_mpi.out</code>, <code>overlap_streams.out</code> and <code>timeline_model.out</code> with this chapter. Expect your milliseconds to differ; check that the shapes (serial after, overlap during, notest at the end) match.</li>
+<li>Instrument Listing 1: time the <code>MPI_Iallreduce</code> start calls and the <code>MPI_Testsome</code> calls separately and print their totals per step. Account for the gap between compute time and backward end in each mode.</li>
+<li>Run Listing 1 with work 1 and work 10 (<code>./overlap_mpi 1</code>, <code>./overlap_mpi 10</code>) and explain how the fraction hidden changes with the compute-to-communication ratio.</li>
+<li>Answer Check yourself questions 4 and 5 with Listing 3 variants.</li>
+<li>On two GPU nodes: profile your non-overlapped data-parallel step (milestone F3) with Nsight Systems or the ROCm Systems Profiler, all ranks on one timeline. Record step time, backward time and all-reduce time per bucket.</li>
+<li>Implement the overlapped version: buckets in reverse layer order, a communication stream (NCCL/RCCL) or Listing 2's pattern (staged MPI), an event per bucket. Check that the gradients are bit-identical to the serial version for integer-valued test data.</li>
+<li>Profile it; measure hidden communication (serial exposed minus overlapped exposed) and the step-time saving; median over at least 20 steps.</li>
+<li>Fill Listing 3 with your measured per-layer backward times and all-reduce parameters and compare its prediction with steps 5–7.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: R1 with the three trace shapes and identical hashes; R2 stopping with <code>cudaErrorNoDevice</code> and <code>MPI_ABORT</code>; R3 as shown. On GPU nodes: a timeline with communication kernels or copies under the backward kernels, labelled "measured on &lt;nodes, GPUs, network, library versions, date&gt;" (AH-23). Steps 5–8 have not been run in this build.</p>
+<p><b>Verification.</b> The milestone's acceptance test, verbatim: "The timeline shows all-reduce kernels running concurrently with backward kernels; step time decreases versus the non-overlapped F3 version on 2 nodes, and the saving is close to the hidden communication time." State "close" as a number before measuring. <sup class="src"><a href="#F8-11-src-C1">C1</a></sup></p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>No concurrency in the profiler → both on one stream, or the communication waits on the whole compute stream → check stream creation and the event dependency.</li>
+<li>Concurrency visible but no saving → interference (reduction kernels, memory bandwidth) → compare backward kernel durations with and without overlap.</li>
+<li>Hang → bucket order differs between ranks → log bucket ids per rank.</li>
+<li>Results differ from serial → dependency missing or buffer reused → bit-compare with integer data.</li>
+</ul>
+<p><b>Extension.</b> Add a dedicated communication thread to Listing 1 that calls <code>MPI_Testsome</code> in a loop (initialise MPI with <code>MPI_Init_thread</code> and check the provided thread level), remove the tests from the compute loop, and compare the traces. Explain the result on a machine where both processes and the extra threads share 4 CPUs.</p>
+
+<h2 id="F8-11-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Ayasha converted her team's training step to non-blocking all-reduces, one per bucket, started as soon as each layer's backward finished. She expected a large saving. The step got slower. Her code starts every bucket correctly and waits for all of them before the optimiser, and the results are identical to the old version. She sends you a trace of one step for each version, recorded by the program itself.</p>
+<p><b>Evidence pack.</b> Real outputs of this build. In the stand-in, Ayasha's version is Listing 1's <code>notest</code> schedule; the old version is <code>serial</code>; a colleague's variant is <code>overlap</code>.</p>
+<p>E1 — the three traces (<code>overlap_mpi.out</code>): <sup class="src"><a href="#F8-11-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F8-11/overlap_mpi"></pre>
+<p>E2 — Ayasha's backward loop (Listing 1, lines 88–102 with <code>mode == "notest"</code>): no MPI call between <code>MPI_Iallreduce</code> starts.</p>
+<p>E3 — the colleague's change: <code>collect(req, tr, t0, false)</code> after every compute slice (lines 93–95), that is, <code>MPI_Testsome</code> 16 times per layer.</p>
+<p>E4 — the model's expectation for an overlap that costs nothing (<code>timeline_model.out</code>): <sup class="src"><a href="#F8-11-src-R3">R3</a></sup></p>
+<pre class="output" data-run="F8-11/timeline_model"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: in Ayasha's trace, when were the buckets started and when did they complete? How many completed before the backward pass ended?</li>
+<li>Compare with the colleague's trace. What is the one code difference (E2, E3), and what does it change in the trace?</li>
+<li>Hypotheses: (a) the network was slow; (b) the all-reduces never progressed during compute; (c) the buckets were started in the wrong order; (d) the compute got slower. Which evidence tests each?</li>
+<li>Root cause: why was Ayasha's step slower than the serial one, not just equal?</li>
+<li>The colleague's version completes 7 of 8 buckets early. Why is its step time not 8 ms shorter than the serial one, as E4's reasoning would suggest?</li>
+<li>Fix and verification: what would you change on this CPU machine, and what on a GPU node? Which measurements prove each?</li>
+<li>Prevention: what should every overlapped implementation record and check?</li>
+</ol>
+<p><b>Method hints.</b> Read the completion row before the step time. A non-blocking operation that completes only in the final wait was never overlapped. Then compare compute time with backward-end time in each mode.</p>
+
+<h2 id="F8-11-project">Mini-project</h2>
+<h3 id="F8-11-mp5">MP5, multi-node part: overlap and the report</h3>
+<p>MP5 "A multi-node all-reduce" has four milestones: "Single-node ring all-reduce (F2) correct for all sizes. Hierarchical two-node version over MPI or verbs. Comparison with NCCL/RCCL bus bandwidth; GPUDirect RDMA on/off where possible. Overlap with a training step (F6) and fault handling (F8)." Its deliverables: "Code, bandwidth curves, a model-versus-measurement report (alpha-beta)." <sup class="src"><a href="#F8-11-src-C2">C2</a></sup> DG401 built the first milestone; <a href="#F8-09">F8-09</a> and <a href="#F8-10">F8-10</a> the second and third; this chapter adds the overlap. Fault handling (milestone F8) follows in DG403.</p>
+<p><b>Brief.</b> Integrate your hierarchical all-reduce (F8-10) into the data-parallel training step (F8-06) as an overlapped, bucketed back-end selectable by a flag, next to NCCL/RCCL. On 2 nodes × all GPUs: show the profiler timeline of both back-ends, serial and overlapped; report step time, backward time, hidden and exposed communication per configuration; and predict all of them with Listing 3 filled from your measured per-layer times and the α and β of your all-reduce. Write the report: bandwidth curves (F8-09, F8-10), the timeline comparison, the model-versus-measurement tables with every gap explained, and a list of what could not be tested and why.</p>
+<p><b>Rubric</b> (MP5's weights). Correctness (30 %): overlapped and serial back-ends give bit-identical gradients on integer test data and loss curves within a stated tolerance; hierarchical all-reduce passes on equal and unequal layouts. Performance versus pre-set targets (25 %): bus bandwidth X % of NCCL/RCCL; step-time saving close to the hidden communication time, both targets set before measuring. Model accuracy and explanation (25 %): alpha-beta predictions for the all-reduce and the timeline, plotted against measurements, gaps explained. Robustness (20 %): every call checked, clean abort of all ranks on any error, layout checks, no use of a buffer during its collective. <sup class="src"><a href="#F8-11-src-C2">C2</a></sup></p>
+<h3 id="F8-11-exam">Exam practice: explain a two-node timeline (DG402 P)</h3>
+<p>The DG402 practical exam asks you to "explain a two-node timeline". Practise on Listing 3's overlapped timeline (E4) and on R1's <code>overlap</code> trace as if they were a two-node profile: (1) identify the backward pass, every bucket's all-reduce, and the exposed tail; (2) compute hidden and exposed communication and the hidden fraction; (3) name the bucket that limits the step and say why it cannot be hidden; (4) say whether the measured saving matches the hidden time and, if not, which evidence explains the difference; (5) propose one change and predict its effect with the model. Marking points for this practice item are in the answers section; the exam's own keys live in a separate file.</p>
+
+<h2 id="F8-11-summary">Summary</h2>
+<ul>
+<li>Gradients of later layers are final early; bucketed all-reduces started as soon as each layer is done can run under the rest of the backward pass.</li>
+<li>Step time ≥ backward + the last-ready bucket's all-reduce; the last bucket's size sets the exposed floor (R3: 6.74 ms of 15.76 ms, invented TN-2 values).</li>
+<li>Non-blocking operations need progress; without MPI calls during compute, R1's buckets all completed in the final wait and the step got slower.</li>
+<li>Overlap is free only if different hardware moves the data; on this CPU build the hidden ~7 ms of communication reappeared inside the backward pass (R1).</li>
+<li>Milestone F6 checks both the timeline (concurrency) and that the saving is close to the hidden time; measure both, with medians and compute times.</li>
+</ul>
+
+<h2 id="F8-11-sources">Sources</h2>
+<ol>
+<li id="F8-11-src-D1">D1 — MPI Forum, "MPI: A Message-Passing Interface Standard" (tier 1): non-blocking collective operations; completion with test and wait; progress. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i> The function signatures were checked by the compiler against Open MPI 4.1.6's <code>mpi.h</code>.</li>
+<li id="F8-11-src-D2">D2 — S. Li et al., "PyTorch Distributed: Experiences on Accelerating Data Parallel Training" (tier 3; the "PyTorch DDP paper" of milestone F6). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-11-src-D3">D3 — NVIDIA, NCCL documentation (CUDA stream semantics, concurrency); AMD, RCCL documentation (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-11-src-D4">D4 — NVIDIA, Nsight Systems User Guide; AMD, ROCm Systems Profiler documentation (tier 1): multi-process timelines. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-11-src-C1">C1 — Systems Curriculum (this project), section 14.3 milestone F6 (goal, reading, build and acceptance test quoted verbatim) and F3; a map, not a source (AH-4).</li>
+<li id="F8-11-src-C2">C2 — University authoring guide, MP5 "A multi-node all-reduce": milestones, deliverables and rubric weights, quoted; DG402 course card (exam P); a map, not a source.</li>
+<li id="F8-11-src-H1">H1 — CUDA 12.0 headers as installed, read in this build: <code>driver_types.h</code> (<code>cudaStreamNonBlocking</code> 0x01, <code>cudaEventDisableTiming</code> 0x02) and the declarations of <code>cudaStreamWaitEvent</code>, <code>cudaEventQuery</code>, <code>cudaMemcpyAsync</code> in <code>cuda_runtime_api.h</code>. Tier 1.</li>
+<li id="F8-11-src-R1">R1 — run of Listing 1 on 2 processes (<code>overlap_mpi.log</code>), Open MPI 4.1.6 with g++ 13.3.0, one shared 4-CPU container, exit code 0; measured on this container (AH-23).</li>
+<li id="F8-11-src-R2">R2 — build and run of Listing 2 (<code>overlap_streams.log</code>), CUDA 12.0 with Open MPI 4.1.6; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>, <code>MPI_ABORT</code>).</li>
+<li id="F8-11-src-R3">R3 — run of Listing 3 (<code>timeline_model.log</code>, input <code>timeline_model.in</code>, invented TN-2 values), g++ 13.3.0 with sanitizers, exit code 0.</li>
+</ol>
+
+<h2 id="F8-11-glossary">Glossary links</h2>
+<p><a href="#gl-communication-computation-overlap">Communication-computation overlap</a> · <a href="#gl-non-blocking-collective-mpi">Non-blocking collective (MPI)</a> · <a href="#gl-mpi-progress">MPI progress</a> · <a href="#gl-exposed-communication">Exposed communication</a> · <a href="#gl-gradient-bucketing">Gradient bucketing</a> · <a href="#gl-data-parallel-training">Data-parallel training</a> · <a href="#gl-non-blocking-operation-mpi">Non-blocking operation (MPI)</a> · <a href="#gl-stream-cuda">Stream (CUDA)</a> · <a href="#gl-cuda-event">CUDA event</a> · <a href="#gl-overlap-efficiency">Overlap efficiency</a></p>
+
+<h2 id="F8-11-next">Next chapter</h2>
+<p>Next: <a href="#F8-12">F8-12 Data parallelism</a> (DG403). Previous: <a href="#F8-10">F8-10 Hierarchical all-reduce</a>. Back to the course: <a href="#DG402">DG402</a>.</p>
+
+<h2 id="F8-11-answers">Answers to Check yourself</h2>
+<ol>
+<li>Backward runs from the last layer to the first; layer 7's gradient depends on nothing computed later, so it is final when its backward ends. Layer 0's backward is the last computation of the step, so its bucket is ready only when there is no compute left to hide it behind.</li>
+<li>Progress is the execution of a pending operation's internal steps. In <code>notest</code> the buckets start at 3.1 to 33.0 ms, but seven complete together at 42.7 ms and the last at 44.4 ms, after the backward pass ended at 34.28 ms: they advanced only inside the final wait.</li>
+<li>(c). (a) false: R1 <code>notest</code>. (b) false: R1 <code>overlap</code>, where the backward pass grew. (d) false: each bucket pays α and overhead; the last-ready bucket's data cannot be hidden however it is split.</li>
+<li>Layer 0's all-reduce: 0.03 + 16 × 0.1048576 = 1.7077 ms; it starts at 13.00 (channel free since 12.45), so step = 14.71 ms; communication total 15.76 − 6.7409 + 1.7077 = 10.73 ms; exposed 1.71 ms; hidden 84 %.</li>
+<li>At 2.5 GB/s each 16 MiB bucket takes 6.74 ms, longer than the 2 ms between layers, so the channel is the bottleneck: buckets queue, communication (about 62 ms in total) far exceeds the 13 ms backward, and only up to about 13 ms of it can be hidden (about a fifth). The step is limited by the channel, not by the last bucket. Run the variant for the exact figures.</li>
+<li>Easier: the big buckets become ready first and have the whole rest of the backward pass to hide behind; the last-ready bucket is small, so the exposed tail is short.</li>
+<li>The gradients are small integers stored as floats, so every sum is exact in any order and every schedule must give the same bits. A different hash would mean a real error: a bucket used before its collective completed, a missing dependency, or collectives matched in the wrong order.</li>
+<li>If one rank returned from <code>main</code> while others were inside or about to enter a collective, those ranks would wait forever. <code>MPI_Abort</code> stops every process of the communicator (R2 shows Open MPI killing all processes).</li>
+</ol>
+<p><b>Exam practice marking points.</b> (1) Backward 0–13.00 ms; buckets 7…1 under it; bucket 0 from 13.00 to 19.74 ms. (2) Total 15.76 ms; exposed 6.74; hidden 9.02 (57 %). (3) Layer 0's 64 MiB bucket, ready only at the end. (4) In the model, saving = hidden by construction; in R1's measurement, about 7 ms were hidden but the backward pass grew by about 7 ms, so the saving attributable to overlap is near zero; evidence: compute versus backward-end times. (5) For example halve layer 0's gradient data: predicted exposed tail 3.39 ms (0.03 + 32 × 0.1048576 = 3.39 ms), step about 16.4 ms.</p>
+<h3 id="F8-11-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Ayasha's buckets started at 3.1, 6.5, 10.8, 15.1, 19.5, 24.0, 28.3 and 33.0 ms and completed at 42.7 (seven) and 44.4 ms; none before the backward pass ended at 34.28 ms.</p>
+<p><b>Difference.</b> The colleague calls <code>MPI_Testsome</code> after every compute slice (E3). With it, each bucket completes 1.6 to 3.7 ms after it started, and 7 of 8 before the backward pass ends.</p>
+<p><b>Hypotheses.</b> (a) Slow network: in the colleague's run the same all-reduces finished in a few ms; and all ranks share one machine here; rejected. (b) No progress: the completion row shows everything finishing inside the final wait; confirmed. (c) Wrong order: the hashes are identical and there was no hang; rejected. (d) Slower compute: compute times were 31.89 (serial), 26.85 (overlap) and 25.17 ms (notest); compute was not slower in Ayasha's version.</p>
+<p><b>Root cause.</b> In this build the non-blocking all-reduces advance only inside MPI calls on the calling process. Ayasha's loop made none between starting a bucket and the final wait, so all eight all-reduces ran in the final <code>MPI_Waitsome</code>, after the backward pass, with the extra costs of eight non-blocking schedules on top (10.13 ms after the backward pass against 8.38 ms serially), and the backward pass itself ended 9.11 ms after its compute time. The cause of that 9.11 ms (the start calls themselves, or interference on the shared CPUs) was not separated in this build; lab step 2 measures it.</p>
+<p><b>Why the colleague did not save 8 ms.</b> On a CPU, progress means the same cores copy and add the buckets inside <code>MPI_Testsome</code>; the backward pass ended 6.97 ms after its 26.85 ms of compute. About 7 ms were hidden and about 7 ms were added to the backward pass. E4's model assumes overlap costs nothing; on this machine it does not.</p>
+<p><b>Fix and verification.</b> On the CPU machine: provide progress (tests in the loop or a progress thread) and accept that the gain is limited by shared cores; verify with the completion trace. On a GPU node: use a communication stream with NCCL/RCCL (or Listing 2's pattern), so copy engines and the network move the data; verify with a profiler timeline showing communication under backward kernels, and a step-time saving close to the hidden time.</p>
+<p><b>Prevention.</b> Record per-bucket start and completion times and the compute time in every overlapped implementation; fail a test if no bucket completes before the backward pass ends; compare hashes with the serial schedule. <b>How the evidence was produced:</b> real runs of Listing 1 (three schedules) and Listing 3 on one shared CPU machine (R1, R3).</p>

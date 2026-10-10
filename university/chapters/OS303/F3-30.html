@@ -1,0 +1,352 @@
+<!--meta
+id: F3-30
+title: Processes and the ELF program loader
+course: OS303
+level: L3–L4
+prereqs: F3-29; F3-21; F2-44; F2-47
+time: 12–16 hours including the lab and the course project
+hardware: none for the lab (QEMU 8.2.2 with TCG, -cpu max; host fuzzer with g++ 13.3 and sanitizers)
+maps: Curriculum Track B, milestone B13 (processes, exec of static ELF executables, exit and wait, demand paging); course project B13 (init launches ten programs; fuzzing the exec path)
+analogy: F3 — the school (a class with its own room, the room plan, the head of year)
+-->
+
+<h2 id="F3-30-hook">Story hook</h2>
+<p>A new class is moving into a room. The caretaker receives a room plan: "desks along the window wall, bookshelf by the door, whiteboard at the front". A good caretaker reads the whole plan first and refuses it if the bookshelf is drawn in the corridor, if two desks occupy the same spot, or if the plan says "and also bring in the school's safe". Furniture is carried in only when somebody first needs it, and on the first morning a folder waits on the teacher's desk: the class list and a note on where things are.</p>
+<p>The head of year opens ten classes at once, and at the end of the day waits at her desk until each class reports how its day went: ten different reports. When a class leaves, its room must be cleared completely, so that the next class finds it empty. One caretaker forgot to take the empty shelf brackets down. After a thousand classes, there were no brackets left in the school.</p>
+<p>That forgetful caretaker is this chapter's forensic case, recorded in a kernel log. The chapter builds the careful one: an ELF loader that trusts nothing in the file, demand paging, the initial stack with arguments and the auxiliary vector, spawn, exit and wait, and the course project: an init that starts ten programs, and a fuzzer that throws thousands of broken programs at the exec path.</p>
+
+<h2 id="F3-30-able">What you will be able to do</h2>
+<ul>
+<li><b>Validate</b> an ELF64 executable completely before loading it, with checks that cannot be fooled by integer wrap-around.</li>
+<li><b>Load</b> program segments lazily: map each page on its first page fault, with file bytes, zero fill and the right permissions.</li>
+<li><b>Build</b> the initial user stack: argc, argv, envp and the auxiliary vector, 16-byte aligned, as the System V ABI describes.</li>
+<li><b>Implement</b> spawn, exit and wait with a process table, zombies, orphans and reaping.</li>
+<li><b>Prove</b> the B13 acceptance tests: init with ten children and ten statuses, memory back at the baseline after 10,000 exec/exit cycles, and malformed ELF files rejected without kernel faults.</li>
+<li><b>Find</b> a slow memory leak from frame statistics and page-table arithmetic.</li>
+</ul>
+
+<div class="co jargon" id="F3-30-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Process</dt><dd><b>Simple words:</b> a running program with its own memory. <b>Analogy:</b> a class with its own room. <b>Precise:</b> here a <code>struct Process</code>: a pid, an address space (its own PML4), the ELF image it runs, one user thread, a parent, an exit status and a wait queue for its children. <sup class="src"><a href="#F3-30-src-D3">D3</a></sup> <sup class="src"><a href="#F3-30-src-R2">R2</a></sup></dd>
+<dt>ELF loader</dt><dd><b>Simple words:</b> the kernel code that reads a program file and sets up memory so the program can run. <b>Analogy:</b> the caretaker with the room plan. <b>Precise:</b> code that validates the ELF header and program headers, creates mappings for every PT_LOAD segment (file bytes up to <code>p_filesz</code>, zeros up to <code>p_memsz</code>, permissions from <code>p_flags</code>) and starts a thread at <code>e_entry</code>. <sup class="src"><a href="#F3-30-src-D1">D1</a></sup></dd>
+<dt>Program header (segment)</dt><dd><b>Simple words:</b> an entry in an ELF file saying "put these bytes at this address with these permissions". <b>Analogy:</b> one line of the room plan. <b>Precise:</b> a 56-byte ELF64 record with type, flags, file offset, virtual address, file size and memory size; the loader acts only on type PT_LOAD and refuses PT_INTERP and PT_DYNAMIC. <sup class="src"><a href="#F3-30-src-D1">D1</a></sup> <sup class="src"><a href="#F3-30-src-R1">R1</a></sup></dd>
+<dt>Demand paging</dt><dd><b>Simple words:</b> mapping a page only when the program first touches it. <b>Analogy:</b> carrying furniture in when someone first needs it. <b>Precise:</b> the page-fault handler checks that the faulting user address belongs to a segment or the stack of the current process and is not yet mapped, maps a zeroed frame filled with the file's bytes, and restarts the instruction. <sup class="src"><a href="#F3-30-src-D3">D3</a></sup> <sup class="src"><a href="#F3-30-src-R2">R2</a></sup></dd>
+<dt>Auxiliary vector</dt><dd><b>Simple words:</b> a list of facts the kernel leaves for a new program, after its arguments. <b>Analogy:</b> the note in the first-day folder. <b>Precise:</b> (type, value) pairs on the initial stack after envp's NULL, ending with AT_NULL; this kernel passes AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ and AT_ENTRY. <sup class="src"><a href="#F3-30-src-D2">D2</a></sup></dd>
+<dt>Initial process stack</dt><dd><b>Simple words:</b> what the stack holds when a program's first instruction runs. <b>Analogy:</b> the first-day folder itself. <b>Precise:</b> at RSP: argc, argv[0..argc−1], NULL, envp[...], NULL, auxv pairs, AT_NULL; strings above; RSP 16-byte aligned. <sup class="src"><a href="#F3-30-src-D2">D2</a></sup></dd>
+<dt>Spawn</dt><dd><b>Simple words:</b> create a new process running a given program, in one step. <b>Analogy:</b> opening a new class in a new room with a given plan. <b>Precise:</b> this kernel's system call 3: validate and load an ELF file from the boot modules, build its stack, create its thread; returns the child's pid. It replaces Unix's <code>fork</code> followed by <code>exec</code>. <sup class="src"><a href="#F3-30-src-R2">R2</a></sup></dd>
+<dt>Zombie process</dt><dd><b>Simple words:</b> a process that has finished but whose parent has not yet asked for its status. <b>Analogy:</b> a class that left, whose report still waits on the head of year's desk. <b>Precise:</b> a <code>Process</code> with <code>exited</code> set, kept in the process table only for its pid and status until <code>wait</code> reaps it. <sup class="src"><a href="#F3-30-src-D3">D3</a></sup></dd>
+<dt>Orphan process</dt><dd><b>Simple words:</b> a process whose parent exited first. <b>Analogy:</b> a class whose head of year went home early. <b>Precise:</b> here a child whose parent pointer was cleared in <code>process_exit</code>; nobody will wait for it, so it reaps itself when it exits (Unix instead re-parents it to init). <sup class="src"><a href="#F3-30-src-R2">R2</a></sup></dd>
+<dt>Init process</dt><dd><b>Simple words:</b> the first user program, which starts the others. <b>Analogy:</b> the head of year who opens the classes. <b>Precise:</b> in this lab <code>u_init.elf</code>, started by the kernel; it spawns ten children and waits for all of them. <sup class="src"><a href="#F3-30-src-C1">C1</a></sup></dd>
+<dt>Fuzzing</dt><dd><b>Simple words:</b> testing with huge numbers of random or mutated inputs. <b>Analogy:</b> handing the caretaker thousands of scribbled room plans. <b>Precise:</b> here mutation fuzzing: random byte changes, bit flips, boundary values and truncations of a valid ELF file, checked by invariants (no kernel fault, no accepted file that breaks the loader's promises, memory back at the baseline). <sup class="src"><a href="#F3-30-src-R3">R3</a></sup></dd>
+</dl></div>
+
+<h2 id="F3-30-pictures">The idea in pictures</h2>
+<figure id="F3-30-fig1"><div class="svgbox">
+<svg viewBox="0 0 900 330" role="img" aria-labelledby="F3-30-f1t F3-30-f1d">
+<title id="F3-30-f1t">Figure 1: from ELF file to address space</title>
+<desc id="F3-30-f1d">Left: the file u_child.elf. At offset 0 the 64-byte ELF header, then four 56-byte program headers; at offset 0x1000 the code; at offset 0x2000 the read-only data. Right: the user half of the address space. The first LOAD segment (offset 0, size 0x120, read-only) goes to 0x80_0040_0000; the second (offset 0x1000, read and execute) to 0x80_0040_1000; the third (offset 0x2000, read-only) to 0x80_0040_2000. Each page is mapped only when first touched. At the top of the user half the stack page below 0xFF_FFFF_F000 is mapped at spawn time with argc, argv, envp and the auxiliary vector. The GNU_STACK header has a type the loader ignores. AT_PHDR points at 0x80_0040_0040, where the program headers appear inside the first segment.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="330"/>
+<text class="sv-tb" x="40" y="28">file u_child.elf (offsets)</text>
+<rect class="sv-b2" x="40" y="40" width="260" height="40"/><text class="sv-ts" x="50" y="64">0x0: ELF header (64 bytes)</text>
+<rect class="sv-b2" x="40" y="80" width="260" height="50"/><text class="sv-ts" x="50" y="102">0x40: 4 program headers</text><text class="sv-ts" x="50" y="120">(56 bytes each)</text>
+<rect class="sv-b3" x="40" y="150" width="260" height="40"/><text class="sv-ts" x="50" y="174">0x1000: .text (R E)</text>
+<rect class="sv-b4" x="40" y="200" width="260" height="40"/><text class="sv-ts" x="50" y="224">0x2000: .eh_frame (R)</text>
+<rect class="sv-box" x="40" y="250" width="260" height="40"/><text class="sv-ts" x="50" y="274">section headers (not loaded)</text>
+<text class="sv-tb" x="560" y="28">user half (virtual addresses)</text>
+<rect class="sv-b5" x="560" y="40" width="300" height="50"/><text class="sv-ts" x="570" y="62">0xFF_FFFF_E000: stack page</text><text class="sv-ts" x="570" y="80">argc, argv, envp, auxv, strings</text>
+<rect class="sv-box" x="560" y="90" width="300" height="40"/><text class="sv-ts" x="570" y="114">… (unmapped until touched) …</text>
+<rect class="sv-b4" x="560" y="140" width="300" height="40"/><text class="sv-ts" x="570" y="164">0x80_0040_2000: R</text>
+<rect class="sv-b3" x="560" y="190" width="300" height="40"/><text class="sv-ts" x="570" y="214">0x80_0040_1000: R E (entry inside)</text>
+<rect class="sv-b2" x="560" y="240" width="300" height="40"/><text class="sv-ts" x="570" y="264">0x80_0040_0000: R (headers; AT_PHDR = +0x40)</text>
+<line class="sv-line" x1="300" y1="80" x2="554" y2="258"/><polygon class="sv-head" points="560,260 549,252 548,264"/>
+<line class="sv-line" x1="300" y1="170" x2="554" y2="210"/><polygon class="sv-head" points="560,211 550,204 549,216"/>
+<line class="sv-line" x1="300" y1="220" x2="554" y2="162"/><polygon class="sv-head" points="560,160 548,159 551,170"/>
+<text class="sv-ts" x="40" y="315">Arrows: PT_LOAD segments, file offset → virtual address. Not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> The three PT_LOAD segments of <code>u_child.elf</code> as <code>readelf</code> printed them in this build, and where the loader maps them (data flow, file to memory) <sup class="src"><a href="#F3-30-src-R1">R1</a></sup>; the format after the ELF specification <sup class="src"><a href="#F3-30-src-D1">D1</a></sup>.</figcaption></figure>
+
+<figure id="F3-30-fig2"><div class="svgbox">
+<svg viewBox="0 0 900 300" role="img" aria-labelledby="F3-30-f2t F3-30-f2d">
+<title id="F3-30-f2t">Figure 2: the initial stack of u_args.elf with argv = u_args.elf, hello, world</title>
+<desc id="F3-30-f2d">Addresses increase upwards. At the top, just below 0xFF_FFFF_F000, the three argument strings, NUL-terminated: "world" at 0xFF_FFFF_EFFA, "hello" at 0xFF_FFFF_EFF4, "u_args.elf" at 0xFF_FFFF_EFE9. Below them, after rounding down to 16 bytes, the words read upwards from RSP = 0xFF_FFFF_EF50: argc = 3; argv[0], argv[1], argv[2] pointing at the strings; a NULL ending argv; a NULL ending the empty envp; then the auxiliary vector pairs (3, AT_PHDR), (4, 56), (5, number of program headers), (6, 4096), (9, entry) and (0, 0). crt0's _start reads argc at RSP and passes RSP + 8 as argv.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="300"/>
+<rect class="sv-b5" x="60" y="20" width="360" height="40"/><text class="sv-ts" x="70" y="44">strings: "u_args.elf" "hello" "world"</text>
+<rect class="sv-box" x="60" y="60" width="360" height="20"/><text class="sv-ts" x="70" y="75">padding to 16 bytes</text>
+<rect class="sv-b4" x="60" y="80" width="360" height="40"/><text class="sv-ts" x="70" y="104">auxv: (3,PHDR) (4,56) (5,n) (6,4096) (9,entry) (0,0)</text>
+<rect class="sv-b3" x="60" y="120" width="360" height="30"/><text class="sv-ts" x="70" y="140">NULL (end of envp; envp is empty)</text>
+<rect class="sv-b3" x="60" y="150" width="360" height="30"/><text class="sv-ts" x="70" y="170">NULL (end of argv)</text>
+<rect class="sv-b3" x="60" y="180" width="360" height="60"/><text class="sv-ts" x="70" y="202">argv[0], argv[1], argv[2]</text><text class="sv-ts" x="70" y="222">(pointers to the strings above)</text>
+<rect class="sv-b2" x="60" y="240" width="360" height="30"/><text class="sv-ts" x="70" y="260">argc = 3   ← RSP at _start</text>
+<line class="sv-dash" x1="420" y1="210" x2="470" y2="210"/><line class="sv-dash" x1="470" y1="210" x2="470" y2="40"/><line class="sv-dash" x1="470" y1="40" x2="426" y2="40"/><polygon class="sv-head" points="420,40 430,34 430,46"/>
+<text class="sv-ts" x="500" y="60">argv[i] points into the strings</text>
+<text class="sv-ts" x="500" y="150">RSP is a multiple of 16 at _start</text>
+<text class="sv-ts" x="500" y="180">crt0: RDI = [RSP] (argc), RSI = RSP + 8 (argv)</text>
+<text class="sv-ts" x="500" y="260">addresses increase upwards; not to scale</text>
+</svg></div><figcaption><b>Figure 2.</b> The initial stack built by <code>build_stack</code> (arrow: pointers into the string area). Addresses and values printed by <code>u_args</code> in the <code>proc</code> run <sup class="src"><a href="#F3-30-src-R2">R2</a></sup>; the layout after the psABI's "Process Initialization" <sup class="src"><a href="#F3-30-src-D2">D2</a></sup>.</figcaption></figure>
+
+<figure id="F3-30-fig3"><div class="svgbox">
+<svg viewBox="0 0 900 250" role="img" aria-labelledby="F3-30-f3t F3-30-f3d">
+<title id="F3-30-f3t">Figure 3: the life of a process</title>
+<desc id="F3-30-f3d">spawn validates the ELF file, creates the address space and the stack, adds the process to the process table and creates its thread: the process is running. It ends by process_exit, called from exit or by the kernel after a fault or a kill. process_exit switches to the kernel's page tables, frees the whole address space, reaps its exited children and orphans the living ones, records the status and wakes the parent: the process is a zombie. The parent's wait finds it, copies the status and reaps it: the Process object is freed. If the parent had already exited, the process is an orphan and reaps itself at exit.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="250"/>
+<rect class="sv-b2" x="30" y="90" width="150" height="60" rx="8"/><text class="sv-tb" x="60" y="125">spawn</text>
+<rect class="sv-b3" x="240" y="90" width="150" height="60" rx="8"/><text class="sv-tb" x="270" y="125">running</text>
+<rect class="sv-b6" x="450" y="90" width="170" height="60" rx="8"/><text class="sv-tb" x="470" y="118">zombie</text><text class="sv-ts" x="470" y="138">(exited, status kept)</text>
+<rect class="sv-b8" x="690" y="90" width="170" height="60" rx="8"/><text class="sv-tb" x="720" y="125">reaped</text>
+<line class="sv-line" x1="180" y1="120" x2="234" y2="120"/><polygon class="sv-head" points="240,120 230,114 230,126"/>
+<line class="sv-line" x1="390" y1="120" x2="444" y2="120"/><polygon class="sv-head" points="450,120 440,114 440,126"/><text class="sv-ts" x="380" y="80">exit / fault / kill</text>
+<line class="sv-line" x1="620" y1="120" x2="684" y2="120"/><polygon class="sv-head" points="690,120 680,114 680,126"/><text class="sv-ts" x="620" y="80">parent's wait</text>
+<path class="sv-dash" d="M315 150 Q315 220 775 220 L775 156"/><polygon class="sv-head" points="775,150 769,160 781,160"/><text class="sv-ts" x="420" y="240">orphan: parent gone, reaps itself at exit</text>
+<text class="sv-ts" x="240" y="175">address space freed at exit,</text><text class="sv-ts" x="240" y="192">not at reaping</text>
+</svg></div><figcaption><b>Figure 3.</b> Process states in the lab kernel (control flow). A zombie keeps only its small <code>Process</code> object; all its memory is freed in <code>process_exit</code>. From <code>process.cc</code> <sup class="src"><a href="#F3-30-src-R2">R2</a></sup>; the Unix model it simplifies after D3.</figcaption></figure>
+
+<h2 id="F3-30-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Each class gets its own room set up from a plan. The caretaker checks the plan before moving anything, carries furniture in only when it is needed, and leaves a folder with the class list on the desk. The head of year opens classes and, at the end of the day, collects each class's report. When a class leaves, everything in its room goes back to the store, down to the last bracket.</p></div>
+<p>A program on disk is just a file. The kernel turns it into a running process: it checks the file carefully, gives the program its own memory, puts the program's arguments where it can find them, and starts it. When the program finishes, the kernel cleans up after it and tells whoever started it how it ended.</p>
+
+<h2 id="F3-30-layer2">Layer 2 — the student explanation</h2>
+<p><b>Where programs come from.</b> This kernel has no file system yet (B14 adds one). The user programs are passed by QEMU as Multiboot modules (<code>-initrd a.elf,b.elf,…</code>), and the kernel keeps them in memory by name. <code>spawn("u_child.elf", argv)</code> looks the name up and loads that file.</p>
+<p><b>Validate everything first.</b> An ELF file is a header followed by tables of offsets and sizes, every one of them chosen by whoever made the file. SP301's ELF chapter (<a href="#F2-44">F2-44</a>) read such files on the host; here a mistake is a kernel bug. <code>elf_check</code> (Listing 1) checks the magic number, class (64-bit), byte order, version, type (an executable, not a shared object), machine (x86-64) and the header sizes; that the program headers lie inside the file; that there is no interpreter or dynamic section (only static programs are supported); and for every PT_LOAD segment that its file part lies inside the file, its memory part inside the user range, that file size ≤ memory size, that its address and offset agree modulo 4096, that no two segments overlap, and finally that the entry point is inside an executable segment. Every comparison is written so that no sum can wrap past 2<sup>64</sup> (the pattern of F3-29's <code>user_range_ok</code>). Only a file that passes every check is loaded.</p>
+<p><b>A new address space.</b> The process gets a fresh top-level page table. Entry 0 is copied from the kernel's (the shared, supervisor-only kernel half); entry 1, the user half, starts empty.</p>
+<p><b>Demand paging.</b> No segment page is mapped at spawn time. When the program first touches a page, the CPU raises a page fault; <code>vm_handle_fault</code> checks that the address is in the user half, that the page belongs to a segment or to the 64 KiB stack, and maps a zeroed frame into which <code>map_program_page</code> copies the file bytes that belong there. Bytes between <code>p_filesz</code> and <code>p_memsz</code> (the <code>.bss</code>) stay zero. A page is writable if it belongs to the stack or to a segment with the write flag.</p>
+<p><b>The initial stack.</b> A program's <code>_start</code> expects to find its arguments on the stack. <code>build_stack</code> maps the top stack page at spawn time and writes, as Figure 2 shows: the argument strings at the very top, then (16-byte aligned) argc, the argv pointers, a NULL, an empty envp ended by NULL, and the auxiliary vector, which tells the program where its program headers are (AT_PHDR, AT_PHENT, AT_PHNUM), the page size (AT_PAGESZ) and its entry point (AT_ENTRY) <sup class="src"><a href="#F3-30-src-D2">D2</a></sup>. <code>u_args</code> prints all of it; its <code>_start</code> address equals the AT_ENTRY value <sup class="src"><a href="#F3-30-src-R2">R2</a></sup>.</p>
+<p><b>Spawn, exit, wait.</b> <code>process_spawn</code> adds the process to the process table under <code>proc_lock</code> and creates its thread, which enters ring 3 with F3-29's <code>enter_user</code>. <code>process_exit</code> (from the exit system call, a fatal user fault, or a kill) frees the address space, reaps already-exited children, orphans the living ones, stores the status and wakes the parent; the process becomes a zombie. <code>process_wait</code> sleeps on the parent's wait queue until some child has exited, takes its status and reaps it. The init test program spawns ten children, each of which exits with status 10 + its argument, and waits for all of them; the run shows ten distinct statuses <sup class="src"><a href="#F3-30-src-R2">R2</a></sup>.</p>
+<p><b>Killing.</b> <code>process_kill</code> sets a flag on the process's thread; the kernel acts on it at the user/kernel boundary (on return from an interrupt or a system call), so a process is never killed in the middle of kernel code that holds a lock. <code>u_spin</code> loops forever in ring 3; after 20 ticks the test kills it and its status is 0x1FF ("killed by the kernel").</p>
+
+<h2 id="F3-30-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-30-l3-why-lazy">Why lazy loading, and what it costs</h3>
+<p>Demand paging means that a program's pages are read only if used: <code>u_nop</code> touches one code page and one stack page, whatever its file contains. It also simplifies spawn: no loop over segments, no partial failure halfway through mapping. The price is that errors move: a segment that is too large for memory fails on the first touch, as a page fault that cannot be satisfied, not at spawn time. This kernel accepts that because segments are limited to the user range by <code>elf_check</code>. A real kernel also reads file pages through a page cache and shares read-only pages between processes running the same program; here each process copies its pages from the in-memory module.</p>
+<p>One detail of <code>map_program_page</code> deserves attention: a page can contain bytes of two segments (the end of one, the start of the next) when a linker packs them. The function copies the bytes of every segment that intersects the page and makes the page writable if any of them is writable. The ELF specification allows this kind of sharing at page boundaries <sup class="src"><a href="#F3-30-src-D1">D1</a></sup>; giving the whole page the union of the permissions is what simple loaders do, and it is a small weakening of protection worth knowing about.</p>
+<h3 id="F3-30-l3-exit">Exit frees everything, in the right order</h3>
+<p><code>process_exit</code> runs on the exiting thread, in its own address space. Before freeing the page tables it switches CR3 to the kernel's (line 223); otherwise the CPU would be walking tables that are being freed. It frees, for the user half only, every mapped frame, every page table, page directory and page-directory-pointer table, then the PML4 (lines 75–103). Entry 0 is the kernel half, shared by everyone, and must never be freed. Only after that does it take <code>proc_lock</code> to update the table and wake the parent. The thread itself then exits like any kernel thread and is reaped by F3-26's zombie reaping.</p>
+<p>No TLB shootdown is needed for the user pages: a process has one thread, every CPU it ran on loaded another CR3 when it switched away (a CR3 load drops the non-global entries; F3-28's check-yourself question 8), and the exiting CPU has just loaded the kernel's CR3. With several threads per process on several CPUs, freeing would require a shootdown to every CPU that has the address space loaded.</p>
+<h3 id="F3-30-l3-wait">Zombies, orphans and the lost-wake-up rule again</h3>
+<p><code>process_wait</code> holds <code>proc_lock</code>, scans for an exited child, and if there is none but there are living children, sleeps on the parent's wait queue with F3-27's <code>WaitQueue::sleep(proc_lock)</code>, which releases the lock only after the thread is queued. <code>process_exit</code> sets <code>exited</code> and wakes the queue under the same lock, so a child that exits between the scan and the sleep cannot be missed. When a parent exits before its children, they become orphans; Unix re-parents them to init, which must reap them. This kernel marks them so they reap themselves at exit: simpler, and enough as long as nobody needs their status.</p>
+<p>In the recorded run, init's ten children were reaped in reverse order (status 19 first) <sup class="src"><a href="#F3-30-src-R2">R2</a></sup>. Nothing in the ABI promises an order: here all ten had exited before init's first wait, the process table is a list with new processes at the head, and <code>wait</code> takes the first exited child it finds.</p>
+<h3 id="F3-30-l3-spawn">Spawn instead of fork</h3>
+<p>Unix creates processes with <code>fork</code> (copy the caller) and <code>exec</code> (replace the copy's program). That design needs copy-on-write page tables to be cheap and raises questions about threads, locks and file descriptors at the moment of the copy. The curriculum lists fork "as a topic" for B13 <sup class="src"><a href="#F3-30-src-C1">C1</a></sup>; this kernel creates a process directly from a program file and arguments, like POSIX <code>posix_spawn</code> or Windows' process creation <sup class="src"><a href="#F3-30-src-D4">D4</a></sup>. Building fork on top of this kernel is a good extension once copy-on-write exists.</p>
+<h3 id="F3-30-l3-fuzz">Fuzzing the exec path: what the two fuzzers prove</h3>
+<p>The B13 test wants "1 hour of fuzzing through the exec path" <sup class="src"><a href="#F3-30-src-C1">C1</a></sup>. This lab fuzzes at two levels. <b>In the kernel</b>, <code>test_fuzz</code> mutates <code>u_child.elf</code> 3000 times (mostly in the first 256 bytes, where the headers are), passes each mutant through the real exec path and runs whatever loads, with a 30-tick limit. The invariants are: no kernel fault, every mutant either rejected or run to an exit or a kill, and memory back at the baseline. In this build 1,877 mutants were rejected for 16 different reasons and 1,123 ran (most exited normally, 14 were killed by a CPU exception in ring 3, none hit the time limit) <sup class="src"><a href="#F3-30-src-R3">R3</a></sup>. <b>On the host</b>, <code>elf_fuzz.cpp</code> compiles the very same <code>elf_check.h</code> under AddressSanitizer and UBSan and mutates a minimal hand-built ELF 200,000 times, copying each mutant into an exactly-sized heap block so that any read past its end is caught; it then re-checks every accepted file against the loader's promises (segments inside the file and the user range, entry inside an executable segment). No sanitizer report and no broken promise <sup class="src"><a href="#F3-30-src-R4">R4</a></sup>. Neither is an hour of coverage-guided fuzzing: they are a few minutes of blind mutation, and the NOTES list the gap.</p>
+<h3 id="F3-30-l3-limits">What this chapter does not do</h3>
+<ul>
+<li><b>Processes with multiple threads</b> (B13's goal names them): one thread per process here.</li>
+<li><b>A file system</b>: programs are Multiboot modules (B14 brings a RAM disk and a VFS).</li>
+<li><b>Environment variables</b>: envp is always empty.</li>
+<li><b>Dynamic linking</b>: PT_INTERP and PT_DYNAMIC are rejected.</li>
+</ul>
+
+<h2 id="F3-30-hardware">How the hardware actually does it</h2>
+<p>The hardware knows nothing about processes or ELF. What it provides: a page-table root per address space (CR3), the user/supervisor and write bits checked on every access, a page fault with the faulting address in CR2 and an error code saying whether the page was absent (bit 0 clear) or protected, and the ability to restart the faulting instruction after the handler returns. Demand paging is built entirely from those: the handler maps the page and returns, and the CPU re-executes the instruction as if nothing happened <sup class="src"><a href="#F3-30-src-D5">D5</a></sup>. A CR3 write switches address spaces and drops the TLB's non-global entries; F3-26's scheduler writes CR3 at a switch only if it differs.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Written from memory and not checked against the documents in this build: the ELF64 header offsets used in <code>elf_check.h</code> (e_type at 16, e_machine at 18, e_version at 20, e_entry at 24, e_phoff at 32, e_ehsize at 52, e_phentsize at 54, e_phnum at 56), the values ET_EXEC = 2, EM_X86_64 = 62, PT_LOAD = 1, PT_DYNAMIC = 2, PT_INTERP = 3, the program-header field offsets and the flag bits (1 execute, 2 write, 4 read); the auxiliary-vector numbers AT_PHDR 3, AT_PHENT 4, AT_PHNUM 5, AT_PAGESZ 6, AT_ENTRY 9 and the initial stack layout and alignment; the page-fault restart semantics. Partial independent evidence: GNU readelf 2.42 in this build printed for <code>u_child.elf</code> "Type: EXEC", "Machine: Advanced Micro Devices X86-64", "Size of this header: 64", "Size of program headers: 56" and the same segments the checker accepted (Listing 3 output), and <code>u_args</code> found its own entry point in the AT_ENTRY slot. Check against the ELF specification / System V gABI ("Program Loading"), the AMD64 psABI ("Process Initialization") and the Intel SDM Vol. 3 "Paging" (D1, D2, D5).</p></div>
+<div class="co note"><span class="lbl">Note</span><p>Untested on hardware. All runs are QEMU 8.2.2 TCG with <code>-cpu max</code>, one CPU; the exec/exit and fuzz tests were not run on several CPUs in this build.</p></div>
+
+<h2 id="F3-30-worked">Worked example</h2>
+<p><b>Loading <code>u_child.elf</code> by hand.</b> From <code>readelf</code> (Listing 3 output): the entry point is 0x80_0040_1019; three PT_LOAD segments: offset 0 → 0x80_0040_0000 (0x120 bytes, R), offset 0x1000 → 0x80_0040_1000 (0x5d bytes, R E), offset 0x2000 → 0x80_0040_2000 (0x54 bytes, R); and a GNU_STACK header, which the loader skips because its type is not PT_LOAD. The checks: each vaddr ≡ offset (mod 4096) — 0x...0000 and 0, 0x...1000 and 0x1000, 0x...2000 and 0x2000: yes. No overlap: [0x...0000, 0x...0120), [0x...1000, 0x...105d), [0x...2000, 0x...2054). The entry 0x...1019 lies in the R E segment: 0x1019 − 0x1000 = 0x19 &lt; 0x5d. The program headers start at file offset 64, which lies inside the first segment (offset 0, file size 0x120), so AT_PHDR = 0x80_0040_0000 + 64 = 0x80_0040_0040, exactly the value <code>u_args</code> printed for its own (equally laid out) file <sup class="src"><a href="#F3-30-src-R2">R2</a></sup>.</p>
+<p><b>First instruction.</b> The thread enters ring 3 at 0x80_0040_1019 with RSP pointing at argc. The fetch faults (page not present); <code>vm_handle_fault</code> finds the page inside the R E segment, maps a frame, copies 0x5d bytes from file offset 0x1000, and the fetch is restarted. <code>u_child</code> then reads <code>argv[1][0]</code>, on the already-mapped stack page; computes 10 + n and calls exit. Its read-only data page is touched only if a string is used.</p>
+<p><b>The stack of <code>u_args</code>.</b> argv strings: "u_args.elf" (11 bytes with NUL), "hello" (6), "world" (6) = 23 bytes, placed downwards from 0xFF_FFFF_F000: "world" at …EFFA, "hello" at …EFF4, "u_args.elf" at …EFE9 — the addresses <code>u_args</code> printed. Words: argc 1 + argv 3 + NULL 1 + envp NULL 1 + auxv 12 = 18 words = 144 bytes. 0xFF_FFFF_EFE9 − 144 = 0xFF_FFFF_EF59, rounded down to 16: 0xFF_FFFF_EF50 = RSP. argv is at RSP + 8 = 0xFF_FFFF_EF58, the value printed <sup class="src"><a href="#F3-30-src-R2">R2</a></sup>.</p>
+
+<h2 id="F3-30-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F3-30/</code>. The user library and <code>crt0.S</code> are F3-29's; the page-fault decision order is in F3-26's <code>trap.cc</code>.</p>
+<p><b>Listing 1</b> — <code>elf_check.h</code></p>
+<pre class="listing" data-src="F3-30/elf_check.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>46–53</td><td><code>rd</code></td><td>Little-endian read, byte by byte.</td><td>No alignment or aliasing assumptions about a hostile buffer.</td></tr>
+<tr><td>63–73</td><td>header checks</td><td>Size, magic, class, data, version, type, machine, header sizes, count.</td><td>Reject anything that is not exactly what the loader understands.</td></tr>
+<tr><td>74</td><td>headers inside the file</td><td><code>phnum * 56 &gt; size − phoff</code> after <code>phoff &gt; size</code>.</td><td>No sum, no wrap; <code>phnum ≤ 64</code> keeps the product small.</td></tr>
+<tr><td>80</td><td>interpreter, dynamic</td><td>Refused.</td><td>Static executables only.</td></tr>
+<tr><td>84–93</td><td>segment checks</td><td>Count, sizes, inside file, inside user range, alignment, overlap.</td><td>Each one has a rejected mutant in the fuzz histogram.</td></tr>
+<tr><td>95–97</td><td><code>phdr_vaddr</code></td><td>Where the program headers appear in memory.</td><td>The AT_PHDR value.</td></tr>
+<tr><td>100–107</td><td>entry check</td><td>Entry inside an executable segment.</td><td>Otherwise the first instruction faults in ring 3 at best.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>process.h</code> and <code>process.cc</code></p>
+<pre class="listing" data-src="F3-30/process.h"></pre>
+<pre class="listing" data-src="F3-30/process.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines (process.cc)</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>21–35</td><td><code>user_pte</code></td><td>Walks four levels, creating tables with P, W and U set.</td><td>U must be set at every level for ring-3 access.</td></tr>
+<tr><td>38–58</td><td><code>map_program_page</code></td><td>Zeroed frame; copy the file bytes of every intersecting segment; permissions.</td><td>Handles <code>.bss</code> and shared boundary pages.</td></tr>
+<tr><td>75–103</td><td><code>free_address_space</code></td><td>Frees frames, page tables, directories and PDPTs of the user half, then the PML4.</td><td>Lines 90–100 are what the forensic build leaves out.</td></tr>
+<tr><td>107–140</td><td><code>build_stack</code></td><td>Strings, alignment, argc, argv, NULLs, auxv.</td><td>Figure 2.</td></tr>
+<tr><td>170–206</td><td><code>process_spawn</code></td><td>Reap zombies; <code>elf_check</code>; PML4 with the kernel half; stack; table; thread.</td><td>Validation happens before any allocation.</td></tr>
+<tr><td>218–251</td><td><code>process_exit</code></td><td>Kernel CR3; free; children; status; wake or self-reap.</td><td>Figure 3.</td></tr>
+<tr><td>258–287</td><td><code>process_wait</code></td><td>Find an exited child or sleep; <code>nohang</code> for polling.</td><td>Sleeps with <code>proc_lock</code> handed to the wait queue.</td></tr>
+<tr><td>303–315</td><td><code>vm_handle_fault</code></td><td>Not-present user fault in a segment or the stack: map and retry.</td><td>Demand paging in 13 lines.</td></tr>
+<tr><td>317–341</td><td><code>user_fault</code>, <code>user_return_check</code></td><td>Kill on a ring-3 exception; act on kill requests at the boundary.</td><td>Status 0x100 | vector, or 0x1FF.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — the user programs <code>u_init.cc</code>, <code>u_child.cc</code>, <code>u_args.cc</code>, <code>u_spin.cc</code>, <code>u_nop.cc</code></p>
+<pre class="listing" data-src="F3-30/u_init.cc"></pre>
+<pre class="listing" data-src="F3-30/u_child.cc"></pre>
+<pre class="listing" data-src="F3-30/u_args.cc"></pre>
+<pre class="listing" data-src="F3-30/u_spin.cc"></pre>
+<pre class="listing" data-src="F3-30/u_nop.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>File</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>u_init.cc</td><td>spawn loop, wait loop</td><td>Ten children with arguments "0"…"9"; waits until −7 (no children); checks ten distinct statuses.</td><td>B13 acceptance test 1, the course project's core.</td></tr>
+<tr><td>u_child.cc</td><td><code>10 + n</code></td><td>Exit status from its argument.</td><td>Proves argv reached the child.</td></tr>
+<tr><td>u_args.cc</td><td>envp and auxv walk</td><td>Skips argv and envp, prints the auxv pairs and <code>_start</code>.</td><td>The worked example's evidence.</td></tr>
+</tbody></table></div>
+<p>The program headers of <code>u_child.elf</code>, as the worked example uses them:</p>
+<pre class="output" data-run="F3-30/readelf_child"></pre>
+
+<p><b>Listing 4</b> — <code>test_proc.cc</code> and <code>run.sh</code></p>
+<pre class="listing" data-src="F3-30/test_proc.cc"></pre>
+<pre class="listing" data-src="F3-30/run.sh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–17</td><td><code>snapshot</code></td><td>Free frames, heap objects, threads, processes, after reaping.</td><td>The baseline of every test.</td></tr>
+<tr><td>40–66</td><td><code>test_proc</code></td><td><code>u_args</code>, init with ten children, kill of <code>u_spin</code>, baseline.</td><td>B13 acceptance test 1.</td></tr>
+<tr><td>68–89</td><td><code>test_execloop</code></td><td>10,000 spawn/exit/wait cycles with a statistics line every 1000.</td><td>B13 acceptance test 3; a leak shows as a slope.</td></tr>
+<tr><td>118–125</td><td>mutation</td><td>1–4 random bytes, mostly in the first 256.</td><td>Headers are where the checks are.</td></tr>
+<tr><td>126–151</td><td>check, spawn, classify</td><td>Rejected by reason; ran and exited, faulted or timed out.</td><td>B13 acceptance test 2 (reduced; see Layer 3).</td></tr>
+<tr><td>run.sh 13–17</td><td>steps</td><td>proc, execloop, fuzz; the leak build's execloop.</td><td>The last run is expected to fail (exit 3).</td></tr>
+</tbody></table></div>
+<p><b>Init and ten children</b> (<code>test=proc</code>):</p>
+<pre class="output" data-run="F3-30/proc"></pre>
+<p><b>10,000 exec/exit cycles</b> (<code>test=execloop</code>):</p>
+<pre class="output" data-run="F3-30/execloop"></pre>
+<p><b>Fuzzing the exec path in the kernel</b> (<code>test=fuzz</code>):</p>
+<pre class="output" data-run="F3-30/fuzz"></pre>
+
+<p><b>Listing 5</b> — <code>elf_fuzz.cpp</code>, the validator under the sanitizers</p>
+<pre class="listing" data-src="F3-30/elf_fuzz.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>22–43</td><td><code>minimal_elf</code></td><td>A 136-byte valid executable: header, one PT_LOAD, 16 bytes of "code".</td><td>A seed whose every byte matters.</td></tr>
+<tr><td>53–70</td><td><code>mutate</code></td><td>Random byte, bit flip, boundary 64-bit value, truncation.</td><td>Boundary values find wrap-around bugs fast.</td></tr>
+<tr><td>90</td><td>exact copy</td><td>Each mutant in its own exactly-sized heap block.</td><td>ASan then catches a read one byte past the end.</td></tr>
+<tr><td>95–102</td><td>promises</td><td>Re-checks every accepted file independently.</td><td>Tests the checker's result, not just its survival.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-30/elf_fuzz"></pre>
+
+<h2 id="F3-30-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The room is an illusion.</b> A process's "room" is a set of page-table entries; the same physical frame can appear in two rooms, or in none, and the kernel's rooms are visible (but locked) in every process.</li>
+<li><b>Furniture appears at the first touch, invisibly.</b> The program never sees demand paging; a caretaker carrying desks in mid-lesson would be noticed.</li>
+<li><b>The head of year cannot hear a class end.</b> A parent learns about a child's exit only by asking (<code>wait</code>); there is no notification unless the kernel adds one (signals, which this kernel does not have).</li>
+<li><b>A rejected plan has no owner to complain to.</b> The loader returns an error code to whoever called spawn; it cannot ask the file's author what was meant.</li>
+</ul>
+
+<h2 id="F3-30-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b><code>offset + filesz &gt; size</code>.</b> Wraps for huge values and accepts a segment that reads far past the file. Use the subtraction form after checking <code>offset ≤ size</code>; the host fuzzer finds the sum form within seconds (try it).</li>
+<li><b>Forgetting <code>.bss</code>.</b> Copying <code>p_memsz</code> bytes from the file reads past the segment; copying <code>p_filesz</code> into a non-zeroed frame leaves garbage in <code>.bss</code>.</li>
+<li><b>A misaligned initial stack.</b> RSP must be a multiple of 16 at <code>_start</code>; compiled code that uses aligned SSE stores would crash (this kernel's programs use no SSE, so the bug would hide until they do).</li>
+<li><b>Freeing the address space while it is loaded.</b> Switch CR3 first.</li>
+<li><b>Freeing only the leaves.</b> Page tables are memory too: the forensic case.</li>
+<li><b>A missing wake-up in exit.</b> The parent sleeps forever; with F3-27's wait queue and the same lock in exit and wait, it cannot happen here.</li>
+<li><b>Debugging method for leaks.</b> Print frames, heap objects, threads and processes at regular intervals in a loop; a constant slope means a fixed number of objects per cycle; divide, then list the objects a cycle allocates and find the ones with that count.</li>
+</ul>
+
+<div class="co transition" id="F3-30-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F3-29 ran single user programs in ring 3 through a system-call ABI with checked copies. <b>What carries over:</b> threads and wait queues (F3-26, F3-27), the per-CPU area and IPIs (F3-28), <code>enter_user</code>, the exception table and <code>user_range_ok</code>'s no-wrap pattern (F3-29), page tables (F3-21) and SP301's knowledge of ELF. <b>What changes:</b> programs are files the kernel validates and loads lazily into their own address spaces; processes have parents, statuses, zombies and orphans; init starts the others; the exec path survives thousands of malformed files. <b>What comes next:</b> OS304 gives the kernel storage (curriculum B14 onward): a virtual file system, an initial RAM disk and a block cache, then FAT32 and ext2, so that init can start programs from files instead of boot modules.</p></div>
+
+<h2 id="F3-30-check">Check yourself</h2>
+<ol>
+<li>Why does <code>elf_check</code> reject a segment with <code>p_filesz &gt; p_memsz</code>?</li>
+<li>Compute AT_PHDR for a file whose program headers are at offset 64 and whose first PT_LOAD has offset 0 and vaddr 0x80_0060_0000.</li>
+<li>Explain in your own words why the kernel validates the whole file before allocating anything for the process.</li>
+<li>Why must <code>process_exit</code> switch to the kernel's CR3 before freeing the page tables?</li>
+<li>A child exits while its parent is between the scan and the sleep in <code>process_wait</code>. Why is the wake-up not lost?</li>
+<li>Why is the kill flag acted on only at the user/kernel boundary?</li>
+<li>Four arguments "a", "bb", "ccc", "dddd": compute RSP at <code>_start</code> (top of strings at 0xFF_FFFF_F000).</li>
+<li>Apply to a new case: a mutant has two PT_LOAD segments that share one page, one R E and one RW. What does <code>map_program_page</code> do with that page, and what risk does that create?</li>
+<li>The kernel fuzzer ran 3000 mutants in this build; B13 asks for an hour. What would you need to make an hour of fuzzing meaningful rather than just long?</li>
+</ol>
+
+<h2 id="F3-30-lab">Lab</h2>
+<div class="co safety"><span class="lbl">Safety</span><p>QEMU only; real hardware only on a designated spare machine with a recovery path (guide section 5.8). Nothing here was run on hardware.</p></div>
+<p><b>Goal (milestone B13, verbatim):</b> "Processes with multiple threads, exec of static ELF executables, exit and wait, demand paging of program segments." <sup class="src"><a href="#F3-30-src-C1">C1</a></sup> (This lab implements processes with one thread each; see Layer 3.)</p>
+<p><b>Acceptance tests (verbatim):</b></p>
+<ol>
+<li>"Init process launches ten child programs from an initial RAM disk; each exits with a different status; init prints all ten statuses." — passed; the "RAM disk" is QEMU's Multiboot modules (<code>proc</code>).</li>
+<li>"Malformed ELF files from a fuzzing corpus are rejected without kernel faults (1 hour of fuzzing through the exec path)." — reduced: 3000 mutants through the kernel's exec path and 200,000 through the validator on the host, no fault (<code>fuzz</code>, <code>elf_fuzz</code>).</li>
+<li>"Memory statistics return to baseline after 10,000 exec/exit cycles." — passed (<code>execloop</code>).</li>
+</ol>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F3-30</code>. Expected: <code>proc</code>, <code>execloop</code>, <code>fuzz</code> exit 1; <code>forensic_leak</code> exit 3; <code>elf_fuzz</code> exit 0.</li>
+<li>Replace one subtraction-form check in <code>elf_check.h</code> by the sum form (for example line 86 by <code>s.offset + s.filesz &gt; size</code>) and run only the host fuzzer. Record how many mutants it takes before a broken promise or a sanitizer report. Restore the line.</li>
+<li>Run the kernel fuzzer with <code>kRuns</code> = 30000 and record the time; extrapolate how many runs an hour would be under TCG.</li>
+<li>Run <code>test=proc</code> with <code>-smp 4</code>. Does the order of init's reports change? Why is any order correct?</li>
+</ol>
+
+<h2 id="F3-30-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> After a refactoring of <code>free_address_space</code>, the nightly exec/exit test fails with "LEAK". The heap, threads and processes are back at their baseline; only free frames are not. You have the statistics log of the failing kernel.</p>
+<p><b>Evidence</b> — <code>test=execloop</code> on the kernel built with <code>-DBUG_LEAK_PAGE_TABLES</code>:</p>
+<pre class="output" data-run="F3-30/forensic_leak"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>How many frames leak per exec/exit cycle? Is the leak constant?</li>
+<li>Which objects are allocated as frames during one cycle of <code>u_nop</code>? List them with their count. (Hint: the PML4, the tables below it for each address used, the stack page, the code page.)</li>
+<li>Compute the PML4, PDPT and page-directory indices of 0x80_0040_1000 and of 0xFF_FFFF_E000. How many page-directory-pointer tables, page directories and page tables does one process need?</li>
+<li>Which group of frames matches the leak exactly?</li>
+<li>Which lines of <code>process.cc</code> are responsible?</li>
+<li>How long would a kernel with 256 MiB of RAM survive this bug at one spawn per millisecond?</li>
+</ol>
+<p><b>Method hints.</b> Divide the slope by the cycle count first. Then count frames per cycle by level of the page-table tree, not by "pages".</p>
+
+<h2 id="F3-30-project">Mini-project (course project B13)</h2>
+<p><b>Init launches ten programs; fuzzing the exec path.</b> The course project extends this chapter's lab into a small, honest system test.</p>
+<ol>
+<li>Make <code>u_init</code> read a list of programs and arguments from a boot module <code>inittab.txt</code> (a text file passed with <code>-initrd</code>), start them, and print a table "pid, program, status" sorted by pid.</li>
+<li>Add a <code>u_crash</code> child that dereferences a null pointer and one that runs forever, and make init kill the latter after a time limit by a new system call <code>kill(pid)</code> (update the ABI table of F3-29).</li>
+<li>Build a fuzzing corpus: the host fuzzer writes 1,000 mutants that its checker <i>accepts</i> into files, which become boot modules; the kernel runs each through the exec path. Run the kernel fuzzer for as long as your machine allows and report runs per minute under TCG (and KVM if you have it).</li>
+<li>Run everything on 1 and 4 CPUs and record every run with <code>qemu_step</code>.</li>
+</ol>
+<p><b>Rubric (20 points).</b> inittab parsing with errors reported, not crashed (3); kill system call with permission rule (parent only) and an updated ABI table (3); status table correct for normal exits, faults and kills (3); corpus fuzzing with the accepted-mutant corpus and a recorded duration (4); memory back at baseline after each phase, on 1 and 4 CPUs (4); a one-page report stating what was and was not tested, with the gap to "1 hour" quantified (3).</p>
+
+<h2 id="F3-30-summary">Summary</h2>
+<ul>
+<li>The loader validates the whole ELF file first: header, program headers inside the file, PT_LOAD segments inside the file and the user range, aligned, non-overlapping, entry executable; no interpreter. No sum can wrap.</li>
+<li>Segments are loaded on demand by the page-fault handler: zeroed frame, file bytes, permissions. The top stack page is built at spawn: argc, argv, envp, auxv, 16-byte aligned.</li>
+<li>Spawn, exit and wait use a process table, zombies, orphans and the wait-queue discipline of F3-27; kills act at the user/kernel boundary.</li>
+<li>Exit frees the user half's frames <i>and</i> its page tables after switching to the kernel's CR3.</li>
+<li>Init reaped ten children with ten statuses; 10,000 exec/exit cycles left memory at the baseline; 3,000 kernel and 200,000 host mutants caused no fault. The hour of fuzzing and multi-threaded processes were not done; nothing was tested on hardware.</li>
+</ul>
+
+<h2 id="F3-30-sources">Sources</h2>
+<ol>
+<li id="F3-30-src-D1">"System V Application Binary Interface" (generic ABI, gABI), "Object Files" and "Program Loading" chapters, and the ELF-64 Object File Format (tier 1; named in B13 as "ELF specification (program loading)"). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-30-src-D2">H. J. Lu et al. (eds.), "System V Application Binary Interface, AMD64 Architecture Processor Supplement" (tier 1; named in B13), "Process Initialization" (initial stack, auxiliary vector). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-30-src-D3">Remzi H. Arpaci-Dusseau and Andrea C. Arpaci-Dusseau, "Operating Systems: Three Easy Pieces" (tier 3; curriculum item 2; named in B13): "Process API", "Address Spaces", "Swapping: Mechanisms". <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-30-src-D4">Pavel Yosifovich, Alex Ionescu, Mark E. Russinovich, David A. Solomon, "Windows Internals, Part 1" (tier 3; curriculum item 30; named in B13), "Processes and jobs", for comparison with process creation without fork. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-30-src-D5">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3 (tier 1; curriculum item 10): "Paging" (page-fault error code, CR3 and TLB behaviour) and "Interrupt and Exception Handling" (fault restart). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-30-src-C1">C1 — "Systems Curriculum", Track B, milestone B13 (goal, reading list, build items and acceptance tests quoted verbatim) and the topic list naming "fork as a topic". A map, not a technical source (AH-4).</li>
+<li id="F3-30-src-R1">R1 — lab runs <code>F3-30/build.log</code> (g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, GNU ld 2.42, exit code 0) and <code>readelf_child.log</code> (GNU readelf 2.42).</li>
+<li id="F3-30-src-R2">R2 — lab runs <code>proc.log</code> and <code>execloop.log</code>: QEMU emulator version 8.2.2 (TCG, <code>-cpu max</code>, one CPU), exit code 1 = pass; sources <code>process.h</code>, <code>process.cc</code>, <code>test_proc.cc</code>, the user programs. Untested on hardware.</li>
+<li id="F3-30-src-R3">R3 — lab run <code>fuzz.log</code>: the kernel exec-path fuzzer, 3000 mutants, exit code 1 = pass. Untested on hardware.</li>
+<li id="F3-30-src-R4">R4 — lab run <code>elf_fuzz.log</code>: <code>elf_check.h</code> under g++ 13.3.0 with AddressSanitizer and UBSan, 200,000 mutants, exit code 0.</li>
+<li id="F3-30-src-R5">R5 — forensic runs <code>build_bug.log</code> (<code>-DBUG_LEAK_PAGE_TABLES</code>, exit code 0) and <code>forensic_leak.log</code> (exit code 3, expected). Untested on hardware.</li>
+</ol>
+
+<h2 id="F3-30-glossary">Glossary links</h2>
+<p><a href="#gl-process">Process</a> · <a href="#gl-elf-loader">ELF loader</a> · <a href="#gl-program-header-segment">Program header (segment)</a> · <a href="#gl-demand-paging">Demand paging</a> · <a href="#gl-auxiliary-vector">Auxiliary vector</a> · <a href="#gl-initial-process-stack">Initial process stack</a> · <a href="#gl-spawn">Spawn</a> · <a href="#gl-zombie-process">Zombie process</a> · <a href="#gl-orphan-process">Orphan process</a> · <a href="#gl-init-process">Init process</a> · <a href="#gl-fuzzing">Fuzzing</a> · <a href="#gl-exit-status">Exit status</a> · <a href="#gl-elf">ELF</a> · <a href="#gl-address-space">Address space</a></p>
+
+<h2 id="F3-30-next">Next chapter</h2>
+<p>This is the last chapter of OS303. Next course: <a href="#OS304">OS304</a> (storage and file systems, curriculum B14 onward). Previous: <a href="#F3-29">F3-29 User mode and system calls</a>. Back to the course: <a href="#OS303">OS303</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (milestone B13).</p>
+
+<h2 id="F3-30-answers">Answers to Check yourself</h2>
+<ol>
+<li>The loader copies <code>p_filesz</code> bytes and zero-fills up to <code>p_memsz</code>; a file part larger than the memory part would write file bytes beyond the segment's memory, into whatever is mapped (or not) there. It is never valid.</li>
+<li>Offset 64 lies inside the segment (offset 0), so AT_PHDR = 0x80_0060_0000 + 64 = 0x80_0060_0040, provided the segment's file size is at least 64 + phnum × 56.</li>
+<li>Good answers mention: a failure halfway would require undoing partial allocations (page tables, frames, a process entry) on every error path, which is where leaks and double frees hide; validating first makes the error path trivial (return an error, nothing to free) and keeps hostile data away from the allocator.</li>
+<li>CR3 points at the PML4 the CPU uses for every access, including the kernel's own code and stack (through the shared entry 0). Freeing it, or the tables below it, while loaded means the CPU may walk freed frames that are reused for something else.</li>
+<li>Both the scan and the sleep happen with <code>proc_lock</code> held, and <code>WaitQueue::sleep</code> releases it only after the thread is on the queue; the exiting child needs <code>proc_lock</code> to set <code>exited</code> and wake the queue, so it either runs before the scan (and is found) or after the parent is queued (and wakes it).</li>
+<li>In the middle of kernel code the thread may hold locks or be halfway through updating a structure; killing it there would leave them locked or inconsistent. At the boundary it holds nothing and its kernel state is clean.</li>
+<li>Strings: "dddd" 5, "ccc" 4, "bb" 3, "a" 2 = 14 bytes (placed in reverse order: the last argument highest), lowest string at 0xFF_FFFF_F000 − 14 = 0xFF_FFFF_EFF2. Words: 1 + 4 + 1 + 1 + 12 = 19 words = 152 bytes; 0xFF_FFFF_EFF2 − 152 = 0xFF_FFFF_EF5A; rounded down to 16: 0xFF_FFFF_EF50.</li>
+<li>It copies the bytes of both segments into one frame and maps it writable (the union of permissions), executable bits aside — so the code bytes on that page are writable from ring 3. A program (or an attacker controlling its input) could then modify its own code on that page; strict loaders refuse such files or map the page with the intersection, at the cost of breaking some linkers' output.</li>
+<li>Coverage feedback (so that mutants that reach new checks are kept), a corpus of real executables from several linkers as seeds, a faster loop (KVM, or the host harness for the validator), and invariants that are checked automatically (sanitizers on the host, memory statistics and the absence of kernel faults in the kernel), plus a record of what was covered — not just the elapsed time.</li>
+</ol>
+<h3 id="F3-30-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Free frames fall from 64,749 to 59,749 after 1000 cycles and by exactly 5,000 per 1000 cycles after that, down to 14,749 after 10,000: 5 frames per cycle, constant. Heap objects, threads and processes stay at the baseline, so Process objects, thread stacks and control blocks are freed; only raw frames leak.</p>
+<p><b>Frames per cycle.</b> One PML4; for 0x80_0040_1000: PML4 index (0x80_0040_1000 &gt;&gt; 39) &amp; 511 = 1, PDPT index (&gt;&gt; 30) &amp; 511 = 0, PD index (&gt;&gt; 21) &amp; 511 = 2; for 0xFF_FFFF_E000: PML4 index 1, PDPT index 511, PD index 511. Same PML4 entry, so one PDPT; two PDPT entries, so two page directories; two PD entries in different directories, so two page tables. Tables below the PML4: 1 + 2 + 2 = 5. Leaves: the stack page (built at spawn) and the code page (demand-faulted), plus the PML4 itself.</p>
+<p><b>Match.</b> The leak is exactly the 5 paging-structure frames below the PML4. Leaves and the PML4 are still freed (otherwise the count would be 7 or 8).</p>
+<p><b>Root cause.</b> In the forensic build, <code>process.cc</code> lines 90–100 (<code>#ifndef BUG_LEAK_PAGE_TABLES</code> around <code>frame_free</code> of the page table, the page directory and the PDPT) are compiled out: <code>free_address_space</code> frees the leaves and the PML4 but not the intermediate tables.</p>
+<p><b>Survival time.</b> About 64,000 free frames at 5 per spawn: about 12,800 spawns, about 13 seconds at one spawn per millisecond.</p>
+<p><b>Fix and prevention.</b> Free every level, as the normal build does. Keep the exec/exit loop with its per-1000 statistics in the test suite: a constant slope finds a 5-frame leak that a single spawn would never show, and dividing the slope by the cycle count names the culprit.</p>

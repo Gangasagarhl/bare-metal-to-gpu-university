@@ -1,0 +1,308 @@
+<!--meta
+id: F6-20
+title: Occupancy and latency hiding: how many rows sit in the hall
+course: CU302
+level: L3
+prereqs: CU301 (F6-10 shared memory, F6-14 reductions); HW301 (F1-58 registers and shared memory, F1-60 schedulers and latency hiding); F6-03; F6-06; F6-07
+time: 8–12 hours including the lab and the forensic lab
+hardware: none for the occupancy model, the scheduler model, the compiler reports and the forensic lab (g++ 13.3 and nvcc 12.0 in the build container); timing Listing 2 needs an NVIDIA GPU with the CUDA Toolkit recorded in the dossier, untested on hardware in this build
+maps: Curriculum E6 (register usage and occupancy recorded per step); 13.2 topic 3 (occupancy and latency hiding; when higher occupancy does not help; instruction-level parallelism); guide 9.2 warp-execution timeline; course forensic "Low occupancy, high speed?"
+analogy: F6 — the great kitchen hall (registered: warp = a row of helpers; registers = each helper's hands; shared memory = the table in the middle of a row group; latency hiding / occupancy = while one row waits for the pantry, another row cooks)
+-->
+
+<h2 id="F6-20-hook">Story hook</h2>
+<p>The great kitchen hall has room for a fixed number of rows of helpers. Tonight the head cook, Amara, is making a soup that needs one ingredient from the far pantry for every bowl. A runner takes a long time to come back from the pantry. While a row waits for its runner, it can do nothing for that bowl.</p>
+<p>Amara's first idea is to fill the hall: as many rows as fit, each sending one runner at a time. While one row waits, another row cooks. Her assistant, Tomás, tries something different. He seats only a quarter of the rows, but every helper in his rows sends four runners at once, for four different bowls, and starts on whichever ingredient comes back first. Tomás's half-empty hall finishes first.</p>
+<p>How can fewer rows be faster? The hall's job is not to be full. Its job is to keep enough runners on the road that the pantry is always busy and the cooks never stand idle. Rows in the hall are one way to get runners on the road; more runners per helper is another. This chapter is about counting both.</p>
+
+<h2 id="F6-20-able">What you will be able to do</h2>
+<ul>
+<li><b>Compute</b> the theoretical occupancy of a kernel from its registers per thread, shared memory per block and block size, name the limiting resource, and <b>check</b> the result against the CUDA Toolkit's own occupancy calculator.</li>
+<li><b>Explain</b> latency hiding with Little's law: how many independent memory operations must be in flight, and how warps (thread-level parallelism) and independent instructions per warp (instruction-level parallelism) both supply them.</li>
+<li><b>Read</b> a compiler report (<code>ptxas -v</code>) and a SASS listing to find a kernel's register count and how many loads it issues before the first use.</li>
+<li><b>Diagnose</b> a case where lower occupancy is faster, from compiler and model evidence, and <b>explain</b> it with instruction-level parallelism.</li>
+<li><b>Record</b> registers and occupancy for every step of the E6 speed table, as the milestone asks.</li>
+</ul>
+
+<div class="co jargon" id="F6-20-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Occupancy</dt><dd><b>Simple words:</b> how full the hall is: the warps that are resident on a multiprocessor, compared with the most it can hold. <b>Analogy:</b> how many rows of helpers sit in the hall, out of the rows it has chairs for. <b>Precise:</b> resident warps per SM ÷ maximum resident warps per SM; limited by registers, shared memory, the warp limit and the block limit, whichever allows fewest blocks (as defined in <a href="#F1-60">F1-60</a>). <sup class="src"><a href="#F6-20-src-D1">D1</a></sup> <sup class="src"><a href="#F6-20-src-D2">D2</a></sup></dd>
+<dt>Theoretical occupancy</dt><dd><b>Simple words:</b> the occupancy the resource limits allow, worked out before the kernel runs. <b>Analogy:</b> how many rows the hall could seat, given how many hands and how much table each row needs. <b>Precise:</b> active blocks per SM computed from the kernel's resource use and the device's per-SM limits, times warps per block, divided by the maximum warps per SM; the value the occupancy API and calculator return. <sup class="src"><a href="#F6-20-src-D1">D1</a></sup> <sup class="src"><a href="#F6-20-src-R1">R1</a></sup></dd>
+<dt>Achieved occupancy</dt><dd><b>Simple words:</b> how full the hall really was, on average, while the kernel ran. <b>Analogy:</b> the rows actually seated, counted every minute; at the end of the evening the hall empties. <b>Precise:</b> the average number of resident warps per SM over the kernel's run, measured by a profiler; it is lower than the theoretical value when the grid is too small, when blocks finish unevenly (the "tail"), or when launches are short. <sup class="src"><a href="#F6-20-src-D3">D3</a></sup></dd>
+<dt>Register allocation unit</dt><dd><b>Simple words:</b> registers are handed out in fixed-size bundles per warp, not one at a time. <b>Analogy:</b> hands are given to rows in packs, so asking for one more hand can cost a whole pack. <b>Precise:</b> the granularity in which the register file is allocated to warps; the toolkit's calculator (<code>cuda_occupancy.h</code>, CUDA 12.0) uses 256 registers per warp for compute capability 8.x, which is why occupancy falls in steps. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup> <sup class="src"><a href="#F6-20-src-D4">D4</a></sup></dd>
+<dt><code>__launch_bounds__</code></dt><dd><b>Simple words:</b> a note on a kernel that tells the compiler the largest block size you will use, and optionally how many blocks you want to fit on one SM. <b>Analogy:</b> telling the hall manager in advance "rows of at most 256, and I want four tables' worth in the hall", so hands are budgeted to match. <b>Precise:</b> a CUDA C++ function qualifier with a maximum threads-per-block argument and an optional minimum-blocks-per-multiprocessor argument; the compiler limits registers per thread to satisfy it, spilling if necessary. <sup class="src"><a href="#F6-20-src-D1">D1</a></sup></dd>
+<dt>Latency hiding</dt><dd><b>Simple words:</b> keeping the GPU busy while some operations wait, by having other independent work ready. <b>Analogy:</b> while one row waits for the pantry, another row cooks. <b>Precise:</b> overlapping the latency of operations with the issue of independent instructions from the same warp (ILP) or other warps (TLP), so that issue slots stay busy (as defined in <a href="#F1-60">F1-60</a>). <sup class="src"><a href="#F6-20-src-D2">D2</a></sup> <sup class="src"><a href="#F6-20-src-D5">D5</a></sup></dd>
+<dt>Instruction-level parallelism (ILP)</dt><dd><b>Simple words:</b> independent instructions inside one thread, which can be in progress at the same time. <b>Analogy:</b> one helper sending four runners for four bowls instead of one. <b>Precise:</b> the degree to which instructions of one instruction stream do not depend on each other's results; on a GPU, for example, several independent loads issued before the first use. <sup class="src"><a href="#F6-20-src-D5">D5</a></sup></dd>
+<dt>Occupancy calculator</dt><dd><b>Simple words:</b> a program or function that does the occupancy arithmetic for you. <b>Analogy:</b> the seating chart of the hall. <b>Precise:</b> NVIDIA ships a host-side calculator in the header <code>cuda_occupancy.h</code> (functions such as <code>cudaOccMaxActiveBlocksPerMultiprocessor</code>, found in the CUDA 12.0 header in this build) and a runtime API (<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code>) that asks the driver for a real device. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup> <sup class="src"><a href="#F6-20-src-D1">D1</a></sup></dd>
+</dl></div>
+<p>A reminder from the faculty's rules: the word <b>kernel</b> here means a GPU function launched on many threads (<a href="#gl-kernel-gpu">kernel (GPU)</a>), not the operating-system kernel of F3 (<a href="#gl-kernel-operating-system">kernel (operating system)</a>).</p>
+
+<h2 id="F6-20-pictures">The idea in pictures</h2>
+<p>Figure 1 is the warp-execution timeline that guide 9.2 requires for this chapter. It shows one warp scheduler over time, in two situations of the model of Listing 3. On the left, four warps each issue one load and wait for it: the scheduler is idle most of the time. On the right, the same four warps each issue four independent loads before waiting: four times as many loads are in flight, and the idle gaps shrink. Nothing about the hall's size changed.</p>
+<figure id="F6-20-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-20-f1t F6-20-f1d">
+<title id="F6-20-f1t">Figure 1: warps issuing, stalling and switching, with one and with four loads in flight per warp</title>
+<desc id="F6-20-f1d">Two timelines of one warp scheduler, time running left to right, not to scale. Top timeline, labelled ILP 1: warps W0 to W3 each issue one load, shown as a small dark box, then a long dashed bar marks the wait for memory; the multiply that uses the value comes after the bar. Below the timeline, a row marked "issue slot" is mostly empty. Bottom timeline, labelled ILP 4: each warp issues four loads back to back, then one long wait that overlaps the waits of the other warps, then four multiplies. The issue-slot row is busier and the whole job ends earlier. A note says: loads in flight, top 4, bottom 16; Little's law: in flight needed equals latency times the rate you want.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="28">ILP 1: one load in flight per warp (4 warps, 4 loads in flight)</text>
+<text class="sv-t" x="20" y="60">W0</text><text class="sv-t" x="20" y="84">W1</text><text class="sv-t" x="20" y="108">W2</text><text class="sv-t" x="20" y="132">W3</text>
+<rect class="sv-b1" x="60" y="48" width="12" height="16"/><line class="sv-dash" x1="72" y1="56" x2="372" y2="56"/><rect class="sv-b2" x="372" y="48" width="12" height="16"/>
+<rect class="sv-b1" x="72" y="72" width="12" height="16"/><line class="sv-dash" x1="84" y1="80" x2="384" y2="80"/><rect class="sv-b2" x="384" y="72" width="12" height="16"/>
+<rect class="sv-b1" x="84" y="96" width="12" height="16"/><line class="sv-dash" x1="96" y1="104" x2="396" y2="104"/><rect class="sv-b2" x="396" y="96" width="12" height="16"/>
+<rect class="sv-b1" x="96" y="120" width="12" height="16"/><line class="sv-dash" x1="108" y1="128" x2="408" y2="128"/><rect class="sv-b2" x="408" y="120" width="12" height="16"/>
+<text class="sv-ts" x="150" y="150">dashed: waiting for the pantry (load latency)</text>
+<text class="sv-ts" x="440" y="62">dark: load issued</text><text class="sv-ts" x="440" y="80">light: multiply issued</text>
+<text class="sv-tb" x="20" y="190">ILP 4: four independent loads per warp before the first use (4 warps, 16 loads in flight)</text>
+<text class="sv-t" x="20" y="222">W0</text><text class="sv-t" x="20" y="246">W1</text><text class="sv-t" x="20" y="270">W2</text><text class="sv-t" x="20" y="294">W3</text>
+<rect class="sv-b1" x="60" y="210" width="48" height="16"/><line class="sv-dash" x1="108" y1="218" x2="360" y2="218"/><rect class="sv-b2" x="360" y="210" width="48" height="16"/>
+<rect class="sv-b1" x="108" y="234" width="48" height="16"/><line class="sv-dash" x1="156" y1="242" x2="408" y2="242"/><rect class="sv-b2" x="408" y="234" width="48" height="16"/>
+<rect class="sv-b1" x="156" y="258" width="48" height="16"/><line class="sv-dash" x1="204" y1="266" x2="456" y2="266"/><rect class="sv-b2" x="456" y="258" width="48" height="16"/>
+<rect class="sv-b1" x="204" y="282" width="48" height="16"/><line class="sv-dash" x1="252" y1="290" x2="504" y2="290"/><rect class="sv-b2" x="504" y="282" width="48" height="16"/>
+<text class="sv-ts" x="530" y="226">4 loads, then 4 multiplies</text>
+<text class="sv-t" x="560" y="260">same time on the clock,</text>
+<text class="sv-t" x="560" y="278">four times the bowls</text>
+<text class="sv-ts" x="20" y="320">Not to scale. Little's law: loads in flight needed = latency × loads per cycle you want. Warps and ILP both add loads in flight.</text>
+</svg></div><figcaption><b>Figure 1.</b> Warp execution timeline of one scheduler. Top: thread-level parallelism only. Bottom: the same warps with instruction-level parallelism of 4. The shapes follow the model of Listing 3, whose latencies are invented inputs, not measurements. <sup class="src"><a href="#F6-20-src-D5">D5</a></sup> <sup class="src"><a href="#F6-20-src-D6">D6</a></sup> <sup class="src"><a href="#F6-20-src-R3">R3</a></sup></figcaption></figure>
+<p>Figure 2 shows the other half of the story: where occupancy comes from. Each block asks for registers (warps × registers per warp, rounded up), shared memory and warp slots. The SM grants whole blocks. Whichever resource runs out first sets the number of blocks, and therefore the number of warps that can hide latency.</p>
+<figure id="F6-20-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 260" role="img" aria-labelledby="F6-20-f2t F6-20-f2d">
+<title id="F6-20-f2t">Figure 2: four limits on the number of resident blocks</title>
+<desc id="F6-20-f2d">Four horizontal bars, one per SM resource, each divided into equal slots that one block of the example kernel would use. Bar 1, registers: 3 slots fit, the rest is too small for a fourth. Bar 2, shared memory: no use, so no limit. Bar 3, warp slots: 8 blocks fit. Bar 4, block slots: 32 blocks fit. A bracket says: active blocks equals the minimum, 3, set by registers. Below: 3 blocks times 8 warps = 24 warps of 64, occupancy 37.5 percent. The example kernel uses 256 threads per block and 72 registers per thread, on the example device of Listing 1.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="260"/>
+<text class="sv-tb" x="20" y="26">Example kernel: 256 threads per block, 72 registers per thread, no shared memory</text>
+<text class="sv-t" x="20" y="62">registers</text>
+<rect class="sv-b4" x="150" y="46" width="150" height="24"/><rect class="sv-b4" x="300" y="46" width="150" height="24"/><rect class="sv-b4" x="450" y="46" width="150" height="24"/><rect class="sv-box" x="600" y="46" width="120" height="24"/>
+<text class="sv-ts" x="160" y="63">block 1</text><text class="sv-ts" x="310" y="63">block 2</text><text class="sv-ts" x="460" y="63">block 3</text><text class="sv-ts" x="606" y="63">too small for 4</text>
+<text class="sv-t" x="20" y="102">shared memory</text><rect class="sv-box" x="150" y="86" width="570" height="24"/><text class="sv-ts" x="160" y="103">not used: no limit</text>
+<text class="sv-t" x="20" y="142">warp slots</text>
+<rect class="sv-b3" x="150" y="126" width="570" height="24"/><text class="sv-ts" x="160" y="143">8 blocks of 8 warps fit</text>
+<text class="sv-t" x="20" y="182">block slots</text>
+<rect class="sv-b2" x="150" y="166" width="570" height="24"/><text class="sv-ts" x="160" y="183">32 blocks fit</text>
+<text class="sv-tb" x="20" y="222">active blocks = min(3, none, 8, 32) = 3, limited by registers</text>
+<text class="sv-t" x="20" y="246">3 blocks × 8 warps = 24 warps of 64 possible: theoretical occupancy 37.5 %</text>
+</svg></div><figcaption><b>Figure 2.</b> The smallest of the four limits wins. Numbers are those that Listing 1 prints for the case "256 threads, 72 registers" on its example device; the device numbers are inputs chosen for the arithmetic, not a product's specification. Bar lengths are not to scale. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup> <sup class="src"><a href="#F6-20-src-D1">D1</a></sup></figcaption></figure>
+
+<h2 id="F6-20-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Hall = one SM; row of helpers = warp; a helper's hands = registers; the table in the middle of a row group = shared memory; runner to the pantry = a load from global memory; "while one row waits for the pantry, another row cooks" = latency hiding; seats filled = occupancy; one helper sending several runners at once = instruction-level parallelism.</p></div>
+<p>The pantry is far away. Every trip takes a long time, and nothing can shorten it. What you can change is how many trips are under way at once. If many runners are on the road, ingredients arrive one after another, and the cooks always have something to work on.</p>
+<p>There are two ways to have many runners on the road. You can seat more rows, each sending one runner. Or each helper can send several runners for different bowls before waiting. Both count. A hall full of rows that each send one runner can be slower than a half-full hall where each helper sends four.</p>
+<p>Seats are limited by what each row needs. If each helper needs many hands (registers), fewer rows fit. If each row group needs a big table (shared memory), fewer groups fit. So a kernel that does more per helper usually means fewer rows, and the art is to find the balance that keeps the pantry busiest.</p>
+
+<h2 id="F6-20-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-20-l2-limits">Four limits, one minimum</h3>
+<p>A multiprocessor (SM) holds resident blocks. Each resident block keeps its registers and shared memory for its whole life, which is why switching between warps costs nothing: the state never leaves the chip. <sup class="src"><a href="#F6-20-src-D1">D1</a></sup> <sup class="src"><a href="#F6-20-src-D2">D2</a></sup> The number of resident blocks of one kernel is the minimum of four numbers <sup class="src"><a href="#F6-20-src-D1">D1</a></sup> <sup class="src"><a href="#F6-20-src-R1">R1</a></sup>:</p>
+<ol>
+<li><b>Registers.</b> Registers per thread × 32, rounded up to the allocation unit, gives registers per warp; the register file per SM divided by that gives warps, and warps divided by warps per block gives blocks. The CUDA 12.0 calculator additionally divides the register file among four sub-partitions for compute capability 8.x and rounds warps per block up to a multiple of four when it checks the per-block limit. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup></li>
+<li><b>Shared memory.</b> Static plus dynamic shared memory per block, plus a per-block amount reserved by the system, rounded up to the allocation granularity; the shared memory per SM divided by that gives blocks. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup> <sup class="src"><a href="#F6-20-src-D1">D1</a></sup></li>
+<li><b>Warp slots.</b> Maximum threads per SM ÷ 32 gives warp slots; divided by warps per block gives blocks. <sup class="src"><a href="#F6-20-src-D1">D1</a></sup></li>
+<li><b>Block slots.</b> A per-SM maximum number of resident blocks. <sup class="src"><a href="#F6-20-src-D1">D1</a></sup></li>
+</ol>
+<p>Theoretical occupancy is active blocks × warps per block ÷ maximum warps per SM. All per-SM limits are properties of your GPU: <code>deviceQuery</code> and <code>cudaGetDeviceProperties</code> report them (F6-07), and the CUDA Programming Guide tabulates them per compute capability. This chapter never quotes them for a real product. <sup class="src"><a href="#F6-20-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The per-SM limits used in Listing 1 (2,048 threads, 32 blocks, 65,536 registers, 102,400 bytes of shared memory, 1,024 bytes reserved per block) are <b>inputs chosen for the arithmetic</b>, not quoted from any document. Before you use the table for a real GPU, replace them with what <code>deviceQuery</code> prints and with the "Technical Specifications per Compute Capability" table of the CUDA C++ Programming Guide for your compute capability (D1). The allocation units (256 registers per warp, 128 bytes of shared memory, 4 sub-partitions) are those coded in the CUDA 12.0 header read in this build for compute capability 8.x; other toolkit versions and architectures may differ.</p></div>
+
+<h3 id="F6-20-l2-little">Little's law: how much must be in flight</h3>
+<p>Little's law says that in a steady state, the average number of items in a system equals their arrival rate times their average time in the system: <i>L</i> = λ<i>W</i>. <sup class="src"><a href="#F6-20-src-D6">D6</a></sup> Applied to memory: if each load takes <i>W</i> cycles and you want the memory system to accept λ loads per cycle, you need <i>L</i> = λ<i>W</i> loads in flight at every moment. With fewer, the memory system idles; more than that does not help, because the roof is reached. <sup class="src"><a href="#F6-20-src-D5">D5</a></sup> <sup class="src"><a href="#F6-20-src-D6">D6</a></sup></p>
+<p>Loads in flight per SM = resident warps × independent loads each warp has outstanding. Occupancy controls the first factor; the code controls the second. Vasily Volkov's talk "Better Performance at Lower Occupancy" is the course card's source for this point: it argues, with measurements on the GPUs of its time, that raising ILP can reach the same throughput with fewer warps. <sup class="src"><a href="#F6-20-src-D5">D5</a></sup> No number from that talk is used here.</p>
+
+<h3 id="F6-20-l2-ilp">How code supplies ILP</h3>
+<p>A thread has ILP when it issues several operations that do not depend on each other before it needs their results. In Listing 2, each thread of <code>scaleIlp&lt;4&gt;</code> loads four elements, <code>blockDim.x</code> apart so that every load of a warp stays coalesced (F6-08), and only then multiplies. The compiler keeps that order in the machine code: the SASS for <code>sm_80</code> shows four <code>LDG</code> instructions before the first <code>FMUL</code>. <sup class="src"><a href="#F6-20-src-R4">R4</a></sup> The price is registers: the four values must sit in registers while they are in flight. <code>ptxas</code> reports 8 registers for ILP 1, 14 for ILP 2, 22 for ILP 4 and 29 for ILP 8. <sup class="src"><a href="#F6-20-src-R5">R5</a></sup></p>
+
+<h2 id="F6-20-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F6-20-l3-calc">The calculator in the toolkit, read and cross-checked</h3>
+<p>The CUDA Toolkit ships its occupancy calculator as a header, <code>cuda_occupancy.h</code>, that compiles as ordinary host C++. In CUDA 12.0 it describes a device with a <code>cudaOccDeviceProp</code> structure (compute capability, threads, registers and shared memory per SM and per block, reserved shared memory) and a kernel with <code>cudaOccFuncAttributes</code> (registers per thread, static shared memory), and <code>cudaOccMaxActiveBlocksPerMultiprocessor</code> returns active blocks plus a bit mask of limiting factors. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup> Reading its source shows the rules that Layer 2 lists: per-architecture tables for the register allocation unit, the maximum registers per thread, the number of sub-partitions, the shared-memory granularity, the maximum blocks per SM, and the shared-memory carveout sizes that the hardware can configure. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup></p>
+<p>Listing 1 implements the four limits in about thirty lines and compares its answer with the header's for 64,000 combinations of block size, registers and shared memory on the example device: all 64,000 agree. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup> That agreement is evidence that the simple model is the model, for this toolkit and this architecture family; it is not evidence about any particular GPU's numbers, which are inputs.</p>
+<h3 id="F6-20-l3-cliffs">Cliffs and steps</h3>
+<p>Because registers are granted per warp in units, occupancy is a step function of registers per thread. In Listing 1's table, 64 registers allow 4 blocks of 256 threads (50 %), 72 registers allow 3 (37.5 %), and 128 allow 2 (25 %). For 1,024-thread blocks, 64 registers fit one block and 65 registers fit none: the launch would fail with a "too many resources" error. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup> Shared memory produces steps the same way: 8,192 bytes per 128-thread block allow 11 blocks, 16,384 bytes per 256-thread block allow 5. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup></p>
+<p>Two tools move a kernel across a step. <code>__launch_bounds__(maxThreads, minBlocks)</code> tells the compiler to fit <i>minBlocks</i> blocks of <i>maxThreads</i> on one SM, and the compiler caps registers accordingly; <code>-maxrregcount</code> caps registers for a whole compilation unit. Both can force <b>spills</b> to local memory, which F6-23's forensic lab shows in SASS. <sup class="src"><a href="#F6-20-src-D1">D1</a></sup> <sup class="src"><a href="#F6-20-src-D2">D2</a></sup></p>
+<h3 id="F6-20-l3-when">When more occupancy helps, and when it does not</h3>
+<p>The Best Practices Guide's position, which this chapter adopts, is that occupancy is a means, not a goal: low occupancy can starve the scheduler, but beyond the point where latency is hidden, more warps add nothing, and the resources they cost (registers per thread, shared memory per block) may be what makes each thread efficient. <sup class="src"><a href="#F6-20-src-D2">D2</a></sup> The model of Listing 3 shows both halves with invented latencies: with ILP 1, throughput rises in proportion to warps (1, 4, 8, 16 warps give 0.25, 0.99, 1.98, 3.95 elements per 100 cycles); with 4 warps, raising ILP from 1 to 8 raises it from 0.99 to 7.27. Holding warps × ILP at 16 gives nearly the same throughput for every split (3.95, 3.90, 3.81, 3.64). <sup class="src"><a href="#F6-20-src-R3">R3</a></sup> In the model, what matters is loads in flight, and the "loads in flight" column tracks throughput.</p>
+<p>GEMM, the subject of the rest of this course, lives on the "fewer, fatter threads" side: F6-23's register-tiled kernels use 75 to 124 registers per thread, which means low theoretical occupancy, and they are designed that way because each thread then does many multiply-adds per value loaded. <sup class="src"><a href="#F6-20-src-R6">R6</a></sup> E6 asks you to record registers and occupancy for every step for exactly this reason: so that the speed table can show whether occupancy explained a change or not. <sup class="src"><a href="#F6-20-src-C1">C1</a></sup></p>
+<h3 id="F6-20-l3-achieved">Theoretical is not achieved</h3>
+<p>The calculator gives an upper bound. A profiler measures achieved occupancy, which can be lower: a grid with fewer blocks than SMs × active blocks never fills the GPU; blocks of uneven length leave a tail where few warps remain; very short kernels are dominated by launch and ramp-up. <sup class="src"><a href="#F6-20-src-D3">D3</a></sup> When a profile shows low achieved occupancy, first compare it with the theoretical number: if they agree, a resource limits you; if achieved is much lower, look at the grid and the tail.</p>
+
+<h2 id="F6-20-hardware">How the hardware actually does it</h2>
+<p>Each SM has a register file and on-chip shared memory that are partitioned among resident blocks when they start, and warp schedulers that each pick, every cycle, an eligible warp from those assigned to them. A warp is eligible when its next instruction's operands are ready; a warp whose next instruction needs a load still in flight is stalled. <sup class="src"><a href="#F6-20-src-D1">D1</a></sup> <sup class="src"><a href="#F1-60-src-D3">F1-60 D3</a></sup> There is no saving and restoring of registers when the scheduler moves between warps; this is why a GPU can switch every cycle and why the register file must hold every resident warp's registers at once. <sup class="src"><a href="#F6-20-src-D1">D1</a></sup> The hardware tracks dependences per instruction, so a warp can have several loads outstanding and stall only at the first instruction that uses one of them; the order of <code>LDG</code> and <code>FMUL</code> in the SASS of Listing 2 is what the hardware will follow. <sup class="src"><a href="#F6-20-src-R4">R4</a></sup> <sup class="src"><a href="#F6-20-src-D7">D7</a></sup> How many warp schedulers an SM has, its register-file size and its memory latency are product facts: read them in the architecture whitepaper of your GPU (named in the dossier), never from this chapter.</p>
+
+<h2 id="F6-20-worked">Worked example</h2>
+<p><b>Task.</b> A kernel uses 256 threads per block, 72 registers per thread and no shared memory. On the example device of Listing 1 (65,536 registers, 2,048 threads, 32 blocks per SM; allocation unit 256 registers per warp; 4 sub-partitions), what is its theoretical occupancy, and how many registers per thread would raise it by one block?</p>
+<ol>
+<li>Registers per warp: 72 × 32 = 2,304, already a multiple of 256, so 2,304. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup></li>
+<li>Per sub-partition: 65,536 ÷ 4 = 16,384 registers, which hold ⌊16,384 ÷ 2,304⌋ = 7 warps; × 4 = 28 warps per SM.</li>
+<li>Warps per block: 256 ÷ 32 = 8. Blocks by registers: ⌊28 ÷ 8⌋ = 3.</li>
+<li>Blocks by warp slots: ⌊(2,048 ÷ 32) ÷ 8⌋ = ⌊64 ÷ 8⌋ = 8. Blocks by block slots: 32. Shared memory: no limit.</li>
+<li>Active blocks = min(3, 8, 32) = 3; warps = 24; occupancy = 24 ÷ 64 = 37.5 %. Listing 1 prints the same row. <sup class="src"><a href="#F6-20-src-R1">R1</a></sup></li>
+<li>For 4 blocks you need 32 warps, so 8 warps per sub-partition: 16,384 ÷ 8 = 2,048 registers per warp, so at most 64 registers per thread. Listing 1's row for 64 registers shows 4 blocks and 50 %.</li>
+</ol>
+<p><b>Second task: in flight.</b> In Listing 3's model, one load takes 400 cycles and the memory system accepts at most one load every 4 cycles. Little's law: to reach that roof, 400 × ¼ = 100 loads must be in flight. Version A of the forensic lab (16 warps, ILP 1) keeps about 16 in flight and reaches 3.95 elements per 100 cycles; version B (4 warps, ILP 8) keeps about 29 in flight and reaches 7.27. Neither is near the roof of 25: both would profit from more of either kind of parallelism. <sup class="src"><a href="#F6-20-src-R3">R3</a></sup> <sup class="src"><a href="#F6-20-src-R2">R2</a></sup></p>
+
+<h2 id="F6-20-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>occupancy.cpp</code>: the four limits, and a cross-check against the toolkit's calculator.</p>
+<pre class="listing" data-src="F6-20/occupancy.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>6</td><td><code>#include &lt;cuda_occupancy.h&gt;</code></td><td>Uses NVIDIA's host-side calculator, which needs no GPU.</td><td>A second, independent implementation to compare with.</td></tr>
+<tr><td>12–17</td><td><code>struct Device</code></td><td>The per-SM limits as inputs.</td><td>Everything device-specific is in one place, to be replaced with your GPU's values.</td></tr>
+<tr><td>34–53</td><td><code>ourModel</code></td><td>Registers per warp rounded to 256, split over 4 sub-partitions; shared memory rounded to 128 with the reserved part; warp and block slots; the minimum and its name.</td><td>The whole of Layer 2 in code; the "block alone too big" check reproduces the failing 1,024 × 65 launch.</td></tr>
+<tr><td>55–81</td><td><code>headerModel</code></td><td>Fills <code>cudaOccDeviceProp</code> and <code>cudaOccFuncAttributes</code> and calls <code>cudaOccMaxActiveBlocksPerMultiprocessor</code>.</td><td>The same question asked of the toolkit.</td></tr>
+<tr><td>91–104</td><td>the table</td><td>Prints each limit and the result for ten kernels.</td><td>Shows steps, the register cliff and shared-memory limits.</td></tr>
+<tr><td>106–121</td><td>cross-check loop</td><td>64,000 combinations, counting agreements.</td><td>A model you can trust is one you have compared, not one that looks right.</td></tr>
+</tbody></table></div>
+<p><b>Build and run</b> (by <code>run_lab.sh</code>): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined occupancy.cpp</code>.</p>
+<pre class="output" data-run="F6-20/occupancy"></pre>
+<p><b>Listing 2</b> — <code>ilp.cu</code>: one memory-bound operation with 1, 2, 4 or 8 independent elements per thread, with occupancy and median time per version.</p>
+<pre class="listing" data-src="F6-20/ilp.cu"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>22–39</td><td><code>scaleIlp&lt;ILP&gt;</code></td><td>Loads ILP values <code>blockDim.x</code> apart into an array, then multiplies and stores them.</td><td>The two loops separate "issue all loads" from "use them"; <code>#pragma unroll</code> turns <code>v[]</code> into registers.</td></tr>
+<tr><td>44–46</td><td><code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code></td><td>Asks the runtime for this kernel's active blocks on the real device.</td><td>The runtime version of Listing 1's question, with the real limits.</td></tr>
+<tr><td>53–66</td><td>timing loop</td><td>One warm-up, then 20 runs timed with events; median.</td><td>The measurement protocol of F6-06.</td></tr>
+<tr><td>68–70</td><td>bandwidth</td><td>Bytes read and written ÷ median time.</td><td>The kernel is memory-bound: GB/s is the right unit.</td></tr>
+</tbody></table></div>
+<p>The run in this build stops at the first runtime call, because the container has no GPU:</p>
+<pre class="output" data-run="F6-20/ilp"></pre>
+<p>What the compiler made of it is real, though. Registers per version for <code>sm_80</code> <sup class="src"><a href="#F6-20-src-R5">R5</a></sup>:</p>
+<pre class="output" data-run="F6-20/resources"></pre>
+<p>And the order of loads, multiplies and stores for ILP 1 and ILP 4 <sup class="src"><a href="#F6-20-src-R4">R4</a></sup>:</p>
+<pre class="output" data-run="F6-20/sass_ilp"></pre>
+<p>In <code>scaleIlp&lt;4&gt;</code>, four <code>LDG</code> (each guarded by a predicate, the bounds check) come before the first <code>FMUL</code>: a warp has four loads in flight before it can stall. In <code>scaleIlp&lt;1&gt;</code> the multiply follows its only load. The <code>.CONSTANT</code> suffix appears because the input pointer is <code>const __restrict__</code>, which lets the compiler use the read-only path. <sup class="src"><a href="#F6-20-src-R4">R4</a></sup> <sup class="src"><a href="#F6-20-src-D7">D7</a></sup></p>
+<p><b>Listing 3</b> — <code>latency_sim.cpp</code>: one warp scheduler, cycle by cycle.</p>
+<pre class="listing" data-src="F6-20/latency_sim.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–17</td><td><code>struct Warp</code></td><td>Program position, rounds left, and when each loaded value arrives.</td><td>Per-value arrival times are the model's ILP: a multiply waits only for its own load.</td></tr>
+<tr><td>34–42</td><td>readiness</td><td>A load needs a free memory port; a multiply needs its value; a store needs the last multiply.</td><td>"Eligible warp", as in the hardware section.</td></tr>
+<tr><td>43–48</td><td>issue</td><td>Records arrival time and occupies the memory port for <code>loadGap</code> cycles.</td><td>The port is the bandwidth roof; latency is separate.</td></tr>
+<tr><td>58–62</td><td>in-flight count</td><td>Adds up loads not yet arrived, every cycle.</td><td>Little's <i>L</i>, measured inside the model.</td></tr>
+</tbody></table></div>
+<p>Input <code>latency_sim.in</code> (first line: latency 400, multiply latency 4, one load per 4 cycles, 8,192 elements; then one case per line):</p>
+<pre class="output" data-run="F6-20/latency_sim"></pre>
+<div class="co warning"><span class="lbl">Watch out</span><p>Listing 3 is a model with invented latencies and a single scheduler. It reproduces the <i>shape</i> of the argument (throughput follows loads in flight until a roof), not any GPU's numbers. The rows "both 16 4" and "both 16 8" also show a limit of the model: its first-ready issue policy bunches loads, so it does not reach its own roof even with 128 loads possible.</p></div>
+
+<h2 id="F6-20-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A runner is a person who can be sent at any time. A load is an instruction that occupies an issue slot, registers for its result, and space in the memory system's queues; "send more runners" eventually stops working because those queues fill, which the analogy hides.</li>
+<li>In the hall, empty chairs cost nothing. On an SM, resources are claimed per block for the block's whole life: a block that waits at a barrier still holds its registers and shared memory, so its seats are not free for others.</li>
+<li>The hall seats rows one at a time. An SM admits whole blocks: a 1,024-thread block needs room for all its 32 warps at once, which is why one register too many can drop occupancy from 50 % to zero (Listing 1, last row).</li>
+<li>Helpers in the story choose to send four runners. A GPU thread has ILP only if the compiler keeps the loads independent and early; reading the SASS is the only way to know (Listing 2).</li>
+</ul>
+
+<h2 id="F6-20-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Chasing 100 % occupancy.</b> Symptom: a change raises occupancy and the kernel gets slower. Cause: the change cut registers per thread (spills) or work per thread (less ILP). Find it: compare <code>ptxas -v</code> before and after and the SASS for <code>LDL</code>/<code>STL</code>. Fix: optimise loads in flight, not occupancy.</li>
+<li><b>Quoting another GPU's limits.</b> Symptom: your occupancy table disagrees with the runtime API. Cause: limits copied from a different compute capability. Fix: take them from <code>cudaGetDeviceProperties</code> on the lab GPU and cross-check with <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code>.</li>
+<li><b>Forgetting dynamic shared memory.</b> Symptom: the calculator says 4 blocks, the profiler shows 2. Cause: the third launch parameter adds shared memory that <code>ptxas -v</code> does not report. Fix: pass the same dynamic size to the occupancy API.</li>
+<li><b>"Too many resources requested for launch".</b> Symptom: a launch error after raising the block size. Cause: registers × threads exceed the per-block register limit (Listing 1's 1,024 × 65 row). Fix: smaller blocks, <code>__launch_bounds__</code>, or fewer registers.</li>
+<li><b>Grid too small.</b> Symptom: high theoretical, low achieved occupancy. Cause: fewer blocks than the GPU can hold. Fix: more, smaller blocks, or more work per launch.</li>
+</ul>
+
+<div class="co transition" id="F6-20-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#CU301">CU301</a> built reductions, scans and transposes where shared memory and synchronisation were the main concerns, and <a href="#F1-60">F1-60</a> introduced warp schedulers and Little's law with a model. <sup class="src"><a href="#F6-20-src-D6">D6</a></sup> <b>What carries over:</b> coalesced access (F6-08), the measurement protocol (F6-06), and reading <code>ptxas -v</code> and SASS. <b>What changes:</b> from now on kernels are compute-heavy and register-hungry; you will deliberately trade occupancy for work per thread, and you must justify every such trade with loads-in-flight reasoning and evidence, not with the occupancy number alone. <sup class="src"><a href="#F6-20-src-D2">D2</a></sup> <sup class="src"><a href="#F6-20-src-D5">D5</a></sup> <b>What comes next:</b> <a href="#F6-21">F6-21</a> writes the naive GEMM, sets up the E6 harness that records registers and occupancy per step, and measures how much arithmetic a GEMM does per byte.</p></div>
+
+<h2 id="F6-20-check">Check yourself</h2>
+<ol>
+<li>On Listing 1's example device, a kernel uses 128-thread blocks, 40 registers and 8,192 bytes of static shared memory. Which resource limits it, and to how many blocks?</li>
+<li>Explain in your own words why switching between warps costs no time, and what that implies for the register file.</li>
+<li>A kernel goes from 64 to 65 registers per thread with 1,024-thread blocks. What happens, and why is the change so abrupt?</li>
+<li>Little's law: a memory system has a latency of 600 cycles (model value) and you want one load per 2 cycles. How many loads must be in flight? With 24 warps, how many independent loads per warp?</li>
+<li>Which is true? (a) Higher occupancy always means higher speed. (b) Occupancy is irrelevant on modern GPUs. (c) Occupancy is one source of loads in flight; ILP is another. (d) ILP only helps on CPUs.</li>
+<li>Predict, then check against Listing 3's output: with 8 warps and ILP 2, roughly how many elements per 100 cycles does the model reach?</li>
+<li>Apply it to a new case: a reduction kernel shows 100 % theoretical and 30 % achieved occupancy. Name two causes you would test first and the evidence for each.</li>
+<li>Why does <code>scaleIlp&lt;8&gt;</code> need more registers than <code>scaleIlp&lt;1&gt;</code>, and what would <code>__launch_bounds__(256, 8)</code> do to it?</li>
+</ol>
+
+<h2 id="F6-20-lab">Lab</h2>
+<p><b>Goal.</b> Build an occupancy table for your kernels and test, on a model and then on your GPU, whether loads in flight or occupancy predicts speed. This prepares the E6 requirement "register usage and occupancy are recorded per step". <sup class="src"><a href="#F6-20-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–3: none beyond a computer with g++ and nvcc (this build: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>Cuda compilation tools, release 12.0, V12.0.140</code>, as printed in the logs). Steps 4–5: an NVIDIA GPU with the toolkit and driver recorded in your dossier, or a cloud GPU. <b>Safety:</b> none beyond normal computer use.</p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-20</code>. Check that the cross-check line reports full agreement.</li>
+<li>Replace Listing 1's device inputs with your GPU's <code>deviceQuery</code> values (F6-07). Add rows for the kernels of your CU301 primitives library, using their <code>ptxas -v</code> reports.</li>
+<li>In <code>latency_sim.in</code>, find the smallest warps × ILP that reaches 90 % of the model's roof. Change the latency to 800 and repeat. Explain the change with Little's law.</li>
+<li>On a GPU: build Listing 2 for your architecture (<code>nvcc -std=c++17 -O2 -lineinfo -arch=sm_XY ilp.cu</code>), run it, and plot GB/s against occupancy for each ILP.</li>
+<li>Compare your best GB/s with your E2 copy bandwidth (F6-09).</li>
+</ol>
+<p><b>Expected observations.</b> From this build: the table and the 64,000-case agreement of Listing 1; the registers 8, 14, 22, 29; the model rows above. On a GPU (untested here), the curriculum's claim to test is that rows with equal loads in flight perform similarly until the bandwidth roof. Record your numbers as "measured on &lt;GPU, driver, toolkit, date&gt;".</p>
+<p><b>Verification.</b> Your Listing 1 table must match <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> on your GPU for every row.</p>
+<p><b>Troubleshooting.</b> Calculator and runtime disagree → check reserved shared memory and dynamic shared memory. ILP 8 no faster than ILP 4 → read its SASS: in this build the compiler interleaved a store between the loads of <code>scaleIlp&lt;8&gt;</code> (see <code>ilp.cu</code>'s full SASS with <code>cuobjdump -sass</code>). GB/s above E2 → you timed the wrong thing (no synchronisation or no warm-up).</p>
+<p><b>Extension.</b> Add a <code>__launch_bounds__</code> variant and record what it does to registers and occupancy.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 2 was compiled for real (default target and <code>sm_80</code>); both runs stop with <code>cudaErrorNoDevice</code> because the build container has no GPU. No GPU time or bandwidth appears in this chapter. To complete steps 4–5 you need an NVIDIA GPU; record its name, driver and toolkit versions as printed by the tools.</p></div>
+
+<h2 id="F6-20-forensic">Forensic lab</h2>
+<p><b>Scenario: "Low occupancy, high speed?"</b> Keiko rewrote a memory-bound kernel so that each thread handles eight elements instead of one. A reviewer, Femi, objects: "The profile shows your version's achieved occupancy is a quarter of the old one. It can't be faster." Keiko's version is nearly twice as fast in the team's measurement. The team asks you to explain the result before merging.</p>
+<p><b>Evidence pack.</b> (1) The compiler's register report for both versions (<code>scaleIlp&lt;1&gt;</code> is version A, <code>scaleIlp&lt;8&gt;</code> is version B) <sup class="src"><a href="#F6-20-src-R5">R5</a></sup>:</p>
+<pre class="output" data-run="F6-20/resources"></pre>
+<p>(2) A simulated profile of one scheduler from Listing 3's model, standing in for the profiler export that a GPU run would give: version A has 16 resident warps (high occupancy), version B only 4, because its grid has an eighth as many blocks <sup class="src"><a href="#F6-20-src-R2">R2</a></sup>:</p>
+<pre class="output" data-run="F6-20/forensic"></pre>
+<p>(3) The load–multiply order in SASS of the two kernels' building blocks (ILP 1 and ILP 4 shown):</p>
+<pre class="output" data-run="F6-20/sass_ilp"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: from evidence (2), what are the cycles, issue utilisation and average loads in flight of each version?</li>
+<li>State two hypotheses for why B is faster despite lower occupancy, and say which evidence could rule each out.</li>
+<li>Using Little's law, explain the speed ratio from the loads-in-flight column.</li>
+<li>Is B's lower occupancy a register limit? Use evidence (1) and Listing 1 to decide.</li>
+<li>What change would make B faster still, and how would you check that it helped?</li>
+<li>Write the two-sentence reply to Femi.</li>
+</ol>
+<p><b>Method hints.</b> Separate theoretical from achieved occupancy. Count independent loads per warp in the SASS. Remember that the model's latencies are invented: argue from ratios, not absolute cycles.</p>
+
+<h2 id="F6-20-project">Mini-project</h2>
+<p><b>The occupancy column of your E6 table.</b> Write a small host function, used by your E6 harness from F6-21 on, that prints for each kernel: registers (from <code>cudaFuncGetAttributes</code>), static and dynamic shared memory, block size, active blocks per SM (from the runtime API), theoretical occupancy, and the limiting resource computed with Listing 1's model using your device's properties. Verify it against the runtime on at least five kernels.</p>
+<p><b>Rubric.</b> Correct numbers on five kernels, matching the runtime (4). Limiting resource named correctly, including ties (2). Dynamic shared memory handled (1). Device limits read from the device, none hard-coded (2). Short note on one kernel where higher occupancy would not help, with a loads-in-flight argument (1).</p>
+
+<h2 id="F6-20-summary">Summary</h2>
+<ul>
+<li>Active blocks per SM = the minimum of the register, shared-memory, warp-slot and block-slot limits; theoretical occupancy follows from it.</li>
+<li>Registers are allocated per warp in units, so occupancy falls in steps, and one register too many can make a launch impossible.</li>
+<li>Listing 1's 30-line model agreed with the CUDA 12.0 calculator on 64,000 of 64,000 inputs.</li>
+<li>Latency is hidden by loads in flight: Little's law, <i>L</i> = λ<i>W</i>; warps and ILP both supply them.</li>
+<li>ILP costs registers (8 → 29 registers from ILP 1 to 8 in this build) and shows in SASS as several loads before the first use.</li>
+<li>Lower occupancy can be faster when each warp keeps more loads in flight; achieved occupancy can be lower than theoretical for grid-size and tail reasons.</li>
+</ul>
+
+<h2 id="F6-20-sources">Sources</h2>
+<ol>
+<li id="F6-20-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): hardware implementation (SIMT architecture, hardware multithreading), the occupancy calculator API, launch bounds, the per-compute-capability technical specifications table. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F6-20-src-D2">D2 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): execution configuration optimisations (occupancy, register pressure, "higher occupancy does not always equate to higher performance" — paraphrased, wording to be confirmed). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-20-src-D3">D3 — NVIDIA, "Nsight Compute" documentation (tier 1): occupancy section (theoretical and achieved occupancy). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-20-src-D4">D4 — NVIDIA, CUDA Toolkit header <code>cuda_occupancy.h</code> as installed with CUDA 12.0 in the build container (tier 4: source code of the toolkit), read in this build: functions <code>cudaOccRegAllocationGranularity</code>, <code>cudaOccSubPartitionsPerMultiprocessor</code>, <code>cudaOccMaxBlocksPerSMRegsLimit</code>, <code>cudaOccMaxActiveBlocksPerMultiprocessor</code>.</li>
+<li id="F6-20-src-D5">D5 — Vasily Volkov, "Better Performance at Lower Occupancy" (GTC 2010 talk) (tier 5, the course card's source for the forensic lab). <i>Title only — not opened during this build; no number from it is used (dossier gate G1 open).</i></li>
+<li id="F6-20-src-D6">D6 — John D. C. Little, "A Proof for the Queuing Formula: L = λW" (Operations Research) (tier 2), as used in <a href="#F1-60">F1-60</a>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-20-src-D7">D7 — NVIDIA, "CUDA Binary Utilities" (tier 1): <code>cuobjdump</code>, SASS instruction set reference (LDG, FMUL, STG; the <code>.CONSTANT</code> qualifier). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-20-src-C1">C1 — Systems Curriculum (this project), milestone E6 and section 13.2 topic 3 (local file <code>SYSTEMS_CURRICULUM.html</code>), quoted for the milestone text only. A map, not a source (AH-4).</li>
+<li id="F6-20-src-R1">R1 — run of Listing 1 (<code>university/labs/F6-20/occupancy.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with ASan and UBSan, exit code 0; the header read is that of CUDA 12.0.</li>
+<li id="F6-20-src-R2">R2 — run of Listing 3 on <code>forensic.in</code> (<code>forensic.log</code>), same compiler, exit code 0; model inputs invented.</li>
+<li id="F6-20-src-R3">R3 — run of Listing 3 on <code>latency_sim.in</code> (<code>latency_sim.log</code>), exit code 0; model inputs invented.</li>
+<li id="F6-20-src-R4">R4 — SASS of Listing 2 for <code>sm_80</code> (<code>sass_ilp.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>, compiled only.</li>
+<li id="F6-20-src-R5">R5 — <code>ptxas -v</code> report of Listing 2 for <code>sm_80</code> (<code>resources.log</code>), same toolkit, compiled only.</li>
+<li id="F6-20-src-R6">R6 — <code>ptxas -v</code> report of F6-23's kernels (<code>university/labs/F6-23/resources.log</code>), same toolkit, compiled only.</li>
+</ol>
+
+<h2 id="F6-20-glossary">Glossary links</h2>
+<p><a href="#gl-occupancy">Occupancy</a> · <a href="#gl-theoretical-occupancy">Theoretical occupancy</a> · <a href="#gl-achieved-occupancy">Achieved occupancy</a> · <a href="#gl-register-allocation-unit">Register allocation unit</a> · <a href="#gl-launch-bounds">__launch_bounds__</a> · <a href="#gl-occupancy-calculator">Occupancy calculator</a> · <a href="#gl-latency-hiding">Latency hiding</a> · <a href="#gl-instruction-level-parallelism-ilp">Instruction-level parallelism (ILP)</a> · <a href="#gl-little-s-law">Little's law</a> · <a href="#gl-warp-scheduler">Warp scheduler</a> · <a href="#gl-spill-local-memory">Spill / local memory</a></p>
+
+<h2 id="F6-20-next">Next chapter</h2>
+<p><a href="#F6-21">F6-21 Naive GEMM and arithmetic intensity</a> starts the E6 step table. Back to the course: <a href="#CU302">CU302</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackE">track E</a>.</p>
+
+<h2 id="F6-20-answers">Answers to Check yourself</h2>
+<ol>
+<li>Shared memory: 8,192 + 1,024 reserved = 9,216 bytes per block, already a multiple of 128; 102,400 ÷ 9,216 = 11 blocks. Registers would allow 12 (1,280 registers per warp; 12 warps per sub-partition; 48 ÷ 4). Listing 1's row says 11, limited by shared memory.</li>
+<li>Every resident warp's registers stay in the register file the whole time, so the scheduler only chooses which warp's next instruction to issue; nothing is saved or restored. Therefore the register file must hold all resident warps' registers at once, and registers per thread directly limit how many warps can be resident.</li>
+<li>The block can no longer be launched (0 active blocks): 65 × 32 = 2,080 rounds to 2,304 registers per warp, × 32 warps = 73,728, more than the 65,536 available per block on the example device. Allocation is per whole block and per warp unit, so there is no partial fit.</li>
+<li>600 × ½ = 300 loads in flight; 300 ÷ 24 = 12.5, so about 13 independent loads per warp (or more warps).</li>
+<li>(c). (a) is the misconception this chapter's forensic lab refutes. (b) is wrong: with too few loads in flight, occupancy is often the cheapest fix. (d) is wrong: Listing 2's SASS shows GPU threads issuing several independent loads.</li>
+<li>About 3.9: warps × ILP = 16, like the "same-in-flight 8 2" row, which prints 3.90.</li>
+<li>Grid too small (count blocks against SMs × active blocks per SM; the launch configuration tells you) and a long tail of uneven blocks (the profiler's timeline or per-block durations); also very short kernels, where launch overhead dominates.</li>
+<li>It keeps eight loaded values in registers at once, plus eight addresses or offsets and predicates; the report shows 29 against 8. <code>__launch_bounds__(256, 8)</code> asks for 8 blocks of 256 threads per SM (on the example device that is 64 warps, so at most 32 registers per thread); 29 already fits, so nothing would change for this kernel; a kernel above the cap would be squeezed, possibly with spills.</li>
+</ol>
+<h3 id="F6-20-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>A: 207,450 cycles, 11.8 % issue busy, 15.8 loads in flight. B: 112,751 cycles, 21.8 % busy, 29.1 in flight. B is about 1.84 times faster in the model.</li>
+<li>H1: B hides latency with ILP (more loads in flight per warp); test with the SASS (loads before first use) and the in-flight column. H2: B does less total work or less memory traffic (for example, better coalescing); ruled out because both versions read and write the same elements with the same access pattern (<code>blockDim.x</code> apart) and the model gives both the same element count. A third, "B has more warps", is ruled out by the evidence (4 against 16).</li>
+<li>Throughput ≈ loads in flight ÷ latency while below the roof: 29.1 ÷ 15.8 ≈ 1.84, the same as the cycle ratio 207,450 ÷ 112,751 ≈ 1.84.</li>
+<li>No: 29 registers per thread allows full occupancy on the example device (Listing 1's model: 1,024 registers per warp, 16 warps per sub-partition). B's low occupancy comes from its smaller grid (achieved, not theoretical), not from registers.</li>
+<li>More loads in flight: more blocks (smaller blocks or fewer elements per thread for this array size) to raise warps, keeping ILP; check the in-flight column (model) or the profiler's achieved occupancy and memory throughput (GPU) before and after, against the E2 copy roof.</li>
+<li>"Occupancy counts warps, but what hides memory latency is loads in flight. Version B keeps eight loads in flight per warp, so its 4 warps have about 29 loads outstanding against version A's 16, which is why it is faster despite lower occupancy."</li>
+</ol>
+<p>How the evidence was produced: Listing 3 run on <code>forensic.in</code>; register report and SASS from <code>nvcc -arch=sm_80</code> (<code>run.sh</code>). Nothing was edited by hand. Wrong answers to expect: "B uses fewer registers" (false, 29 against 8); "the profiler is wrong" (achieved occupancy really is lower).</p>

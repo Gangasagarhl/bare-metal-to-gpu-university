@@ -1,0 +1,286 @@
+<!--meta
+id: F9-48
+title: Measuring latency
+course: RB304
+level: L3–L4
+prereqs: F9-45 (lateness, jitter, absolute release times); F9-47 (what delays a woken task); BR-08 (measurement discipline); a Linux computer with g++
+time: 8–12 hours including the lab
+hardware: none (a Linux computer; run as a user allowed real-time priorities, or as root on a test machine); all numbers in this chapter were measured on the build container, a virtual machine without PREEMPT_RT
+maps: Course RB304 goal "measure and report latency honestly"; course lab "latency histograms" (measurement half); bridge BR-08 (measurement discipline); Linux real-time documentation; prepares F9-49, F9-50 and RB403 (F9-67)
+analogy: F9 — a drummer who must hit every beat (registered); here: recording every beat of a long concert and listing the late ones, not playing one bar and calling it good
+-->
+
+<h2 id="F9-48-hook">Story hook</h2>
+<p>A drummer's teacher says: "Play along with the click for one minute." The student is perfect for fifty-nine seconds and a bit late once. "Fine," says the student. The teacher answers: "In the concert you play for two hours. How late is the worst beat going to be? And does it get worse when the stage lights are hot and the audience is loud?"</p>
+<p>That is the question of this chapter. A control loop must be on time in its worst cycle, under the load the robot really has, for as long as the robot runs. You will build a small tool that measures exactly that, and you will see four results that every robot engineer should have seen once with their own eyes: an average that hides the problem, load that multiplies the tail, a real-time priority that fixes most of it, and a page fault that hides in a line of code that looks harmless.</p>
+
+<h2 id="F9-48-able">What you will be able to do</h2>
+<ul>
+<li><b>Build</b> a wake-up latency tester that uses absolute release times and records every cycle.</li>
+<li><b>Report</b> latency as a histogram with percentiles, maximum, sample count and the exact conditions.</li>
+<li><b>Measure</b> the effect of load, scheduling policy, locked memory and per-cycle allocation, and explain each result.</li>
+<li><b>Find</b> page faults inside a real-time loop from evidence, and remove them.</li>
+<li><b>Judge</b> what a measurement can and cannot prove about the worst case.</li>
+</ul>
+
+<div class="co jargon" id="F9-48-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Percentile</dt><dd><b>Simple words:</b> the value below which a given share of the measurements falls. <b>Analogy:</b> the 99th percentile of beats is the lateness that only 1 beat in 100 exceeds. <b>Precise:</b> for n sorted samples, the pth percentile is the sample at a chosen index near p/100·n; Listing 1 uses index ⌊p/100·n⌋, so its "p99.9" of 5,000 samples is the fifth-largest sample. Always state n with a percentile. <sup class="src"><a href="#F9-48-src-D4">D4</a></sup></dd>
+<dt>Latency histogram</dt><dd><b>Simple words:</b> a count of how many cycles had each amount of lateness. <b>Analogy:</b> a chart of all the drummer's beats, sorted by how late they were. <b>Precise:</b> counts per lateness bin; for latency the bins are best spaced roughly logarithmically, because the interesting part is the long, sparse tail and not the dense median. <sup class="src"><a href="#F9-48-src-D3">D3</a></sup></dd>
+<dt>Tail latency</dt><dd><b>Simple words:</b> the rare, large latencies at the end of the histogram. <b>Analogy:</b> the few beats that went badly wrong in two hours. <b>Precise:</b> the high percentiles and the maximum of a latency distribution; for hard deadlines the maximum observed is the evidence, and even it is only a lower bound of the true worst case.</dd>
+<dt>Page fault</dt><dd><b>Simple words:</b> the processor finding that a memory page is not ready and asking the kernel to prepare it. <b>Analogy:</b> the drummer reaching for a stick that is still in the bag. <b>Precise:</b> an exception taken when a virtual address has no valid mapping or the access is not allowed; a <i>minor</i> fault is resolved without reading from storage (for example a new zero-filled page), a <i>major</i> fault needs storage I/O. Both run kernel code inside the faulting thread. <sup class="src"><a href="#F9-48-src-D2">D2</a></sup></dd>
+<dt>Locked memory (mlockall)</dt><dd><b>Simple words:</b> telling the kernel to keep all of the program's memory in RAM and ready. <b>Analogy:</b> laying every stick and brush out before the concert. <b>Precise:</b> <code>mlockall(MCL_CURRENT | MCL_FUTURE)</code> asks the kernel to keep all current mappings and future ones in RAM, so they are not paged out; it does not stop a program from creating new mappings inside its loop. <sup class="src"><a href="#F9-48-src-D2">D2</a></sup></dd>
+<dt>Background load</dt><dd><b>Simple words:</b> other work the computer does during the measurement. <b>Analogy:</b> the hot lights and loud audience. <b>Precise:</b> a defined, repeatable set of competing activity (processor, memory, input/output, interrupts) under which the latency is measured; a latency number without its load is not a result.</dd>
+</dl></div>
+<p>Terms from earlier chapters: <a href="#gl-start-latency-release-jitter-at-the-start">start latency</a>, <a href="#gl-jitter">jitter</a> (<a href="#F9-45">F9-45</a>); <a href="#gl-wake-up-latency-scheduling-latency">wake-up latency</a>, <a href="#gl-preempt-rt">PREEMPT_RT</a> (<a href="#F9-47">F9-47</a>); <a href="#gl-virtual-memory">virtual memory</a> (<a href="#OS301">OS301</a>).</p>
+
+<h2 id="F9-48-pictures">The idea in pictures</h2>
+<figure id="F9-48-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 230" role="img" aria-labelledby="F9-48-f1t F9-48-f1d">
+<title id="F9-48-f1t">Figure 1: what one cycle of the latency tester measures</title>
+<desc id="F9-48-f1d">A time line with three cycles of 1000 microseconds. In each cycle, a release time is marked by a downward arrow at the start; the thread wakes a little later, shown by a short gap labelled wake-up latency; then a block labelled work follows, whose length is measured separately as work time. The next release is computed by adding the period to the previous release, not to the wake-up time, so lateness does not accumulate. The third cycle shows a large wake-up latency.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="230"/>
+<line class="sv-line" x1="30" y1="120" x2="730" y2="120"/>
+<polygon class="sv-head" points="738,120 728,115 728,125"/><text class="sv-ts" x="690" y="140">time</text>
+<polygon class="sv-head" points="60,112 54,100 66,100"/><text class="sv-ts" x="40" y="92">release k</text>
+<polygon class="sv-head" points="280,112 274,100 286,100"/><text class="sv-ts" x="250" y="92">k+1</text>
+<polygon class="sv-head" points="500,112 494,100 506,100"/><text class="sv-ts" x="470" y="92">k+2</text>
+<rect class="sv-b3" x="60" y="112" width="12" height="16"/>
+<rect class="sv-b1" x="72" y="112" width="40" height="16"/>
+<rect class="sv-b3" x="280" y="112" width="14" height="16"/>
+<rect class="sv-b1" x="294" y="112" width="40" height="16"/>
+<rect class="sv-b3" x="500" y="112" width="120" height="16"/>
+<rect class="sv-b1" x="620" y="112" width="40" height="16"/>
+<line class="sv-line2" x1="500" y1="150" x2="620" y2="150"/><text class="sv-ts" x="510" y="168">wake-up latency (late)</text>
+<line class="sv-line2" x1="620" y1="185" x2="660" y2="185"/><text class="sv-ts" x="600" y="203">work time</text>
+<rect class="sv-b3" x="40" y="180" width="14" height="12"/><text class="sv-ts" x="60" y="191">latency: woke − release</text>
+<rect class="sv-b1" x="240" y="180" width="14" height="12"/><text class="sv-ts" x="260" y="191">work (none, fresh or reuse)</text>
+<text class="sv-ts" x="40" y="30">release k+1 = release k + period (absolute times, F9-45): one late cycle does not shift the next</text>
+<text class="sv-ts" x="40" y="48">each cycle's latency is stored in an array prepared before the loop</text>
+</svg></div><figcaption><b>Figure 1.</b> One cycle of Listing 1: sleep until an absolute release time, take the time on waking, do the cycle's work, take the time again. The two differences are recorded for every cycle. <sup class="src"><a href="#F9-48-src-D2">D2</a></sup></figcaption></figure>
+
+<figure id="F9-48-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 260" role="img" aria-labelledby="F9-48-f2t F9-48-f2d">
+<title id="F9-48-f2t">Figure 2: the same measurement under load, SCHED_OTHER against SCHED_FIFO 80</title>
+<desc id="F9-48-f2d">Two bar rows, one per configuration, showing the number of samples above three thresholds out of 5000: above 500 microseconds, above 1000 and above 2000. SCHED_OTHER with 4 load threads: 483, 364 and 248. SCHED_FIFO 80 with locked memory and the same load: 17, 10 and 3. The bars are drawn on a scale where 100 pixels stand for 100 samples, and the SCHED_OTHER bars are cut at the drawing edge with their numbers written next to them.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="260"/>
+<text class="sv-tb" x="20" y="28">cycles out of 5,000 later than a threshold, with 4 load threads (measured, AH-23)</text>
+<text class="sv-t" x="20" y="70">SCHED_OTHER</text>
+<rect class="sv-b5" x="190" y="52" width="520" height="14"/><text class="sv-ts" x="716" y="64">483</text>
+<rect class="sv-b5" x="190" y="70" width="520" height="14"/><text class="sv-ts" x="716" y="82">364</text>
+<rect class="sv-b5" x="190" y="88" width="520" height="14"/><text class="sv-ts" x="716" y="100">248</text>
+<text class="sv-t" x="20" y="150">SCHED_FIFO 80</text>
+<rect class="sv-b2" x="190" y="132" width="17" height="14"/><text class="sv-ts" x="214" y="144">17</text>
+<rect class="sv-b2" x="190" y="150" width="10" height="14"/><text class="sv-ts" x="207" y="162">10</text>
+<rect class="sv-b2" x="190" y="168" width="3" height="14"/><text class="sv-ts" x="200" y="180">3</text>
+<text class="sv-ts" x="110" y="64">≥ 500 µs</text><text class="sv-ts" x="110" y="82">≥ 1 ms</text><text class="sv-ts" x="110" y="100">≥ 2 ms</text>
+<text class="sv-ts" x="110" y="144">≥ 500 µs</text><text class="sv-ts" x="110" y="162">≥ 1 ms</text><text class="sv-ts" x="110" y="180">≥ 2 ms</text>
+<text class="sv-ts" x="20" y="220">scale: 1 px = 1 sample; the SCHED_OTHER bars are cut at 520 px. Counts summed from the histograms</text>
+<text class="sv-ts" x="20" y="238">of load_other.out and load_fifo.out (bins 500 µs and above, 1,000 µs and above, 2,000 µs and above).</text>
+</svg></div><figcaption><b>Figure 2.</b> Load and priority. The medians differ by about 70 µs (113.4 against 42.0); the tails differ by a factor of 20 to 80. The median would have hidden the most important result. <sup class="src"><a href="#F9-48-src-R3">R3</a></sup> <sup class="src"><a href="#F9-48-src-R4">R4</a></sup></figcaption></figure>
+
+<h2 id="F9-48-layer1">Layer 1 — the kid explanation</h2>
+<p>To find out whether a clock-driven program is always on time, you let it set an alarm many thousands of times and write down, every time, how late it woke up. Then you count: how many times was it a little late, how many times very late, and what was the latest of all.</p>
+<p>You do it while the computer is busy, because a robot's computer is busy. You do it for a long time, because rare problems are rare. And you write down exactly how you did it, so somebody else can do it again and check.</p>
+
+<h2 id="F9-48-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F9-48-l2-tool">The tool</h3>
+<p>Listing 1 is a small tester in the style of the classic "cyclic test": one measuring thread sleeps until absolute release times with <code>clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, …)</code>, reads the clock on waking, and stores the difference. It can run the thread under SCHED_OTHER or SCHED_FIFO, lock memory, start load threads, and do per-cycle work that touches either freshly allocated or prepared memory. <sup class="src"><a href="#F9-48-src-D2">D2</a></sup> <sup class="src"><a href="#F9-48-src-D3">D3</a></sup> Three rules make its numbers trustworthy:</p>
+<ol>
+<li><b>Absolute release times</b> (F9-45): a late cycle does not move the following releases, so every sample is measured against the true schedule.</li>
+<li><b>Nothing allocated in the loop</b> except what the experiment wants: the result arrays are created and touched before the loop starts, and printing happens after it.</li>
+<li><b>Every sample kept</b>, then sorted for percentiles and binned for the histogram, with the sample count printed.</li>
+</ol>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The established tool for this measurement on Linux is <code>cyclictest</code> from the "rt-tests" collection, with options for priorities, intervals, histograms and several threads; its name, options and output format are from the author's memory, and it was not installed in the build container, so this chapter builds its own small tool. Check the rt-tests documentation before using it, and compare its numbers with Listing 1 on your machine.</p></div>
+
+<h3 id="F9-48-l2-results">Five measurements</h3>
+<p>All five ran on the build container, back to back, 1,000 µs period. They are measurements on a virtual machine shared with other work (AH-23): they will be different on your machine and on a second run here. The first: an idle machine, ordinary policy. <sup class="src"><a href="#F9-48-src-R2">R2</a></sup></p>
+<pre class="output" data-run="F9-48/idle_other"></pre>
+<p>Second: the same with four load threads (one per processor) writing through a 4 MiB buffer each, at ordinary priority. <sup class="src"><a href="#F9-48-src-R3">R3</a></sup></p>
+<pre class="output" data-run="F9-48/load_other"></pre>
+<p>Third: the same load, but the measuring thread at SCHED_FIFO 80 with all memory locked. <sup class="src"><a href="#F9-48-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F9-48/load_fifo"></pre>
+<p>Reading them together:</p>
+<ul>
+<li><b>Load hurts the tail far more than the median.</b> SCHED_OTHER's median moved from 98.3 to 113.4 µs; its 99th percentile from 238.1 to 5,818.6 µs; its maximum from 2.1 to 15.5 ms. 55 cycles were 5 ms or more late, five whole periods. <sup class="src"><a href="#F9-48-src-R2">R2</a></sup> <sup class="src"><a href="#F9-48-src-R3">R3</a></sup></li>
+<li><b>Real-time priority removes most of the load's effect.</b> With SCHED_FIFO 80 under the same load: median 42.0, p99 141.5, maximum 3,100.4 µs. The load threads are SCHED_OTHER, so they never run before the measuring thread when it is ready. <sup class="src"><a href="#F9-48-src-R4">R4</a></sup></li>
+<li><b>Not all of it.</b> 3 cycles of 5,000 were still 2–5 ms late. On this machine a woken SCHED_FIFO thread can still wait for non-preemptible kernel work (the kernel is PREEMPT_NONE, F9-47) and for the host, which may not be running the virtual processor at all. This measurement cannot tell the two apart; a tracer could tell the first (Layer 3), and only bare hardware removes the second.</li>
+<li><b>The median is lower for SCHED_FIFO even without contention</b> (42 against 98 µs). A likely cause is timer slack, the kernel's permission to delay ordinary threads' timer expiry slightly to group wake-ups; it does not apply to real-time threads (unverified box below). The minimum of about 22–25 µs for SCHED_FIFO is this virtual machine's floor; bare hardware is usually lower.</li>
+</ul>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That ordinary threads have a default timer slack of 50 µs and real-time threads none, and that it can be read and changed per thread (<code>prctl</code> with <code>PR_SET_TIMERSLACK</code>, <code>/proc/&lt;pid&gt;/timerslack_ns</code>), is from the author's memory and was not tested in this build. Check the man pages <code>prctl(2)</code> and <code>proc(5)</code>, then test: if true, setting the slack of the SCHED_OTHER measuring thread to 1 ns should move its median close to the SCHED_FIFO median.</p></div>
+
+<h3 id="F9-48-l2-report">How to report a measurement</h3>
+<p>A latency result is a sentence with all of these parts: <b>what</b> was measured (wake-up latency of a periodic thread, 1,000 µs period), <b>how many</b> samples (5,000, i.e. 5 seconds), the <b>distribution</b> (histogram, p50, p99, p99.9, maximum), the <b>conditions</b> (machine, kernel and its preemption model, policy and priority, locked memory, load, processor placement) and the <b>tool and its version</b>. The <code>.log</code> next to every output in this course records them (<a href="#BR-08">BR-08</a>). Five seconds is far too short for a robot; it was chosen to keep the build fast. Real qualification runs last hours, with the robot's real load. <sup class="src"><a href="#F9-48-src-D3">D3</a></sup></p>
+
+<h2 id="F9-48-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F9-48-l3-faults">Page faults in the loop</h3>
+<p>Locking memory with <code>mlockall</code> keeps every page that exists, and (with MCL_FUTURE) every page of mappings created later, in RAM. It does not stop the loop from creating new mappings. Listing 1's <code>--work fresh</code> allocates a 256 KiB vector every cycle; with glibc's threshold for using a separate mapping fixed at 128 KiB (line 129), each such allocation becomes a new mapping that the kernel must create, populate and later remove. <code>--work reuse</code> touches a vector prepared before the loop. Both under SCHED_FIFO 80 with locked memory and no load: <sup class="src"><a href="#F9-48-src-R5">R5</a></sup> <sup class="src"><a href="#F9-48-src-R6">R6</a></sup></p>
+<pre class="output" data-run="F9-48/fault_fresh"></pre>
+<pre class="output" data-run="F9-48/fault_reuse"></pre>
+<p>195,033 minor faults in 3,000 cycles is 65 per cycle: one for each of the 64 pages of 4 KiB in 256 KiB, plus one. The median work time is 79.8 µs against 1.2 µs: the loop's real work (touching 64 bytes) is the same, and 98 % of the time went into the kernel's page handling. The wake-up latency tail is also worse with fresh memory (p99.9 2,065.0 against 620.0 µs) — a plausible cause is the extra kernel work for mapping and unmapping, but these two short runs on a shared virtual machine do not prove it. <sup class="src"><a href="#F9-48-src-R5">R5</a></sup> <sup class="src"><a href="#F9-48-src-R6">R6</a></sup></p>
+<p>The rules that follow (<a href="#F9-49">F9-49</a> applies them to a ROS 2-style node): allocate everything before the loop; reserve container capacity; touch stack and heap you will need (pre-fault); lock memory; check with a fault counter like line 44 that the loop's count is zero. <sup class="src"><a href="#F9-48-src-D1">D1</a></sup> <sup class="src"><a href="#F9-48-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That glibc adapts its mapping threshold at run time by default (the reason line 129 fixes it), and the exact meaning of <code>M_MMAP_THRESHOLD</code>, are from the author's memory; check the man page <code>mallopt(3)</code>. What was verified: with the threshold fixed at 128 KiB the fresh work faulted 65 times per cycle, and with prepared memory zero times.</p></div>
+
+<h3 id="F9-48-l3-cpu">Processors, interrupts and isolation</h3>
+<p>On a machine with several processors, the next step after priority is placement: run the control thread on a processor that runs nothing else and receives as few interrupts as possible. The Linux mechanisms are processor affinity (<code>sched_setaffinity</code>, the <code>taskset</code> tool), interrupt affinity (per interrupt line), and boot-time isolation of processors from the general scheduler (F9-47's unverified box). <sup class="src"><a href="#F9-48-src-D1">D1</a></sup> Measure per processor: a latency problem caused by one device often appears only on the processor that receives its interrupts. F9-50's lab pins its controller to a processor and reports the effect on this machine.</p>
+
+<h3 id="F9-48-l3-trace">From "how late" to "why late"</h3>
+<p>A histogram tells you how late; a trace tells you why. The Linux kernel's tracing system can record scheduling events, interrupt entry and exit, and how long preemption or interrupts were disabled, and can stop when a latency threshold is exceeded so that the last events before the bad cycle are kept. <sup class="src"><a href="#F9-48-src-D1">D1</a></sup> F9-49 uses a small trace of its own (which callback ran when) to find a cause inside the program; the kernel tracer does the same for causes inside the kernel.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Kernel tracing names from memory, not used in this build: the "ftrace" framework under the tracing file system, tracers that record the longest interrupts-off and preemption-off sections and the wake-up latency of the highest-priority task, and a break-on-threshold option in cyclictest that stops the trace. The build container's kernel has <code>CONFIG_PREEMPT_TRACER</code> not set (F9-47's <code>config.out</code>), so the preemption-off tracer is not available there. Check the kernel's tracing documentation for your version.</p></div>
+
+<h3 id="F9-48-l3-bound">What a measurement proves</h3>
+<p>A measured maximum is a lower bound on the true worst case: the true worst is at least that bad. No number of samples turns it into an upper bound. Engineers combine three things: analysis of what can happen (F9-46, F9-47's model), measurement under the worst realistic load for long periods, and margin: a requirement that the measured maximum, with the conditions recorded, stays well under the deadline. How much margin and how long a run are project decisions; write them down with the result. <sup class="src"><a href="#F9-48-src-D4">D4</a></sup></p>
+
+<h2 id="F9-48-hardware">How the hardware actually does it</h2>
+<p>The clock that Listing 1 reads (<code>CLOCK_MONOTONIC</code>) is backed by a hardware counter; on the build container the kernel's clock source was <code>tsc</code>, the processor's time-stamp counter (F9-47's <code>config.out</code>). <sup class="src"><a href="#F9-48-src-R1">R1</a></sup> Reading it is fast and does not enter the kernel on most systems, so the measurement disturbs the result little. The wake-up itself starts from a timer interrupt programmed for the release time; its accuracy depends on the timer hardware and, on a virtual machine, on the host delivering it. A page fault is an exception raised by the memory management unit when a translation is missing (<a href="#OS301">OS301</a>): the processor stops the instruction, runs the kernel's handler, which finds or zero-fills a physical page and writes the page table, and then retries the instruction. 64 of those per cycle are what the fresh-work run shows.</p>
+
+<h2 id="F9-48-worked">Worked example</h2>
+<p><b>Task.</b> A requirement says: "the 1 kHz loop's wake-up latency shall stay below 300 µs". Using <code>load_fifo.out</code>, decide whether the build container meets it, and compute how many cycles per hour would violate it if the measured distribution held.</p>
+<ol>
+<li>Count samples at 500 µs and above from the histogram: 7 + 7 + 3 = 17. The 200–499 µs bin has 16 more, some of which may be above 300 µs; the histogram cannot tell. The listing's percentiles do not either (p99.9 is 1,205.3 µs, far above 300). So at least 17 and at most 33 of 5,000 cycles violate: 0.34 % to 0.66 %. <sup class="src"><a href="#F9-48-src-R4">R4</a></sup></li>
+<li>Per hour (3,600,000 cycles): 12,240 to 23,760 violations, if the distribution held.</li>
+<li>Verdict: fails, clearly. The useful follow-ups are a finer histogram around the requirement (add a 300 µs edge to line 93), a longer run, and the causes (a real-time kernel, bare hardware, F9-47).</li>
+<li>Lesson: choose histogram bins around the requirement before measuring.</li>
+</ol>
+
+<h2 id="F9-48-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>latency.cc</code>. It is a <code>.cc</code> file so that the course's generic runner does not build it with sanitizers only; <code>run.sh</code> builds it twice: with sanitizers for a short check, and with <code>-O2</code> for the measurement.</p>
+<pre class="listing" data-src="F9-48/latency.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>37–42</td><td><code>nowNs</code></td><td>Reads CLOCK_MONOTONIC in nanoseconds.</td><td>A clock that never jumps backwards.</td></tr>
+<tr><td>44–49</td><td><code>minorFaults</code></td><td><code>getrusage(RUSAGE_THREAD)</code>.</td><td>The fault counter that exposes allocation in the loop.</td></tr>
+<tr><td>53–63</td><td><code>loadThread</code></td><td>Writes through a 4 MiB buffer forever, SCHED_OTHER.</td><td>Processor and cache load that you can repeat.</td></tr>
+<tr><td>67–76</td><td><code>doWork</code></td><td>"fresh": new 256 KiB vector each cycle; "reuse": the prepared one.</td><td>The forensic experiment in two branches.</td></tr>
+<tr><td>78–89</td><td><code>report</code></td><td>Sorts, prints min, avg, p50, p99, p99.9, max.</td><td>Percentile index ⌊p/100·n⌋, stated in the Jargon box.</td></tr>
+<tr><td>91–106</td><td><code>histogram</code></td><td>Roughly logarithmic bins from 10 µs to 5 ms.</td><td>The tail stays visible.</td></tr>
+<tr><td>126–134</td><td><code>mallopt</code>, <code>mlockall</code></td><td>Fixed mapping threshold for "fresh"; locked memory if asked.</td><td>Repeatable experiment; the standard preparation.</td></tr>
+<tr><td>139–141</td><td>arrays</td><td>All result storage allocated before the loop.</td><td>The tool must not disturb itself.</td></tr>
+<tr><td>146–153</td><td><code>pthread_setschedparam</code></td><td>SCHED_FIFO for the measuring thread only; reports refusal.</td><td>The output states the policy that really applied.</td></tr>
+<tr><td>155–167</td><td>the loop</td><td>Absolute release, wake time, work time, next release = release + period.</td><td>Figure 1 in code.</td></tr>
+</tbody></table></div>
+<p>The lab script, with its build commands and the five measurement steps:</p>
+<pre class="listing" data-src="F9-48/run.sh"></pre>
+<p>The sanitizer check run (its timing is not used): <sup class="src"><a href="#F9-48-src-R7">R7</a></sup></p>
+<pre class="output" data-run="F9-48/smoke"></pre>
+
+<h2 id="F9-48-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A drummer's late beat is heard at once; a late control cycle may have no visible effect until the rare unlucky combination.</b> That is why the measurement must be long and the analysis must exist.</li>
+<li><b>Recording a drummer does not change the playing; measuring a computer does a little.</b> Reading the clock and storing the sample take time, and a heavy tracer can change the timing it records.</li>
+<li><b>A concert has one stage; the robot's computer has the load of all its own software.</b> The right "background load" is the robot's software itself, not an artificial one alone.</li>
+</ul>
+
+<h2 id="F9-48-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> a beautiful histogram in the lab, failures on the robot. <b>Cause:</b> measured idle, or for one minute. <b>Fix:</b> measure under the robot's load for hours; report the conditions.</li>
+<li><b>Symptom:</b> only averages reported. <b>Fix:</b> histogram, percentiles, maximum and sample count; Figure 2 is the reason.</li>
+<li><b>Symptom:</b> the tool's own latency explodes after a few minutes. <b>Cause:</b> the tool grows a vector or prints inside the loop. <b>Fix:</b> preallocate, print afterwards.</li>
+<li><b>Symptom:</b> SCHED_FIFO "has no effect". <b>Cause:</b> the call failed silently (no permission; <code>RLIMIT_RTPRIO</code> 0 for a normal user, F9-47), or it was set on the wrong thread. <b>Fix:</b> check the return value and print the applied policy, as lines 149–152 do.</li>
+<li><b>Symptom:</b> rare spikes even with SCHED_FIFO and locked memory. <b>Check:</b> the fault counter of the loop; the kernel's preemption model; interrupts on that processor; virtualisation or firmware. <b>Find:</b> a kernel trace stopped at the spike.</li>
+</ul>
+
+<div class="co transition" id="F9-48-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F9-45">F9-45</a> defined lateness and jitter and measured a single loop; <a href="#F9-47">F9-47</a> explained what delays a woken task and modelled the effect of PREEMPT_RT; <a href="#BR-08">BR-08</a> set the rules for measurement evidence. <b>What carries over:</b> absolute release times, the distinction between median and worst case, recording conditions with every number. <b>What changes:</b> the measurement becomes a tool with controlled variables (policy, locking, load, work), the output becomes a histogram with percentiles, and the question moves from "is it late" to "what makes it late". <b>What comes next:</b> <a href="#F9-49">F9-49</a> applies these rules inside a ROS 2-style node, where the causes of lateness are your own program's structure: executors, callback groups, logging and allocation.</p></div>
+
+<h2 id="F9-48-check">Check yourself</h2>
+<ol>
+<li>Why does Listing 1 compute the next release as <code>release + period</code> and not <code>woke + period</code>? What would the histogram show otherwise?</li>
+<li>From <code>idle_other.out</code> and <code>load_other.out</code>: by what factor did the median change, and by what factor the 99th percentile?</li>
+<li>Explain why SCHED_FIFO 80 removes most of the effect of the four load threads, and name two causes that it cannot remove.</li>
+<li>Where did the 195,033 faults come from? Show the arithmetic.</li>
+<li><code>mlockall(MCL_CURRENT | MCL_FUTURE)</code> was active in the fresh-work run. Why did faults still happen?</li>
+<li>Apply to a new case: a camera driver thread allocates a 6 MiB buffer per frame. Predict what you would see with Listing 1's fault counter and what to change.</li>
+<li>Your colleague's report says "max latency 85 µs". List what is missing before you can use the number.</li>
+<li>Predict, then run: add <code>--interval 250</code> to the <code>load_fifo</code> step. Will the maximum change? Will the count of cycles above 1 ms change? Explain your prediction and compare.</li>
+</ol>
+
+<h2 id="F9-48-lab">Lab</h2>
+<p><b>Goal.</b> Measure your machine's wake-up latency under controlled conditions, find the effect of load, policy and in-loop allocation, and write a report another engineer can repeat.</p>
+<p><b>Hardware and software needed.</b> A Linux computer, g++ 13.3.0 (as in the logs) or similar, permission for real-time priorities (a user with an <code>RLIMIT_RTPRIO</code> above 80, or root on a test machine). Run <code>university/labs/run_lab.sh university/labs/F9-48</code>.</p>
+<div class="co safety"><span class="lbl">Safety</span><p>A SCHED_FIFO thread that never sleeps can freeze a processor. Listing 1's measuring thread always sleeps; if you change it, keep real-time throttling enabled (F9-47) and test on a machine you can reset. Do not run load tests on a robot's computer while it drives motors. See the course <a href="#safety">safety rules</a>.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Read the six <code>.log</code> files first: machine, kernel, command, exit code.</li>
+<li>Repeat <code>load_fifo</code> three times. Record how much its p99, p99.9 and maximum vary between runs. That variation is the precision of your measurement.</li>
+<li>Extend the run to at least 600,000 loops (10 minutes) under your realistic load (compile a large project, copy files over the network).</li>
+<li>Pin the measuring thread to one processor (for example run the program under <code>taskset</code>) and the load to the others; compare.</li>
+<li>Add a 300 µs edge to the histogram and evaluate the worked example's requirement on your machine.</li>
+</ol>
+<p><b>Expected observations.</b> On the build container: the outputs above. Pattern to expect elsewhere: load grows the SCHED_OTHER tail by orders of magnitude; SCHED_FIFO with locked memory removes most of it; fresh allocation shows tens of faults per cycle and a much longer work time; prepared memory shows zero. <sup class="src"><a href="#F9-48-src-R3">R3</a></sup> <sup class="src"><a href="#F9-48-src-R4">R4</a></sup> <sup class="src"><a href="#F9-48-src-R5">R5</a></sup> Exact numbers will differ (AH-23).</p>
+<p><b>Verification.</b> The fault counter of every real-time configuration with prepared memory reads 0; the policy line shows SCHED_FIFO when asked; all steps exit 0.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"SCHED_FIFO refused: Operation not permitted" → raise the user's real-time limit (your distribution's limits configuration) or use a test machine as root.</li>
+<li>"mlockall failed: Cannot allocate memory" → the locked-memory limit is too low for the program; raise <code>RLIMIT_MEMLOCK</code>.</li>
+<li>Very large spikes at regular intervals → power management or firmware; record and test with the board's documented real-time settings.</li>
+</ul>
+<p><b>Extension.</b> Add a second measuring thread at a lower priority on the same processor and show how its histogram changes when the first one's work grows.</p>
+
+<h2 id="F9-48-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Kofi's balance controller does all the right things: SCHED_FIFO 80, <code>mlockall</code>, absolute release times. Its step function is short. Yet its work time per cycle is 80 µs where his estimate was "a few microseconds", and once in a while a cycle takes over 2 ms. The step function contains this line, added last week "to keep the function self-contained": a local buffer of 256 KiB, created at the start of each cycle.</p>
+<p><b>Evidence pack.</b> Listing 1 reproduces both versions: <code>--work fresh</code> is the new code, <code>--work reuse</code> the old code. <sup class="src"><a href="#F9-48-src-R5">R5</a></sup> <sup class="src"><a href="#F9-48-src-R6">R6</a></sup></p>
+<pre class="output" data-run="F9-48/fault_fresh"></pre>
+<pre class="output" data-run="F9-48/fault_reuse"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare work time (p50 and maximum) and the fault counts.</li>
+<li>Hypotheses: (a) the computation got slower; (b) the processor is shared with other work; (c) the kernel serves page faults during the step. What does each predict for the fault counter?</li>
+<li>Root cause: why does <code>mlockall</code> not prevent these faults?</li>
+<li>Fix: write the change.</li>
+<li>Prevention: what automatic test would catch the next such change?</li>
+</ol>
+<p><b>Method hints.</b> Divide the faults by the cycles. Compare with 256 KiB / 4 KiB.</p>
+
+<h2 id="F9-48-project">Mini-project</h2>
+<p><b>A latency report generator.</b> Extend Listing 1 to write its samples to a binary file after the run, and write a second program that reads two such files and prints both histograms side by side with a finer, configurable set of bins, the percentiles, and the conditions read from a small header (policy, priority, load, kernel, date). Use it to compare two configurations of your choice on your machine.</p>
+<p><b>Rubric.</b> Samples stored without disturbing the loop (2). Header captures all conditions of Layer 2 (2). Side-by-side output readable and correct, checked against a hand count (3). Comparison report with interpretation and limits (2). Clean sanitizer build of the reader (1).</p>
+
+<h2 id="F9-48-summary">Summary</h2>
+<ul>
+<li>Measure wake-up latency with absolute release times, every sample kept, nothing allocated in the loop.</li>
+<li>Report histogram, percentiles with sample count, maximum and full conditions; the median hides what matters.</li>
+<li>On the build container under load: SCHED_OTHER p99 5.8 ms, maximum 15.5 ms; SCHED_FIFO 80 with locked memory p99 0.14 ms, maximum 3.1 ms (measured, AH-23).</li>
+<li>A fresh 256 KiB buffer per cycle cost 65 page faults per cycle and a work time of 80 µs instead of 1.2 µs, despite <code>mlockall</code>.</li>
+<li>A measured maximum is a lower bound of the worst case; combine it with analysis and margin.</li>
+</ul>
+
+<h2 id="F9-48-sources">Sources</h2>
+<ol>
+<li id="F9-48-src-D1">Linux kernel documentation, "Real-Time Preemption" and the tracing documentation (tier 2). <i>Titles only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F9-48-src-D2">Linux man-pages project: <code>clock_nanosleep(2)</code>, <code>mlockall(2)</code>, <code>getrusage(2)</code>, <code>mallopt(3)</code>, <code>pthread_setschedparam(3)</code> (tier 2). <i>Titles only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F9-48-src-D3">rt-tests documentation (cyclictest) (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F9-48-src-D4">Giorgio Buttazzo, "Hard Real-Time Computing Systems" (tier 3): measurement and worst-case execution time. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F9-48-src-R1">R1 — F9-47's <code>config.log</code> (the build container's clock source and kernel configuration).</li>
+<li id="F9-48-src-R2">R2 — <code>idle_other.log</code>, exit code 0; measured on the build container (AH-23).</li>
+<li id="F9-48-src-R3">R3 — <code>load_other.log</code>, exit code 0; measured on the build container (AH-23).</li>
+<li id="F9-48-src-R4">R4 — <code>load_fifo.log</code>, exit code 0; measured on the build container (AH-23).</li>
+<li id="F9-48-src-R5">R5 — <code>fault_fresh.log</code>, exit code 0; measured on the build container (AH-23).</li>
+<li id="F9-48-src-R6">R6 — <code>fault_reuse.log</code>, exit code 0; measured on the build container (AH-23).</li>
+<li id="F9-48-src-R7">R7 — <code>smoke.log</code>, sanitizer build with address and undefined-behaviour checks, exit code 0.</li>
+</ol>
+
+<h2 id="F9-48-glossary">Glossary links</h2>
+<p><a href="#gl-percentile">Percentile</a> · <a href="#gl-latency-histogram">Latency histogram</a> · <a href="#gl-tail-latency">Tail latency</a> · <a href="#gl-page-fault">Page fault</a> · <a href="#gl-locked-memory-mlockall">Locked memory (mlockall)</a> · <a href="#gl-background-load">Background load</a> · <a href="#gl-jitter">Jitter</a></p>
+
+<h2 id="F9-48-next">Next chapter</h2>
+<p>Next: <a href="#F9-49">F9-49 Real-time in ROS 2</a>. Previous: <a href="#F9-47">F9-47 Linux with PREEMPT_RT</a>. Back to the course: <a href="#RB304">RB304</a>. Measurement rules: <a href="#BR-08">BR-08</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackH">Track H</a>.</p>
+
+<h2 id="F9-48-answers">Answers to Check yourself</h2>
+<ol>
+<li>So that every sample is lateness against the true schedule and a late cycle does not shift all later releases (F9-45's drift). With <code>woke + period</code> each sample would still show the wake-up delay, but the schedule would drift and the loop would run slower than 1 kHz.</li>
+<li>Median 98.3 → 113.4 µs, a factor of about 1.15; p99 238.1 → 5,818.6 µs, a factor of about 24.</li>
+<li>The load threads are SCHED_OTHER; a ready SCHED_FIFO thread runs before any of them on its processor. It cannot remove non-preemptible kernel work (this kernel is PREEMPT_NONE), interrupt handlers, firmware activity, or the host not running the virtual processor.</li>
+<li>Each cycle allocated 256 KiB as a new mapping: 256 / 4 = 64 pages, each touched once, plus one more fault per cycle (the measured rate is 65.01): 65 × 3,000 = 195,000; this run does not show where the remaining 33 come from.</li>
+<li><code>mlockall</code> applies to mappings; the loop created and removed a new mapping each cycle, so each cycle the kernel had to provide new pages. Locking memory does not make allocation free.</li>
+<li>6 MiB / 4 KiB = 1,536 faults per frame and a large work time; the fix is a pool of buffers allocated and touched before streaming starts, reused frame by frame.</li>
+<li>Sample count and run length, percentiles and histogram, load, policy and priority, locked memory, machine, kernel and preemption model, tool and version, period.</li>
+<li>A sensible prediction: the median changes little; the count above 1 ms per second of run time grows roughly with the number of cycles, because there are four times as many chances; the maximum may grow. The measured result on your machine is the answer; this build did not run it.</li>
+</ol>
+<h3 id="F9-48-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Fresh: work p50 79.8 µs, maximum 2,464.6 µs, 195,033 minor faults (65 per cycle). Reuse: work p50 1.2 µs, maximum 1,482.3 µs, 0 faults. <sup class="src"><a href="#F9-48-src-R5">R5</a></sup> <sup class="src"><a href="#F9-48-src-R6">R6</a></sup></p>
+<p><b>Hypotheses.</b> (a) Slower computation would not produce faults. (b) Sharing the processor would show in wake-up latency more than in work time and would not produce faults in this thread (the counter is per thread). (c) Faults per cycle equal to the page count of the buffer: confirmed.</p>
+<p><b>Root cause.</b> A 256 KiB buffer above the allocator's mapping threshold is a new mapping each cycle; its 64 pages are provided by the kernel each time and returned at the end. <code>mlockall</code> keeps existing pages resident; it does not make new ones free.</p>
+<p><b>Fix.</b> Make the buffer a member created and touched at start-up (the "reuse" branch, lines 73–74), and keep the step function free of allocation.</p>
+<p><b>Prevention.</b> A test that runs the controller for N cycles and asserts that the loop's minor-fault count (line 44's counter) and an allocation counter (F9-49) are zero; run it in continuous integration.</p>
+<p><b>How the evidence was made.</b> The same program with <code>--work fresh</code> and <code>--work reuse</code>, both SCHED_FIFO 80, locked memory, no load, 3,000 cycles, back to back.</p>

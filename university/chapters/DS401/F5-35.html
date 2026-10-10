@@ -1,0 +1,364 @@
+<!--meta
+id: F5-35
+title: InfiniBand and RoCE
+course: DS401
+level: L4
+prereqs: F5-34; DS201 (F5-02 layers, F5-03 Ethernet and IP addressing, F5-04 UDP and TCP); HW205 (F1-51 packet captures, F1-53 RDMA preview)
+time: 10–14 hours including the lab and the forensic lab
+hardware: none for the lab: g++ and tshark (the build used g++ 13.3 and TShark (Wireshark) 4.2.2). The frames are built byte by byte by the lab's own program; no RDMA NIC, switch or real network traffic is involved (untested on hardware).
+maps: Curriculum Track F, section 14.1 row "Inter-node networks" (InfiniBand, RoCE v2); reading-list item 81 (InfiniBand Architecture Specification; RoCE v2 annex; pending verification); milestone F5 (two nodes over InfiniBand or RoCE, concepts)
+analogy: F5 — friends in different towns (new mappings proposed in NOTES.md: InfiniBand = the towns' own private courier railway; RoCE = couriers driving on the public roads; a lossless traffic class = a lane with traffic lights that stop cars instead of turning parcels away)
+-->
+
+<h2 id="F5-35-hook">Story hook</h2>
+<p>The courier service from <a href="#F5-34">F5-34</a> grows. In one valley, the towns build their own courier railway: their own tracks, their own stations, a central timetable office that gives every station a number and tells every junction which way to switch. A train leaves only when the next station has said it has room, so no parcel is ever thrown off a full platform.</p>
+<p>In the next valley there is no money for tracks. The couriers drive on the public roads, inside the same envelopes and address labels as everybody else's post. That works, but the public roads were built for traffic where a lost parcel is simply sent again. A courier who loses one parcel must go back and redeliver everything since that parcel, which is slow. So the valley paints one lane on every road: in that lane, traffic lights stop the vans when the road ahead is full, instead of turning parcels away.</p>
+<p>The private railway is <b>InfiniBand</b>. The couriers on public roads are <b>RoCE</b>, RDMA over Converged Ethernet. The painted lane with traffic lights is a lossless traffic class. This chapter opens the parcels and reads every label, byte by byte.</p>
+
+<h2 id="F5-35-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the layers of the InfiniBand architecture (physical, link, network, transport) and what a subnet manager, a LID and a GID are.</li>
+<li><b>Decode</b> the InfiniBand transport headers (BTH, RETH, AETH) of a captured RoCE v2 frame by hand and check your decoding with tshark.</li>
+<li><b>Explain</b> the difference between RoCE v1 and RoCE v2 and what RoCE needs from the Ethernet network: an MTU that fits the RDMA path MTU, and a lossless class or a congestion-control scheme.</li>
+<li><b>Calculate</b> per-packet header overhead and the largest RoCE path MTU that fits a given Ethernet MTU.</li>
+<li><b>Diagnose</b> from a capture why one sender's RDMA traffic is retransmitted: PSN gaps, NAKs, go-back-N, and a DSCP that puts it in the wrong traffic class.</li>
+</ul>
+
+<div class="co jargon" id="F5-35-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Subnet manager (SM)</dt><dd><b>Simple words:</b> a program that discovers an InfiniBand network, gives every port an address and tells every switch where to send each address. <b>Analogy:</b> the railway's timetable office that numbers the stations and sets the junctions. <b>Precise:</b> the InfiniBand management entity that sweeps the subnet, assigns a local identifier to each port, computes routes and programs the switches' forwarding tables; a port learns the SM's own LID (the installed verbs header exposes it as <code>sm_lid</code> in <code>struct ibv_port_attr</code>). <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-D3">D3</a></sup></dd>
+<dt>LID and GID</dt><dd><b>Simple words:</b> two kinds of address: a short one used inside one InfiniBand network, and a long one that works everywhere (on RoCE it is built from the IP address). <b>Analogy:</b> a station number on the local railway, and a full postal address. <b>Precise:</b> the local identifier (LID) is a 16-bit address assigned by the subnet manager and used by switches inside a subnet; the global identifier (GID) is a 128-bit address carried in a Global Route Header, required for routing between subnets and, on RoCE, used for every packet. The verbs header declares <code>uint16_t lid</code> and <code>union ibv_gid</code> with 16 raw bytes. <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-D3">D3</a></sup></dd>
+<dt>Base Transport Header (BTH)</dt><dd><b>Simple words:</b> the 12-byte label on every RDMA packet: what kind of packet it is, which queue pair it is for, and its sequence number. <b>Analogy:</b> the courier's own label inside the envelope: "parcel 5 for shelf-desk 0x11". <b>Precise:</b> the InfiniBand transport header present in every packet: opcode, solicited-event and migration bits, pad count, header version, partition key, destination queue pair number (24 bits), acknowledge-request bit and packet sequence number (24 bits); decoded field by field by tshark in this chapter's lab. <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-D4">D4</a></sup></dd>
+<dt>Packet sequence number (PSN)</dt><dd><b>Simple words:</b> the number of each packet on a connection, so the receiver can spot a missing one. <b>Analogy:</b> numbering parcels 100, 101, 102… so a missing 102 is noticed when 103 arrives. <b>Precise:</b> a 24-bit counter in the BTH; for reliable service the responder expects PSNs in order, acknowledges them, and reports a gap with a negative acknowledgement (NAK, PSN sequence error) carrying the expected PSN. <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-R4">R4</a></sup></dd>
+<dt>RoCE v1 and RoCE v2</dt><dd><b>Simple words:</b> two ways of carrying InfiniBand's transport over Ethernet: v1 directly inside Ethernet frames, v2 inside UDP/IP packets so routers can forward it. <b>Analogy:</b> v1 couriers stay on the roads of one town; v2 couriers use full postal addresses and can cross between towns. <b>Precise:</b> RoCE v1 places the GRH and transport headers directly after an Ethernet header with its own EtherType (0x8915 as decoded by tshark); RoCE v2 replaces the GRH by an IPv4 or IPv6 header and a UDP header whose destination port identifies RoCE (4791 in tshark's decode table), so packets are routable at layer 3. <sup class="src"><a href="#F5-35-src-D2">D2</a></sup> <sup class="src"><a href="#F5-35-src-D4">D4</a></sup> <sup class="src"><a href="#F5-35-src-R3">R3</a></sup></dd>
+<dt>Path MTU (RDMA)</dt><dd><b>Simple words:</b> the largest amount of message data that one RDMA packet carries on a connection. <b>Analogy:</b> the largest parcel the courier's van takes in one trip; longer notes are split. <b>Precise:</b> the InfiniBand MTU chosen per connection from 256, 512, 1024, 2048 or 4096 bytes (the values of <code>enum ibv_mtu</code> in the installed header), counting payload only; on RoCE, the packet with all its headers must also fit the Ethernet MTU of every link on the path. <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-D3">D3</a></sup> <sup class="src"><a href="#F5-35-src-R1">R1</a></sup></dd>
+<dt>Lossless traffic class and priority flow control (PFC)</dt><dd><b>Simple words:</b> a setting that makes an Ethernet switch tell the sender "wait" instead of throwing packets away when one class of traffic fills its buffer. <b>Analogy:</b> the painted lane with traffic lights. <b>Precise:</b> Ethernet priority-based flow control pauses transmission of one priority (traffic class) on a link when the receiver's buffer for that priority passes a threshold; packets are mapped to priorities by a VLAN priority field or by the IP DSCP value; RoCE deployments commonly put RDMA traffic in such a class. <sup class="src"><a href="#F5-35-src-D5">D5</a></sup> <sup class="src"><a href="#F5-35-src-D6">D6</a></sup></dd>
+<dt>Go-back-N</dt><dd><b>Simple words:</b> after a lost packet, resend that packet and every packet after it, even those that arrived. <b>Analogy:</b> the courier who lost parcel 102 redelivers 102, 103, 104 and 105. <b>Precise:</b> a retransmission scheme in which the receiver accepts only in-order packets and discards later ones after a gap, and the sender, on a NAK or timeout, resumes from the first missing sequence number; the reliable-connection recovery assumed in this chapter's forensic lab and in the model of <a href="#F5-37">F5-37</a>. <sup class="src"><a href="#F5-35-src-D1">D1</a></sup></dd>
+</dl>
+<p>Terms from earlier courses: <a href="#gl-mtu-maximum-transmission-unit">MTU (maximum transmission unit)</a> (DS201), <a href="#gl-infiniband-and-roce">InfiniBand and RoCE</a> and <a href="#gl-queue-pair-qp">queue pair</a> (HW205), and from <a href="#F5-34">F5-34</a> <a href="#gl-transport-offload">transport offload</a>.</p>
+</div>
+
+<h2 id="F5-35-pictures">The idea in pictures</h2>
+<p>Figure 1 stacks the three ways of carrying the same InfiniBand transport. The transport headers and the payload are identical; what changes is what carries them.</p>
+<figure id="F5-35-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F5-35-f1t F5-35-f1d">
+<title id="F5-35-f1t">Figure 1: native InfiniBand, RoCE v1 and RoCE v2 packet stacks</title>
+<desc id="F5-35-f1d">Three columns of stacked boxes, the outermost layer at the top. Native InfiniBand: local route header with LIDs, optional global route header with GIDs, base transport header, extended transport headers, payload, invariant CRC, variant CRC; carried on InfiniBand links and switches managed by a subnet manager, with credit-based link-level flow control. RoCE v1: Ethernet header with EtherType 0x8915, global route header, base transport header, extended headers, payload, invariant CRC, Ethernet frame check sequence; stays inside one Ethernet layer-2 network. RoCE v2: Ethernet header with EtherType IPv4 or IPv6, IP header, UDP header with destination port 4791, base transport header, extended headers, payload, invariant CRC, Ethernet frame check sequence; routable by IP routers. The transport rows are shaded the same in all three columns to show they are unchanged.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="20" y="24">InfiniBand (native)</text><text class="sv-tb" x="270" y="24">RoCE v1</text><text class="sv-tb" x="520" y="24">RoCE v2</text>
+<rect class="sv-b4" x="20" y="36" width="220" height="26" rx="4"/><text class="sv-t" x="30" y="54">LRH: local route header (LIDs)</text>
+<rect class="sv-b4" x="20" y="66" width="220" height="26" rx="4"/><text class="sv-t" x="30" y="84">GRH (GIDs), when routed</text>
+<rect class="sv-b4" x="270" y="36" width="220" height="26" rx="4"/><text class="sv-t" x="280" y="54">Ethernet, type 0x8915</text>
+<rect class="sv-b4" x="270" y="66" width="220" height="26" rx="4"/><text class="sv-t" x="280" y="84">GRH (GIDs), 40 bytes</text>
+<rect class="sv-b4" x="520" y="36" width="220" height="26" rx="4"/><text class="sv-t" x="530" y="54">Ethernet, type IPv4 / IPv6</text>
+<rect class="sv-b4" x="520" y="66" width="220" height="26" rx="4"/><text class="sv-t" x="530" y="84">IP header (+ UDP, port 4791)</text>
+<rect class="sv-b1" x="20" y="96" width="720" height="26" rx="4"/><text class="sv-t" x="30" y="114">BTH: opcode, partition key, destination QP, PSN (12 bytes) — identical in all three</text>
+<rect class="sv-b1" x="20" y="126" width="720" height="26" rx="4"/><text class="sv-t" x="30" y="144">extended transport headers when needed: RETH (address, key, length), AETH (ACK / NAK), …</text>
+<rect class="sv-b2" x="20" y="156" width="720" height="26" rx="4"/><text class="sv-t" x="30" y="174">payload: at most the path MTU (256 … 4096 bytes)</text>
+<rect class="sv-b1" x="20" y="186" width="720" height="22" rx="4"/><text class="sv-t" x="30" y="202">ICRC: invariant CRC (4 bytes), covers the fields that do not change on the way</text>
+<rect class="sv-b4" x="20" y="212" width="220" height="22" rx="4"/><text class="sv-t" x="30" y="228">VCRC (link CRC)</text>
+<rect class="sv-b4" x="270" y="212" width="220" height="22" rx="4"/><text class="sv-t" x="280" y="228">Ethernet FCS</text>
+<rect class="sv-b4" x="520" y="212" width="220" height="22" rx="4"/><text class="sv-t" x="530" y="228">Ethernet FCS</text>
+<text class="sv-ts" x="20" y="256">IB links and switches; SM;</text><text class="sv-ts" x="20" y="272">credit-based flow control</text>
+<text class="sv-ts" x="270" y="256">one Ethernet layer-2 network</text><text class="sv-ts" x="270" y="272">(not routable)</text>
+<text class="sv-ts" x="520" y="256">routable over IP;</text><text class="sv-ts" x="520" y="272">needs lossless class or congestion control</text>
+</svg></div><figcaption><b>Figure 1.</b> The same transport in three carriers. Layer structure after D1 and D2 (title only, pending verification) <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-D2">D2</a></sup>; the EtherType 0x8915, the UDP port 4791 and the RoCE header layouts as decoded by tshark 4.2.2 in R2 and R3 <sup class="src"><a href="#F5-35-src-R2">R2</a></sup> <sup class="src"><a href="#F5-35-src-R3">R3</a></sup>. The native InfiniBand column (LRH, VCRC) was not built or decoded in this lab. Box sizes are not to scale.</figcaption></figure>
+
+<p>Figure 2 is frame 1 of the lab, a RoCE v2 RDMA WRITE of 32 bytes, with every byte accounted for. The offsets are the ones printed by Listing 2's hexdump and confirmed by tshark.</p>
+<figure id="F5-35-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 230" role="img" aria-labelledby="F5-35-f2t F5-35-f2d">
+<title id="F5-35-f2t">Figure 2: byte layout of a 106-byte RoCE v2 RDMA WRITE Only frame</title>
+<desc id="F5-35-f2d">A horizontal bar divided into segments with byte offsets. Offset 0 to 13: Ethernet header, 14 bytes. Offset 14 to 33: IPv4 header, 20 bytes, with DSCP 26 and ECN 2. Offset 34 to 41: UDP header, 8 bytes, source port 49152, destination port 4791. Offset 42 to 53: base transport header, 12 bytes: opcode 0x0a, partition key 0xffff, destination QP 0x000011, acknowledge request set, PSN 5. Offset 54 to 69: RDMA extended transport header, 16 bytes: virtual address 0x00007f0000001000, remote key 0x00001234, DMA length 32. Offset 70 to 101: payload, 32 bytes, the text "DS401: written by an RDMA WRITE." Offset 102 to 105: invariant CRC placeholder, 4 bytes of zero. Total 106 bytes.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="230"/>
+<rect class="sv-b4" x="20" y="40" width="91" height="44"/><text class="sv-t" x="26" y="60">Ethernet</text><text class="sv-ts" x="26" y="77">14 B</text>
+<rect class="sv-b4" x="111" y="40" width="130" height="44"/><text class="sv-t" x="117" y="60">IPv4</text><text class="sv-ts" x="117" y="77">20 B, DSCP 26</text>
+<rect class="sv-b4" x="241" y="40" width="52" height="44"/><text class="sv-t" x="246" y="60">UDP</text><text class="sv-ts" x="246" y="77">8 B</text>
+<rect class="sv-b1" x="293" y="40" width="78" height="44"/><text class="sv-t" x="299" y="60">BTH</text><text class="sv-ts" x="299" y="77">12 B</text>
+<rect class="sv-b1" x="371" y="40" width="104" height="44"/><text class="sv-t" x="377" y="60">RETH</text><text class="sv-ts" x="377" y="77">16 B</text>
+<rect class="sv-b2" x="475" y="40" width="208" height="44"/><text class="sv-t" x="481" y="60">payload</text><text class="sv-ts" x="481" y="77">32 B</text>
+<rect class="sv-b1" x="683" y="40" width="26" height="44"/><text class="sv-ts" x="686" y="77">4</text>
+<text class="sv-ts" x="20" y="32">0</text><text class="sv-ts" x="105" y="32">14</text><text class="sv-ts" x="234" y="32">34</text><text class="sv-ts" x="286" y="32">42</text><text class="sv-ts" x="364" y="32">54</text><text class="sv-ts" x="468" y="32">70</text><text class="sv-ts" x="672" y="32">102</text><text class="sv-ts" x="706" y="32">106</text>
+<text class="sv-tm" x="20" y="112">UDP: 49152 -&gt; 4791, length 72, checksum 0</text>
+<text class="sv-tm" x="20" y="132">BTH: opcode 0x0a (RC RDMA WRITE Only), P_Key 0xffff, dest QP 0x000011, A=1, PSN 5</text>
+<text class="sv-tm" x="20" y="152">RETH: VA 0x00007f0000001000, R_Key 0x00001234, DMA length 32</text>
+<text class="sv-tm" x="20" y="172">payload: "DS401: written by an RDMA WRITE."   ICRC: 00 00 00 00 (not computed)</text>
+<text class="sv-ts" x="20" y="204">Widths are proportional to byte counts (6.5 px per byte). Ethernet preamble, gap and FCS are not in the capture.</text>
+</svg></div><figcaption><b>Figure 2.</b> Frame 1 of <code>roce_packet.out</code> <sup class="src"><a href="#F5-35-src-R1">R1</a></sup>, decoded by tshark in <code>dissect.out</code> <sup class="src"><a href="#F5-35-src-R2">R2</a></sup>. The ICRC is left as zero by the lab; a real adapter computes it (see the unverified box in Layer 3).</figcaption></figure>
+
+<p>Figure 3 is the forensic lab's situation: three senders write to one receiver at once (incast), and the switch port in front of the receiver has one lossless class and one lossy class.</p>
+<figure id="F5-35-fig3"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F5-35-f3t F5-35-f3d">
+<title id="F5-35-f3t">Figure 3: incast into a switch port with a lossless and a lossy traffic class</title>
+<desc id="F5-35-f3d">Three senders on the left, node-a, node-c and node-d, each with an arrow into a switch in the middle. node-a and node-c mark their packets with DSCP 26; node-d marks with DSCP 0. Inside the switch, the egress port towards node-b has two queues: class 3, lossless with PFC, fed by DSCP 26; and class 0, lossy, fed by every other DSCP. When class 3 fills, the switch sends a pause back to node-a and node-c, drawn as dashed arrows labelled pause. When class 0 fills, packets are dropped, drawn as a cross labelled drop. The receiver node-b is on the right.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<rect class="sv-b1" x="20" y="30" width="150" height="40" rx="6"/><text class="sv-t" x="30" y="50">node-a</text><text class="sv-ts" x="30" y="64">DSCP 26</text>
+<rect class="sv-b1" x="20" y="100" width="150" height="40" rx="6"/><text class="sv-t" x="30" y="120">node-c</text><text class="sv-ts" x="30" y="134">DSCP 26</text>
+<rect class="sv-b8" x="20" y="170" width="150" height="40" rx="6"/><text class="sv-t" x="30" y="190">node-d</text><text class="sv-ts" x="30" y="204">DSCP 0</text>
+<rect class="sv-box" x="270" y="20" width="250" height="210" rx="8"/><text class="sv-tb" x="282" y="40">switch, port to node-b</text>
+<rect class="sv-b5" x="290" y="60" width="210" height="50" rx="4"/><text class="sv-t" x="300" y="80">class 3: lossless (PFC on)</text><text class="sv-ts" x="300" y="98">full -&gt; send pause upstream</text>
+<rect class="sv-b6" x="290" y="150" width="210" height="50" rx="4"/><text class="sv-t" x="300" y="170">class 0: lossy (PFC off)</text><text class="sv-ts" x="300" y="188">full -&gt; drop the packet</text>
+<line class="sv-line2" x1="170" y1="50" x2="282" y2="80"/><polygon class="sv-head" points="280,74 290,82 278,85"/>
+<line class="sv-line2" x1="170" y1="120" x2="282" y2="92"/><polygon class="sv-head" points="276,88 290,90 280,98"/>
+<line class="sv-line2" x1="170" y1="190" x2="282" y2="176"/><polygon class="sv-head" points="279,170 290,175 280,181"/>
+<line class="sv-dash" x1="290" y1="66" x2="176" y2="36"/><polygon class="sv-head" points="178,30 170,34 180,40"/><text class="sv-ts" x="200" y="28">pause</text>
+<text class="sv-tb" x="508" y="182">X drop</text>
+<rect class="sv-b2" x="600" y="100" width="140" height="44" rx="6"/><text class="sv-t" x="612" y="120">node-b</text><text class="sv-ts" x="612" y="136">receiver</text>
+<line class="sv-line2" x1="520" y1="122" x2="592" y2="122"/><polygon class="sv-head" points="590,117 600,122 590,127"/>
+<text class="sv-ts" x="20" y="238">The mapping DSCP -&gt; class is switch configuration; the DSCP a sender uses is set per queue pair or per device.</text>
+</svg></div><figcaption><b>Figure 3.</b> The configuration of the forensic lab, from <code>incast.out</code> <sup class="src"><a href="#F5-35-src-R4">R4</a></sup>. PFC and DSCP-to-class mapping after D5 and D6 (title only, pending verification) <sup class="src"><a href="#F5-35-src-D5">D5</a></sup> <sup class="src"><a href="#F5-35-src-D6">D6</a></sup>. Arrows show the data flow; the dashed arrow is the flow-control signal. One pause arrow is drawn for both lossless senders.</figcaption></figure>
+
+<h2 id="F5-35-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Mapping (proposed for the F5 registry): InfiniBand = a private courier railway with its own tracks, stations and timetable office; the timetable office = the subnet manager; a station number = a LID; a full postal address = a GID; RoCE = couriers on the public roads, using ordinary envelopes (Ethernet, IP and UDP headers) around their own label (the transport headers); the painted lane with traffic lights = a lossless traffic class with priority flow control; "redeliver everything since the lost parcel" = go-back-N.</p></div>
+<p>Every RDMA packet carries a small label that says what it is (a write, a read, a reply), which desk it is for (the queue pair) and its number in the sequence. The label is the same whether the packet rides on InfiniBand or on Ethernet. On InfiniBand the network itself never throws packets away: a link sends only when the other end has said it has room. On Ethernet, switches drop packets when they are full, so a RoCE network must be set up so that RDMA packets get a lane where switches say "wait" instead, or the courier will spend its time redelivering.</p>
+
+<h2 id="F5-35-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F5-35-l2-layers">The InfiniBand architecture in four layers</h3>
+<p>The InfiniBand Architecture Specification defines a complete network, not only a protocol <sup class="src"><a href="#F5-35-src-D1">D1</a></sup>:</p>
+<ul>
+<li><b>Physical layer:</b> its own cables, connectors and signalling (line rates are product facts: read them in the adapter's and switch's datasheets, AH-21).</li>
+<li><b>Link layer:</b> packets switched inside one subnet by the destination LID in the Local Route Header; several virtual lanes per link; <b>credit-based flow control</b>: a port transmits on a virtual lane only when the receiver has advertised buffer space, so the fabric does not drop packets for lack of buffer <sup class="src"><a href="#F5-35-src-D1">D1</a></sup>.</li>
+<li><b>Network layer:</b> the Global Route Header with 128-bit GIDs, for routing between subnets <sup class="src"><a href="#F5-35-src-D1">D1</a></sup>.</li>
+<li><b>Transport layer:</b> queue pairs and transport services (reliable connection, unreliable connection, unreliable datagram, and reliable datagram), carried by the Base Transport Header and extended headers <sup class="src"><a href="#F5-35-src-D1">D1</a></sup>. The installed verbs header lists the queue-pair types <code>IBV_QPT_RC</code>, <code>IBV_QPT_UC</code>, <code>IBV_QPT_UD</code> among others <sup class="src"><a href="#F5-35-src-D3">D3</a></sup>.</li>
+</ul>
+<p>A <b>subnet manager</b> runs somewhere in the fabric (on a switch or a host). It discovers the topology, assigns LIDs, computes routes and writes forwarding tables into the switches. Until it has done so, ports do not reach the active state <sup class="src"><a href="#F5-35-src-D1">D1</a></sup>. The verbs interface shows the result to a program: <code>ibv_query_port</code> fills a <code>struct ibv_port_attr</code> whose fields include the port's <code>lid</code>, the subnet manager's <code>sm_lid</code>, the <code>active_mtu</code> and the <code>link_layer</code> (<code>IBV_LINK_LAYER_INFINIBAND</code> or <code>IBV_LINK_LAYER_ETHERNET</code>) <sup class="src"><a href="#F5-35-src-D3">D3</a></sup>.</p>
+<h3 id="F5-35-l2-bth">The transport headers, read from a real decoder</h3>
+<p>Listing 2 builds frames byte by byte and tshark decodes them (R2). The Base Transport Header of frame 1, bytes 42–53, reads <code>0a 00 ff ff 00 00 00 11 80 00 00 05</code>, which tshark decodes as <sup class="src"><a href="#F5-35-src-R1">R1</a></sup> <sup class="src"><a href="#F5-35-src-R2">R2</a></sup>:</p>
+<div class="tw"><table>
+<thead><tr><th>Bytes</th><th>Field (tshark's name)</th><th>Value</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>Opcode</td><td>0x0a</td><td>Reliable Connection (RC) – RDMA WRITE Only (10): top three bits 000 = RC, low five bits 01010 = WRITE Only</td></tr>
+<tr><td>1</td><td>Solicited Event, MigReq, Pad Count, Header Version</td><td>0x00</td><td>no event requested; no padding (the payload is a multiple of 4 bytes); version 0</td></tr>
+<tr><td>2–3</td><td>Partition Key</td><td>65535</td><td>0xffff, the partition used by the lab</td></tr>
+<tr><td>4</td><td>Reserved</td><td>00</td><td></td></tr>
+<tr><td>5–7</td><td>Destination Queue Pair</td><td>0x000011</td><td>24-bit QP number at the receiver</td></tr>
+<tr><td>8</td><td>Acknowledge Request, Reserved (7 bits)</td><td>0x80</td><td>A = 1: the responder should acknowledge</td></tr>
+<tr><td>9–11</td><td>Packet Sequence Number</td><td>5</td><td>24-bit PSN</td></tr>
+</tbody></table></div>
+<p>The opcode values are also in the installed rdma-core header <code>infiniband/opcode.h</code>: <code>IBV_OPCODE_RC = 0x00</code>, <code>IBV_OPCODE_UC = 0x20</code>, <code>IBV_OPCODE_UD = 0x60</code>, and within a group <code>IBV_OPCODE_RDMA_WRITE_FIRST = 0x06</code>, <code>…_MIDDLE = 0x07</code>, <code>…_LAST = 0x08</code>, <code>…_ONLY = 0x0a</code>, <code>IBV_OPCODE_SEND_ONLY = 0x04</code>, <code>IBV_OPCODE_ACKNOWLEDGE = 0x11</code> <sup class="src"><a href="#F5-35-src-D3">D3</a></sup>. Two independent artefacts (a header from the RDMA project and a decoder from the Wireshark project) agree with each other and with the bytes; neither is the specification, which remains the authority (D1).</p>
+<p>Extended transport headers follow the BTH when the opcode needs them <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-R2">R2</a></sup>:</p>
+<ul>
+<li><b>RETH</b> (RDMA Extended Transport Header, 16 bytes) on the first packet of an RDMA WRITE and on an RDMA READ request: Virtual Address (64 bits), Remote Key (32 bits), DMA Length (32 bits). This is where the remote key travels: the responder's adapter checks it against its registered regions (<a href="#F5-36">F5-36</a>).</li>
+<li><b>AETH</b> (ACK Extended Transport Header, 4 bytes) on acknowledgements: a syndrome byte and a 24-bit message sequence number. tshark decodes syndrome 0x00 as "Ack" with a credit count, and syndrome 0x60 as "Nak", error code "PSN Sequence Error" (frame 14 of the forensic capture) <sup class="src"><a href="#F5-35-src-R4">R4</a></sup>.</li>
+<li><b>ICRC</b> (invariant CRC, 4 bytes) at the end: a CRC over the parts of the packet that do not change in transit, so the end points can detect corruption that a per-link check would miss <sup class="src"><a href="#F5-35-src-D1">D1</a></sup>. The lab writes zeros; tshark shows "Invariant CRC: 0x00000000" without judging it.</li>
+</ul>
+<h3 id="F5-35-l2-roce">RoCE v1 and RoCE v2</h3>
+<p>RoCE keeps the InfiniBand transport and replaces the InfiniBand link layer with Ethernet <sup class="src"><a href="#F5-35-src-D2">D2</a></sup>. In version 1 the GRH (40 bytes, laid out like an IPv6 header with "Next Header" 0x1b for the InfiniBand transport) follows the Ethernet header directly; frame 3 of the lab is such a frame, with EtherType 0x8915, and tshark names that EtherType "RDMA over Converged Ethernet" <sup class="src"><a href="#F5-35-src-R2">R2</a></sup>. Because there is no IP header, RoCE v1 cannot cross an IP router. Version 2 replaces the GRH with a real IPv4 or IPv6 header plus a UDP header; the UDP destination port says "this is RoCE". tshark's built-in decode table maps UDP port 4791 and EtherType 35093 (0x8915) to its InfiniBand dissector <sup class="src"><a href="#F5-35-src-R3">R3</a></sup>. RoCE v2 packets are ordinary IP packets to every router and switch: they can be routed, hashed across links and classified by their DSCP field.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The UDP port 4791 and EtherType 0x8915 are confirmed here only as <i>what the Wireshark 4.2.2 dissector decodes</i> (a tier-4 source: "what this implementation does"), not from the RoCE v2 annex of the InfiniBand specification, which was not opened. Also not checked: the rule for the UDP source port (implementations may vary it per connection so that switches spread flows across paths), the requirement on the UDP checksum (the lab sends 0, which tshark accepts as "zero-value ignored"), and how the ICRC is computed over the masked IP and UDP fields. Read the annex for the release recorded in the dossier.</p></div>
+<h3 id="F5-35-l2-mtu">MTUs: two numbers that must agree</h3>
+<p>An RDMA connection has a path MTU, one of 256, 512, 1024, 2048 or 4096 bytes (<code>enum ibv_mtu</code> in the installed header, values <code>IBV_MTU_256 = 1</code> to <code>IBV_MTU_4096 = 5</code>) <sup class="src"><a href="#F5-35-src-D3">D3</a></sup>. It counts message payload per packet. On RoCE v2, each packet also carries IPv4 (20), UDP (8), BTH (12), ICRC (4) and, on the first packet of a WRITE, RETH (16) bytes, and the resulting IP packet must not exceed the Ethernet MTU of any link on the path (DS201's MTU counts the IP packet) <sup class="src"><a href="#F5-35-src-R1">R1</a></sup>. The lab's table:</p>
+<pre class="output" data-run="F5-35/roce_packet"></pre>
+<p>With the standard Ethernet MTU of 1500 bytes, 1024 is the largest RDMA path MTU that fits (its first packet is a 1084-byte IP packet; 2048 would need 2108). Raising the Ethernet MTU on every port of the path (a "jumbo" MTU; 9000 is used in the table only as an example, the maximum is in each device's datasheet) allows 4096. The payload share rises from 94.6 % to 98.6 % <sup class="src"><a href="#F5-35-src-R1">R1</a></sup>, and, more importantly, a message needs a quarter of the packets, so per-packet costs (adapter processing, acknowledgements, loss recovery) shrink too.</p>
+<h3 id="F5-35-l2-lossless">Why RoCE wants a lossless network</h3>
+<p>InfiniBand's link layer does not drop packets for lack of buffer, and its reliable transport was designed for that world <sup class="src"><a href="#F5-35-src-D1">D1</a></sup>. Ethernet switches drop when a queue is full. If an RDMA packet is dropped, the responder sees the next PSN out of order, discards it, and returns a NAK with the PSN it expected; the requester then resends from that PSN, including packets that had arrived (go-back-N) <sup class="src"><a href="#F5-35-src-D1">D1</a></sup>. Two families of remedies exist, and real deployments combine them <sup class="src"><a href="#F5-35-src-D5">D5</a></sup> <sup class="src"><a href="#F5-35-src-D6">D6</a></sup>:</p>
+<ul>
+<li><b>Make the class lossless:</b> classify RDMA traffic into one priority (by DSCP or VLAN priority), enable priority flow control on that priority on every port of the path, and give it buffer headroom; the switch pauses the upstream port instead of dropping.</li>
+<li><b>Avoid filling queues:</b> switches mark packets with Explicit Congestion Notification (ECN) when queues grow; the receiver tells the sender, and the sender's adapter lowers its rate.</li>
+</ul>
+<p>Both depend on configuration that must be consistent across hosts and switches. One host that marks its RDMA traffic with the wrong DSCP silently lands in a lossy class: that is the forensic lab.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Not checked in this build: the IEEE standard numbers and clause titles for priority-based flow control and enhanced transmission selection (cited by title only as D5); the name and details of the congestion-control algorithm that RoCE adapters implement in response to ECN (vendor documentation, D6); the DSCP value or priority a given vendor recommends for RoCE (the lab's DSCP 26 is the lab's own choice, which tshark labels "Assured Forwarding 31"); and the exact behaviour of a responder after a PSN gap (whether it NAKs once and then silently discards, as the lab assumes). These all need the InfiniBand specification, the RoCE v2 annex, the switch's and the adapter's documentation for the versions in use.</p></div>
+
+<h2 id="F5-35-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F5-35-l3-ib-vs-roce">Choosing between InfiniBand and RoCE</h3>
+<p>The two share the transport and the verbs interface, so applications port between them with small changes (mainly addressing: LIDs on InfiniBand, GIDs on RoCE, and the <code>is_global</code> flag of the address vector, <a href="#F5-36">F5-36</a>) <sup class="src"><a href="#F5-35-src-D3">D3</a></sup>. The differences are operational:</p>
+<div class="tw"><table>
+<thead><tr><th>Question</th><th>InfiniBand</th><th>RoCE v2</th></tr></thead>
+<tbody>
+<tr><td>Network equipment</td><td>InfiniBand switches and adapters; a separate fabric next to the Ethernet network</td><td>Ethernet switches and RoCE-capable adapters; can share the data-centre network</td></tr>
+<tr><td>Addressing and routing</td><td>LIDs from the subnet manager; GRH between subnets</td><td>IP addresses (GIDs derived from them); normal IP routing</td></tr>
+<tr><td>Loss</td><td>No drops for lack of buffer (credit-based link flow control)</td><td>Drops unless a lossless class or congestion control keeps queues short</td></tr>
+<tr><td>Management</td><td>Subnet manager must run; fabric tools</td><td>Switch QoS configuration (DSCP mapping, PFC, ECN) on every hop; host settings per adapter</td></tr>
+<tr><td>Failure modes</td><td>SM availability, cabling, link errors</td><td>Configuration mismatches between hosts and switches; pause storms and head-of-line blocking when PFC spreads congestion</td></tr>
+</tbody></table></div>
+<p>All rows come from the architecture's design (D1, D2, D5) and are pending verification; none is a statement about a product's performance <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-D2">D2</a></sup> <sup class="src"><a href="#F5-35-src-D5">D5</a></sup>.</p>
+<h3 id="F5-35-l3-pfc">The cost of making Ethernet lossless</h3>
+<p>Priority flow control works per link and per priority: a full queue pauses the whole upstream port's traffic in that priority, including flows that were not causing the congestion. Pauses can spread backwards through the network (congestion spreading), and a cycle of pauses between switches can stall a class entirely. A device that keeps sending pauses because it cannot receive (a stuck host) can block every RDMA flow that shares its upstream links. These are reasons to keep the lossless class small, use ECN-based rate control so that pauses are rare, and monitor pause counters on every port <sup class="src"><a href="#F5-35-src-D5">D5</a></sup> <sup class="src"><a href="#F5-35-src-D6">D6</a></sup>. There is also a third design point: adapters whose transport tolerates loss better (selective retransmission instead of go-back-N), which some vendors document; check the adapter's documentation before assuming either behaviour.</p>
+<h3 id="F5-35-l3-icrc">Two CRCs, and why the lab does not compute the ICRC</h3>
+<p>On InfiniBand a variant CRC protects each link hop and the invariant CRC protects the packet end to end; on RoCE the Ethernet frame check sequence plays the per-hop role <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-D2">D2</a></sup>. The ICRC for RoCE v2 is computed over the IP, UDP and transport headers with the fields that routers may change (such as the time-to-live, the DSCP/ECN byte and the checksums) replaced by ones. The lab writes zeros instead, because computing it correctly needs the exact mask and CRC parameters from the specification, which this build could not open; a real adapter would discard the lab's frames. That is acceptable for decoding practice and is why the lab's frames are "untested on hardware".</p>
+<h3 id="F5-35-l3-ecmp">Routing RoCE v2 in a data-centre network</h3>
+<p>Data-centre networks spread traffic across equal-cost paths by hashing header fields, often including the UDP source port. A RoCE v2 connection keeps its packets in order only if all its packets take the same path, so a connection uses one source port for its life; different connections may use different ports so that the network spreads them. Retransmissions after loss and reordering are both costly for go-back-N; adaptive per-packet routing, which can reorder, interacts badly with it. Treat these as design questions to settle with the network team and the adapter documentation (D6), not as facts this chapter has verified.</p>
+
+<h2 id="F5-35-hardware">How the hardware actually does it</h2>
+<p>The adapter does in hardware what the lab does in <code>packet.hpp</code>: for every packet of a message it builds Ethernet, IP, UDP and BTH headers from the queue pair's state (addresses, DSCP, destination QP number, next PSN), takes up to one path MTU of payload from host memory by DMA, computes the ICRC and the frame check sequence, and transmits. On receive it checks the CRCs, finds the queue pair from the destination QP field, checks the PSN against the expected one, and for a WRITE checks the remote key and bounds before writing the payload to host memory by DMA <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-D6">D6</a></sup>. Switches look only at the outer headers: Ethernet addresses, IP addresses, DSCP, UDP ports for hashing; to them RoCE v2 is ordinary UDP traffic, which is why classification by DSCP must be configured explicitly.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> No frame in this chapter was sent or received by an RDMA adapter or forwarded by a switch: the lab builds the bytes in C++ and decodes them with tshark from a capture file. The adapter's internal steps above are the chapter's reading of the architecture, not checked against any adapter's documentation. To test: two hosts with RoCE-capable adapters (or Soft-RoCE, the software implementation whose user-space provider <code>librxe</code> is installed in the build container but whose kernel driver is not available, <a href="#F5-36">F5-36</a>), a capture on a mirror port, and a comparison of real frames with Figure 2.</p></div>
+
+<h2 id="F5-35-worked">Worked example</h2>
+<p><b>Decode the first 54 bytes of frame 1 by hand, then compute how many packets and header bytes a 1 MiB RDMA WRITE needs at path MTU 1024 and 4096.</b></p>
+<pre><code>offset  bytes                                         field
+ 0      02 00 00 00 00 02  02 00 00 00 00 01  08 00   Ethernet: dst, src, type 0x0800 = IPv4
+14      45 6a 00 5c ...                               IPv4: version 4, IHL 5 (20 bytes);
+                                                      0x6a = 0110 1010: DSCP 011010 = 26, ECN 10
+        ... 00 5c                                     total length 0x5c = 92 = 20 + 72
+23      11                                            protocol 17 = UDP
+26      0a 00 00 01  0a 00 00 02                      10.0.0.1 -&gt; 10.0.0.2
+34      c0 00 12 b7 00 48 00 00                       UDP: 0xc000 = 49152 -&gt; 0x12b7 = 4791,
+                                                      length 0x48 = 72 = 8 + 12 + 16 + 32 + 4
+42      0a 00 ff ff 00 00 00 11 80 00 00 05           BTH (table in Layer 2)</code></pre>
+<p>Check: 0x12b7 = 1 × 4096 + 2 × 256 + 11 × 16 + 7 = 4096 + 512 + 176 + 7 = 4791. All values agree with tshark's decoding <sup class="src"><a href="#F5-35-src-R2">R2</a></sup>.</p>
+<p><b>A 1 MiB WRITE.</b> 1 MiB = 1,048,576 bytes.</p>
+<ul>
+<li>Path MTU 1024: 1,048,576 / 1024 = 1024 packets. Header bytes as captured: 1024 × 58 + 16 (one RETH) = 59,408. Payload share 1,048,576 / (1,048,576 + 59,408) = 94.6 %.</li>
+<li>Path MTU 4096: 256 packets; 256 × 58 + 16 = 14,864 header bytes; share 98.6 %.</li>
+</ul>
+<p>The shares match the table of R1. The packet count matters as much as the share: four times more packets means four times more per-packet work in both adapters and, as the forensic lab and <a href="#F5-37">F5-37</a> show, more packets in flight to resend after a drop.</p>
+
+<h2 id="F5-35-code">Code walk-through</h2>
+<p>Built and run by <code>university/labs/run_lab.sh university/labs/F5-35</code> (g++ with <code>-std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined</code>); its <code>run.sh</code> then decodes the capture files with tshark and deletes them. The field layouts in <code>packet.hpp</code> were written by the author and checked only by tshark's decoding (R2, R4), not against the specification.</p>
+<p><b>Listing 1</b> — <code>packet.hpp</code>: header builders and a pcap writer.</p>
+<pre class="listing" data-src="F5-35/packet.hpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–18</td><td><code>put8</code> … <code>put64</code>, <code>append</code></td><td>Append integers most-significant byte first.</td><td>All these headers are big-endian ("network byte order"), whatever the CPU (<a href="#F5-09">F5-09</a>).</td></tr>
+<tr><td>25–36</td><td><code>ethernet</code></td><td>Destination and source MAC (locally administered 02:00:…), then the EtherType.</td><td>0x0800 announces IPv4 (RoCE v2); 0x8915 announces RoCE v1.</td></tr>
+<tr><td>38–61</td><td><code>ipv4</code></td><td>20-byte header with DSCP and ECN in the second byte, protocol 17, and the header checksum computed as the ones'-complement sum.</td><td>The DSCP is what switches classify on (Figure 3); tshark checks the layout.</td></tr>
+<tr><td>63–71</td><td><code>udp</code></td><td>Source port, destination port, length, checksum 0.</td><td>Destination 4791 is what makes tshark (and adapters) treat the payload as RoCE.</td></tr>
+<tr><td>74–85</td><td><code>bth</code></td><td>Opcode; flags byte with the pad count; partition key 0xffff; reserved byte; 24-bit destination QP; A bit; 24-bit PSN.</td><td>Twelve bytes on every packet: the table in Layer 2.</td></tr>
+<tr><td>88–95</td><td><code>reth</code></td><td>64-bit virtual address, 32-bit remote key, 32-bit length.</td><td>Where the remote key travels on the wire.</td></tr>
+<tr><td>98–104</td><td><code>aeth</code></td><td>Syndrome byte and 24-bit message sequence number.</td><td>ACKs and NAKs: syndrome 0x00 = ACK, 0x60 = NAK PSN sequence error (R4).</td></tr>
+<tr><td>107</td><td><code>icrcPlaceholder</code></td><td>Four zero bytes.</td><td>Honest placeholder: the ICRC is not computed (Layer 3).</td></tr>
+<tr><td>110–120</td><td><code>roceV2</code></td><td>Wraps transport bytes in UDP, IPv4 and Ethernet with the right lengths.</td><td>The RoCE v2 column of Figure 1 in ten lines.</td></tr>
+<tr><td>122–159</td><td><code>PcapWriter</code></td><td>Writes the classic pcap file header (link type 1, Ethernet) and one record per frame, little-endian.</td><td>A file format tshark reads; lets you test decoders without a network.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>roce_packet.cpp</code>: three frames and the MTU table.</p>
+<pre class="listing" data-src="F5-35/roce_packet.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>31–32</td><td><code>payload</code></td><td>Exactly 32 ASCII bytes.</td><td>A multiple of 4, so the pad count stays 0.</td></tr>
+<tr><td>35–39</td><td>frame 1</td><td>BTH (RDMA WRITE Only, QP 0x11, PSN 5, A=1) + RETH + payload + ICRC, wrapped as RoCE v2 with DSCP 26.</td><td>Figure 2 and the worked example decode it.</td></tr>
+<tr><td>42–45</td><td>frame 2</td><td>BTH (Acknowledge, PSN 5) + AETH (syndrome 0, MSN 1) back to node A.</td><td>The responder's answer; no payload.</td></tr>
+<tr><td>48–64</td><td>frame 3</td><td>Ethernet with EtherType 0x8915, a 40-byte GRH (version 6, next header 0x1b, GIDs fe80::1 and fe80::2), BTH for SEND Only, 16 bytes, ICRC.</td><td>RoCE v1 for comparison: no IP, no UDP.</td></tr>
+<tr><td>66–69</td><td>pcap</td><td>Writes the three frames 5 us apart.</td><td>Input for tshark in <code>run.sh</code>.</td></tr>
+<tr><td>76–89</td><td>MTU table</td><td>Header sum, payload share and IP-packet size per path MTU, compared with Ethernet MTUs 1500 and 9000.</td><td>The arithmetic behind "1024 is the largest path MTU on a standard-MTU Ethernet".</td></tr>
+</tbody></table></div>
+<p><b>tshark's decoding of the three frames</b> (<code>tshark -r roce.pcap -V</code>, frame-metadata block removed):</p>
+<pre class="output" data-run="F5-35/dissect"></pre>
+<p><b>tshark's own decode table</b>, filtered for InfiniBand:</p>
+<pre class="output" data-run="F5-35/decodes"></pre>
+
+<h2 id="F5-35-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A railway timetable office is needed for every train. The subnet manager is needed to set the network up and to react to changes; packets flow without asking it each time.</li>
+<li>"The network never drops a parcel" is true of InfiniBand only for lack of buffer space. Bit errors, failed links and misconfiguration still lose packets, and the transport still has timeouts and retries <sup class="src"><a href="#F5-35-src-D1">D1</a></sup>.</li>
+<li>Traffic lights in a painted lane stop only the cars in that lane. A PFC pause stops a whole priority on a whole link, including innocent flows, and pauses can spread backwards through several switches (Layer 3).</li>
+<li>Couriers on public roads look like any other van only from outside. To a switch, RoCE v2 is ordinary UDP; nothing in the network "knows" it is RDMA unless someone configures a classification rule.</li>
+<li>A courier who loses parcel 102 could redeliver only 102. Whether an adapter resends only the missing packet or everything after it is a property of the transport and the adapter; this chapter assumes go-back-N.</li>
+</ul>
+
+<h2 id="F5-35-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Connection set-up fails or packets vanish only for large messages.</td><td>The RDMA path MTU does not fit the Ethernet MTU of some link.</td><td>Compare <code>active_mtu</code> (from <code>ibv_query_port</code>) with every interface's and switch port's MTU; the R1 table gives the IP-packet sizes.</td><td>Use a path MTU that fits, or raise the Ethernet MTU on the whole path.</td></tr>
+<tr><td>One host's RDMA traffic is retransmitted a lot; others are clean.</td><td>That host marks RDMA traffic with a DSCP that maps to a lossy class.</td><td>Capture on a mirror port; list DSCP per source (forensic lab).</td><td>Set the traffic class per QP or the device default to the lossless DSCP; audit all hosts.</td></tr>
+<tr><td>All RDMA flows through one switch stall for long periods.</td><td>PFC pauses spreading from one congested or stuck port.</td><td>Switch pause counters per port and priority; find the port that sends pauses.</td><td>Remove the stuck device; enable ECN-based rate control; limit the lossless class.</td></tr>
+<tr><td>tshark shows RoCE v2 traffic as plain UDP.</td><td>The traffic uses a UDP destination port other than the one the dissector knows.</td><td><code>tshark -G decodes</code> (R3); "Decode As" for the port in use.</td><td>Fix the sender, or tell the decoder which port to treat as RoCE.</td></tr>
+<tr><td>A hand-built test frame is ignored by a real adapter.</td><td>Zero or wrong ICRC (as in this lab), wrong partition key or QP number.</td><td>Adapter error counters; compare with a frame captured from real traffic.</td><td>Compute the ICRC as the specification defines it; use real QP numbers.</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F5-35-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> DS201 taught Ethernet, IP, UDP and TCP layers (<a href="#F5-02">F5-02</a>–<a href="#F5-04">F5-04</a>) and HW205 decoded captures with tshark (<a href="#F1-51">F1-51</a>); <a href="#F5-34">F5-34</a> explained why RDMA moves the transport into the adapter. <b>What carries over:</b> layering, headers in network byte order, MTU arithmetic, DSCP as a field switches classify on, and reading captures field by field <sup class="src"><a href="#F5-35-src-R2">R2</a></sup>. <b>What changes:</b> the transport is InfiniBand's (opcodes, queue-pair numbers, PSNs, NAKs) even on Ethernet; loss is no longer cheap, so the network must be configured for the traffic; and a capture on the host shows nothing, because the adapter, not the kernel, builds the packets <sup class="src"><a href="#F5-35-src-D1">D1</a></sup> <sup class="src"><a href="#F5-35-src-D2">D2</a></sup>. <b>What comes next:</b> <a href="#F5-36">F5-36</a> programs these packets through verbs: queue pairs, memory registration and the keys you saw in the RETH.</p></div>
+
+<h2 id="F5-35-check">Check yourself</h2>
+<ol>
+<li>Name the four layers of the InfiniBand architecture and one thing each does. Which one does RoCE replace?</li>
+<li>What does the subnet manager do, and which field of <code>struct ibv_port_attr</code> lets a program see that one exists?</li>
+<li>Decode by hand: the BTH bytes <code>06 00 ff ff 00 00 01 23 00 00 01 2c</code>. Give opcode (name), destination QP and PSN.</li>
+<li>Why can RoCE v2 cross IP routers and RoCE v1 cannot? Which bytes in the lab's frames show it?</li>
+<li>Apply to a new case: a cluster's Ethernet MTU is 4200 on every port. What is the largest RDMA path MTU that fits, and how many packets does a 64 KiB WRITE need?</li>
+<li>Explain in your own words why a dropped packet costs RoCE more than it costs TCP, and name the two families of remedies.</li>
+<li>A colleague says "PFC makes the network lossless, so we can turn it on for all traffic". Give two reasons this is a bad idea.</li>
+<li>Predict, then run: change the DSCP of frame 1 (line 39 of Listing 2) to 46. What does tshark print for the Differentiated Services field?</li>
+</ol>
+
+<h2 id="F5-35-lab">Lab</h2>
+<p><b>Goal.</b> Build RoCE frames byte by byte, decode them with tshark, and extend the builder with an RDMA READ exchange and a multi-packet WRITE whose PSNs and opcodes you predict before decoding.</p>
+<p><b>Hardware and software needed.</b> Linux with g++ (C++20) and tshark; no RDMA hardware. The build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> and <code>TShark (Wireshark) 4.2.2</code>. The frames are not sent on any network. <b>Safety:</b> none beyond normal computer use; do not inject hand-built frames into a production network.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F5-35</code> from the repository root; expect exit status 0 and the files <code>roce_packet.out</code>, <code>dissect.out</code>, <code>decodes.out</code>, <code>incast.out</code>, <code>incast_capture.out</code>, <code>nak_detail.out</code>.</li>
+<li>Compare <code>roce_packet.out</code>'s hex with <code>dissect.out</code> for frame 2. Write the AETH bytes and their meaning.</li>
+<li>Add a frame 4: an RDMA READ Request (look up the opcode in <code>/usr/include/infiniband/opcode.h</code>) with a RETH asking for 64 bytes; and a frame 5: the READ Response Only carrying 64 bytes back, with an AETH. Predict tshark's opcode names, then check.</li>
+<li>Add a 4-packet RDMA WRITE (First with RETH, two Middle, Last with A=1), path MTU 256, PSNs 40–43. Predict the UDP length of each packet; check with <code>tshark -r roce.pcap -T fields -e udp.length -e infiniband.bth.opcode -e infiniband.bth.psn</code>.</li>
+<li>Change the payload to 30 bytes and set the pad count so that the payload plus padding is a multiple of 4. What does tshark show?</li>
+<li>Extend the MTU table with a column "packets for 1 MiB" and check it against the worked example.</li>
+</ol>
+<p><b>Expected observations.</b> tshark decodes every lab frame as "InfiniBand" with the opcode names, QP numbers and PSNs you wrote (R2); the Differentiated Services field of frame 1 reads "0x6a (DSCP: AF31, ECN: ECT(0))"; the MTU table matches the worked example.</p>
+<p><b>Verification.</b> For each new frame, the fields printed by tshark equal your predictions; <code>run_lab.sh</code> still exits 0 with no sanitizer messages.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>tshark prints "Malformed Packet" → a length field disagrees with the bytes (IP total length, UDP length or GRH payload length); recompute them from the parts.</li>
+<li>tshark shows "Data" instead of "InfiniBand" → wrong UDP destination port or EtherType.</li>
+<li>Opcode decoded as a different transport (UC, UD) → the top three bits of the opcode select the transport group (Layer 2 table).</li>
+<li>Strange PSNs → a value was written with 16 bits instead of 24; use <code>put24</code>.</li>
+</ul>
+<p><b>Extension.</b> Write a decoder: read <code>roce.pcap</code> back in C++ and print the BTH fields yourself, then compare with tshark for every frame. Or build an Unreliable Datagram SEND (it needs a DETH extended header; find its layout in the specification, not from memory).</p>
+
+<h2 id="F5-35-forensic">Forensic lab</h2>
+<p><b>Scenario — "one sender is always slow".</b> Three nodes write to node-b at the same time in a storage benchmark. node-a and node-c finish together; node-d always finishes last and its adapter's retransmission counter grows. Everyone checked that node-d has "the same RoCE configuration". The operators collected a configuration report and mirrored node-b's switch port to a capture.</p>
+<p><b>Evidence pack.</b> (1) The configuration report:</p>
+<pre class="output" data-run="F5-35/incast"></pre>
+<p>(2) The capture as a field listing (time in seconds; opcode 6 = WRITE First, 7 = Middle, 8 = Last, 17 = Acknowledge; the last column is the AETH syndrome):</p>
+<pre class="output" data-run="F5-35/incast_capture"></pre>
+<p>(3) tshark's decoding of frame 14:</p>
+<pre class="output" data-run="F5-35/nak_detail"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>For each sender, list the PSNs seen in order. Which PSNs of which sender are missing the first time?</li>
+<li>What is frame 14, who sends it to whom, and what does its PSN mean?</li>
+<li>Which packets of node-d are sent twice? Which of them had already reached the mirror port before? What recovery scheme does this show?</li>
+<li>State at least two hypotheses for why only node-d loses packets, and say which evidence line decides between them.</li>
+<li>Give the fix, and one check that would have caught the problem before the benchmark.</li>
+</ol>
+<p><b>Method hints.</b> Sort the capture by source address; for each source write the PSN sequence and the DSCP column side by side; then read the configuration report's line about classes. Ask which packets the switch was allowed to drop.</p>
+
+<h2 id="F5-35-project">Mini-project</h2>
+<p><b>A RoCE frame checker.</b> Write a C++ tool that reads a pcap file and, for every RoCE v2 frame, checks: UDP destination port, IP total length versus UDP length versus transport bytes, BTH pad count versus payload length, PSN continuity per (source, destination QP), and DSCP against a list of allowed values given on the command line. It prints one line per anomaly. Test it on the lab's captures and on frames you break on purpose. <b>Rubric:</b> correct parsing verified against tshark 30 %; each check demonstrated with a frame that triggers it 30 %; clear anomaly messages 20 %; code quality and tests 20 %.</p>
+
+<h2 id="F5-35-summary">Summary</h2>
+<ul>
+<li>InfiniBand is a full network: physical and link layers with credit-based flow control, LIDs from a subnet manager, GIDs for routing, and a transport with queue pairs and several services.</li>
+<li>Every RDMA packet carries a 12-byte BTH (opcode, partition key, destination QP, PSN); RETH carries address, remote key and length; AETH carries ACKs and NAKs; the ICRC protects invariant fields.</li>
+<li>RoCE v1 puts the GRH and transport straight into Ethernet (EtherType 0x8915); RoCE v2 uses IP and UDP (port 4791) and is routable; tshark 4.2.2 decodes both.</li>
+<li>The RDMA path MTU (256–4096) counts payload; on RoCE the IP packet with all headers must fit the Ethernet MTU: 1024 is the largest on a 1500-byte MTU.</li>
+<li>Loss is expensive for RoCE (NAK and go-back-N), so RDMA traffic needs a lossless class (PFC) and/or ECN-based rate control, configured consistently on hosts and switches.</li>
+<li>Lossless Ethernet has its own failure modes: pauses hit innocent flows and can spread.</li>
+<li>Everything in this chapter was built and decoded in software; nothing ran on RDMA hardware.</li>
+</ul>
+
+<h2 id="F5-35-sources">Sources</h2>
+<ol>
+<li id="F5-35-src-D1">D1 — InfiniBand Trade Association, "InfiniBand Architecture Specification" (tier 1; curriculum reading-list item 81): architecture overview, link layer (local route header, virtual lanes, credit-based flow control, VCRC), network layer (GRH, GID), transport layer (BTH, RETH, AETH, ICRC, transport services, PSNs, ACK/NAK and retransmission), subnet management. <i>Title only — not opened during this build; the Source Researcher must confirm the release, volume and chapter titles (dossier gate G1 open).</i></li>
+<li id="F5-35-src-D2">D2 — InfiniBand Trade Association, the RoCE v2 annex to the InfiniBand Architecture Specification (tier 1; curriculum item 81 names it "RoCE v2 annex"): encapsulation in UDP/IP, UDP port, ICRC for RoCE. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-35-src-D3">D3 — rdma-core project, headers <code>infiniband/verbs.h</code> and <code>infiniband/opcode.h</code> as installed by Ubuntu package <code>libibverbs-dev</code> <code>50.0-2ubuntu0.2</code> (tier 2). <i>Opened in this build (2026-10-09): <code>enum ibv_mtu</code>, <code>enum ibv_port_state</code>, the link-layer enumeration, <code>struct ibv_port_attr</code> (<code>lid</code>, <code>sm_lid</code>, <code>active_mtu</code>, <code>link_layer</code>), <code>union ibv_gid</code>, <code>enum ibv_qp_type</code>, and the opcode values of <code>opcode.h</code>.</i></li>
+<li id="F5-35-src-D4">D4 — The Wireshark project, TShark (Wireshark) 4.2.2 as packaged by Ubuntu, its InfiniBand dissector (tier 4: "what this implementation does"). <i>Run in this build: field names and decodings in R2 and R4, decode table in R3.</i></li>
+<li id="F5-35-src-D5">D5 — IEEE 802.1Q, its clauses on priority-based flow control and enhanced transmission selection (tier 1); IETF RFCs on the Differentiated Services field and on Explicit Congestion Notification for IP (tier 1). <i>Title only — not opened during this build; the exact standard and clause numbers must be confirmed (dossier gate G1 open).</i></li>
+<li id="F5-35-src-D6">D6 — NVIDIA, "RDMA Aware Networks Programming User Manual" (tier 1 for vendor material) and the RoCE configuration documentation of the adapter in use (to be named in the dossier): RoCE deployment, lossless configuration, congestion control. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-35-src-R1">R1 — <code>university/labs/F5-35/roce_packet.log</code>: Listing 2 with Listing 1, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, Linux x86_64 cloud build container, exit code 0.</li>
+<li id="F5-35-src-R2">R2 — <code>university/labs/F5-35/dissect.log</code>: <code>TShark (Wireshark) 4.2.2</code>, <code>tshark -r roce.pcap -V</code>, exit code 0.</li>
+<li id="F5-35-src-R3">R3 — <code>university/labs/F5-35/decodes.log</code>: <code>tshark -G decodes</code> filtered for InfiniBand, exit code 0.</li>
+<li id="F5-35-src-R4">R4 — <code>university/labs/F5-35/incast.log</code>, <code>incast_capture.log</code>, <code>nak_detail.log</code>: the forensic generator and its tshark decodings, exit code 0 each.</li>
+</ol>
+
+<h2 id="F5-35-glossary">Glossary links</h2>
+<p><a href="#gl-subnet-manager-sm">Subnet manager (SM)</a> · <a href="#gl-lid-and-gid">LID and GID</a> · <a href="#gl-base-transport-header-bth">Base Transport Header (BTH)</a> · <a href="#gl-packet-sequence-number-psn">Packet sequence number (PSN)</a> · <a href="#gl-roce-v1-and-roce-v2">RoCE v1 and RoCE v2</a> · <a href="#gl-path-mtu-rdma">Path MTU (RDMA)</a> · <a href="#gl-lossless-traffic-class-and-priority-flow-control-pfc">Lossless traffic class and priority flow control (PFC)</a> · <a href="#gl-go-back-n">Go-back-N</a> · <a href="#gl-mtu-maximum-transmission-unit">MTU (maximum transmission unit)</a> · <a href="#gl-infiniband-and-roce">InfiniBand and RoCE</a></p>
+
+<h2 id="F5-35-next">Next chapter</h2>
+<p>Next: <a href="#F5-36">F5-36 Verbs, queue pairs and memory registration</a>. Previous: <a href="#F5-34">F5-34 Why RDMA</a>. Back to the course: <a href="#DS401">DS401</a>.</p>
+
+<h2 id="F5-35-answers">Answers to Check yourself</h2>
+<ol>
+<li>Physical (cables, signalling); link (LID switching inside a subnet, virtual lanes, credit-based flow control); network (GRH, GIDs, routing between subnets); transport (queue pairs, BTH and extended headers, reliability). RoCE replaces the physical and link layers with Ethernet (v2 also uses IP and UDP in place of the GRH).</li>
+<li>It discovers the fabric, assigns LIDs, computes routes and programs switch forwarding tables; <code>sm_lid</code> in <code>struct ibv_port_attr</code> holds the subnet manager's LID (and <code>state</code> shows whether the port became active).</li>
+<li>Opcode 0x06 = RC RDMA WRITE First; flags 0; P_Key 0xffff; destination QP 0x000123; A = 0; PSN 0x00012c = 300. (Compare with frame 3 of the forensic capture.)</li>
+<li>RoCE v2 packets are IP packets: routers forward them by the IP header (frame 1 bytes 14–33 and the UDP header at 34–41). RoCE v1 frames have EtherType 0x8915 and a GRH but no IP header (frame 3 bytes 12–13 = 89 15), so an IP router does not forward them.</li>
+<li>4096. The largest IP packet at path MTU 4096 is the first packet of a WRITE: 20 + 8 + 12 + 16 + 4096 + 4 = 4156 bytes, which is not more than 4200, so it fits (R1 table). A 64 KiB WRITE then needs 65,536 / 4096 = 16 packets. (Distractor: answering 2048 by reading only the "fits 1500 / fits 9000" columns; compute with the actual MTU.)</li>
+<li>With go-back-N, one drop makes the responder discard everything after the gap, and the requester resends from the missing PSN, so one drop costs a whole window of packets; TCP with selective acknowledgements resends mostly the missing segments. Remedies: make the RDMA class lossless (PFC with DSCP classification and headroom) and keep queues short with ECN-based rate control.</li>
+<li>Pauses stop every flow of that priority on a link, including innocent ones, and can spread backwards and stall large parts of the network; traffic that tolerates loss (most TCP) gains nothing and adds pause pressure. Also, more lossless traffic needs more buffer headroom on every switch.</li>
+<li>46 is 101110 in binary; with ECN 10 the byte is 1011 1010 = 0xba. A scratch run made while writing this chapter (the same frame with DSCP 46, decoded by the same tshark 4.2.2; not one of the recorded lab runs) printed "Differentiated Services Field: 0xba (DSCP: EF PHB, ECN: ECT(0))" and "Expedited Forwarding (46)". Also the IP header checksum changes, because the second byte changed.</li>
+</ol>
+<h3 id="F5-35-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> node-a (10.0.0.1): PSN 100–105 in order, ACK for 105 (frame 16). node-c (10.0.0.3): 200–205 in order, ACK for 205 (frame 18). node-d (10.0.0.4): 300, 301, then 304 (frame 13) — 302 and 303 never reached the port the first time. Frame 14 is from node-b to node-d: an Acknowledge with AETH syndrome 96 = 0x60, which tshark decodes as "Nak", error code "PSN Sequence Error", with PSN 302: "I expected 302" <sup class="src"><a href="#F5-35-src-R4">R4</a></sup>. node-d's 305 still arrives (frame 19, discarded by the receiver after the gap), then node-d resends 302, 303, 304, 305 (frames 20–23) and gets an ACK for 305 (frame 24). 304 and 305 were sent twice although they had reached the receiver: go-back-N.</p>
+<p><b>Hypotheses.</b> (1) node-d's link or cable is faulty: possible, but a faulty link would not drop exactly the packets in the middle of the incast burst only; the capture alone cannot rule it out, the switch's error counters could. (2) node-d's traffic is in a different class: the DSCP column shows 0 for every node-d packet and 26 for node-a and node-c, and the configuration says "DSCP 26 -&gt; class 3 lossless; all other DSCP -&gt; class 0 (lossy, PFC off)". During incast, the lossless class pauses senders, while the lossy class drops. (3) node-d's path MTU differs: ruled out, the report shows 1024 for all three. (4) The receiver is slow for node-d's QP: ruled out, the receiver ACKs and NAKs promptly.</p>
+<p><b>Root cause.</b> node-d's queue pairs use traffic class (DSCP) 0, not 26, so its RDMA packets go to the lossy class and are dropped under incast; go-back-N then resends everything after each drop.</p>
+<p><b>Fix and check.</b> Set node-d's RoCE traffic class to DSCP 26 (per QP through the address vector's traffic class, or the adapter's default for RDMA traffic; the exact setting is in the adapter documentation, D6). Prevention: a fleet audit that compares each host's RoCE settings with the switch's classification, and an alert on NAK or retransmission counters per host.</p>
+<p><b>How the evidence was produced.</b> <code>incast.cpp</code> is a scripted replay, not a simulation: it writes the configuration report and a capture in which, for senders whose DSCP is not the lossless one, the 3rd and 4th packets of the burst are left out ("dropped before the mirror port"); the receiver's NAK and the go-back-N resend follow the rules assumed in Layer 2. All frames are built by <code>packet.hpp</code> and decoded by tshark 4.2.2; nothing was sent on a network.</p>

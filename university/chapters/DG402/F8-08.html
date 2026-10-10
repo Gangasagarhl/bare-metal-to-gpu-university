@@ -1,0 +1,347 @@
+<!--meta
+id: F8-08
+title: GPU-aware MPI
+course: DG402
+level: L4
+prereqs: F8-07; F8-04 (topology: PCIe, NVLink, xGMI); CU201 (F6-04 kernels and copies, F6-05 error checking); HW301 (pinned memory and the alpha-beta model); DS401 (F5-38 kernel bypass and zero copy)
+time: 10–14 hours including the lab and the course forensic lab
+hardware: for the full lab, one machine with one or more NVIDIA GPUs (or AMD GPUs for the ROCm variant) and an MPI library built with GPU support, or a cloud GPU instance; the probes, the staging benchmark and the forensic lab need only Open MPI and g++ (this build: Open MPI 4.1.6 without CUDA support, CUDA 12.0 nvcc, no GPU)
+maps: Curriculum Track F, milestone F4 (MPI and GPU-aware MPI): device buffers, "know when the MPI library stages through host memory", OSU benchmarks with device buffers; reading-list items 77 and 83; DG402 course forensic "Staging through host memory"
+analogy: F8 — a chain of kitchen halls with a delivery service between them (new mappings proposed in NOTES.md: host staging = carrying crates from the hall's pantry out to the loading dock before the van can take them; GPU-aware MPI = a delivery crew allowed to recognise pantry crates and fetch them itself)
+-->
+
+<h2 id="F8-08-hook">Story hook</h2>
+<p>In the chain of kitchen halls, the delivery vans load only at the loading dock behind each hall. The ingredients, though, live in the pantry deep inside, where the cooks work. For years every hall did the same dance: a helper carried the crate from the pantry to the dock, the van drove it to the next hall, and a helper there carried it from the dock into that hall's pantry.</p>
+<p>Then the delivery company announced a new crew: they recognise pantry crates and fetch them themselves, sometimes straight from pantry to pantry. Halls that had signed up for the new crew found their deliveries much quicker. One hall, run by Ingrid, signed the same contract but saw no change at all. Her deliveries arrived intact and on time by the old schedule, every single one. Only when someone compared her delivery times with the time of "walk to the dock, drive, walk from the dock" did the truth come out: her contract had never been activated, and her helpers were still carrying every crate by hand, quietly and correctly.</p>
+<p>Correct but slow is the hardest kind of bug to see. This chapter teaches you how to ask an MPI library whether it can take GPU memory directly, how to stage correctly when it cannot, and how to read the logs that tell you which one actually happened.</p>
+
+<h2 id="F8-08-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what a GPU-aware (CUDA-aware or ROCm-aware) MPI library does with a device pointer, and the three paths a GPU buffer can take between ranks.</li>
+<li><b>Query</b> an MPI library for GPU support at compile time and at run time, and read its build configuration (<code>ompi_info</code>, the transport modules installed).</li>
+<li><b>Write</b> a halo exchange with device buffers that uses device pointers when the library supports them and stages correctly through pinned host memory when it does not.</li>
+<li><b>Measure</b> the cost of staging with a latency and bandwidth benchmark, and predict it with the alpha-beta model.</li>
+<li><b>Diagnose</b> the course forensic case "Staging through host memory": find, from benchmark results and logs, that the library was built without GPU support.</li>
+</ul>
+
+<div class="co jargon" id="F8-08-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>GPU-aware MPI (CUDA-aware, ROCm-aware)</dt><dd><b>Simple words:</b> an MPI library that accepts the address of GPU memory in its send and receive calls and moves the data itself. <b>Analogy:</b> the delivery crew that recognises pantry crates and fetches them. <b>Precise:</b> an MPI implementation that detects device pointers passed as buffers (for NVIDIA GPUs through CUDA's unified virtual addressing and pointer-attribute queries) and moves the data with GPU-capable transports: peer copies or inter-process handles inside a node, GPUDirect RDMA or pipelined staging between nodes. Support is a build-time property of the library (and of its transport layer). The MPI Standard itself does not mention GPUs. <sup class="src"><a href="#F8-08-src-D2">D2</a></sup> <sup class="src"><a href="#F8-08-src-D5">D5</a></sup> <sup class="src"><a href="#F8-08-src-C1">C1</a></sup></dd>
+<dt>Host staging</dt><dd><b>Simple words:</b> copying GPU data into ordinary computer memory, sending that, and copying it back into the other GPU. <b>Analogy:</b> carrying the crate from the pantry to the loading dock and back in at the other end. <b>Precise:</b> a device-to-host copy into a (preferably pinned) host buffer, a host-to-host MPI transfer, and a host-to-device copy at the receiver; done by the application when the library is not GPU-aware, or by the library internally (often in pipelined chunks) when no direct GPU path exists. <sup class="src"><a href="#F8-08-src-C1">C1</a></sup> <sup class="src"><a href="#F8-08-src-D2">D2</a></sup></dd>
+<dt>Unified virtual addressing (UVA)</dt><dd><b>Simple words:</b> host and GPU memory share one range of addresses, so a pointer alone tells you where the memory is. <b>Analogy:</b> every crate in every room has a unique shelf number, so the crew knows from the number whether it is in the pantry or on the dock. <b>Precise:</b> a CUDA feature in which host and device allocations of a process occupy one virtual address space; <code>cudaPointerGetAttributes</code> returns a <code>cudaPointerAttributes</code> whose type is one of <code>cudaMemoryTypeUnregistered</code>, <code>cudaMemoryTypeHost</code>, <code>cudaMemoryTypeDevice</code> or <code>cudaMemoryTypeManaged</code> (enum in the installed <code>driver_types.h</code>). <sup class="src"><a href="#F8-08-src-H2">H2</a></sup> <sup class="src"><a href="#F8-08-src-D5">D5</a></sup></dd>
+<dt>MCA parameter (Open MPI)</dt><dd><b>Simple words:</b> a named setting of Open MPI that you can read and change without recompiling. <b>Analogy:</b> a switch on the delivery company's control panel. <b>Precise:</b> a parameter of Open MPI's Modular Component Architecture, set with <code>mpirun --mca &lt;name&gt; &lt;value&gt;</code> or the environment, and listed with its value, source and help text by <code>ompi_info</code>; read-only parameters such as <code>mpi_built_with_cuda_support</code> report how the library was built. <sup class="src"><a href="#F8-08-src-D2">D2</a></sup> <sup class="src"><a href="#F8-08-src-R2">R2</a></sup></dd>
+<dt>UCX (Unified Communication X)</dt><dd><b>Simple words:</b> a communication library that many MPI libraries use underneath to reach the network and the GPUs. <b>Analogy:</b> the company that owns the vans and the road permits, hired by the delivery service. <b>Precise:</b> an open-source communication framework with transports for shared memory, TCP, InfiniBand/RoCE verbs and GPU memory, loaded as modules; Open MPI can use it as its point-to-point layer (this build was configured <code>--with-ucx</code>, R2). <sup class="src"><a href="#F8-08-src-D4">D4</a></sup> <sup class="src"><a href="#F8-08-src-R2">R2</a></sup></dd>
+<dt>OSU Micro-Benchmarks</dt><dd><b>Simple words:</b> a standard set of small MPI test programs that measure latency and bandwidth between ranks. <b>Analogy:</b> timing a test parcel of each size between two halls. <b>Precise:</b> a benchmark suite from Ohio State University (curriculum reading-list item 83) whose point-to-point and collective tests can place buffers in host or device memory; milestone F4 asks for their device-buffer results "logged next to host-buffer results". <sup class="src"><a href="#F8-08-src-D3">D3</a></sup> <sup class="src"><a href="#F8-08-src-C1">C1</a></sup></dd>
+</dl></div>
+
+<h2 id="F8-08-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the three paths a GPU buffer can take from rank 0 to rank 1. Figure 2 shows what the library does with the pointer you pass, and where the answer "GPU-aware or not" is decided.</p>
+<figure id="F8-08-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F8-08-f1t F8-08-f1d">
+<title id="F8-08-f1t">Figure 1: three paths for a GPU buffer between two ranks</title>
+<desc id="F8-08-f1d">Three horizontal lanes. Lane A, application staging with a library that is not GPU-aware: GPU memory of rank 0, arrow labelled cudaMemcpy device to host to a pinned host buffer, arrow labelled MPI_Send of a host pointer through the transport to rank 1's pinned host buffer, arrow labelled cudaMemcpy host to device into rank 1's GPU memory; three steps one after another. Lane B, GPU-aware library that stages internally: the application passes the device pointer; inside the library, chunks are copied to host, sent and copied back, with the chunks overlapping in a pipeline. Lane C, GPU-aware library with a direct path: the application passes the device pointer and the data move from GPU memory to GPU memory by peer copy inside a node or by GPUDirect RDMA through the network card between nodes, with no host copy.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="16" y="22">A. Library not GPU-aware: the application stages (Listing 3, "staged")</text>
+<rect class="sv-b5" x="16" y="34" width="100" height="40" rx="6"/><text class="sv-ts" x="24" y="52">rank 0 GPU</text><text class="sv-ts" x="24" y="66">memory dU</text>
+<rect class="sv-b3" x="196" y="34" width="110" height="40" rx="6"/><text class="sv-ts" x="204" y="52">pinned host</text><text class="sv-ts" x="204" y="66">buffer hStage</text>
+<rect class="sv-b3" x="446" y="34" width="110" height="40" rx="6"/><text class="sv-ts" x="454" y="52">pinned host</text><text class="sv-ts" x="454" y="66">buffer hStage</text>
+<rect class="sv-b5" x="636" y="34" width="100" height="40" rx="6"/><text class="sv-ts" x="644" y="52">rank 1 GPU</text><text class="sv-ts" x="644" y="66">memory dU</text>
+<line class="sv-line" x1="116" y1="54" x2="192" y2="54"/><polygon class="sv-head" points="186,49 186,59 194,54"/><text class="sv-ts" x="122" y="88">1. D2H copy</text>
+<line class="sv-line" x1="306" y1="54" x2="442" y2="54"/><polygon class="sv-head" points="436,49 436,59 444,54"/><text class="sv-ts" x="314" y="88">2. MPI on host pointers</text>
+<line class="sv-line" x1="556" y1="54" x2="632" y2="54"/><polygon class="sv-head" points="626,49 626,59 634,54"/><text class="sv-ts" x="562" y="88">3. H2D copy</text>
+<text class="sv-tb" x="16" y="126">B. GPU-aware library, staging inside the library (no direct path)</text>
+<rect class="sv-b5" x="16" y="138" width="100" height="40" rx="6"/><text class="sv-ts" x="24" y="162">device pointer</text>
+<rect class="sv-b2" x="150" y="138" width="460" height="40" rx="6"/>
+<rect class="sv-b3" x="160" y="146" width="60" height="10"/><rect class="sv-b4" x="222" y="146" width="80" height="10"/><rect class="sv-b3" x="304" y="146" width="60" height="10"/>
+<rect class="sv-b3" x="222" y="160" width="60" height="10"/><rect class="sv-b4" x="284" y="160" width="80" height="10"/><rect class="sv-b3" x="366" y="160" width="60" height="10"/>
+<text class="sv-ts" x="440" y="162">chunks: copy | send | copy,</text><text class="sv-ts" x="440" y="174">overlapped (pipeline)</text>
+<rect class="sv-b5" x="636" y="138" width="100" height="40" rx="6"/><text class="sv-ts" x="644" y="162">device pointer</text>
+<line class="sv-line" x1="116" y1="158" x2="146" y2="158"/><polygon class="sv-head" points="140,153 140,163 148,158"/>
+<line class="sv-line" x1="610" y1="158" x2="632" y2="158"/><polygon class="sv-head" points="626,153 626,163 634,158"/>
+<text class="sv-tb" x="16" y="222">C. GPU-aware library with a direct path: no host copy</text>
+<rect class="sv-b5" x="16" y="234" width="100" height="40" rx="6"/><text class="sv-ts" x="24" y="258">device pointer</text>
+<rect class="sv-b5" x="636" y="234" width="100" height="40" rx="6"/><text class="sv-ts" x="644" y="258">device pointer</text>
+<line class="sv-line" x1="116" y1="254" x2="632" y2="254"/><polygon class="sv-head" points="626,249 626,259 634,254"/>
+<text class="sv-ts" x="150" y="248">same node: peer copy or inter-process handle over PCIe or NVLink (F8-04)</text>
+<text class="sv-ts" x="150" y="272">two nodes: GPUDirect RDMA, the network card reads and writes GPU memory (F8-09)</text>
+<text class="sv-ts" x="16" y="310">Arrows are data flow. Box widths and arrow lengths are not to scale and say nothing about time.</text>
+</svg></div><figcaption><b>Figure 1.</b> The three paths. This build's library is not GPU-aware (R1, R2), so Listing 3 takes path A; paths B and C need a library built with GPU support and are untested here. The idea of paths B and C follows the curriculum's Track F concept table and the Open MPI, UCX and NVIDIA GPUDirect documentation named in the Sources (pending verification). <sup class="src"><a href="#F8-08-src-C1">C1</a></sup> <sup class="src"><a href="#F8-08-src-D2">D2</a></sup> <sup class="src"><a href="#F8-08-src-D6">D6</a></sup></figcaption></figure>
+
+<figure id="F8-08-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F8-08-f2t F8-08-f2d">
+<title id="F8-08-f2t">Figure 2: what happens to a device pointer inside MPI</title>
+<desc id="F8-08-f2d">A vertical stack. Top: the application calls MPI_Send with a buffer pointer. Next box: the MPI library. A decision diamond asks: was the library built with GPU support? If no, the library treats the pointer as host memory and its CPU code reads it; with a device pointer this is an invalid access, and the run fails or reads garbage. If yes, a second box asks the CUDA runtime about the pointer (unified virtual addressing); if the pointer is host memory, the normal host path is used; if it is device memory, the library picks a GPU-capable transport: peer or IPC copy inside the node, GPUDirect RDMA if the network and drivers allow, otherwise pipelined staging. On the right, the places where the answer can be read: MPIX_CUDA_AWARE_SUPPORT in mpi-ext.h at compile time, MPIX_Query_cuda_support at run time, ompi_info parameters mpi_built_with_cuda_support, the configure command line, and the transport modules installed.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<rect class="sv-b1" x="16" y="16" width="330" height="34" rx="6"/><text class="sv-t" x="26" y="38">application: MPI_Send(buf, n, type, …)</text>
+<line class="sv-line" x1="180" y1="50" x2="180" y2="70"/><polygon class="sv-head" points="175,64 185,64 180,72"/>
+<polygon class="sv-b6" points="180,74 340,104 180,134 20,104"/><text class="sv-ts" x="96" y="100">built with GPU</text><text class="sv-ts" x="104" y="114">support?</text>
+<line class="sv-line" x1="20" y1="104" x2="20" y2="170"/><polygon class="sv-head" points="15,164 25,164 20,172"/><text class="sv-ts" x="26" y="152">no</text>
+<rect class="sv-b8" x="16" y="174" width="150" height="70" rx="6"/><text class="sv-ts" x="24" y="192">pointer treated as</text><text class="sv-ts" x="24" y="206">host memory: CPU</text><text class="sv-ts" x="24" y="220">reads a device address</text><text class="sv-ts" x="24" y="234">→ crash or garbage</text>
+<line class="sv-line" x1="340" y1="104" x2="372" y2="104"/><polygon class="sv-head" points="366,99 366,109 374,104"/><text class="sv-ts" x="342" y="96">yes</text>
+<rect class="sv-b2" x="376" y="84" width="170" height="40" rx="6"/><text class="sv-ts" x="384" y="102">ask the GPU runtime:</text><text class="sv-ts" x="384" y="116">host or device? (UVA)</text>
+<line class="sv-line" x1="460" y1="124" x2="460" y2="160"/><polygon class="sv-head" points="455,154 465,154 460,162"/>
+<rect class="sv-b5" x="196" y="164" width="350" height="80" rx="6"/><text class="sv-ts" x="206" y="182">device memory → choose a GPU-capable transport:</text><text class="sv-ts" x="206" y="198">same node: peer copy / IPC handle</text><text class="sv-ts" x="206" y="214">other node: GPUDirect RDMA if NIC, drivers allow</text><text class="sv-ts" x="206" y="230">otherwise: pipelined staging inside the library</text>
+<rect class="sv-b4" x="566" y="16" width="180" height="228" rx="6"/>
+<text class="sv-tb" x="576" y="36">Where to read it</text>
+<text class="sv-ts" x="576" y="58">compile time:</text><text class="sv-tm" x="576" y="74">MPIX_CUDA_AWARE_SUPPORT</text>
+<text class="sv-ts" x="576" y="96">run time:</text><text class="sv-tm" x="576" y="112">MPIX_Query_cuda_support()</text>
+<text class="sv-ts" x="576" y="134">ompi_info parameter:</text><text class="sv-tm" x="576" y="150">mpi_built_with_cuda_support</text>
+<text class="sv-ts" x="576" y="172">configure command line</text>
+<text class="sv-ts" x="576" y="194">transport modules installed</text>
+<text class="sv-ts" x="576" y="216">(Open MPI names; other</text><text class="sv-ts" x="576" y="230">libraries: their own docs)</text>
+<text class="sv-ts" x="16" y="270">Control flow (arrows) inside the library, simplified. This build answers "no" at the diamond (R1, R2).</text>
+<text class="sv-ts" x="16" y="288">The branches on the "yes" side are not observed in this build.</text>
+</svg></div><figcaption><b>Figure 2.</b> Decision flow for a buffer pointer. The names in the right-hand box were read from this build's installed headers and <code>ompi_info</code> (H1, R1, R2); the "yes" branch is described from the curriculum's concept table and the documentation named in the Sources, pending verification. <sup class="src"><a href="#F8-08-src-H1">H1</a></sup> <sup class="src"><a href="#F8-08-src-R2">R2</a></sup> <sup class="src"><a href="#F8-08-src-D2">D2</a></sup> <sup class="src"><a href="#F8-08-src-D5">D5</a></sup></figcaption></figure>
+
+<h2 id="F8-08-layer1">Layer 1 — the kid explanation</h2>
+<p>Inside each kitchen hall, the food is in the pantry, and the vans only load at the dock. If the delivery crew does not know about pantries, a helper must carry each crate out to the dock first, and another helper carries it back in at the other end. That works, but it adds two walks to every delivery.</p>
+<p>A smarter crew knows what a pantry crate looks like. You hand them the pantry shelf number, and they work out the fastest way: straight across a corridor to a pantry in the same building, or with a special van that can load right inside the pantry.</p>
+<p>The catch is that you must know which crew you hired. If you hand a pantry shelf number to the old crew, they go to the dock, find nothing there, and get confused. So before you hand over a pantry number, you ask: "are you the smart crew?" If not, you carry the crate to the dock yourself.</p>
+
+<h2 id="F8-08-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F8-08-l2-what">What "GPU-aware" means</h3>
+<p>MPI calls take a buffer address. Without GPU support, the library assumes that address is host memory and lets the CPU read or write it, through <code>memcpy</code>, through the kernel's socket calls or through a network card registration. A device pointer from <code>cudaMalloc</code> is not host memory, so passing it to such a library is an error, and what happens next depends on the code path. <sup class="src"><a href="#F8-08-src-D2">D2</a></sup> <sup class="src"><a href="#F8-08-src-D5">D5</a></sup> A GPU-aware library checks each buffer: with CUDA's unified virtual addressing, the pointer's value alone identifies host or device memory, and the runtime call <code>cudaPointerGetAttributes</code> reports which (the installed header lists the memory types). <sup class="src"><a href="#F8-08-src-H2">H2</a></sup> For device memory it uses a path that can reach the GPU (Figure 1, B and C). <sup class="src"><a href="#F8-08-src-D2">D2</a></sup> The MPI Standard does not define any of this; it is an implementation feature, so you must ask the library you have. <sup class="src"><a href="#F8-08-src-D1">D1</a></sup></p>
+<h3 id="F8-08-l2-ask">Asking Open MPI</h3>
+<p>Open MPI answers in three places, and this build gives the same answer in all three (Listing 1 and the build report):</p>
+<ul>
+<li><b>Compile time.</b> The header <code>mpi-ext.h</code> includes Open MPI's "cuda" extension, whose generated header defines <code>MPIX_CUDA_AWARE_SUPPORT</code>. In this installation the line reads <code>#define MPIX_CUDA_AWARE_SUPPORT 0</code>. <sup class="src"><a href="#F8-08-src-H1">H1</a></sup></li>
+<li><b>Run time.</b> The same header declares <code>int MPIX_Query_cuda_support(void)</code>; Listing 1 prints its value, 0 (R1). <sup class="src"><a href="#F8-08-src-H1">H1</a></sup> <sup class="src"><a href="#F8-08-src-R1">R1</a></sup> The run-time answer matters because one compiled program may meet a different library at run time (a container image, a module system).</li>
+<li><b>Build report.</b> <code>ompi_info</code> lists the read-only parameters <code>mpi_built_with_cuda_support</code> and <code>opal_built_with_cuda_support</code>, both <code>false</code>, with the help text "Whether CUDA GPU buffer support is built into library or not", and the full configure command line (R2). <sup class="src"><a href="#F8-08-src-R2">R2</a></sup></li>
+</ul>
+<pre class="output" data-run="F8-08/aware_probe"></pre>
+<pre class="output" data-run="F8-08/ompi_build"></pre>
+<p>Read the build report like an engineer: the configure options include <code>--with-ucx</code>, <code>--with-verbs</code>, <code>--with-libfabric</code>, <code>--with-psm2</code> and <code>--with-slurm</code>, but no option that names CUDA or ROCm; and the UCX module folder holds transports for cross-memory attach (<code>libuct_cma</code>), InfiniBand (<code>libuct_ib</code>) and the RDMA connection manager (<code>libuct_rdmacm</code>), plus a ROCm module for UCX's own performance test, but no CUDA transport module. <sup class="src"><a href="#F8-08-src-R2">R2</a></sup> Each line is consistent with "this library cannot take device pointers"; together they are proof.</p>
+<h3 id="F8-08-l2-stage">Staging correctly</h3>
+<p>When the library is not GPU-aware, the application stages (Figure 1, A): copy the outgoing data from the device into a host buffer, call MPI on the host buffer, copy the received data back into device memory. Listing 3 does this for the halo exchange of <a href="#F8-07">F8-07</a> with three rules: <sup class="src"><a href="#F8-08-src-D5">D5</a></sup></p>
+<ol>
+<li><b>Use pinned host memory</b> for the staging buffers (<code>cudaMallocHost</code>). Pageable memory forces the driver to copy through its own pinned staging area first (the installed CUDA header says pageable copies use "staging memory for DMA transfer", as quoted in the glossary entry from <a href="#F1-62">F1-62</a>), adding a hidden third copy. <sup class="src"><a href="#F8-08-src-H2">H2</a></sup></li>
+<li><b>Order the work.</b> The kernel that produced the boundary cells must have finished before the device-to-host copy, and the host-to-device copy must have finished before the next kernel reads the halos. Listing 3 uses the default stream and <code>cudaDeviceSynchronize</code> (line 152) for clarity; <a href="#F8-11">F8-11</a> replaces that with streams and events.</li>
+<li><b>Decide once, log it.</b> Listing 3 decides "aware" or "staged" at start-up from <code>MPIX_Query_cuda_support()</code> and prints the decision. The forensic lab is about the day nobody read that line.</li>
+</ol>
+<p>On a GPU-aware library the same program passes <code>dU + 1</code> directly (lines 124–127). Even then MPI is not stream-aware: an MPI call on a device buffer does not wait for kernels you launched, so the program must synchronize (or wait on an event) before handing the buffer to MPI, exactly as before a host copy. <sup class="src"><a href="#F8-08-src-D2">D2</a></sup></p>
+<h3 id="F8-08-l2-cost">What staging costs</h3>
+<p>In the alpha-beta model, a staged message of m bytes costs one device-to-host copy, one transfer and one host-to-device copy: t<sub>staged</sub> ≈ (α<sub>c</sub> + m/β<sub>c</sub>) + (α<sub>n</sub> + m/β<sub>n</sub>) + (α<sub>c</sub> + m/β<sub>c</sub>), where c is the copy and n the network or shared-memory transport. For small m the two extra α<sub>c</sub> terms dominate; for large m the two extra m/β<sub>c</sub> terms do. <sup class="src"><a href="#F8-08-src-D7">D7</a></sup> Listing 2 measures the shape of this on the CPU: in its "staged" mode every transfer is preceded and followed by a <code>memcpy</code> through a separate bounce buffer. Both buffers are host memory here, so the copies are CPU copies, not PCIe transfers: this is a model of the structure, not a GPU measurement. In this run the ratio staged/direct stays near 1 up to 32 KiB and grows to 1.45 at 128 KiB, 2.31 at 2 MiB and 3.35 at 8 MiB (R4). <sup class="src"><a href="#F8-08-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F8-08/pingpong_staging"></pre>
+<p>The numbers are noisy (other jobs share this container's CPUs) and they are CPU numbers. What carries over to real GPUs is the method: run the same benchmark with host buffers and with device buffers and log them side by side, as milestone F4 requires; if the device curve equals "host curve plus two copies", the library or the application is staging. <sup class="src"><a href="#F8-08-src-C1">C1</a></sup></p>
+
+<h2 id="F8-08-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: a crew that recognises pantry crates still needs a road, a door and a key for every pantry, and each of those is a separate piece of software that must be built and configured. GPU awareness is a property of a whole stack, not of one library.</p>
+<h3 id="F8-08-l3-stack">The stack that must agree</h3>
+<ul>
+<li><b>The MPI library</b> must be built with GPU support (in Open MPI, a configure option naming the CUDA installation; for ROCm, the corresponding option or a GPU-aware UCX). <sup class="src"><a href="#F8-08-src-D2">D2</a></sup></li>
+<li><b>The transport layer</b> (UCX, libfabric, or the library's own transports) must be built with its GPU modules, or device buffers fall back to staging or fail. <sup class="src"><a href="#F8-08-src-D4">D4</a></sup></li>
+<li><b>The GPU driver and the network driver</b> must support the direct path: peer access between GPUs in a node (<a href="#F8-04">F8-04</a>), and for GPUDirect RDMA a kernel module that lets the network card's driver register GPU memory (<a href="#F8-09">F8-09</a>). <sup class="src"><a href="#F8-08-src-D6">D6</a></sup></li>
+<li><b>The topology</b> decides whether the direct path is fast: a network card and a GPU behind the same PCIe switch behave differently from a pair whose traffic crosses the CPU's root complex (<a href="#F8-04">F8-04</a>). <sup class="src"><a href="#F8-08-src-D6">D6</a></sup></li>
+</ul>
+<p>Other MPI libraries expose the same capability with different switches and queries (MVAPICH, MPICH with its GPU support, vendor MPIs); their documentation is the source for each, never the Open MPI names above. <sup class="src"><a href="#F8-08-src-D2">D2</a></sup></p>
+<h3 id="F8-08-l3-force">Asking for what was not built</h3>
+<p>Open MPI has a writable parameter <code>mpi_cuda_support</code> next to the read-only <code>mpi_built_with_cuda_support</code> (R2). Setting the writable one cannot add what the build left out. The lab runs Listing 1 with <code>--mca mpi_cuda_support 1</code> on this library: each process prints Open MPI's own help message, "The user requested CUDA support with the --mca mpi_cuda_support 1 flag but the library was not compiled with any support." (the same text is in the installed help file <code>help-mpi-runtime.txt</code>), and both processes then die with a segmentation fault; mpirun reports exit code 139 (R3). <sup class="src"><a href="#F8-08-src-R3">R3</a></sup> <sup class="src"><a href="#F8-08-src-H1">H1</a></sup> The crash after the message was not investigated further (the backtrace has no symbols); the lesson is the message, which names the cause in one sentence.</p>
+<pre class="output" data-run="F8-08/force_cuda"></pre>
+<h3 id="F8-08-l3-semantics">Semantics you must keep in mind</h3>
+<ul>
+<li><b>No stream ordering.</b> MPI calls are not enqueued on CUDA streams; synchronize the producing stream (or an event) before the call, and do not launch a consumer kernel before the receive has completed. <sup class="src"><a href="#F8-08-src-D2">D2</a></sup></li>
+<li><b>Managed memory</b> (<code>cudaMallocManaged</code>) is reported as <code>cudaMemoryTypeManaged</code> (H2) and may be handled differently from plain device memory by different libraries; check the library's documentation before passing it. <sup class="src"><a href="#F8-08-src-H2">H2</a></sup></li>
+<li><b>Which GPU.</b> A rank must select its device (<code>cudaSetDevice</code>) before allocating or calling MPI on device buffers; Listing 3 uses <code>rank % devices</code>, which is wrong when ranks of several nodes are numbered consecutively but each node has its own GPUs. <a href="#F8-10">F8-10</a> uses a node-local rank from <code>MPI_Comm_split_type</code>.</li>
+<li><b>Collectives</b> on device buffers are allowed by GPU-aware libraries, but the library may implement the reduction arithmetic on the CPU (staging the data) or on the GPU; NCCL and RCCL (<a href="#F8-06">F8-06</a>) are built for device-resident collectives and are often used alongside MPI for exactly that reason. <sup class="src"><a href="#F8-08-src-D2">D2</a></sup> <sup class="src"><a href="#F8-08-src-D8">D8</a></sup></li>
+</ul>
+<h3 id="F8-08-l3-osu">The OSU benchmarks with device buffers</h3>
+<p>Milestone F4's acceptance test asks for "OSU latency and bandwidth benchmarks with device buffers run on one node and the results are logged next to host-buffer results". The benchmarks take options that place the send and receive buffers in host or device memory per side; build them against the same MPI library and GPU toolkit you will use. <sup class="src"><a href="#F8-08-src-D3">D3</a></sup> <sup class="src"><a href="#F8-08-src-C1">C1</a></sup> The OSU Micro-Benchmarks are not installed in this build, so Listing 2 stands in for them, with its own output format.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Written from memory, not checked against the documents in this build: that Open MPI's CUDA support is enabled with a configure option of the form <code>--with-cuda</code> (check the Open MPI installation documentation of your version); that UCX needs its CUDA transport module and that such a module exists under a name like <code>libuct_cuda</code> (check the UCX documentation; this build has no such module, R2); how a GPU-aware library detects device pointers internally; the ROCm-aware equivalents; and the OSU Micro-Benchmarks' command-line options for device buffers (check the OSU documentation; the options differ between versions). The only facts observed here are R1–R5 and the installed headers H1, H2.</p></div>
+
+<h2 id="F8-08-hardware">How the hardware actually does it</h2>
+<p>A staged message crosses the PCIe link between GPU and host twice per side (out of the sender's GPU, into the receiver's), each time carried by a DMA engine on the GPU (the copy engines of <a href="#F6-29">F6-29</a>) into or out of pinned host memory, plus the transfer between host buffers by the CPU (shared memory) or the network card (<a href="#F1-52">F1-52</a>). <sup class="src"><a href="#F8-08-src-D5">D5</a></sup> Inside one node, a GPU-aware library can instead map the peer GPU's memory (inter-process handles) and let a GPU copy engine move the data directly over PCIe or NVLink, as your peer-copy matrix in <a href="#F8-04">F8-04</a> measured. <sup class="src"><a href="#F8-08-src-D5">D5</a></sup> Between nodes, GPUDirect RDMA lets the network card read the sender's GPU memory and write the receiver's directly over PCIe, so host memory is not touched at all; <a href="#F8-09">F8-09</a> covers what that requires. <sup class="src"><a href="#F8-08-src-D6">D6</a></sup> None of these hardware paths exists in the build container: no GPU, no RDMA device. The CUDA listing is built for real and its run stops at the runtime's own error.</p>
+
+<h2 id="F8-08-worked">Worked example</h2>
+<p><b>Predict the staging penalty, then compare with R4.</b> Take Listing 2's 2 MiB row (2,097,152 bytes). The direct one-way time measured 225.33 µs (R4), so the transport moved about 2,097,152 / 225.33 µs ≈ 9.3 GB/s. The staged mode adds per one-way trip one copy on the sending side and one on the receiving side (rank 1 even does two, Listing 2 lines 37–38, because it stages both its receive and its reply). If a CPU <code>memcpy</code> of 2 MiB took about as long as the transfer itself (both are memory copies on this machine), two extra copies would roughly triple the time; the measurement says 521.55 µs, a ratio of 2.31. At 8 KiB the ratio is 1.01: the copies are tiny compared with the per-message cost.</p>
+<p><b>The same reasoning for a GPU</b>, with symbols instead of numbers (no GPU was available to measure): for m bytes, t<sub>staged</sub> − t<sub>direct</sub> ≈ 2α<sub>c</sub> + 2m/β<sub>c</sub>. With your own measured α<sub>c</sub> and β<sub>c</sub> from the CU201 bandwidth lab (<a href="#F6-09">F6-09</a>), write the predicted penalty for 8 KiB and 8 MiB into your lab record before running the OSU benchmarks; at small sizes expect the 2α<sub>c</sub> term to dominate, at large sizes the 2m/β<sub>c</sub> term. <a href="#F8-09">F8-09</a> adds pipelining, which hides most of the copy time for large messages.</p>
+
+<h2 id="F8-08-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>aware_probe.cc</code>: ask the library (output in Layer 2, R1).</p>
+<pre class="listing" data-src="F8-08/aware_probe.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>6</td><td><code>#include &lt;mpi-ext.h&gt;</code></td><td>Open MPI's extension header.</td><td>Declares the CUDA query only in Open MPI; other libraries have no such header (guard with <code>#if</code>).</td></tr>
+<tr><td>16–19</td><td><code>MPI_Get_library_version</code></td><td>Prints which library is linked at run time.</td><td>Evidence for the log: the library you compiled against may not be the one you run.</td></tr>
+<tr><td>21–25</td><td><code>MPIX_CUDA_AWARE_SUPPORT</code></td><td>The compile-time answer (0 here, H1).</td><td>Fixed when the header was generated at build time.</td></tr>
+<tr><td>27–33</td><td><code>MPIX_Query_cuda_support()</code></td><td>The run-time answer (0 here, R1).</td><td>The one to trust when a binary moves between systems.</td></tr>
+<tr><td>34–36</td><td>decision</td><td>Prints which path the application should take.</td><td>A log line that must be read, not ignored.</td></tr>
+</tbody></table></div>
+<p><b>Build and run:</b> <code>mpic++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -DOMPI_SKIP_MPICXX aware_probe.cc -o aware_probe</code>, then <code>mpirun --allow-run-as-root --oversubscribe -np 2 ./aware_probe</code> (from <code>aware_probe.log</code>).</p>
+
+<p><b>Listing 2</b> — <code>pingpong_staging.cc</code>: direct versus staged ping-pong, a CPU model of staging (output in Layer 2, R4).</p>
+<pre class="listing" data-src="F8-08/pingpong_staging.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–21</td><td><code>wire</code></td><td>The buffer MPI sees: the application buffer (direct) or the bounce buffer (staged).</td><td>The only difference between the two modes is where MPI reads and writes.</td></tr>
+<tr><td>22–23</td><td><code>MPI_Barrier</code>, <code>MPI_Wtime</code></td><td>Start both ranks together; read the clock.</td><td>Without the barrier, one rank's start-up skews the first iterations.</td></tr>
+<tr><td>26–33</td><td><code>memcpy</code> before send, after receive</td><td>Rank 0's staging copies, standing in for D2H and H2D.</td><td>Two extra copies per round trip on this side.</td></tr>
+<tr><td>35–40</td><td>rank 1</td><td>Receive, copy out and back in, reply.</td><td>Rank 1 also stages, as a GPU rank would.</td></tr>
+<tr><td>44</td><td>divide by 2·iters</td><td>One-way time.</td><td>Ping-pong measures round trips.</td></tr>
+<tr><td>58–66</td><td>sizes ×4, median of 9</td><td>8 B to 8 MiB; median of nine repetitions per mode.</td><td>A shared container is noisy; the median resists outliers.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>halo_device.cc</code>: the stencil of <a href="#F8-07">F8-07</a> with the grid in GPU memory; CUDA source compiled with <code>nvcc -x cu</code> (the <code>.cc</code> name only keeps the generic lab runner, which links no MPI, from building it).</p>
+<pre class="listing" data-src="F8-08/halo_device.cc"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -x cu -std=c++17 -O2 -lineinfo -Werror all-warnings -DOMPI_SKIP_MPICXX $(mpicxx --showme:compile) halo_device.cc -o halo_device -L/usr/lib/x86_64-linux-gnu/openmpi/lib -lmpi</code>, then <code>mpirun --allow-run-as-root --oversubscribe -np 2 ./halo_device</code>. <code>mpicxx --showme:compile</code> prints the include flags the wrapper would add, so nvcc compiles against the same headers.</p>
+<pre class="output" data-run="F8-08/halo_device"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The build is real and warning-free; the run printed the decision "halo path: staged" (correct for this library) and then stopped at <code>cudaGetDeviceCount</code> with <code>cudaErrorNoDevice</code> on both ranks (R5). On a machine with GPUs the program should print the same hash as <a href="#F8-07">F8-07</a>'s CPU version, <code>9fef6c9047951684</code>, because the kernel uses the non-contracting <code>_rn</code> intrinsics in the CPU's operation order; that equality has not been observed. The aware path (lines 124–127) has never run.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>42–49</td><td><code>heatStep</code></td><td>One thread per owned cell; same arithmetic and order as the CPU.</td><td><code>__dadd_rn</code>, <code>__dsub_rn</code>, <code>__dmul_rn</code> carry the installed header's "note_nofma" marker: they are not fused into multiply-adds, so bits can match the CPU (H2).</td></tr>
+<tr><td>76–82</td><td>path decision</td><td>Aware only if the header and the run-time query both say so; <code>--force-staged</code> overrides.</td><td>Lets you measure both paths on a GPU-aware library.</td></tr>
+<tr><td>89–91</td><td><code>cudaSetDevice(rank % devices)</code></td><td>One GPU per rank.</td><td>Correct on one node only; <a href="#F8-10">F8-10</a> uses a node-local rank.</td></tr>
+<tr><td>106–109</td><td><code>cudaMalloc</code>, initial copies</td><td>Grid and its copy in device memory, halos included.</td><td>Both buffers start identical so the swap is safe.</td></tr>
+<tr><td>113–114</td><td><code>cudaMallocHost</code></td><td>Four pinned doubles for staging.</td><td>Pinned: no hidden driver staging copy.</td></tr>
+<tr><td>124–127</td><td>aware exchange</td><td>Device pointers straight into <code>MPI_Sendrecv</code>.</td><td>Valid only on a GPU-aware library.</td></tr>
+<tr><td>129–140</td><td>staged exchange</td><td>D2H of the two boundary cells, host <code>MPI_Sendrecv</code>, H2D into the halos.</td><td>Figure 1, path A.</td></tr>
+<tr><td>149–152</td><td>launch, check, synchronize</td><td>Kernel on the default stream; error check; wait.</td><td>MPI is not stream-aware: the next exchange must not start before the kernel ends.</td></tr>
+<tr><td>158–172</td><td>copy back, gather, hash</td><td>Same output format as <a href="#F8-07">F8-07</a>.</td><td>Direct comparison with the CPU hash.</td></tr>
+</tbody></table></div>
+
+<h2 id="F8-08-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The old crew does not just "get confused"; the program fails.</b> Handing a device pointer to a library that is not GPU-aware is an invalid memory access by the CPU, which can crash or silently read something else. The story's gentle confusion understates it.</li>
+<li><b>"Smart crew" is not one switch.</b> The analogy suggests one contract. In reality the MPI library, its transport layer, both drivers and the topology must all support the direct path; any missing piece silently turns path C into path B or A (Layer 3).</li>
+<li><b>Carrying crates is not always the slow option.</b> For tiny messages the per-message costs dominate and staging adds little (ratio 1.01 at 8 KiB in R4); for some topologies a pipelined staged path can rival a direct one (<a href="#F8-09">F8-09</a>). The story suggests the walk is always the problem.</li>
+<li><b>Pantry and dock are separate rooms; UVA addresses are not.</b> With unified virtual addressing, host and device addresses come from one address range; the "where is it" question is answered from the pointer value by the runtime, not by the shape of a crate.</li>
+</ul>
+
+<h2 id="F8-08-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Segmentation fault inside an MPI call with a device buffer</td><td>Library not GPU-aware</td><td>Listing 1; <code>ompi_info --parsable --all | grep cuda_support</code> (R1, R2)</td><td>Stage (Listing 3), or install a GPU-aware build</td></tr>
+<tr><td>Device-buffer bandwidth equals host bandwidth "plus two copies"</td><td>Staging: by the application's fallback or inside the library</td><td>Log host and device results side by side (R4); read the decision line and the build report</td><td>GPU-aware build with the direct transport; then re-measure</td></tr>
+<tr><td>Wrong halo values, no error</td><td>MPI called before the producing kernel finished</td><td>Insert <code>cudaDeviceSynchronize</code> before the call: if results change, it was a race</td><td>Synchronize the stream or wait on an event before MPI</td></tr>
+<tr><td>Help message "requested CUDA support … not compiled" (R3)</td><td>Writable parameter set on a library built without support</td><td>Read the message; compare with <code>mpi_built_with_cuda_support</code></td><td>Remove the parameter, or rebuild the library</td></tr>
+<tr><td>All ranks of a node use GPU 0</td><td>Device chosen from the global rank on several nodes</td><td>Print <code>cudaGetDevice</code> and host name per rank</td><td>Use the node-local rank (<a href="#F8-10">F8-10</a>)</td></tr>
+<tr><td>Staging slower than expected</td><td>Pageable host buffers</td><td>Profiler timeline: copies without overlap; check the allocation call</td><td><code>cudaMallocHost</code> or register the buffer</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F8-08-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F8-07">F8-07</a> exchanged halos with host buffers; <a href="#F8-04">F8-04</a> measured how GPUs in one machine reach each other; CU201 taught explicit copies and error checks (<a href="#F6-04">F6-04</a>, <a href="#F6-05">F6-05</a>). <b>What carries over:</b> the MPI calls, the safe exchange pattern, the bit-exact hash as a test, and the habit of checking every return code. <sup class="src"><a href="#F8-08-src-D1">D1</a></sup> <b>What changes:</b> the buffer may live in device memory, and whether MPI may touch it is a build-time property of the library that you must query (R1, R2); MPI does not see CUDA streams, so you order kernels and MPI calls yourself; and the same correct program can be fast or slow depending on a path you do not see unless you log and measure it. <sup class="src"><a href="#F8-08-src-H1">H1</a></sup> <sup class="src"><a href="#F8-08-src-D2">D2</a></sup> <b>What comes next:</b> <a href="#F8-09">F8-09</a> takes the exchange to two machines: the network, RDMA, and the direct path from network card to GPU memory.</p></div>
+
+<h2 id="F8-08-check">Check yourself</h2>
+<ol>
+<li>Name three places where you can find out whether an Open MPI installation is CUDA-aware, and the value each shows in this build.</li>
+<li>Explain in your own words why MPI cannot simply "look at" a pointer and know it is a device pointer unless it was built with GPU support.</li>
+<li>Which statement is true? (a) Setting <code>--mca mpi_cuda_support 1</code> makes any Open MPI CUDA-aware. (b) A GPU-aware MPI waits for kernels on the buffer's stream before sending. (c) A program compiled with <code>MPIX_CUDA_AWARE_SUPPORT</code> = 1 may still run with a library that is not CUDA-aware. (d) Staging always doubles the time of a message.</li>
+<li>In Listing 3, what goes wrong if line 152 (<code>cudaDeviceSynchronize</code>) is deleted and the library is GPU-aware? And if it is not?</li>
+<li>Predict, then run: Listing 2 with only 1 KiB and 16 MiB messages. Which ratio do you expect for each, and why?</li>
+<li>Apply to a new case: an AMD GPU cluster with a ROCm-aware MPI. Which three questions do you ask before passing a <code>hipMalloc</code> pointer to <code>MPI_Send</code>, and where do you look for each answer?</li>
+<li>Using the alpha-beta model, write the extra time of a staged message of m bytes. Which term dominates at 8 KiB and which at 8 MiB?</li>
+<li>Why does Listing 3 use pinned memory for only four doubles, when the copies are so small? Would pageable memory be wrong or only slower?</li>
+</ol>
+
+<h2 id="F8-08-lab">Lab</h2>
+<p><b>Goal.</b> Milestone F4: "Point-to-point and collective MPI with device buffers; know when the MPI library stages through host memory." Build: "A GPU-aware MPI build; a halo-exchange (stencil) example that sends device buffers between ranks." <sup class="src"><a href="#F8-08-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–3: Open MPI and g++ only (this build: <code>mpirun (Open MPI) 4.1.6</code>, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>Cuda compilation tools, release 12.0, V12.0.140</code>; no GPU). Steps 4–7: one machine with two or more NVIDIA GPUs (or a cloud instance), the CUDA toolkit and driver (record both), an Open MPI built with CUDA support (record its <code>ompi_info</code>), and the OSU Micro-Benchmarks built against both. Folder <code>university/labs/F8-08</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use. Building MPI from source on a shared cluster: install into your own prefix, never over the system's MPI.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F8-08</code>. Compare <code>aware_probe.out</code>, <code>ompi_build.out</code>, <code>force_cuda.out</code>, <code>pingpong_staging.out</code> and <code>halo_device.out</code> with this chapter.</li>
+<li>Run Listing 1 against every MPI installation you can reach (cluster modules, containers). Record the three answers for each.</li>
+<li>Predict the staged/direct ratio of Listing 2 at 32 MiB from the 2 MiB and 8 MiB rows; add 32 MiB to the size loop and check.</li>
+<li>On a GPU machine with a CUDA-aware MPI: run Listing 1 (expect 1 and 1), then Listing 3 on 2 ranks with and without <code>--force-staged</code>. Both must print hash <code>9fef6c9047951684</code>.</li>
+<li>Time 500 steps of each path with <code>MPI_Wtime</code> (median of 20 runs after warm-up, <a href="#F6-06">F6-06</a>).</li>
+<li>Run the OSU latency and bandwidth tests on one node with host buffers and with device buffers on both sides; put the four curves in one table.</li>
+<li>Repeat step 6 with the same benchmark binary against a non-GPU-aware MPI, if the benchmark offers a staging option, and compare with your prediction from the worked example.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: R1 prints 0 and 0 and the decision "stage device buffers through host memory yourself"; R2 shows <code>false</code> for all four cuda_support parameters and no CUDA option or module; R3 prints the help message and exit code 139; R4 shows a staged/direct ratio near 1 for small messages, rising for large ones (2.31 at 2 MiB, 3.35 at 8 MiB in this run); R5 prints "halo path: staged" and then <code>cudaErrorNoDevice</code>. On a GPU machine, steps 4–7: your numbers, labelled "measured on &lt;GPUs, driver, toolkit, MPI build, date&gt;" (AH-23). Nothing in steps 4–7 has been observed in this build.</p>
+<p><b>Verification.</b> The milestone's acceptance tests, verbatim: "OSU latency and bandwidth benchmarks with device buffers run on one node and the results are logged next to host-buffer results." and "The stencil gives the same answer on 1, 2 and 4 ranks." For the second, run Listing 3 on 1, 2 and 4 ranks and compare hashes with <a href="#F8-07">F8-07</a>. Also: Compute Sanitizer reports no errors for each rank (<a href="#F6-05">F6-05</a>). <sup class="src"><a href="#F8-08-src-C1">C1</a></sup></p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Listing 1 prints 1 at compile time but 0 at run time → the binary runs against a different library → check <code>MPI_Get_library_version</code> and the dynamic linker's search path.</li>
+<li>Crash in <code>MPI_Sendrecv</code> on the aware path → the run-time library is not CUDA-aware, or the device pointer came from another device → print the run-time query and the current device per rank.</li>
+<li>Hash differs from the CPU's → fused multiply-adds (did you replace the <code>_rn</code> intrinsics?) or a missing synchronization → compile with <code>-fmad=false</code> as a test and add the synchronization back.</li>
+<li><code>nvcc</code> cannot find <code>mpi.h</code> → missing include flags → use <code>$(mpicxx --showme:compile)</code> as in the log.</li>
+</ul>
+<p><b>Extension.</b> Replace the per-cell staging copies by one <code>cudaMemcpyAsync</code> of each boundary on a dedicated stream with an event, and measure whether the staged path gets closer to the aware one. Then port Listing 3 to HIP (<a href="#BR-02">BR-02</a>) and repeat the probe for a ROCm-aware MPI.</p>
+
+<h2 id="F8-08-forensic">Forensic lab</h2>
+<p><b>Scenario — "Staging through host memory" (the DG402 course forensic).</b> Amara's team moved its halo-exchange application to a new cluster image "with GPU-aware MPI". The results are correct and identical to the old image, but the exchange is no faster, and the team's device-buffer benchmark curve sits exactly where "host buffers plus two copies" would put it. The application's log, which nobody reads, has one line at start-up. The image's maintainers insist "MPI was built with UCX, so GPU support is in". You receive the evidence below; your job is to prove where the data went and which build option is missing.</p>
+<p><b>Evidence pack.</b> Every item is a real output of this build. E1 is the university's CPU stand-in for the team's benchmark: the "direct" column is the host-buffer path, the "staged" column is what a host-staged path adds (the OSU Micro-Benchmarks are not installed here, so their output format is not reproduced).</p>
+<p>E1 — benchmark, host path versus staged path (<code>pingpong_staging.out</code>): <sup class="src"><a href="#F8-08-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F8-08/pingpong_staging"></pre>
+<p>E2 — the application's start-up line and what followed on this container (<code>halo_device.out</code>; on the team's cluster the run continued normally after the first line): <sup class="src"><a href="#F8-08-src-R5">R5</a></sup></p>
+<pre class="output" data-run="F8-08/halo_device"></pre>
+<p>E3 — the probe (<code>aware_probe.out</code>): <sup class="src"><a href="#F8-08-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F8-08/aware_probe"></pre>
+<p>E4 — the library's build report (<code>ompi_build.out</code>): <sup class="src"><a href="#F8-08-src-R2">R2</a></sup></p>
+<pre class="output" data-run="F8-08/ompi_build"></pre>
+<p>E5 — an engineer's attempt to "switch GPU support on" (<code>force_cuda.out</code>): <sup class="src"><a href="#F8-08-src-R3">R3</a></sup></p>
+<pre class="output" data-run="F8-08/force_cuda"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: from E1, at which sizes does the staged path cost almost nothing extra and from which size does it clearly cost more? What do the large-size ratios suggest about how many extra copies there are?</li>
+<li>Hypotheses: state at least two explanations for "correct but not faster" (for example: the library stages internally; the application stages because it decided the library is not aware; the direct path exists but the topology makes it slow). Which evidence items test each?</li>
+<li>Root cause: which lines of E2, E3 and E4 prove that the application staged, and why it had to?</li>
+<li>Which build option is missing? Point to the line in E4 that would contain it and name the two layers (MPI library and transport) where GPU support must be enabled. Explain why "built with UCX" (E4) does not imply GPU support.</li>
+<li>What does E5 prove, and why is it not a fix?</li>
+<li>Fix and verification: list the steps to rebuild and the three checks (E3-style probe, E4-style report, E1-style benchmark with device buffers) that would prove the fix.</li>
+<li>Prevention: which start-up check and which deployment test would have caught this before the image was released?</li>
+</ol>
+<p><b>Method hints.</b> Start from the cheapest evidence: a one-line log message beats a benchmark curve. Then confirm the cause from the build report, and only then explain the performance curve with the alpha-beta model. Separate "what the library can do" (E3, E4) from "what the application chose" (E2).</p>
+
+<h2 id="F8-08-project">Mini-project</h2>
+<p><b>A GPU-path report card.</b> Write a small MPI + CUDA program (or HIP) that, run on any cluster, prints one block per node: MPI library version; compile-time and run-time GPU support; the relevant build parameters from the library's own query interface; number of GPUs per node and their PCI bus ids; and a measured one-way time for 8 B and 8 MiB with device buffers, with and without forced staging. Run it on every system you can access and keep the outputs as the evidence pack of your MP5 report.</p>
+<p><b>Rubric.</b> Correct, guarded queries for at least two MPI libraries or two builds (3). Clear, labelled measurements with medians (3). Handles "no GPU" and "not aware" without crashing (2). A one-paragraph interpretation per system (2).</p>
+
+<h2 id="F8-08-summary">Summary</h2>
+<ul>
+<li>GPU-aware MPI accepts device pointers and chooses a GPU-capable path; the MPI Standard does not define it, so you query the library.</li>
+<li>Open MPI answers at compile time (<code>MPIX_CUDA_AWARE_SUPPORT</code>), at run time (<code>MPIX_Query_cuda_support()</code>) and in <code>ompi_info</code>; this build says no in all three (R1, R2).</li>
+<li>Support needs the whole stack: MPI build, transport modules, drivers and topology; "built with UCX" is not "built with GPU support" (R2).</li>
+<li>Without support, stage: pinned host buffers, D2H, MPI, H2D, with the kernel finished before the copy.</li>
+<li>MPI is not stream-aware: synchronize before handing a device buffer to MPI, aware or not.</li>
+<li>Staging costs about 2α<sub>c</sub> + 2m/β<sub>c</sub> per message: invisible for small messages, large for big ones (R4, CPU model).</li>
+<li>Log the chosen path and benchmark host and device buffers side by side: "correct but slow" is found only by comparison.</li>
+</ul>
+
+<h2 id="F8-08-sources">Sources</h2>
+<ol>
+<li id="F8-08-src-D1">D1 — MPI Forum, "MPI: A Message-Passing Interface Standard" (tier 1): buffers, datatypes and point-to-point semantics; the Standard's silence on device memory. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-08-src-D2">D2 — The Open MPI Project, Open MPI documentation for the 4.1 series (tier 2): CUDA-aware support (building, run-time checks, behaviour with device buffers), MCA parameters; plus the GPU-support documentation of MVAPICH and MPICH for the comparison in Layer 3. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-08-src-D3">D3 — The Ohio State University, OSU Micro-Benchmarks documentation (tier 2/4; curriculum reading-list item 83): point-to-point and collective tests with host and device buffers. <i>Title only — not opened during this build (dossier gate G1 open).</i> Not installed in this build.</li>
+<li id="F8-08-src-D4">D4 — The UCX project, UCX documentation (tier 2; curriculum item 83): transports and GPU memory support. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-08-src-D5">D5 — NVIDIA, "CUDA C++ Programming Guide" (tier 1; the guide's registry records the title "CUDA Programming Guide", version 13.x) and "CUDA Runtime API": unified virtual addressing, page-locked host memory, copies and synchronization, inter-process communication, peer access. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-08-src-D6">D6 — NVIDIA, "GPUDirect RDMA" documentation (tier 1; curriculum item 82), and the ROCm documentation on GPU-aware networking (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-08-src-D7">D7 — The alpha-beta (latency-bandwidth) cost model as taught in <a href="#F8-03">F8-03</a> and HW301; Thakur, Rabenseifner, Gropp, "Optimization of Collective Communication Operations in MPICH" (tier 5). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-08-src-D8">D8 — NVIDIA, NCCL documentation (tier 1; the guide's registry records version 2.32.x when opened) and AMD, RCCL documentation (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-08-src-C1">C1 — Systems Curriculum (this project), section 14.1 rows "MPI with GPUs" and "GPUDirect", and section 14.3 milestone F4 (goal, build, acceptance tests quoted verbatim); a map, not a source (AH-4).</li>
+<li id="F8-08-src-H1">H1 — Open MPI 4.1.6 as installed (Ubuntu packages libopenmpi-dev and openmpi-common 4.1.6-7ubuntu2), read in this build: <code>mpi-ext.h</code> (includes the "cuda" extension), <code>openmpi/mpiext/mpiext_cuda_c.h</code> (<code>#define MPIX_CUDA_AWARE_SUPPORT 0</code>; <code>int MPIX_Query_cuda_support(void)</code>), and the help file <code>/usr/share/openmpi/help-mpi-runtime.txt</code> (section "no cuda support"). Tier 4.</li>
+<li id="F8-08-src-H2">H2 — CUDA 12.0 headers as installed, read in this build: <code>driver_types.h</code> (<code>cudaMemoryTypeUnregistered</code>, <code>cudaMemoryTypeHost</code>, <code>cudaMemoryTypeDevice</code>, <code>cudaMemoryTypeManaged</code>; <code>struct cudaPointerAttributes</code>), <code>cuda_runtime_api.h</code> (<code>cudaPointerGetAttributes</code>; the pageable-copy "staging memory for DMA transfer" note quoted in F1-62's glossary entry), <code>crt/device_double_functions.h</code> (<code>__dadd_rn</code>, <code>__dsub_rn</code>, <code>__dmul_rn</code>, each with the "note_nofma" marker). Tier 1.</li>
+<li id="F8-08-src-R1">R1 — run of Listing 1 (<code>aware_probe.log</code>), Open MPI 4.1.6 with g++ 13.3.0, 2 processes, exit code 0.</li>
+<li id="F8-08-src-R2">R2 — <code>ompi_info</code> and the UCX module folder on this build (<code>ompi_build.log</code>); package versions from the system's package list (UCX 1.16.0).</li>
+<li id="F8-08-src-R3">R3 — Listing 1 with <code>--mca mpi_cuda_support 1</code> (<code>force_cuda.log</code>), exit code 139 (expected failure).</li>
+<li id="F8-08-src-R4">R4 — run of Listing 2 (<code>pingpong_staging.log</code>), 2 processes on one shared container, exit code 0; measured on this container, CPU only (AH-23).</li>
+<li id="F8-08-src-R5">R5 — build and run of Listing 3 (<code>halo_device.log</code>), CUDA 12.0 nvcc with Open MPI 4.1.6; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+</ol>
+
+<h2 id="F8-08-glossary">Glossary links</h2>
+<p><a href="#gl-gpu-aware-mpi-cuda-aware-rocm-aware">GPU-aware MPI</a> · <a href="#gl-host-staging">Host staging</a> · <a href="#gl-unified-virtual-addressing-uva">Unified virtual addressing</a> · <a href="#gl-mca-parameter-open-mpi">MCA parameter</a> · <a href="#gl-ucx-unified-communication-x">UCX</a> · <a href="#gl-osu-micro-benchmarks">OSU Micro-Benchmarks</a> · <a href="#gl-pinned-page-locked-memory">Pinned memory</a> · <a href="#gl-gpudirect-rdma">GPUDirect RDMA</a> · <a href="#gl-mpi-message-passing-interface">MPI</a></p>
+
+<h2 id="F8-08-next">Next chapter</h2>
+<p>Next: <a href="#F8-09">F8-09 Two nodes: RDMA and GPUDirect RDMA</a>. Previous: <a href="#F8-07">F8-07 MPI basics</a>. Back to the course: <a href="#DG402">DG402</a>.</p>
+
+<h2 id="F8-08-answers">Answers to Check yourself</h2>
+<ol>
+<li>The compile-time macro <code>MPIX_CUDA_AWARE_SUPPORT</code> in Open MPI's extension header (0 here, H1); the run-time function <code>MPIX_Query_cuda_support()</code> (0, R1); <code>ompi_info</code>'s read-only parameters <code>mpi_built_with_cuda_support</code>/<code>opal_built_with_cuda_support</code> (false, R2). The configure line and the transport modules are supporting evidence (no CUDA option, no CUDA module).</li>
+<li>Recognising a device pointer needs the GPU runtime: with UVA the runtime knows which address ranges are device allocations, and a pointer-attribute query asks it. A library built without GPU support does not link against or call the GPU runtime, so it has no way to ask and treats every buffer as host memory.</li>
+<li>(c). A program compiled against a CUDA-aware header can be run with a different, non-aware library (containers, modules): that is why the run-time query exists. (a) is false: R3 shows the library refusing because support was not compiled in. (b) is false: MPI does not see streams. (d) is false: the extra cost is 2α<sub>c</sub> + 2m/β<sub>c</sub>, small for small messages (R4: ratio about 1 at 8 KiB).</li>
+<li>Aware library: MPI may read the boundary cells before the kernel has written them, sending stale values; the result is wrong without an error (a race). Not aware: the D2H <code>cudaMemcpy</code> on the default stream waits for the preceding kernel on the same (legacy default) stream, so the staged path happens to stay correct, which hides the bug until the program moves to an aware library or to non-default streams.</li>
+<li>1 KiB: a ratio near 1, because per-message costs dominate and two 1 KiB copies are tiny. 16 MiB: a ratio of about 2–4, because both extra copies scale with size and are comparable to the transfer itself on this machine; the exact value is noisy (R4 has 2.31 at 2 MiB and 3.35 at 8 MiB). Run it to see.</li>
+<li>(1) Is this MPI build ROCm-aware? Its documentation names the query or build report (and for Open MPI over UCX, whether UCX was built with ROCm support). (2) Do the transports have GPU modules for AMD GPUs (UCX module list, library build report)? (3) Does the driver and network stack allow direct access to GPU memory, and is the topology good (ROCm documentation on GPU-aware networking; the topology tools of <a href="#F8-04">F8-04</a>)? If any answer is no or unknown, stage.</li>
+<li>Δt ≈ 2α<sub>c</sub> + 2m/β<sub>c</sub> (one D2H and one H2D, each with a fixed cost and a size-proportional cost). At 8 KiB the 2α<sub>c</sub> term dominates; at 8 MiB the 2m/β<sub>c</sub> term does.</li>
+<li>Pinned memory is about correctness of the method and avoiding a hidden copy, not about the size here: with pageable memory the copy is still correct but goes through the driver's own staging buffer (H2), and asynchronous copies from pageable memory do not overlap. For four doubles it is only slower, not wrong; for large halos the hidden copy matters, and the habit should be right from the start.</li>
+</ol>
+<h3 id="F8-08-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> E1: the staged/direct ratio is between 0.89 and 1.04 from 8 B to 32 KiB, then 1.45 at 128 KiB, 1.67 at 512 KiB, 2.31 at 2 MiB and 3.35 at 8 MiB. Small messages pay only the fixed costs, which are small for in-memory copies; large messages pay copies proportional to size. A ratio rising from 1 towards 3 is what one copy before and one after the transfer (more on rank 1, which stages both directions) produce when a copy costs about as much as the transfer.</p>
+<p><b>Hypotheses.</b> H1: the application stages because it decided the library is not aware (tested by E2's first line and E3). H2: the library is aware but stages internally because no direct transport exists (tested by E4: a CUDA-aware build with no GPU transport module would show built-with-CUDA true). H3: the direct path exists but is slow because of topology (tested by a topology view; it would not explain a "not aware" probe).</p>
+<p><b>Root cause.</b> E2's first line, "halo path: staged", shows the application chose path A. E3 shows why: compile-time <code>MPIX_CUDA_AWARE_SUPPORT = 0</code>, run-time <code>MPIX_Query_cuda_support() = 0</code>. E4 confirms from the library itself: <code>mpi_built_with_cuda_support:value:false</code>, with the help text "Whether CUDA GPU buffer support is built into library or not". H2 is ruled out (the library is not CUDA-aware at all) and H3 is irrelevant until the library can take device pointers.</p>
+<p><b>Missing option.</b> The configure command line in E4 lists <code>--with-ucx</code>, <code>--with-verbs</code>, <code>--with-libfabric</code>, <code>--with-psm2</code> and others, but no option naming CUDA. GPU support must be enabled in the MPI library at configure time (for Open MPI an option naming the CUDA installation; the exact spelling is in the Open MPI installation documentation, unverified here) and in the transport layer: the UCX module list in E4 has <code>libuct_cma</code>, <code>libuct_ib</code>, <code>libuct_rdmacm</code> and a ROCm perftest module, but no CUDA transport module. "Built with UCX" only says which transport layer is used; UCX itself must be built with its CUDA support, and Open MPI must be built with CUDA support too.</p>
+<p><b>E5.</b> It proves the diagnosis a second way: Open MPI itself states that the library "was not compiled with any support". It is not a fix because a run-time parameter cannot add code that was not compiled; here the processes even crashed afterwards (exit code 139).</p>
+<p><b>Fix and verification.</b> Build UCX with CUDA support and Open MPI with CUDA support against that UCX (or install vendor packages built that way), in a separate prefix. Verify: (1) the probe prints 1 and 1; (2) <code>ompi_info</code> shows built_with_cuda_support true and the CUDA option in the configure line, and the UCX module folder contains a CUDA transport module; (3) the device-buffer benchmark no longer follows "host plus two copies", and Listing 3 prints "halo path: aware" and the same hash.</p>
+<p><b>Prevention.</b> Make the application fail loudly (or at least warn on every rank) when it expected a GPU-aware library and the run-time query says no, controlled by a configuration flag; add an image acceptance test that runs the probe and a device-buffer benchmark and compares it with a stored baseline. <b>How the evidence was produced:</b> real runs in this build of Listings 1–3 and <code>ompi_info</code> on a stock Open MPI 4.1.6 package built without CUDA support; E1 is a CPU model of staging (memcpy through a bounce buffer), not a GPU measurement.</p>

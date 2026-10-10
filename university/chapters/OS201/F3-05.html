@@ -1,0 +1,319 @@
+<!--meta
+id: F3-05
+title: Concurrency inside the OS
+course: OS201
+level: L2
+prereqs: F3-03; F3-04; HW202 (F1-30 multicore processors: threads, data races, atomics); HW203 (F1-36 cache coherence, F1-37 memory consistency)
+time: 4–6 hours including the lab
+hardware: a computer running Linux (or WSL) with g++ 13, riscv64-linux-gnu-g++ 13 and qemu-system-riscv64 (this build: QEMU 8.2.2); no physical RISC-V board needed
+maps: Curriculum P4 (OSTEP, concurrency part: locks, condition variables, common concurrency problems); xv6 book chapters on locking and on sleep and wakeup (curriculum reading-list item 9); forensic lab "The frozen machine" from the OS201 course card
+analogy: F3 — the school (registered: deadlock = two students each holding a book the other needs; thread = a student working in the room); new mappings proposed in NOTES.md: "lock = the one key to a shared cupboard: whoever holds the key may open it", "spinlock = standing at the cupboard and trying the handle again and again", "sleeping lock (mutex) = writing your name on the list at the cupboard and sitting down until you are called", "lock ordering = a school rule that keys are always collected in alphabetical order"
+-->
+
+<h2 id="F3-05-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>Two students in the library each need two books for their homework: the atlas and the dictionary. Ravi picks up the atlas first. At the same moment, on the other side of the room, Lina picks up the dictionary. Ravi now waits for the dictionary; Lina waits for the atlas. Each politely holds what they have until the other is finished. The library closes, and both are still standing there.</p>
+<p>Nobody did anything wrong on their own. Each student followed a sensible plan. The trouble is the combination: two people, two books, two different orders. The fix is a rule that costs nothing: "always take the atlas before the dictionary". Then whoever gets the atlas first gets both, and the other waits a minute.</p>
+<p>An operating system kernel runs on several cores at once, and its shared tables are the library's books. This chapter is about the keys that protect them, and about the frozen machine you get when two cores take the keys in different orders.</p>
+</div>
+
+<h2 id="F3-05-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> why kernel code that runs on several cores needs locks, and what a critical section is.</li>
+<li><b>Explain</b> how a spinlock works with one atomic instruction, and when a kernel uses a sleeping lock instead.</li>
+<li><b>Name</b> the four conditions for deadlock and show them in a real trace.</li>
+<li><b>Diagnose</b> a frozen machine from its serial log and the program counters of its CPUs, and prove a deadlock with a wait-for graph.</li>
+<li><b>Fix</b> a lock-order deadlock with a global lock order, and in C++ with <code>std::scoped_lock</code>.</li>
+</ul>
+
+<div class="co jargon" id="F3-05-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Critical section</dt><dd><b>Simple words:</b> a piece of code that must not run on two cores at the same time over the same data. <b>Analogy:</b> the moments when a student has the shared cupboard open. <b>Precise:</b> a code region that accesses shared data and must execute with mutual exclusion with respect to other critical sections on that data, so that their steps never interleave. <sup class="src"><a href="#F3-05-src-D1">D1</a></sup></dd>
+<dt>Lock</dt><dd><b>Simple words:</b> a variable that says "somebody is using this data; wait". <b>Analogy:</b> the one key to a shared cupboard. <b>Precise:</b> a synchronization object with acquire and release operations that guarantees that at most one thread holds it at a time; code holding the lock forms a critical section. Also called a mutual-exclusion lock. <sup class="src"><a href="#F3-05-src-D1">D1</a></sup></dd>
+<dt>Spinlock</dt><dd><b>Simple words:</b> a lock you wait for by trying again and again in a loop. <b>Analogy:</b> standing at the cupboard and trying the handle again and again. <b>Precise:</b> a lock whose acquire operation repeatedly executes an atomic read-modify-write (such as an atomic swap) until it observes the lock free; the waiting core stays busy. Used for short critical sections, and where the waiter cannot sleep, as in interrupt handlers. <sup class="src"><a href="#F3-05-src-D1">D1</a></sup> <sup class="src"><a href="#F3-05-src-D2">D2</a></sup></dd>
+<dt>Sleeping lock</dt><dd><b>Simple words:</b> a lock whose waiters give up the CPU until it is free. <b>Analogy:</b> writing your name on the list and sitting down until you are called. <b>Precise:</b> a lock whose acquire operation, when the lock is taken, blocks the calling thread (the scheduler runs something else) and wakes it when the lock is released; suited to long critical sections. <code>std::mutex</code> is the C++ interface to one. <sup class="src"><a href="#F3-05-src-D1">D1</a></sup> <sup class="src"><a href="#F3-05-src-D8">D8</a></sup></dd>
+<dt>Deadlock</dt><dd><b>Simple words:</b> threads that wait for each other forever. <b>Analogy:</b> two students each holding a book the other needs (registered). <b>Precise:</b> a state in which each thread of a set waits for a resource held by another thread of the same set, so none can proceed; it requires mutual exclusion, hold-and-wait, no preemption and circular wait. <sup class="src"><a href="#F3-05-src-D7">D7</a></sup> <sup class="src"><a href="#F3-05-src-S2">S2</a></sup></dd>
+<dt>Lock ordering</dt><dd><b>Simple words:</b> a rule that says in which order locks may be taken. <b>Analogy:</b> keys are always collected in alphabetical order. <b>Precise:</b> a global partial order on locks such that every thread acquires locks only in increasing order; it makes circular wait, and so deadlock between those locks, impossible. <sup class="src"><a href="#F3-05-src-D1">D1</a></sup> <sup class="src"><a href="#F3-05-src-D7">D7</a></sup></dd>
+<dt>Wait-for graph</dt><dd><b>Simple words:</b> a drawing of who waits for whom. <b>Analogy:</b> arrows from each waiting student to the student holding their book. <b>Precise:</b> a directed graph with one node per thread and an edge from T to U when T waits for a resource held by U; with single-instance resources such as locks, a cycle means deadlock. <sup class="src"><a href="#F3-05-src-D7">D7</a></sup></dd>
+<dt>Hart</dt><dd><b>Simple words:</b> RISC-V's word for one CPU that runs instructions. <b>Analogy:</b> one teacher. <b>Precise:</b> a RISC-V hardware thread: a context that fetches and executes its own instruction stream with its own registers; each has a number readable from the <code>mhartid</code> register. <sup class="src"><a href="#F3-05-src-D6">D6</a></sup> <sup class="src"><a href="#F3-05-src-D5">D5</a></sup></dd>
+</dl></div>
+
+<h2 id="F3-05-pictures">The idea in pictures</h2>
+<p>Figure 1 is the wait-for graph of the frozen machine in this chapter's forensic lab, drawn from its real serial log. Figure 2 is the same story on a time line: what each CPU did, line by line, until both stopped.</p>
+<figure id="F3-05-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 270" role="img" aria-labelledby="F3-05-f1t F3-05-f1d">
+<title id="F3-05-f1t">Wait-for graph of the frozen machine: a cycle of two</title>
+<desc id="F3-05-f1d">Two circles for the two CPUs: cpu0 running pid 3 (rename) on the left and cpu1 running pid 4 (unlink) on the right. Two boxes for the locks: dir /home at the top and inode notes.txt at the bottom. A solid arrow from the lock dir /home to cpu0 says held by. A solid arrow from the lock inode notes.txt to cpu1 says held by. A dashed arrow from cpu0 to inode notes.txt says waits for, and a dashed arrow from cpu1 to dir /home says waits for. Following the arrows, cpu0 waits for cpu1 and cpu1 waits for cpu0: a cycle. A note says this cycle is the deadlock that lockgraph found.</desc>
+<rect class="sv-b1" x="290" y="20" width="180" height="44"/><text class="sv-tb" x="306" y="47">lock 'dir /home'</text>
+<rect class="sv-b2" x="290" y="200" width="180" height="44"/><text class="sv-tb" x="306" y="227">lock 'inode notes.txt'</text>
+<circle class="sv-b5" cx="110" cy="132" r="56"/><text class="sv-tb" x="82" y="128">cpu0</text><text class="sv-ts" x="68" y="148">pid 3, rename</text>
+<circle class="sv-b6" cx="650" cy="132" r="56"/><text class="sv-tb" x="622" y="128">cpu1</text><text class="sv-ts" x="608" y="148">pid 4, unlink</text>
+<line class="sv-line" x1="290" y1="50" x2="160" y2="102"/><polygon class="sv-head" points="164,95 154,106 168,106"/>
+<text class="sv-ts" x="170" y="62">held by</text>
+<line class="sv-line" x1="470" y1="214" x2="600" y2="164"/><polygon class="sv-head" points="592,160 606,162 598,172"/>
+<text class="sv-ts" x="540" y="214">held by</text>
+<line class="sv-dash" x1="160" y1="162" x2="282" y2="212"/><polygon class="sv-head" points="276,205 290,216 278,218"/>
+<text class="sv-ts" x="150" y="210">waits for</text>
+<line class="sv-dash" x1="600" y1="102" x2="478" y2="52"/><polygon class="sv-head" points="484,48 470,48 480,60"/>
+<text class="sv-ts" x="560" y="62">waits for</text>
+<text class="sv-t" x="300" y="128">cpu0 waits for cpu1,</text>
+<text class="sv-t" x="300" y="148">cpu1 waits for cpu0: a cycle</text>
+</svg></div>
+<figcaption><b>Figure 1.</b> The wait-for graph that <code>lockgraph</code> built from the frozen machine's log (R4). Solid: "is held by"; dashed: "waits for". Each lock has one holder, so the cycle is a deadlock.<sup class="src"><a href="#F3-05-src-R4">R4</a></sup> <sup class="src"><a href="#F3-05-src-D7">D7</a></sup></figcaption>
+</figure>
+
+<figure id="F3-05-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F3-05-f2t F3-05-f2d">
+<title id="F3-05-f2t">Time line of the frozen machine on two CPUs</title>
+<desc id="F3-05-f2d">Two horizontal lanes, cpu0 on top and cpu1 below, with time running to the right. cpu0: rename starts, takes the lock dir /home and keeps it, later asks for inode notes.txt and then spins forever. cpu1: unlink starts after cpu0 holds dir /home, takes inode notes.txt and keeps it, asks for dir /home and spins forever. Both lanes end in a hatched spinning region labelled pc 0x800001f4, locks.cc line 69. A marker at the right says QEMU stopped by the 6 second time limit, exit code 124.</desc>
+<text class="sv-tb" x="20" y="70">cpu0</text><text class="sv-tb" x="20" y="170">cpu1</text>
+<line class="sv-line2" x1="70" y1="65" x2="720" y2="65"/><line class="sv-line2" x1="70" y1="165" x2="720" y2="165"/>
+<rect class="sv-b1" x="80" y="40" width="360" height="50"/><text class="sv-ts" x="88" y="60">holds (until the end)</text><text class="sv-tm" x="88" y="80">dir /home</text>
+<rect class="sv-b2" x="250" y="140" width="160" height="50"/><text class="sv-ts" x="258" y="160">holds (until the end)</text><text class="sv-tm" x="258" y="180">inode notes.txt</text>
+<rect class="sv-b4" x="410" y="140" width="300" height="50"/><text class="sv-ts" x="418" y="160">acquire 'dir /home': spinning</text><text class="sv-tm" x="418" y="180">pc 0x800001f4 (locks.cc:69)</text>
+<rect class="sv-b4" x="440" y="40" width="270" height="50"/><text class="sv-ts" x="448" y="60">acquire 'inode notes.txt': spinning</text><text class="sv-tm" x="448" y="80">pc 0x800001f4 (locks.cc:69)</text>
+<line class="sv-dash" x1="720" y1="25" x2="720" y2="215"/>
+<text class="sv-ts" x="470" y="236">QEMU stopped by the 6 s limit: exit code 124</text>
+<text class="sv-ts" x="80" y="118">order: dir, then inode</text>
+<text class="sv-ts" x="250" y="218">order: inode, then dir</text>
+<line class="sv-line" x1="70" y1="235" x2="400" y2="235"/><polygon class="sv-head" points="400,229 410,235 400,241"/><text class="sv-ts" x="80" y="228">time</text>
+</svg></div>
+<figcaption><b>Figure 2.</b> The frozen machine's log (R1) and CPU registers (R2) as a time line. Both CPUs end inside the same loop, each waiting for the lock the other holds.<sup class="src"><a href="#F3-05-src-R1">R1</a></sup> <sup class="src"><a href="#F3-05-src-R2">R2</a></sup></figcaption>
+</figure>
+
+<h2 id="F3-05-layer1">Layer 1 — the kid explanation</h2>
+<p>A computer has several cores, and all of them can run parts of the operating system at the same time. They share the operating system's lists: which programs exist, which files are open, which memory is free. If two cores change the same list at the same moment, the list can end up broken, like two people writing on the same line of a notebook at once.<sup class="src"><a href="#F3-05-src-D1">D1</a></sup></p>
+<p>So the operating system uses <b>locks</b>. A lock is like the one key to a cupboard: only the person holding the key may open it, and everyone else waits until the key is returned. That keeps the lists tidy.<sup class="src"><a href="#F3-05-src-D1">D1</a></sup></p>
+<p>Locks bring a new danger. If one core holds key A and waits for key B, while another core holds key B and waits for key A, both wait forever. The computer freezes. This is called a <b>deadlock</b>. The cure is a rule: everyone takes the keys in the same order.<sup class="src"><a href="#F3-05-src-D7">D7</a></sup></p>
+
+<h2 id="F3-05-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F3-05-l2-why">Why the kernel needs locks</h3>
+<p>F3-01 to F3-04 described the kernel as if one CPU ran it. On a multicore machine every core enters the kernel on its own: one core handles a system call from one process while another handles a page fault for a second and a third takes a timer interrupt.<sup class="src"><a href="#F3-05-src-D2">D2</a></sup> They all touch shared kernel data: the process table, the list of free frames, the scheduler's queue, the directory blocks of a file system. HW202 (F1-30) showed that two threads incrementing one plain counter lose updates, because "read, add, write" is three steps and the steps interleave.<sup class="src"><a href="#F3-05-src-D1">D1</a></sup> In the kernel the consequences are worse than a wrong count: two cores could take the same free frame for two processes, or link a half-built entry into a list. Code that must not interleave with other code on the same data is a <b>critical section</b>, and a lock makes it one.</p>
+<p>Even on one core the kernel has the same problem in miniature: an interrupt can arrive in the middle of kernel code, and the interrupt handler may touch the same data. That is why xv6's spinlocks also turn interrupts off on the core that holds them.<sup class="src"><a href="#F3-05-src-D2">D2</a></sup></p>
+
+<h3 id="F3-05-l2-spin">How a spinlock works</h3>
+<p>A lock is a word in memory: 0 means free, 1 means taken. Acquiring it cannot be "read the word; if it is 0, write 1", because two cores could both read 0 before either writes. The processor must do the read and the write as one indivisible step: an <a href="#gl-atomic-operation">atomic operation</a>. The university's kernel uses an atomic swap: write 1 and get the old value back, in one step. If the old value was 0, this core took the lock; if it was 1, somebody else has it, so try again.<sup class="src"><a href="#F3-05-src-D1">D1</a></sup> Listing 1, line 69, is exactly that loop, and the compiler turned it into the RISC-V instruction <code>amoswap.w.aq</code> (R6, in "How the hardware actually does it").<sup class="src"><a href="#F3-05-src-R6">R6</a></sup> Release is a single atomic store of 0.</p>
+<p>The <code>__ATOMIC_ACQUIRE</code> and <code>__ATOMIC_RELEASE</code> words in the listing are memory-ordering constraints (HW203, F1-37): the processor and compiler may not move the critical section's loads and stores out past the lock operations, so the next holder sees all the previous holder's writes.<sup class="src"><a href="#F3-05-src-D8">D8</a></sup></p>
+<p>A spinning core does no useful work. That is acceptable when critical sections are short (a few list operations) and when the waiter could not sleep anyway, such as inside an interrupt handler. When a holder may wait for something slow, such as a disk read, the kernel uses a <b>sleeping lock</b>: a waiter asks the scheduler to block it, and the release wakes it. xv6 has both kinds; the file system's per-file locks are sleeping locks, because they are held across disk operations.<sup class="src"><a href="#F3-05-src-D2">D2</a></sup> In user programs, <code>std::mutex</code> plays the sleeping-lock role.<sup class="src"><a href="#F3-05-src-D8">D8</a></sup></p>
+
+<h3 id="F3-05-l2-deadlock">Deadlock</h3>
+<p>Operations that touch two objects need two locks. A file system's <code>rename</code> changes a directory and an inode; <code>unlink</code> changes the same two. If <code>rename</code> takes the directory lock first and <code>unlink</code> takes the inode lock first, and both run at once on two cores, each can end up holding one lock and spinning for the other. That is the frozen machine of Figure 1, and it is a real run: the university's kernel on two emulated RISC-V CPUs in QEMU printed its last lines and then nothing, until the 6-second limit stopped QEMU with exit code 124.<sup class="src"><a href="#F3-05-src-R1">R1</a></sup></p>
+<p>The textbook lists four conditions that must all hold for a deadlock:<sup class="src"><a href="#F3-05-src-D7">D7</a></sup></p>
+<ol>
+<li><b>Mutual exclusion:</b> a lock has one holder at a time.</li>
+<li><b>Hold and wait:</b> a thread holds one lock while waiting for another.</li>
+<li><b>No preemption:</b> nobody can take a lock away from its holder.</li>
+<li><b>Circular wait:</b> a cycle of threads, each waiting for a lock held by the next.</li>
+</ol>
+<p>Break any one and deadlock is impossible. In practice kernels break the fourth: they fix a <b>lock order</b>, and every code path takes locks in that order. With one order, the thread that gets the first lock can always get the rest, so no cycle can form.<sup class="src"><a href="#F3-05-src-D1">D1</a></sup> <sup class="src"><a href="#F3-05-src-D7">D7</a></sup> The fixed kernel (<code>-DSAME_ORDER</code>) makes <code>unlink</code> take the directory first as <code>rename</code> does; the same interleaving now completes and powers the machine off with exit code 0.<sup class="src"><a href="#F3-05-src-R3">R3</a></sup></p>
+<p>In user-space C++ there is a second way when you need several mutexes at once: <code>std::scoped_lock</code> with all of them. It acquires them with a deadlock-avoidance algorithm whatever order the callers name them in.<sup class="src"><a href="#F3-05-src-D8">D8</a></sup> Listing 3 moves books between two shelves in opposite directions in two threads, 100,000 times each, and finishes with the total intact.<sup class="src"><a href="#F3-05-src-R5">R5</a></sup></p>
+
+<h2 id="F3-05-layer3">Layer 3 — the engineer's depth</h2>
+<p><b>Lock order must be written down.</b> A kernel with hundreds of locks needs a documented order (for example "directory before the inodes in it; parent before child; the process-table lock before any single process's lock"), and every new code path must respect it. xv6's book describes its own ordering rules for the file system and the process locks.<sup class="src"><a href="#F3-05-src-D2">D2</a></sup> When an operation cannot know the order in advance (two inodes found during a path walk), a common rule is to order by a stable key, such as the inode number or the lock's address. That is the idea behind <code>std::scoped_lock</code>'s deadlock avoidance, done with retries instead of a fixed order.<sup class="src"><a href="#F3-05-src-D8">D8</a></sup></p>
+<p><b>Tools find the cycle before the machine freezes.</b> A lock validator records, at run time, every pair "lock B taken while holding lock A" and reports the first time a path takes them in the opposite order, even if that run did not deadlock. The Linux kernel has one (lockdep).<sup class="src"><a href="#F3-05-src-D1">D1</a></sup> Listing 4 is a much smaller relative: it rebuilds the wait-for graph after the fact from a log. ThreadSanitizer reports lock-order inversions in user programs too.</p>
+<p><b>Spinlocks and interrupts.</b> If a core holds a spinlock and an interrupt handler on the same core tries to take it, the handler spins forever: the holder cannot run until the handler returns. A deadlock with one CPU. That is why kernels disable interrupts while holding a lock that handlers also use (xv6 does this for every spinlock).<sup class="src"><a href="#F3-05-src-D2">D2</a></sup></p>
+<p><b>Sleep and wakeup.</b> Sleeping locks, pipes and <code>wait</code> all need "block until a condition changes". The danger is a lost wake-up: the condition changes after a thread checked it but before it went to sleep. The fix is to hold a lock while checking and to release it atomically with going to sleep; condition variables (<code>std::condition_variable</code>, the xv6 <code>sleep</code> and <code>wakeup</code> pair) are built for that pattern.<sup class="src"><a href="#F3-05-src-D1">D1</a></sup> <sup class="src"><a href="#F3-05-src-D2">D2</a></sup></p>
+<p><b>Other failures.</b> Livelock (threads keep reacting to each other and make no progress), priority inversion (a low-priority holder blocks a high-priority waiter while medium-priority work runs), and lock contention (correct but slow, because all cores wait for one lock) are the other faces of locking; the textbook covers them with deadlock.<sup class="src"><a href="#F3-05-src-D1">D1</a></sup> <sup class="src"><a href="#F3-05-src-D7">D7</a></sup> Lock-free data structures avoid locks with atomic instructions alone; they are a later topic.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The statements about xv6 in this chapter (spinlocks that disable interrupts; sleeping locks for inodes; its documented lock-ordering rules; the <code>sleep</code> and <code>wakeup</code> names) and about Linux's lockdep come from the author's memory and were not checked against the xv6 source or book or the Linux documentation in this build; xv6's source is not in the build container. Also unverified: that <code>amoswap.w.aq</code> is defined with acquire semantics exactly as C++'s <code>__ATOMIC_ACQUIRE</code> requires (the compiler chose it, R6; the mapping is in the RISC-V specification, D6, not opened). The deadlock in the forensic lab is real, but its interleaving is forced by the kernel's <code>step</code> flags so that it happens on every run; in a real kernel the same bug strikes rarely and at random.</p></div>
+
+<h2 id="F3-05-hardware">How the hardware actually does it</h2>
+<p>The disassembly of the frozen kernel's <code>acquire</code> shows the spin loop the two stuck CPUs were executing:</p>
+<pre class="output" data-run="F3-05/spin_loop"></pre>
+<p>The address <code>0x800001f4</code>, where QEMU found both program counters (R2), is the top of this loop. <code>amoswap.w.aq a5,a5,(a4)</code> swaps the 32-bit word at the lock's address (<code>a4</code> = lock + 8, the <code>locked</code> field) with 1 and returns the old value in <code>a5</code>; <code>bnez</code> loops while it was not 0. The <code>.aq</code> suffix marks acquire ordering. The <code>beq s0,s4</code> instruction compares the spin counter with 2,000,000 (<code>s4</code> was loaded with <code>0x1e8480</code>), the watchdog of line 70.<sup class="src"><a href="#F3-05-src-R6">R6</a></sup> <sup class="src"><a href="#F3-05-src-D6">D6</a></sup> On real hardware an atomic instruction gets exclusive ownership of the cache line holding the lock through the coherence protocol of HW203 (F1-36): while two cores spin with swaps, that line moves back and forth between their caches on every attempt, which slows both and the memory system around them. Production spinlocks therefore spin on a plain load until the lock looks free and only then try the atomic, or use queue-based designs.<sup class="src"><a href="#F3-05-src-D1">D1</a></sup> RISC-V also offers the load-reserved / store-conditional pair (<code>lr.w</code>, <code>sc.w</code>) from which any atomic update can be built.<sup class="src"><a href="#F3-05-src-D6">D6</a></sup></p>
+<div class="co unverified"><span class="lbl">Untested on hardware</span><p>All runs in this chapter are on QEMU's emulated RISC-V machine (2 harts) and on the x86-64 build container. QEMU emulates the atomic instructions' results, not real cache-coherence traffic or timing. Nothing here was run on a RISC-V board, and the chapter gives no timing for spinning.</p></div>
+
+<h2 id="F3-05-worked">Worked example</h2>
+<p>Show, using only the frozen machine's serial log (R1), that the four deadlock conditions all hold.</p>
+<ol>
+<li><b>Order of events.</b> cpu0 (pid 3) logs "holds 'dir /home'". Then cpu1 (pid 4) logs "holds 'inode notes.txt'". Then cpu1 asks for 'dir /home' and cpu0 asks for 'inode notes.txt'. Neither ever logs "holds" again.</li>
+<li><b>Mutual exclusion.</b> The watchdog lines say "still spinning on 'dir /home' held by cpu0" and "… 'inode notes.txt' held by cpu1": each lock has exactly one holder, and the other CPU is excluded.</li>
+<li><b>Hold and wait.</b> cpu0 holds 'dir /home' and waits for 'inode notes.txt'; cpu1 holds 'inode notes.txt' and waits for 'dir /home'. No "release" line appears for either lock.</li>
+<li><b>No preemption.</b> The spinlock has no way to be taken from its holder; nothing in the code releases a lock except its holder (Listing 1, lines 87–91).</li>
+<li><b>Circular wait.</b> cpu0 → (waits for a lock held by) cpu1 → cpu0. Listing 4 finds the same cycle mechanically.<sup class="src"><a href="#F3-05-src-R4">R4</a></sup></li>
+<li><b>Confirm the "frozen, not slow" claim</b> with independent evidence: three seconds after start both program counters were <code>0x800001f4</code>, which <code>addr2line</code> maps to <code>acquire</code> at <code>locks.cc:69</code>, the spin loop (R2); and QEMU never powered off (exit code 124, R1).<sup class="src"><a href="#F3-05-src-R1">R1</a></sup> <sup class="src"><a href="#F3-05-src-R2">R2</a></sup></li>
+<li><b>Choose which condition to break.</b> Circular wait: make <code>unlink</code> take 'dir /home' before 'inode notes.txt', like <code>rename</code>. The fixed build's log (R3) shows cpu1 waiting at "acquire 'dir /home'" until cpu0 releases it, then completing.<sup class="src"><a href="#F3-05-src-R3">R3</a></sup></li>
+</ol>
+
+<h2 id="F3-05-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>locks.cc</code>: the university's lock kernel (uni-rv), run on two harts. Hart 0 plays a <code>rename</code> system call of process 3, hart 1 an <code>unlink</code> of process 4. The kernel prints through the emulated serial port and powers QEMU off through its test device (both as in F3-07's memory map).</p>
+<pre class="listing" data-src="F3-05/locks.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">6–7</td><td><code>uart</code>, <code>finisher</code></td><td>Addresses of the serial port and QEMU's power-off device.</td><td>Memory-mapped I/O (HW204); the serial log is the evidence.</td></tr>
+<tr><td class="n">9–13</td><td><code>struct Spinlock</code></td><td>A name, the lock word, and the holding hart.</td><td>The name and holder exist only for debugging, as in xv6's spinlock.<sup class="src"><a href="#F3-05-src-D2">D2</a></sup></td></tr>
+<tr><td class="n">15–17</td><td>three locks</td><td>The console lock, a directory lock, an inode lock.</td><td>The last two are the deadlock's books.</td></tr>
+<tr><td class="n">18–19</td><td><code>step</code>, <code>done</code></td><td>Flags that make the harts take turns at fixed points.</td><td>They force the bad interleaving on every run (unverified box).</td></tr>
+<tr><td class="n">21–30</td><td><code>raw_acquire</code>, <code>raw_release</code></td><td>Atomic swap loop; atomic store of 0.</td><td>The bare spinlock, used for the console.</td></tr>
+<tr><td class="n">47–63</td><td><code>log</code></td><td>Prints one whole line while holding the console lock.</td><td>Without it, the two harts' characters would mix.</td></tr>
+<tr><td class="n">65–86</td><td><code>acquire</code></td><td>Logs the request, spins with an atomic swap (line 69), logs "holds".</td><td>Line 69 is where both CPUs were found (R2).</td></tr>
+<tr><td class="n">70–82</td><td>watchdog</td><td>After 2,000,000 failed attempts, prints who holds the lock.</td><td>A debugging aid: it turns silence into evidence.</td></tr>
+<tr><td class="n">87–91</td><td><code>release</code></td><td>Logs and releases.</td><td>Only the holder releases: "no preemption".</td></tr>
+<tr><td class="n">92–96</td><td><code>set</code>, <code>wait_until</code></td><td>Atomic store; spin until a flag reaches a value.</td><td>Plain variables shared between harts would be a data race.</td></tr>
+<tr><td class="n">101–112</td><td>hart 0</td><td><code>rename</code>: dir lock, then inode lock; at the end powers off.</td><td>Order: dir → inode.</td></tr>
+<tr><td class="n">116–122</td><td><code>SAME_ORDER</code></td><td><code>unlink</code> with dir → inode.</td><td>The fix.</td></tr>
+<tr><td class="n">123–130</td><td>default</td><td><code>unlink</code> with inode → dir.</td><td>The bug: the opposite order.</td></tr>
+<tr><td class="n">133</td><td><code>wfi</code></td><td>Waits for an interrupt, forever.</td><td>A hart with nothing to do sleeps.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>entry.S</code>: the first instructions on every hart; each gets its own 4 KiB stack and calls <code>kmain</code> with its hart number.</p>
+<pre class="listing" data-src="F3-05/entry.S"></pre>
+<p>The frozen run (default build) and the fixed run (<code>-DSAME_ORDER</code>):</p>
+<pre class="output" data-run="F3-05/frozen"></pre>
+<pre class="output" data-run="F3-05/fixed"></pre>
+<p><b>Listing 3</b> — <code>transfer.cpp</code>: the user-space version of the lesson.</p>
+<pre class="listing" data-src="F3-05/transfer.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">7–10</td><td><code>struct Shelf</code></td><td>A count protected by its own mutex.</td><td>One lock per object, as kernels do.</td></tr>
+<tr><td class="n">15</td><td><code>std::scoped_lock both(from.m, to.m);</code></td><td>Locks both mutexes, released at the end of the loop body.<sup class="src"><a href="#F3-05-src-D8">D8</a></sup></td><td>Deadlock-free even though the two threads name them in opposite orders.</td></tr>
+<tr><td class="n">24–25</td><td>two threads</td><td>left → right and right → left, 100,000 moves each.</td><td>The opposite orders of the frozen machine.</td></tr>
+<tr><td class="n">28–29</td><td>print</td><td>Prints both counts and the total.</td><td>200 means no move was lost; finishing at all means no deadlock.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-05/transfer"></pre>
+<p>Replacing line 15 with two <code>std::lock_guard</code>s, <code>from.m</code> first, is the frozen machine in user space: it can hang. This build did not run that version (a hang that appears only sometimes is a poor recorded run); the lab asks you to.</p>
+<p><b>Listing 4</b> — <code>lockgraph.cc</code>: reads a lock log and finds wait-for cycles.</p>
+<pre class="listing" data-src="F3-05/lockgraph.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">10–12</td><td><code>holder</code>, <code>waiting</code>, <code>pidOf</code></td><td>Who holds each lock; which lock each CPU asked for.</td><td>The two kinds of edge of Figure 1.</td></tr>
+<tr><td class="n">17–21</td><td><code>sscanf</code>, quotes</td><td>Parses "cpuN pid P: verb 'lock'"; skips other lines.</td><td>The watchdog and QEMU lines are ignored.</td></tr>
+<tr><td class="n">24–29</td><td>acquire, holds, release</td><td>Updates the state.</td><td>"acquire" without a later "holds" means waiting.</td></tr>
+<tr><td class="n">36–46</td><td>edges</td><td>For each waiting CPU, an edge to the lock's holder.</td><td>Builds the wait-for graph.</td></tr>
+<tr><td class="n">47–61</td><td>cycle search</td><td>Follows edges from each CPU; a return to the start is a cycle.</td><td>Each CPU waits for at most one lock, so following edges is enough.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-05/lockgraph"></pre>
+
+<h2 id="F3-05-breaks">Where the analogy breaks</h2>
+<ol>
+<li><b>Students notice; CPUs do not.</b> Two students would soon talk and one would put a book down. A spinning core has no idea it is in a cycle; it tries the same instruction forever (Figure 2). Only a design rule (lock order) or a tool notices.</li>
+<li><b>A key is a thing; a lock is a convention.</b> A cupboard without the key stays shut. A lock protects data only if every piece of code that touches the data takes the lock first; nothing stops a careless function from writing without it.<sup class="src"><a href="#F3-05-src-D1">D1</a></sup></li>
+<li><b>Trying the handle costs others too.</b> A student rattling a handle disturbs nobody else much. Spinning cores fight over one cache line and slow the memory system for everyone (How the hardware actually does it).</li>
+<li><b>The registered deadlock picture has two students.</b> Real cycles can be long (A waits for B, B for C, C for A) and can involve other resources besides locks; the four conditions still apply.<sup class="src"><a href="#F3-05-src-D7">D7</a></sup></li>
+</ol>
+
+<h2 id="F3-05-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Machine or program stops responding; CPUs busy (spinlocks) or idle (mutexes)</td><td>Deadlock, often two locks in opposite orders</td><td>Stop it and read every CPU's or thread's PC and stack (QMP, gdb <code>thread apply all bt</code>); build the wait-for graph</td><td>A global lock order; <code>std::scoped_lock</code> for several mutexes</td></tr>
+<tr><td>Hang only on some runs</td><td>The bad interleaving is rare</td><td>Lock validators (lockdep, ThreadSanitizer) report the inversion without the hang</td><td>Same as above; add the validator to tests</td></tr>
+<tr><td>A shared list is corrupted now and then</td><td>A path touches shared data without its lock</td><td>ThreadSanitizer in user space; assert "lock held" in kernel functions</td><td>Take the lock; document which lock protects which data</td></tr>
+<tr><td>Single-core kernel hangs in an interrupt</td><td>Handler takes a spinlock its own core already holds</td><td>The PC is in the handler's acquire</td><td>Disable interrupts while holding such locks</td></tr>
+<tr><td>Thread sleeps forever although the event happened</td><td>Lost wake-up: condition checked without a lock</td><td>Look for a check and a sleep not covered by the same lock</td><td>Condition variable with its mutex; loop on the condition</td></tr>
+<tr><td>Everything correct but slow on many cores</td><td>Contention on one lock</td><td>Profile time spent spinning or blocked</td><td>Finer-grained locks, per-CPU data</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F3-05-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> HW202 (F1-30) showed data races and atomics between threads; HW203 (F1-36, F1-37) explained coherence and memory ordering; F3-03 made threads and preemption the normal case. <b>What carries over:</b> every rule about data races and atomics; the scheduler can stop a thread anywhere.<sup class="src"><a href="#F3-05-src-D8">D8</a></sup> <b>What changes:</b> now the shared data is the kernel's own, the code that races is the kernel running on several cores (and its interrupt handlers), and a mistake freezes the whole machine instead of one program. Locks fix races and bring a new failure, deadlock, which you prevent by design.<sup class="src"><a href="#F3-05-src-D1">D1</a></sup> <b>What comes next:</b> F3-06 builds files and directories, the very structures that <code>rename</code> and <code>unlink</code> lock, and asks what happens when the power fails in the middle of changing them.</p></div>
+
+<h2 id="F3-05-check">Check yourself</h2>
+<ol>
+<li>What is a critical section, and why does a single-core kernel still need to protect some of them?</li>
+<li>Why can a lock not be acquired with an ordinary load followed by an ordinary store?</li>
+<li>When would a kernel use a sleeping lock instead of a spinlock? Give one example.</li>
+<li>List the four deadlock conditions and say which one lock ordering breaks.</li>
+<li>Predict, then run: in Listing 1's default build, move <code>set(step, 2);</code> on line 125 to before line 124. Does the machine still freeze? Explain from the code.</li>
+<li>Apply to a new case: a drone's flight software has a thread that holds the "sensor data" mutex while it waits for the "log file" mutex, and a logging thread that does the reverse. The drone freezes once in many flights. Explain and fix.</li>
+<li>Both CPUs of the frozen machine were at the same PC. Why does that not mean they wait for the same lock?</li>
+<li>Which is true? (a) <code>std::scoped_lock</code> requires all callers to name mutexes in the same order. (b) A cycle in the wait-for graph with single-holder locks means deadlock. (c) Spinlocks are best for critical sections that read the disk. (d) Deadlock needs at least three threads.</li>
+</ol>
+
+<h2 id="F3-05-lab">Lab</h2>
+<h3 id="F3-05-lab-goal">Goal</h3>
+<p>Reproduce the frozen machine, find the deadlock from evidence alone, fix it, and see the same bug and fix in user-space C++.</p>
+<h3 id="F3-05-lab-hw">Hardware and software needed</h3>
+<p>A Linux computer (or WSL) with <code>g++</code>, <code>riscv64-linux-gnu-g++</code> (cross compiler, this build 13.3.0), <code>qemu-system-riscv64</code> (this build 8.2.2) and Python 3. No RISC-V board; all RISC-V runs are emulated. The xv6 lab that adds locking exercises is not part of this course card; F3-08 reads xv6's spinlock.</p>
+<h3 id="F3-05-lab-safety">Safety</h3>
+<p>None beyond normal computer use. Always run QEMU with a time limit (<code>timeout</code>), because a deadlocked guest never exits on its own.</p>
+<h3 id="F3-05-lab-steps">Steps</h3>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F3-05</code>. Expect status 0: the frozen run's exit code 124 is the expected result and is recorded in <code>frozen.log</code>.</li>
+<li>Read <code>run.sh</code> and find how it asks QEMU for the program counters while the machine hangs (QMP socket, <code>info registers -a</code>).</li>
+<li>Do Check yourself 5 on a copy of the lab folder and run the copy. Record what the serial log shows.</li>
+<li>Write a third version of <code>unlink</code> that breaks "hold and wait" instead: take 'inode notes.txt', and if 'dir /home' is not free at once (one atomic swap), release the inode lock and start again. Show its log.</li>
+<li>Replace <code>std::scoped_lock</code> in Listing 3 with two <code>std::lock_guard</code>s (<code>from.m</code>, then <code>to.m</code>). Run it ten times with <code>timeout 10</code> and record how many runs hang. Then build with <code>-fsanitize=thread</code> and read the report.</li>
+</ol>
+<h3 id="F3-05-lab-expect">Expected observations</h3>
+<p>Step 1 reproduces the outputs above.<sup class="src"><a href="#F3-05-src-R1">R1</a></sup> <sup class="src"><a href="#F3-05-src-R3">R3</a></sup> <sup class="src"><a href="#F3-05-src-R4">R4</a></sup> In step 3, cpu0 still holds 'dir /home' when cpu1 asks for 'inode notes.txt', and the outcome depends on which hart gets there first; your log decides. In step 4 the machine powers off; cpu1 may log several retries. Step 5 was not run in this build: a hang count is a property of your machine and run, so record it as a measurement. ThreadSanitizer is expected to warn about a lock-order inversion (a "potential deadlock"), even on runs that do not hang.</p>
+<h3 id="F3-05-lab-verify">Verification</h3>
+<p>(1) <code>lockgraph</code> on your step 4 log prints "no cycle". (2) Your step 5 table states the machine, the CPU count, the number of hung runs out of ten, and the first line of the ThreadSanitizer report.</p>
+<h3 id="F3-05-lab-trouble">Troubleshooting</h3>
+<ul>
+<li>QEMU prints nothing → the output is buffered in a pipe; redirect to a file as <code>run.sh</code> does.</li>
+<li><code>qmp_regs.py</code> cannot connect → QEMU had not created the socket yet; wait a moment, or check the <code>-qmp</code> path.</li>
+<li>The kernel build fails with "unrecognized opcode" → check <code>-march=rv64gc</code>; the atomics need the A extension.</li>
+<li>The watchdog line never appears → the spin count of line 70 is too large for your emulation speed; lower it.</li>
+</ul>
+<h3 id="F3-05-lab-ext">Extension</h3>
+<p>Give the kernel a third hart and a third lock and build a three-way deadlock (cpu0 → cpu1 → cpu2 → cpu0). Run <code>run.sh</code>'s QEMU command with <code>-smp 3</code> and check that <code>lockgraph</code> prints the three-node cycle.</p>
+
+<h2 id="F3-05-forensic">Forensic lab</h2>
+<p><b>Scenario: "The frozen machine".</b> A test machine running the school's file server kernel froze during the night. The serial console stopped in the middle of two system calls, and the CPUs stayed busy. Kemal, on call, captured the serial log and, before restarting it, asked the machine's emulator for every CPU's program counter. Your job: say why it froze, prove it, and fix it.</p>
+<p><b>Evidence pack.</b> The serial log (above in the walk-through, <code>frozen</code>), the CPU registers mapped to source lines, the disassembly of the loop (in "How the hardware actually does it"), the source (Listing 1) and the output of <code>lockgraph</code> on the log.</p>
+<pre class="output" data-run="F3-05/cpus"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Which locks does each CPU hold, and which does each want, at the end of the log? Quote the lines.</li>
+<li>Kemal's first hypothesis is "an infinite loop in the file-system code". What do the program counters say? Give a second hypothesis.</li>
+<li>Draw the wait-for graph and show the cycle. Which four conditions hold, and where is each in the evidence?</li>
+<li>Find the two code paths and their lock orders in Listing 1.</li>
+<li>Propose a fix, show the evidence that it works, and propose a test that would catch the next such bug before a hang.</li>
+</ol>
+<p><b>Method hints.</b> "acquire" without a matching "holds" means waiting. Two CPUs at one PC can wait for different locks: look at the register that holds the lock's address, or at the watchdog lines. A frozen machine is a cycle, a crash or an infinite loop; the evidence tells them apart.</p>
+
+<h2 id="F3-05-project">Mini-project</h2>
+<p>Turn <code>lockgraph</code> into a small lock-order validator. Read a log of many runs, record every pair "lock B acquired while holding lock A" per CPU, and report any pair that also appears as "A while holding B", with the line numbers of both, even when the log has no deadlock. Feed it the fixed run's log, the frozen run's log, and a log you create in which the two orders occur at different times without a hang. Rubric: pairs recorded per CPU with correct handling of release (2); all three logs analysed, with the inversion reported for the non-hanging log (2); builds with the course flags, no warnings, no sanitizer reports (1).</p>
+
+<h2 id="F3-05-summary">Summary</h2>
+<ul>
+<li>Kernel code runs on several cores and in interrupt handlers at once; shared kernel data needs critical sections.</li>
+<li>A spinlock is an atomic swap in a loop (<code>amoswap.w.aq</code> on RISC-V); a sleeping lock blocks the waiter.</li>
+<li>Deadlock needs mutual exclusion, hold and wait, no preemption and circular wait; kernels break circular wait with a lock order.</li>
+<li>A frozen machine is diagnosed from evidence: the log's last lines, every CPU's PC, and the wait-for graph.</li>
+<li>In C++, <code>std::scoped_lock</code> takes several mutexes without deadlock.</li>
+</ul>
+
+<h2 id="F3-05-sources">Sources</h2>
+<ol>
+<li id="F3-05-src-D1">D1 — Remzi H. Arpaci-Dusseau and Andrea C. Arpaci-Dusseau, "Operating Systems: Three Easy Pieces" (curriculum item 2), concurrency part: chapters on locks (spinlocks, atomic exchange, spinning versus sleeping), condition variables, lock-based data structures and common concurrency problems (deadlock, lock ordering). Title only — not opened during this build; the Source Researcher must confirm version and chapter titles (dossier gate G1 open).</li>
+<li id="F3-05-src-D2">D2 — Russ Cox, Frans Kaashoek, Robert Morris, the xv6 book (RISC-V edition; curriculum item 9), chapters on locking (spinlocks, interrupts, lock ordering, sleep locks) and on scheduling (sleep and wakeup). Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-05-src-D5">D5 — RISC-V International, "The RISC-V Instruction Set Manual, Volume II: Privileged Architecture": <code>mhartid</code>. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-05-src-D6">D6 — RISC-V International, "The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA": the A extension (atomic memory operations such as <code>amoswap</code> with acquire and release bits; <code>lr</code> and <code>sc</code>) and the definition of a hart. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-05-src-D7">D7 — Abraham Silberschatz, Peter B. Galvin, Greg Gagne, "Operating System Concepts" (curriculum item 26), chapter on deadlocks: the four necessary conditions, resource-allocation and wait-for graphs, prevention by ordering. Title only — not opened during this build; edition and chapters to be recorded (dossier gate G1 open).</li>
+<li id="F3-05-src-D8">D8 — ISO/IEC 14882 (the C++ standard; working draft for C++20): mutual exclusion (<code>std::mutex</code>, <code>std::scoped_lock</code> and the deadlock-avoidance algorithm of <code>std::lock</code>), atomic operations and memory order (acquire, release). Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-05-src-S2">S2 — University Authoring Guide (this project), section 8.1, F3/F4 map: "Deadlock: two students each holding a book the other needs; both wait forever". Opened in this build (local file).</li>
+<li id="F3-05-src-R1">R1 — Lab run "frozen" (<code>F3-05/frozen.log</code>): Listing 1 default build, <code>riscv64-linux-gnu-g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, QEMU emulator version 8.2.2, machine virt with 2 harts, 6 s limit; exit code 124 is the expected result. 2026-10-09.</li>
+<li id="F3-05-src-R2">R2 — Lab run "cpus" (<code>F3-05/cpus.log</code>): QMP <code>info registers -a</code> 3 s after start of the frozen machine, Python 3.13.16, then <code>riscv64-linux-gnu-addr2line</code>.</li>
+<li id="F3-05-src-R3">R3 — Lab run "fixed" (<code>F3-05/fixed.log</code>): Listing 1 with <code>-DSAME_ORDER</code>, same toolchain and machine; exit code 0.</li>
+<li id="F3-05-src-R4">R4 — Lab run of Listing 4 on the frozen log (<code>F3-05/lockgraph.log</code>): <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, sanitizer build.</li>
+<li id="F3-05-src-R5">R5 — Lab run of Listing 3 (<code>F3-05/transfer.log</code>): same host toolchain, sanitizer build, Linux x86_64 cloud build container with 4 CPUs.</li>
+<li id="F3-05-src-R6">R6 — Lab run "spin_loop" (<code>F3-05/spin_loop.log</code>): <code>GNU objdump (GNU Binutils for Ubuntu) 2.42</code> on the frozen kernel.</li>
+</ol>
+
+<h2 id="F3-05-glossary">Glossary links</h2>
+<p><a href="#gl-critical-section">Critical section</a> · <a href="#gl-lock">Lock</a> · <a href="#gl-spinlock">Spinlock</a> · <a href="#gl-sleeping-lock">Sleeping lock</a> · <a href="#gl-mutex">Mutex</a> · <a href="#gl-deadlock">Deadlock</a> · <a href="#gl-lock-ordering">Lock ordering</a> · <a href="#gl-wait-for-graph">Wait-for graph</a> · <a href="#gl-hart">Hart</a> · <a href="#gl-data-race">Data race</a> · <a href="#gl-atomic-operation">Atomic operation</a> · <a href="#gl-thread">Thread</a> · <a href="#gl-interrupt">Interrupt</a></p>
+
+<h2 id="F3-05-next">Next chapter</h2>
+<p>Next: <a href="#F3-06">F3-06 Files and storage</a>. Previous: <a href="#F3-04">F3-04 Virtual memory</a>. Back to the course: <a href="#OS201">OS201</a>.</p>
+
+<h2 id="F3-05-answers">Answers to Check yourself</h2>
+<ol>
+<li>A region of code that touches shared data and must not interleave with other such regions on the same data. On one core, an interrupt handler can run in the middle of kernel code and touch the same data, so the kernel must still protect it (for example by turning interrupts off).</li>
+<li>Two cores can both load 0 before either stores 1; both then believe they hold the lock. The read and the write must be one atomic operation, such as a swap.</li>
+<li>When the holder may wait for something slow, or the critical section is long, so waiters should give the CPU to other work. Example: a file's lock held across a disk read.</li>
+<li>Mutual exclusion, hold and wait, no preemption, circular wait. Lock ordering breaks circular wait.</li>
+<li>Then hart 1 sets step 2 before it holds 'inode notes.txt', so hart 0 can race it for that lock: if hart 0 gets the inode lock first, it completes both, and hart 1 then gets both too; if hart 1 gets it first, the old cycle forms. The forced interleaving is gone and the outcome depends on timing, which is how such bugs behave in real kernels. Your log decides which case happened.</li>
+<li>The two threads take the same two mutexes in opposite orders: a lock-order deadlock that needs an unlucky interleaving, hence "once in many flights". Fix: one order everywhere (sensor data before log file), or lock both with <code>std::scoped_lock</code>, or do not hold the sensor mutex while logging (copy the data, release, then log). Add ThreadSanitizer runs to the tests.</li>
+<li>The PC says which instruction runs, not which data: both execute the same <code>acquire</code> code with a different lock address in a register (<code>s1</code>, <code>a4</code>). The watchdog lines show the two locks are different.</li>
+<li>(b). (a) It avoids deadlock in any order. (c) Waiting for a disk needs a sleeping lock. (d) Two threads are enough (Figure 1).</li>
+</ol>
+<h3 id="F3-05-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>cpu0 (pid 3): "holds 'dir /home'", then "acquire 'inode notes.txt'" with no "holds". cpu1 (pid 4): "holds 'inode notes.txt'", then "acquire 'dir /home'" with no "holds". The watchdog lines confirm both: "still spinning on 'dir /home' held by cpu0" and "still spinning on 'inode notes.txt' held by cpu1".</li>
+<li>Both PCs are <code>0x800001f4</code> = <code>acquire</code>, <code>locks.cc:69</code>: the spin loop of a lock, not file-system code. Second hypothesis: a deadlock between two lock holders. The watchdog lines and the absence of any "release" decide for deadlock.</li>
+<li>cpu0 → cpu1 (waits for 'inode notes.txt', held by cpu1) → cpu0 (cpu1 waits for 'dir /home', held by cpu0); <code>lockgraph</code> prints "CYCLE: cpu0 -&gt; cpu1 -&gt; cpu0". Mutual exclusion: one holder per lock in the watchdog lines. Hold and wait: each holds one and asks for another. No preemption: only <code>release</code> by the holder frees a lock (lines 87–91). Circular wait: the cycle.</li>
+<li>Hart 0, <code>rename</code> (lines 103 and 106): 'dir /home' then 'inode notes.txt'. Hart 1, <code>unlink</code> default build (lines 124 and 126): 'inode notes.txt' then 'dir /home'.</li>
+<li>Fix: one documented order, directory before inode, in both paths (<code>-DSAME_ORDER</code>); the fixed run logs cpu1 waiting at "acquire 'dir /home'" until cpu0's release, then finishing, and QEMU exits 0. Test: run a lock-order validator (lockdep in Linux, the mini-project here) on every test run, so the inversion is reported even when no hang happens.</li>
+</ol>
+<p><b>How the evidence was produced:</b> <code>run.sh</code> built the kernel, ran it in QEMU with a 6-second limit and a QMP socket, sent <code>info registers -a</code> after 3 seconds, mapped the PCs with <code>addr2line</code>, and ran <code>lockgraph</code> on the saved log. The only edit is the replacement of the host's process number of the <code>timeout</code> command by "&lt;timeout's pid&gt;". The bad interleaving is forced by the <code>step</code> flags (see the unverified box).</p>

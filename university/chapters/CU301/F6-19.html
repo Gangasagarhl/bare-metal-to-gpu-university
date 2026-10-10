@@ -1,0 +1,315 @@
+<!--meta
+id: F6-19
+title: Matrix transpose: tiling, padding and swizzling
+course: CU301
+level: L3
+prereqs: F6-10 (shared memory, tiles), F6-11 (bank conflicts, padding), F6-12 (barriers); CU201 F6-08 (coalescing), F6-09 (bandwidth, E2 copy kernels)
+time: 8–12 hours including the lab and milestone E5
+hardware: Milestone E5 needs an NVIDIA GPU and its profiler (and an AMD GPU for the LDS part). The access audit, the CPU replay of all kernels, the forensic replay and the compiler evidence run on any computer with g++ and nvcc (this build: no GPU)
+maps: Curriculum Track E 13.2 topic 4 (memory: coalescing, shared memory, bank conflicts); milestone E5 (naive, tiled, padded and swizzled transposes; correct for non-square and non-tile-multiple shapes; zero or near-zero bank conflicts; X % of the E2 copy bandwidth)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-19-hook">Story hook</h2>
+<p>The pantry's jars stand in long shelves, row after row. Tonight's job is to move them to a second pantry, but turned: what was a row must become a column. Neighbouring helpers can fetch neighbouring jars from a shelf in one trip. Reading a row is easy. Putting the jars down along a column is not: each helper walks to a different shelf.</p>
+<p>Mei's idea: each row group fetches a square block of jars, row by row, and sets it on the table in the middle of the row. Then they pick the jars up from the table <em>column by column</em> and carry each column to the new pantry, where it is now a row. Both trips to the pantries are neighbour-to-neighbour. The only awkward moment is at the table: picking up a column means every helper reaches into the same drawer. Mei shifts each row on the table by one place, and the queue at the drawer disappears. Rahim has another trick: instead of shifting, he shuffles where each jar is put on the table by a simple rule, so no drawer is visited twice, and the table needs no extra space.</p>
+<p>This chapter is milestone E5: naive, tiled, padded and swizzled transposes.</p>
+
+<h2 id="F6-19-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> why a naive transpose cannot make both its reads and its writes coalesced, and how a shared-memory tile fixes it.</li>
+<li><b>Compute</b> the bank of every shared-memory access of a 32 × 32 tile with pitch 32, with pitch 33, and with an XOR swizzle, and predict the passes.</li>
+<li><b>Write</b> the four E5 kernels so that they are correct for non-square and non-tile-multiple shapes.</li>
+<li><b>Read</b> the evidence of padding and swizzling in the compiler output (shared-memory size, address offsets, the XOR).</li>
+<li><b>Measure</b> (on a GPU) each kernel as a percentage of a copy kernel, and <b>diagnose</b> a transpose that is right only for square matrices.</li>
+</ul>
+
+<div class="co jargon" id="F6-19-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Transpose</dt><dd><b>Simple words:</b> turning a matrix so that rows become columns. <b>Analogy:</b> moving jars so each shelf row becomes a column in the new pantry. <b>Precise:</b> for an input of <i>h</i> rows and <i>w</i> columns in row-major order, <code>out[c * h + r] = in[r * w + c]</code>; the output has <i>w</i> rows of <i>h</i> elements. <sup class="src"><a href="#F6-19-src-R2">R2</a></sup></dd>
+<dt>Tiled transpose</dt><dd><b>Simple words:</b> a transpose that goes through a small square in shared memory so that both global reads and global writes are along rows. <b>Analogy:</b> a square of jars set on the table and picked up by columns. <b>Precise:</b> a block loads a TILE × TILE tile with row-wise (coalesced) reads, synchronises, and writes the tile's columns as rows of the output tile at the swapped block coordinates. <sup class="src"><a href="#F6-19-src-D2">D2</a></sup> <sup class="src"><a href="#F6-19-src-D3">D3</a></sup></dd>
+<dt>Padding</dt><dd><b>Simple words:</b> making each tile row one element longer than needed so columns fall into different banks. <b>Analogy:</b> shifting each row on the table by one place. <b>Precise:</b> <code>tile[32][33]</code>: element (<i>r</i>, <i>c</i>) is word 33<i>r</i> + <i>c</i>, bank (<i>r</i> + <i>c</i>) mod 32 in a 32-bank model; costs one unused word per row (<a href="#F6-11">F6-11</a>). <sup class="src"><a href="#F6-19-src-D2">D2</a></sup> <sup class="src"><a href="#F6-19-src-R2">R2</a></sup></dd>
+<dt>Swizzling (XOR)</dt><dd><b>Simple words:</b> storing each element at a column computed with a simple bit rule, so no column read hits one bank twice, without extra space. <b>Analogy:</b> Rahim's rule for where each jar goes on the table. <b>Precise:</b> store logical (<i>r</i>, <i>c</i>) at physical column <i>c</i> XOR <i>r</i> in a <code>tile[32][32]</code>; for fixed <i>c</i>, <i>r</i> ↦ <i>c</i> ⊕ <i>r</i> is a permutation of 0…31, so a column read touches every bank once; so does a row write. <sup class="src"><a href="#F6-19-src-R2">R2</a></sup></dd>
+<dt>Coalesced write</dt><dd><b>Simple words:</b> neighbouring threads storing to neighbouring addresses, so the stores combine into few memory transactions. <b>Analogy:</b> putting neighbouring jars on one shelf in one trip. <b>Precise:</b> the store counterpart of coalescing (<a href="#F6-08">F6-08</a>); in the 32-byte-segment model of Listing 2, a warp storing 32 consecutive floats touches 4 segments, 32 floats one row apart touch 32. <sup class="src"><a href="#F6-19-src-R2">R2</a></sup></dd>
+<dt>Copy bandwidth (reference)</dt><dd><b>Simple words:</b> how fast the GPU can just copy the matrix, the ceiling a transpose is measured against. <b>Analogy:</b> moving the jars without turning them. <b>Precise:</b> E5's target is "X % of your E2 copy bandwidth"; Listing 1's <code>copyTile</code> uses the same tiles and threads without transposing and reports each kernel's time as a percentage of it. <sup class="src"><a href="#F6-19-src-C1">C1</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-19-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the tiled transpose: which tile is read, where it goes, and which direction each access runs. Figure 2 shows the shared tile itself in a small model with 4 banks, for the three layouts.</p>
+<figure id="F6-19-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-19-f1t F6-19-f1d">
+<title id="F6-19-f1t">Figure 1: tiled transpose through shared memory</title>
+<desc id="F6-19-f1d">Left: the input matrix in global memory, width w and height h, divided into 32 by 32 tiles; tile (bx, by) is highlighted, and an arrow along its first row is labelled read rows, coalesced. Middle: the shared-memory tile of the block, 32 by 32 (or 32 by 33 with padding); the rows are written in, then after a barrier the columns are read out, labelled read a column, bank conflicts unless padded or swizzled. Right: the output matrix in global memory, width h and height w; tile (by, bx), at swapped block coordinates, is highlighted, and an arrow along its first row is labelled write rows, coalesced. Arrows show data flow from input to tile to output.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="24">input (h rows × w columns)</text>
+<rect class="sv-box" x="20" y="36" width="200" height="150"/>
+<line class="sv-dash" x1="70" y1="36" x2="70" y2="186"/><line class="sv-dash" x1="120" y1="36" x2="120" y2="186"/><line class="sv-dash" x1="170" y1="36" x2="170" y2="186"/>
+<line class="sv-dash" x1="20" y1="86" x2="220" y2="86"/><line class="sv-dash" x1="20" y1="136" x2="220" y2="136"/>
+<rect class="sv-b1" x="120" y="36" width="50" height="50"/><text class="sv-ts" x="124" y="56">tile</text><text class="sv-ts" x="124" y="72">(bx, by)</text>
+<line class="sv-line2" x1="124" y1="80" x2="166" y2="80"/><polygon class="sv-head" points="162,76 162,84 170,80"/>
+<text class="sv-ts" x="20" y="206">1. read rows: coalesced</text>
+<text class="sv-tb" x="290" y="24">shared tile (one block)</text>
+<rect class="sv-b3" x="290" y="36" width="160" height="150"/>
+<line class="sv-line2" x1="300" y1="56" x2="436" y2="56"/><polygon class="sv-head" points="432,52 432,60 440,56"/>
+<text class="sv-ts" x="300" y="80">rows written in</text>
+<line class="sv-line2" x1="310" y1="96" x2="310" y2="176"/><polygon class="sv-head" points="306,172 314,172 310,180"/>
+<text class="sv-ts" x="320" y="130">column read out</text>
+<text class="sv-ts" x="320" y="146">(after the barrier)</text>
+<text class="sv-ts" x="290" y="206">2. barrier; read a column:</text>
+<text class="sv-ts" x="290" y="222">bank conflicts unless</text>
+<text class="sv-ts" x="290" y="238">padded or swizzled</text>
+<text class="sv-tb" x="520" y="24">output (w rows × h columns)</text>
+<rect class="sv-box" x="520" y="36" width="150" height="200"/>
+<line class="sv-dash" x1="570" y1="36" x2="570" y2="236"/><line class="sv-dash" x1="620" y1="36" x2="620" y2="236"/>
+<line class="sv-dash" x1="520" y1="86" x2="670" y2="86"/><line class="sv-dash" x1="520" y1="136" x2="670" y2="136"/><line class="sv-dash" x1="520" y1="186" x2="670" y2="186"/>
+<rect class="sv-b2" x="570" y="136" width="50" height="50"/><text class="sv-ts" x="574" y="156">tile</text><text class="sv-ts" x="574" y="172">(by, bx)</text>
+<line class="sv-line2" x1="574" y1="180" x2="616" y2="180"/><polygon class="sv-head" points="612,176 612,184 620,180"/>
+<text class="sv-ts" x="520" y="256">3. write rows: coalesced</text>
+<line class="sv-line" x1="222" y1="110" x2="284" y2="110"/><polygon class="sv-head" points="280,105 280,115 288,110"/>
+<line class="sv-line" x1="452" y1="110" x2="514" y2="140"/><polygon class="sv-head" points="508,134 506,144 516,141"/>
+<text class="sv-ts" x="20" y="300">Not to scale. Tile size 32 × 32, block 32 × 8 threads, 4 elements per thread (Listing 1, lines 15–16).</text>
+</svg></div><figcaption><b>Figure 1.</b> The tiled transpose: global reads and global writes both run along rows; the turn happens in shared memory, where the column read is the bank-conflict risk. Arrows show data flow. <sup class="src"><a href="#F6-19-src-D2">D2</a></sup> <sup class="src"><a href="#F6-19-src-R2">R2</a></sup></figcaption></figure>
+
+<figure id="F6-19-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F6-19-f2t F6-19-f2d">
+<title id="F6-19-f2t">Figure 2: where logical column 0 lives in three tile layouts, 4-bank model</title>
+<desc id="F6-19-f2d">Three small grids of a 4 by 4 tile in a model with 4 banks; each cell shows its bank number. Left, pitch 4: cell (r, c) is in bank c; the logical column 0 is the first physical column, all four cells in bank 0, marked: 4 passes. Middle, pitch 5: each row has a fifth padding cell drawn dashed; cell (r, c) is word 5r + c, bank (r + c) mod 4; logical column 0 is still the first physical column, but its cells are in banks 0, 1, 2, 3: 1 pass. Right, XOR swizzle with pitch 4: logical element (r, c) is stored at physical column c XOR r; logical column 0 is therefore stored on the diagonal, physical cells (0,0), (1,1), (2,2), (3,3), in banks 0, 1, 2, 3: 1 pass, with no padding cells.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="20" y="24">pitch 4 (no padding)</text>
+<text class="sv-tb" x="270" y="24">pitch 5 (padding)</text>
+<text class="sv-tb" x="540" y="24">XOR swizzle, pitch 4</text>
+<g>
+<rect class="sv-b8" x="20" y="40" width="40" height="40"/><text class="sv-t" x="35" y="65">0</text><rect class="sv-box" x="60" y="40" width="40" height="40"/><text class="sv-t" x="75" y="65">1</text><rect class="sv-box" x="100" y="40" width="40" height="40"/><text class="sv-t" x="115" y="65">2</text><rect class="sv-box" x="140" y="40" width="40" height="40"/><text class="sv-t" x="155" y="65">3</text>
+<rect class="sv-b8" x="20" y="80" width="40" height="40"/><text class="sv-t" x="35" y="105">0</text><rect class="sv-box" x="60" y="80" width="40" height="40"/><text class="sv-t" x="75" y="105">1</text><rect class="sv-box" x="100" y="80" width="40" height="40"/><text class="sv-t" x="115" y="105">2</text><rect class="sv-box" x="140" y="80" width="40" height="40"/><text class="sv-t" x="155" y="105">3</text>
+<rect class="sv-b8" x="20" y="120" width="40" height="40"/><text class="sv-t" x="35" y="145">0</text><rect class="sv-box" x="60" y="120" width="40" height="40"/><text class="sv-t" x="75" y="145">1</text><rect class="sv-box" x="100" y="120" width="40" height="40"/><text class="sv-t" x="115" y="145">2</text><rect class="sv-box" x="140" y="120" width="40" height="40"/><text class="sv-t" x="155" y="145">3</text>
+<rect class="sv-b8" x="20" y="160" width="40" height="40"/><text class="sv-t" x="35" y="185">0</text><rect class="sv-box" x="60" y="160" width="40" height="40"/><text class="sv-t" x="75" y="185">1</text><rect class="sv-box" x="100" y="160" width="40" height="40"/><text class="sv-t" x="115" y="185">2</text><rect class="sv-box" x="140" y="160" width="40" height="40"/><text class="sv-t" x="155" y="185">3</text>
+</g>
+<text class="sv-ts" x="20" y="222">column 0: banks 0 0 0 0</text><text class="sv-tb" x="20" y="242">4 passes</text>
+<g>
+<rect class="sv-b5" x="270" y="40" width="40" height="40"/><text class="sv-t" x="285" y="65">0</text><rect class="sv-box" x="310" y="40" width="40" height="40"/><text class="sv-t" x="325" y="65">1</text><rect class="sv-box" x="350" y="40" width="40" height="40"/><text class="sv-t" x="365" y="65">2</text><rect class="sv-box" x="390" y="40" width="40" height="40"/><text class="sv-t" x="405" y="65">3</text><rect class="sv-dash" x="430" y="40" width="40" height="40"/><text class="sv-ts" x="440" y="65">(0)</text>
+<rect class="sv-b5" x="270" y="80" width="40" height="40"/><text class="sv-t" x="285" y="105">1</text><rect class="sv-box" x="310" y="80" width="40" height="40"/><text class="sv-t" x="325" y="105">2</text><rect class="sv-box" x="350" y="80" width="40" height="40"/><text class="sv-t" x="365" y="105">3</text><rect class="sv-box" x="390" y="80" width="40" height="40"/><text class="sv-t" x="405" y="105">0</text><rect class="sv-dash" x="430" y="80" width="40" height="40"/><text class="sv-ts" x="440" y="105">(1)</text>
+<rect class="sv-b5" x="270" y="120" width="40" height="40"/><text class="sv-t" x="285" y="145">2</text><rect class="sv-box" x="310" y="120" width="40" height="40"/><text class="sv-t" x="325" y="145">3</text><rect class="sv-box" x="350" y="120" width="40" height="40"/><text class="sv-t" x="365" y="145">0</text><rect class="sv-box" x="390" y="120" width="40" height="40"/><text class="sv-t" x="405" y="145">1</text><rect class="sv-dash" x="430" y="120" width="40" height="40"/><text class="sv-ts" x="440" y="145">(2)</text>
+<rect class="sv-b5" x="270" y="160" width="40" height="40"/><text class="sv-t" x="285" y="185">3</text><rect class="sv-box" x="310" y="160" width="40" height="40"/><text class="sv-t" x="325" y="185">0</text><rect class="sv-box" x="350" y="160" width="40" height="40"/><text class="sv-t" x="365" y="185">1</text><rect class="sv-box" x="390" y="160" width="40" height="40"/><text class="sv-t" x="405" y="185">2</text><rect class="sv-dash" x="430" y="160" width="40" height="40"/><text class="sv-ts" x="440" y="185">(3)</text>
+</g>
+<text class="sv-ts" x="270" y="222">column 0: banks 0 1 2 3</text><text class="sv-tb" x="270" y="242">1 pass</text>
+<g>
+<rect class="sv-b5" x="540" y="40" width="40" height="40"/><text class="sv-t" x="555" y="65">0</text><rect class="sv-box" x="580" y="40" width="40" height="40"/><text class="sv-t" x="595" y="65">1</text><rect class="sv-box" x="620" y="40" width="40" height="40"/><text class="sv-t" x="635" y="65">2</text><rect class="sv-box" x="660" y="40" width="40" height="40"/><text class="sv-t" x="675" y="65">3</text>
+<rect class="sv-box" x="540" y="80" width="40" height="40"/><text class="sv-t" x="555" y="105">0</text><rect class="sv-b5" x="580" y="80" width="40" height="40"/><text class="sv-t" x="595" y="105">1</text><rect class="sv-box" x="620" y="80" width="40" height="40"/><text class="sv-t" x="635" y="105">2</text><rect class="sv-box" x="660" y="80" width="40" height="40"/><text class="sv-t" x="675" y="105">3</text>
+<rect class="sv-box" x="540" y="120" width="40" height="40"/><text class="sv-t" x="555" y="145">0</text><rect class="sv-box" x="580" y="120" width="40" height="40"/><text class="sv-t" x="595" y="145">1</text><rect class="sv-b5" x="620" y="120" width="40" height="40"/><text class="sv-t" x="635" y="145">2</text><rect class="sv-box" x="660" y="120" width="40" height="40"/><text class="sv-t" x="675" y="145">3</text>
+<rect class="sv-box" x="540" y="160" width="40" height="40"/><text class="sv-t" x="555" y="185">0</text><rect class="sv-box" x="580" y="160" width="40" height="40"/><text class="sv-t" x="595" y="185">1</text><rect class="sv-box" x="620" y="160" width="40" height="40"/><text class="sv-t" x="635" y="185">2</text><rect class="sv-b5" x="660" y="160" width="40" height="40"/><text class="sv-t" x="675" y="185">3</text>
+</g>
+<text class="sv-ts" x="540" y="222">column 0 stored at (r, 0 XOR r):</text><text class="sv-ts" x="540" y="238">the diagonal, banks 0 1 2 3</text><text class="sv-tb" x="540" y="258">1 pass, no padding</text>
+<text class="sv-ts" x="20" y="288">Numbers in cells = bank. Shaded = where logical column 0 is stored. 4-bank model for drawing; the kernels use 32 × 32 and a 32-bank model.</text>
+</svg></div><figcaption><b>Figure 2.</b> Three layouts of the shared tile in a small model. Padding moves each row by one bank; the XOR swizzle moves each element within its row; both put a logical column into different banks. Pass counts for the real 32 × 32 case are printed by Listing 2. <sup class="src"><a href="#F6-19-src-R2">R2</a></sup> <sup class="src"><a href="#F6-19-src-D2">D2</a></sup></figcaption></figure>
+
+<h2 id="F6-19-layer1">Layer 1 — the kid explanation</h2>
+<p>Turning a big table of numbers on its side means reading along rows and writing along columns. Helpers are fast when they work on neighbours, so one of the two directions is always slow. The fix is to carry a small square to the shared table, then pick it up the other way round. On the table, a column must not all sit in one drawer; shift each row by one place, or use a rule that spreads the column over all drawers.</p>
+
+<h2 id="F6-19-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-19-l2-naive">The naive kernel and its strided write</h3>
+<p>Listing 1's <code>naive</code> (lines 27–34) gives each thread an element and writes <code>out[x * height + (y + j)] = in[(y + j) * width + x]</code> (line 32). For one warp, <i>x</i> runs over 32 neighbours: the reads are consecutive, the writes are <code>height</code> floats apart. Listing 2 counts it for a 4,096 × 4,096 matrix: the load touches 4 segments of 32 bytes, the store 32. <sup class="src"><a href="#F6-19-src-R2">R2</a></sup> Swapping the roles only moves the problem: then the reads are strided. Whichever way you index, one side of a direct transpose is uncoalesced. <sup class="src"><a href="#F6-19-src-D2">D2</a></sup></p>
+<h3 id="F6-19-l2-tiled">The tiled kernel</h3>
+<p>The template <code>tiled&lt;MODE&gt;</code> (lines 37–56) has three phases (Figure 1):</p>
+<ol>
+<li><b>Load</b> (lines 43–47): thread (<code>tx</code>, <code>ty</code>) reads rows <code>ty</code>, <code>ty</code> + 8, <code>ty</code> + 16, <code>ty</code> + 24 of the input tile; along <code>tx</code> the addresses are consecutive (4 segments per warp). It stores into <code>tile[r][c]</code> with <i>r</i> = <code>ty + j</code>, <i>c</i> = <code>tx</code>: a row of the tile, one pass.</li>
+<li><b>Barrier</b> (line 48): no thread reads the tile before all of it has been written (<a href="#F6-12">F6-12</a>).</li>
+<li><b>Store</b> (lines 49–55): the block coordinates are swapped (lines 49–50); thread (<code>tx</code>, <code>ty</code>) reads <code>tile[tx][ty + j]</code>, a <em>column</em> of the tile, and writes it to consecutive addresses of the output row: 4 segments per warp. <sup class="src"><a href="#F6-19-src-R2">R2</a></sup></li>
+</ol>
+<p>Both global accesses are now coalesced; the price is one shared-memory round trip and one barrier. The column read in phase 3 is where the banks matter.</p>
+<h3 id="F6-19-l2-banks">The banks of a column read</h3>
+<p>In the 32-bank, 4-byte model of <a href="#F6-11">F6-11</a>, word <i>k</i> is in bank <i>k</i> mod 32. <sup class="src"><a href="#F6-19-src-D1">D1</a></sup> For <code>tile[32][32]</code>, lane <i>r</i> of the column read takes word 32<i>r</i> + <i>c</i>, bank <i>c</i> for every lane: 32 distinct words in one bank, 32 passes. Listing 2 prints exactly that for <code>tiledNoPad</code>: shared write 1 pass, shared read 32. <sup class="src"><a href="#F6-19-src-R2">R2</a></sup> Two fixes:</p>
+<ul>
+<li><b>Padding</b> (<code>MODE == 1</code>, line 40: <code>tile[32][33]</code>): word 33<i>r</i> + <i>c</i>, bank (<i>r</i> + <i>c</i>) mod 32, all different for <i>r</i> = 0…31: 1 pass. Cost: 4,224 bytes of shared memory instead of 4,096 (ptxas, R4).</li>
+<li><b>Swizzling</b> (<code>MODE == 2</code>, lines 45 and 53): logical (<i>r</i>, <i>c</i>) is stored at physical column <i>c</i> ⊕ <i>r</i>. A column read (fixed <i>c</i>, lane <i>r</i>) takes banks <i>c</i> ⊕ 0, <i>c</i> ⊕ 1, …, <i>c</i> ⊕ 31: a permutation of 0…31, 1 pass. A row write (fixed <i>r</i>, lane <i>c</i>) takes <i>c</i> ⊕ <i>r</i> for all <i>c</i>: also a permutation, 1 pass. Shared memory stays at 4,096 bytes (R4). <sup class="src"><a href="#F6-19-src-R2">R2</a></sup> <sup class="src"><a href="#F6-19-src-R4">R4</a></sup></li>
+</ul>
+<p>Listing 2 confirms 1 pass for both reads and writes of <code>tiledPad</code> and <code>tiledSwizzle</code>. <sup class="src"><a href="#F6-19-src-R2">R2</a></sup></p>
+<h3 id="F6-19-l2-shapes">Non-square and non-multiple shapes</h3>
+<p>E5 requires "correct for non-square and non-tile-multiple shapes". <sup class="src"><a href="#F6-19-src-C1">C1</a></sup> Two rules make the tiled kernel safe. The grid covers the input, rounded up: ⌈<i>w</i>/32⌉ × ⌈<i>h</i>/32⌉ blocks (line 74). Each global access has its own bounds check with the right dimensions: the load checks <code>x &lt; width &amp;&amp; y + j &lt; height</code> (line 46); after the swap, the store checks <code>x &lt; height &amp;&amp; y + j &lt; width</code> and writes with row length <code>height</code> (line 54). The barrier is outside every condition, so every thread reaches it. Listing 2 replays every block of every kernel for 1,000 × 700, 33 × 65, 1 × 77 and 64 × 64: 0 errors for all four transposes. <sup class="src"><a href="#F6-19-src-R2">R2</a></sup></p>
+
+<h2 id="F6-19-layer3">Layer 3 — the engineer's depth</h2>
+<p>Mei's shift and Rahim's rule both work on the table; the engineer's questions are what each costs, when each one fails, and what the profiler will show.</p>
+<h3 id="F6-19-l3-pad-vs-swizzle">Padding or swizzling?</h3>
+<p>Padding is one character in the source and trivially correct, but it wastes a column per row and breaks alignment: a padded row of 33 floats starts at 132-byte steps, so vector loads of 16 bytes from shared memory no longer line up for every row. Swizzling keeps the tile dense and aligned, which matters when tiles are large, when they are filled by asynchronous or vectorised copies, or when shared memory per block limits occupancy (<a href="#F6-10">F6-10</a>). Its cost is an XOR per index (cheap) and an index rule every reader and writer must agree on. <sup class="src"><a href="#F6-19-src-D2">D2</a></sup> <sup class="src"><a href="#F6-19-src-D3">D3</a></sup> CU302's GEMM tiles and CUTLASS's layouts use swizzles of this family; the XOR here is the simplest member.</p>
+<h3 id="F6-19-l3-elem">Other element sizes</h3>
+<p>The bank arithmetic above assumes 4-byte elements. With 8-byte <code>double</code>s, each element spans two 4-byte words, and with 1- or 2-byte elements several share a word. Pitch 33 and <i>c</i> ⊕ <i>r</i> are then not automatically conflict-free; redo the arithmetic with words, and check against the profiler.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The 32-bank, 4-byte-wide model is the one the CUDA documentation describes for recent compute capabilities according to the authors' memory, but it was not checked against the CUDA C++ Programming Guide's compute-capability appendix in this build; how 8-byte accesses are served (possibly in two half-warp phases) was not checked either. For AMD GPUs, E5 asks you to read "the vendor's description of LDS banks in the AMD ISA guide for your architecture"; the LDS bank count and width were not checked here. Check: D1 (shared memory section, compute-capability appendix) and the AMD ISA reference guide for your GPU.</p></div>
+<h3 id="F6-19-l3-profiler">What the profiler should show</h3>
+<p>E5 accepts when the "profiler shows zero (or near-zero) shared-memory bank conflicts for the final version". <sup class="src"><a href="#F6-19-src-C1">C1</a></sup> Expected, from the model: for <code>tiledNoPad</code>, the shared loads need 32 times as many wavefronts (passes) as requests; for <code>tiledPad</code> and <code>tiledSwizzle</code>, one per request. The forensic lab of <a href="#F6-11">F6-11</a> shows the same transpose from the profiler's side. Only an Nsight Compute run on a GPU can confirm this; none was possible in this build.</p>
+<h3 id="F6-19-l3-roofline">How fast can it be?</h3>
+<p>A transpose does no arithmetic: it reads and writes every element once, so its time is bounded below by the copy time. Listing 1 therefore reports each kernel as a percentage of <code>copyTile</code>, which uses the same grid, block shape and bounds checks, and prints "GB/s" as 2 × elements × 4 bytes / time (line 123). <sup class="src"><a href="#F6-19-src-R1">R1</a></sup> E5 measures against "your E2 copy bandwidth" (<a href="#F6-09">F6-09</a>); <code>copyTile</code> is a convenient stand-in, but use the E2 number in your report. The integer index <code>(y + j) * width + x</code> overflows for matrices with more than 2^31 elements; use 64-bit indices before going there (<a href="#F6-14">F6-14</a>).</p>
+
+<h2 id="F6-19-hardware">How the hardware actually does it</h2>
+<p>The compiler output shows the three designs as numbers. ptxas reports 4,096 bytes of shared memory for <code>tiledNoPad</code> and <code>tiledSwizzle</code> and 4,224 for <code>tiledPad</code>; <code>naive</code> and <code>copyTile</code> use none. <sup class="src"><a href="#F6-19-src-R4">R4</a></sup> In the SASS of <code>tiledSwizzle</code>, the four stores to the tile are <code>STS [R14.X4]</code>, <code>[R14.X4+0x400]</code>, <code>[R7.X4+0x800]</code>, <code>[R21.X4+0xc00]</code>: rows 8 apart, 8 × 32 × 4 = 1,024 = 0x400 bytes, the unpadded pitch (padding would give 0x420, as F6-11 showed). The swizzle itself appears as only four <code>LOP3.LUT … 0x3c</code> instructions, before the stores, <code>BAR.SYNC 0x0</code> and the <code>LDS</code> loads of the column read: one per <code>j</code>, because the writer's <code>threadIdx.x ^ r</code> and the reader's <code>(threadIdx.y + j) ^ threadIdx.x</code> are the same value, and the compiler computes it once for both phases. <sup class="src"><a href="#F6-19-src-R5">R5</a></sup> <code>LOP3</code> computes any function of three inputs from an 8-bit truth table; with the usual operand masks 0xF0, 0xCC and 0xAA, XOR of the first two inputs is 0xF0 ⊕ 0xCC = 0x3C, which matches. <sup class="src"><a href="#F6-19-src-R5">R5</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The LOP3 truth-table convention (operand masks 0xF0, 0xCC, 0xAA) is from memory; NVIDIA's instruction-set reference was not opened. The consistency of four LOP3 instructions, one per <code>j</code>, with the four distinct XOR values of the source is the evidence used here. Check: the CUDA binary utilities documentation for your architecture.</p></div>
+
+<h2 id="F6-19-worked">Worked example</h2>
+<p><b>Task.</b> In the swizzled tile, lane <i>r</i> = 0…3 of a warp reads logical column <i>c</i> = 5. Give the physical columns and banks, then check two lanes of a padded read.</p>
+<ol>
+<li>Physical column = <i>c</i> ⊕ <i>r</i>: 5 ⊕ 0 = 5, 5 ⊕ 1 = 4, 5 ⊕ 2 = 7, 5 ⊕ 3 = 6 (binary 101 with the last two bits flipped as <i>r</i> says).</li>
+<li>Word = 32<i>r</i> + physical column: 5, 36, 71, 102. Bank = word mod 32: 5, 4, 7, 6. All different.</li>
+<li>For all 32 lanes, <i>r</i> ↦ 5 ⊕ <i>r</i> takes every value 0…31 once (XOR with a constant is its own inverse), so all 32 banks are used once: 1 pass.</li>
+<li>Padded tile, lanes 0 and 31 reading column 5: words 5 and 33 × 31 + 5 = 1,028; banks 5 and 1,028 mod 32 = 4. Different, as (<i>r</i> + <i>c</i>) mod 32 predicts: (31 + 5) mod 32 = 4.</li>
+<li>Unpadded tile, same lanes: words 5 and 32 × 31 + 5 = 997; banks 5 and 997 mod 32 = 5. The same bank: this is the conflict.</li>
+</ol>
+
+<h2 id="F6-19-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>transpose.cu</code>: copy, naive, tiled, padded and swizzled kernels; checked on 1,000 × 700 and 4,096 × 4,096 and timed (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-19/transpose.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings transpose.cu -o transpose</code>.</p>
+<pre class="output" data-run="F6-19/transpose"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Built for real; the run stopped at <code>cudaGetDevice</code> (R1). Expected, not observed: "0 errors" for every kernel and shape, and timings in which <code>naive</code> is the slowest and the padded and swizzled kernels come closest to the copy. No time, bandwidth or percentage was measured in this build. What would be needed: an NVIDIA GPU, a rerun, and Nsight Compute for the bank-conflict criterion.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–16</td><td><code>TILE</code>, <code>ROWS</code></td><td>32 × 32 tiles, 32 × 8 threads, 4 elements per thread.</td><td>Fewer threads per tile; each thread loops over <code>j</code>.</td></tr>
+<tr><td>18–25</td><td><code>copyTile</code></td><td>Same tiles, no transpose.</td><td>The reference for "% of copy".</td></tr>
+<tr><td>32</td><td>naive store</td><td><code>out[x * height + (y + j)]</code></td><td>Stride <code>height</code> across a warp: 32 segments.</td></tr>
+<tr><td>40</td><td><code>tile[TILE][MODE == 1 ? TILE + 1 : TILE]</code></td><td>Pitch 33 for the padded kernel.</td><td>4,224 versus 4,096 bytes (R4).</td></tr>
+<tr><td>45, 53</td><td><code>threadIdx.x ^ r</code>, <code>(threadIdx.y + j) ^ r</code></td><td>The swizzled column, on write and read.</td><td>Writer and reader use the same rule.</td></tr>
+<tr><td>46</td><td>load with bounds</td><td><code>x &lt; width &amp;&amp; y + j &lt; height</code></td><td>Non-multiple shapes.</td></tr>
+<tr><td>48</td><td><code>__syncthreads()</code></td><td>Tile complete before any column read.</td><td>Outside every condition.</td></tr>
+<tr><td>49–50</td><td>swap block coordinates</td><td>Output tile (<code>by</code>, <code>bx</code>).</td><td>The transpose of the tile grid.</td></tr>
+<tr><td>54</td><td>store with bounds</td><td><code>x &lt; height &amp;&amp; y + j &lt; width</code>, row length <code>height</code>.</td><td>The forensic bug lives here.</td></tr>
+<tr><td>72–92</td><td><code>timeKernel</code></td><td>Warm-up, 20 timed runs, median.</td><td>CU201's protocol in miniature.</td></tr>
+<tr><td>115–125</td><td>check and report</td><td>Errors, ms, GB/s, % of copy.</td><td>E5's two acceptance numbers.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>transpose_audit.cpp</code>: segments and bank passes for one warp, and a CPU replay of every block on awkward shapes.</p>
+<pre class="listing" data-src="F6-19/transpose_audit.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined transpose_audit.cpp -o transpose_audit</code>.</p>
+<pre class="output" data-run="F6-19/transpose_audit"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–19</td><td><code>segments</code></td><td>Distinct 32-byte segments of a warp's addresses.</td><td>The coalescing model of F6-08.</td></tr>
+<tr><td>21–28</td><td><code>passes</code></td><td>Most distinct words in any one bank.</td><td>The bank model of F6-11.</td></tr>
+<tr><td>31–36</td><td><code>word</code></td><td>Word index for pitch 32, pitch 33, swizzle.</td><td>The three layouts of Figure 2.</td></tr>
+<tr><td>39–79</td><td><code>replay</code></td><td>Runs each kernel's index arithmetic for every block and thread.</td><td>Correctness without a GPU.</td></tr>
+<tr><td>87–105</td><td>part 1</td><td>One warp, <code>j</code> = 0, block (0, 0).</td><td>The numbers of Layer 2.</td></tr>
+<tr><td>107–124</td><td>part 2</td><td>Four shapes, compared with the true transpose.</td><td>E5's "non-square and non-tile-multiple".</td></tr>
+</tbody></table></div>
+
+<p><b>Compiler evidence.</b> ptxas resource report and the shared-memory part of <code>tiledSwizzle</code> in SASS (sm_80):</p>
+<pre class="output" data-run="F6-19/resources"></pre>
+<pre class="output" data-run="F6-19/sass_swizzle"></pre>
+
+<h2 id="F6-19-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Shifting a row on a real table takes space; on the GPU so does padding, but swizzling does not.</b> The kitchen has no equivalent of storing jars at XOR-ed places: it is a pure index rule, invisible until you read the code.</li>
+<li><b>The pantry trips are not equal.</b> In the hall, a column trip is "slower"; on a GPU the cost is the number of memory transactions (32 segments instead of 4 in the model), and caches can partly hide it; the real ratio must be measured.</li>
+<li><b>Drawers are not furniture.</b> Banks are an addressing rule (word mod 32 in the model), so the same tile can be conflict-free for one access pattern and 32-way conflicted for another; nothing physical moves.</li>
+</ul>
+
+<h2 id="F6-19-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> correct for square matrices, wrong or crashing for 1,000 × 700. <b>Cause:</b> the output index uses <code>width</code> as its row length (the forensic lab). <b>How to find it:</b> test a non-square shape in both orientations; Compute Sanitizer memcheck reports the out-of-bounds writes. <b>Fix:</b> output rows have length <code>height</code>.</li>
+<li><b>Symptom:</b> garbage in some output elements, varying between runs. <b>Cause:</b> barrier missing, or placed inside the bounds check so edge threads skip it. <b>Fix:</b> one <code>__syncthreads()</code> between the phases, reached by all threads.</li>
+<li><b>Symptom:</b> padded kernel no faster than unpadded. <b>Cause:</b> padding applied to the wrong dimension (<code>tile[33][32]</code>). <b>Fix:</b> pad the row length, the second index.</li>
+<li><b>Symptom:</b> swizzled kernel wrong. <b>Cause:</b> the reader uses a different XOR rule from the writer (for example, XOR with <code>threadIdx.y</code> instead of the logical row). <b>Fix:</b> one helper function for the physical column, used by both.</li>
+<li><b>Symptom:</b> slow edges on small matrices. <b>Cause:</b> partial tiles do little work. <b>Fix:</b> none needed for large matrices; for small ones, measure before tuning.</li>
+</ul>
+
+<div class="co transition" id="F6-19-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-08">F6-08</a> (coalescing), <a href="#F6-10">F6-10</a> (shared-memory tiles), <a href="#F6-11">F6-11</a> (banks and padding), <a href="#F6-12">F6-12</a> (barriers). <b>What carries over:</b> neighbouring threads on neighbouring addresses; the bank of a word is its index mod 32 in the model; one barrier between writing a tile and reading it. <sup class="src"><a href="#F6-19-src-D1">D1</a></sup> <b>What changes:</b> you now design the shared-memory layout to make two different global access patterns both efficient, and you choose between padding and swizzling by what else the tile must do (alignment, size, vector copies). <sup class="src"><a href="#F6-19-src-D2">D2</a></sup> <b>What comes next:</b> CU302 starts at <a href="#F6-20">F6-20</a> with occupancy and latency hiding, and then tiles a matrix multiply through shared memory and registers, where the same layouts and swizzles return.</p></div>
+
+<h2 id="F6-19-check">Check yourself</h2>
+<ol>
+<li>Why can a direct (naive) transpose not have both its reads and its writes coalesced?</li>
+<li>How many segments of 32 bytes does one warp's store touch in the naive kernel for a 4,096 × 4,096 float matrix, according to Listing 2? Why?</li>
+<li>For <code>tile[32][32]</code>, which bank does lane <i>r</i> use when reading column <i>c</i>? And for <code>tile[32][33]</code>?</li>
+<li>Prove that the XOR swizzle makes both the row write and the column read conflict-free in the 32-bank model.</li>
+<li>What does each swizzle cost compared with padding, and what does it save? Use R4.</li>
+<li>Apply: a matrix of 100 rows and 40 columns. How many blocks does Listing 1 launch, and which bounds check stops the store of the tile at input block (1, 3)?</li>
+<li>Explain in your own words why the barrier must not be inside the bounds check.</li>
+<li>Apply: with 8-byte <code>double</code> elements and 4-byte banks, which words does lane <i>r</i> touch reading column 0 of <code>double tile[32][33]</code>? Are you sure there is no conflict?</li>
+</ol>
+
+<h2 id="F6-19-lab">Lab</h2>
+<p><b>Goal.</b> Milestone E5: "Use shared memory / LDS to make both reads and writes coalesced; remove bank conflicts with padding or swizzling." Build "naive, tiled, padded and swizzled transposes". Accept: "Correct for non-square and non-tile-multiple shapes. Profiler shows zero (or near-zero) shared-memory bank conflicts for the final version; throughput reaches X % of your E2 copy bandwidth." <sup class="src"><a href="#F6-19-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–4: g++ 13.3 and nvcc 12.0, no GPU. Steps 5–7: an NVIDIA GPU with CUDA 12.0 and Nsight Compute; for the LDS part, an AMD GPU with HIP. Folder <code>university/labs/F6-19</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-19</code> from the repository root; read every output.</li>
+<li>Extend Listing 2's part 1 to all four values of <code>j</code> and to a block other than (0, 0). Do the pass counts change?</li>
+<li>Add shapes 31 × 33, 32 × 1 and 4,097 × 3 to part 2; all must show 0 errors.</li>
+<li>Write the X you will accept for E5 before you measure (as for E3's exam P).</li>
+<li>On a GPU: run Listing 1; all kernels must report 0 errors.</li>
+<li>On a GPU: profile <code>tiledNoPad</code>, <code>tiledPad</code> and <code>tiledSwizzle</code> with Nsight Compute; record the shared-memory bank-conflict counters and compare with Listing 2.</li>
+<li>On a GPU: compare each kernel with your E2 copy bandwidth; record "% of E2 copy" in a table with the protocol of CU201.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: the pass counts stay 1/32, 1/1, 1/1 for every <code>j</code> and block, because the bank depends only on the index within the tile. Steps 5–7: your measurements; none exist in this build.</p>
+<p><b>Verification.</b> 0 errors on every shape; bank-conflict counters at or near zero for the final kernel.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Nsight Compute metric names differ between versions → search its metric list for "bank" in your version; do not copy names from this page (none are given).</li>
+<li>Percentages above 100 % of copy → check that copy and transpose use the same sizes and that the warm-up run is excluded.</li>
+<li>HIP port: the AMD wave has 64 lanes; redo the bank arithmetic for the LDS of your GPU (unverified box above).</li>
+</ul>
+<p><b>Extension.</b> In-place transpose of a square matrix: each block swaps two tiles (or transposes a diagonal tile in place). Why can't a non-square matrix be transposed in place this simply?</p>
+
+<h2 id="F6-19-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A tiled transpose passed its tests on 64 × 64 and 1,024 × 1,024 matrices. On a 1,000 × 700 image (width × height), results are wrong and a later kernel crashes with an illegal-address error; on 700 × 1,000 the results are wrong but nothing crashes. A colleague suspects a bank-conflict fix that went wrong. The store line reads <code>out[(y + j) * width + x] = tile[...]</code>.</p>
+<p><b>Evidence pack.</b> A CPU replay of the scenario's kernel and the fixed one (<code>nonsquare.cpp</code>), counting wrong elements, elements never written and writes beyond the output buffer:</p>
+<pre class="listing" data-src="F6-19/nonsquare.cpp"></pre>
+<pre class="output" data-run="F6-19/nonsquare"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which shapes fail, and how many elements are wrong, unwritten and written outside?</li>
+<li>Hypotheses: a bank-conflict fix gone wrong, a missing barrier, a wrong row length in the store. Which evidence decides?</li>
+<li>Explain why square shapes cannot reveal the bug.</li>
+<li>Explain why 1,000 × 700 writes outside the buffer and 700 × 1,000 does not.</li>
+<li>Fix and prevention.</li>
+</ol>
+<p><b>Method hints.</b> What is the row length of the output? Compute the largest index the bug can write for both shapes.</p>
+
+<h2 id="F6-19-project">Mini-project</h2>
+<p><b>A transpose module for the primitives library.</b> A templated transpose for 1-, 4- and 8-byte elements with a swizzled tile chosen per element size, correct for all shapes, with tests on E5's shapes and a table of "% of E2 copy" for each version; a short note on which layout you chose for 8-byte elements and the evidence (arithmetic plus profiler) that it is conflict-free.</p>
+<p><b>Rubric.</b> Correct on all shapes and element sizes (4). Bank arithmetic shown for every element size (2). Profiler evidence of zero or near-zero conflicts (2). Measured table against E2 copy with the CU201 protocol (2).</p>
+
+<h2 id="F6-19-summary">Summary</h2>
+<ul>
+<li>A direct transpose has one uncoalesced side: 32 segments per warp instead of 4 in the model.</li>
+<li>A shared-memory tile makes both global sides coalesced: read rows, barrier, read columns, write rows at swapped block coordinates.</li>
+<li>The column read of a <code>[32][32]</code> tile hits one bank 32 times.</li>
+<li>Padding (<code>[32][33]</code>) fixes it with 128 extra bytes; the XOR swizzle fixes it with none.</li>
+<li>Bounds checks must use the right dimension on each side; the barrier must be reached by all threads.</li>
+<li>A transpose is judged against copy bandwidth; only a GPU run can give the percentage.</li>
+</ul>
+
+<h2 id="F6-19-sources">Sources</h2>
+<ol>
+<li id="F6-19-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): shared memory, the compute-capability appendix (banks). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-19-src-D2">D2 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): coalesced access to global memory, shared memory and memory banks (the transpose and padding example). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-19-src-D3">D3 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): memory coalescing and corner turning, tiling. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-19-src-C1">C1 — Systems Curriculum (this project), milestone E5 (goal, read, build and accept quoted). A map, not a source (AH-4).</li>
+<li id="F6-19-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-19/transpose.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F6-19-src-R2">R2 — run of Listing 2 (<code>transpose_audit.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-19-src-R3">R3 — run of the forensic replay <code>nonsquare.cpp</code> (<code>nonsquare.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-19-src-R4">R4 — ptxas resource report of Listing 1 for sm_80 (<code>resources.log</code>), CUDA 12.0; compiled only.</li>
+<li id="F6-19-src-R5">R5 — SASS of <code>tiledSwizzle</code> for sm_80 (<code>sass_swizzle.log</code>), cuobjdump from CUDA 12.0; compiled only.</li>
+</ol>
+
+<h2 id="F6-19-glossary">Glossary links</h2>
+<p><a href="#gl-transpose">Transpose</a> · <a href="#gl-tiled-transpose">Tiled transpose</a> · <a href="#gl-padding">Padding</a> · <a href="#gl-swizzling-xor">Swizzling (XOR)</a> · <a href="#gl-coalesced-write">Coalesced write</a> · <a href="#gl-copy-bandwidth-reference">Copy bandwidth (reference)</a> · <a href="#gl-bank-conflict">Bank conflict</a> · <a href="#gl-tile">Tile</a></p>
+
+<h2 id="F6-19-next">Next chapter</h2>
+<p>Next: <a href="#F6-20">F6-20 Occupancy and latency hiding</a> (course CU302). Previous: <a href="#F6-18">F6-18 Sorting on the GPU</a>. Back to the course: <a href="#CU301">CU301</a>.</p>
+
+<h2 id="F6-19-answers">Answers to Check yourself</h2>
+<ol>
+<li>A warp's 32 neighbouring threads touch either 32 neighbours in one row of the input (and then 32 elements of one column of the output, far apart) or the reverse; a direct mapping cannot make both sides consecutive.</li>
+<li>32: neighbouring lanes write 4,096 floats apart, so every store falls into its own 32-byte segment (R2). A distractor is "4, as for the load": that holds only for the load.</li>
+<li>Pitch 32: bank <i>c</i> for every lane (32 passes). Pitch 33: bank (<i>r</i> + <i>c</i>) mod 32, different for every lane (1 pass).</li>
+<li>Element (<i>r</i>, <i>c</i>) is in bank <i>c</i> ⊕ <i>r</i> (word 32<i>r</i> + (<i>c</i> ⊕ <i>r</i>), mod 32). Row write: <i>r</i> fixed, <i>c</i> = 0…31, and <i>c</i> ↦ <i>c</i> ⊕ <i>r</i> is a bijection on 0…31. Column read: <i>c</i> fixed, <i>r</i> = 0…31, and <i>r</i> ↦ <i>c</i> ⊕ <i>r</i> is a bijection. One word per bank in both cases: 1 pass.</li>
+<li>Cost: one XOR per index (four LOP3 in the SASS, R5) and an index rule to keep consistent. Saving: 128 bytes of shared memory per block (4,096 instead of 4,224, R4) and aligned rows.</li>
+<li>⌈40/32⌉ × ⌈100/32⌉ = 2 × 4 = 8 blocks. Input block (1, 3) covers columns 32–39 and rows 96–99; after the swap it writes output rows 32–63 (only 32–39 exist, since the output has 40 rows) and columns 96–127 (only 96–99 exist). The store check <code>x &lt; height</code> (here <i>x</i> is an output column, &lt; 100) and <code>y + j &lt; width</code> (output row &lt; 40) stops the rest.</li>
+<li>Threads outside the matrix would skip it, while the others wait at it; a barrier that not all threads of the block reach is undefined behaviour (F6-12).</li>
+<li>Element (<i>r</i>, 0) starts at byte 8 × 33<i>r</i>, word 66<i>r</i>, bank 66<i>r</i> mod 32 = 2<i>r</i> mod 32, and also uses word 66<i>r</i> + 1. Lanes <i>r</i> and <i>r</i> + 16 land in the same banks with different words, so in the simple 4-byte model there are 2-way conflicts; whether the hardware serves 8-byte accesses in two phases (which could remove them) is the unverified question of Layer 3. Not sure without the documentation and a profiler: that is the point.</li>
+</ol>
+<h3 id="F6-19-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Square shapes: 0 wrong, 0 unwritten, 0 outside. 1,000 × 700: 699,300 wrong, 210,000 never written, 210,000 writes outside the buffer. 700 × 1,000: 699,000 wrong, 209,700 never written, 0 outside. The fixed kernel: 0 everywhere (R3).</p>
+<p><b>Hypotheses.</b> A bank-conflict layout or a missing barrier would not depend on whether the matrix is square, and could not write outside the buffer: the tile is read and written with in-range indices. A wrong row length in the store fits: it only matters when width ≠ height.</p>
+<p><b>Why square shapes hide it.</b> When <code>width == height</code>, the buggy and correct row lengths are equal; the same code is correct.</p>
+<p><b>Outside or not.</b> The output has <code>width</code> rows of <code>height</code> elements. With the bug, a row index up to <code>width</code> − 1 is multiplied by <code>width</code>. For 1,000 × 700: largest index 999 × 1,000 + 699 = 999,699 ≥ 700,000 = buffer size, so writes land outside (on a GPU, in other allocations, hence the later illegal address). For 700 × 1,000: 699 × 700 + 999 = 490,299 &lt; 700,000, inside the buffer but in the wrong places, overwriting some elements twice and leaving others unwritten.</p>
+<p><b>Fix.</b> <code>out[(y + j) * height + x]</code> (Listing 1, line 54). <b>Prevention:</b> E5's own acceptance test, non-square shapes in both orientations; Compute Sanitizer memcheck on every new kernel; name the dimensions of the output explicitly (<code>outRows</code>, <code>outCols</code>).</p>
+<p><b>How the evidence was produced:</b> <code>nonsquare.cpp</code> replays every block and thread of the kernel on the CPU and counts instead of writing outside the buffer; no GPU was used.</p>

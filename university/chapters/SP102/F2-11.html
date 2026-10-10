@@ -1,0 +1,367 @@
+<!--meta
+id: F2-11
+title: RAII: resources that clean up after themselves
+course: SP102
+level: L2
+prereqs: F2-10
+time: 4–5 hours including the lab and the forensic lab
+hardware: A Linux computer with the C++ toolchain recorded in the dossier (this build: g++ 13.3.0 on Linux x86_64); the listings use Linux file descriptors and /proc/self/fd
+maps: Curriculum 1.1 (language topics, first part); RAII for host-side resources carries over into BR-01 (C++ to CUDA) and every driver wrapper of the kernel tracks
+analogy: F2 — the restaurant building and its kitchen (registered mapping: RAII = borrowing a tool from the tool wall, returned automatically when you leave the room)
+-->
+<h2 id="F2-11-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>The kitchen has a tool wall: the big pot, the only mandoline, the key to the spice cabinet. The rule says: take a tool, use it, hang it back. Most days that works.</p>
+<p>Then one evening Tariq takes the spice key, sees that the dish needs no spice after all, and hurries off to the next order. The key is in his apron pocket. Ten minutes later Mei needs saffron. The cabinet is locked, and the key is nowhere. "Someone else is using it," she thinks, and waits. Nobody is using it. Nobody will ever bring it back.</p>
+<p>Lucía, the head chef, solves it for good: the tool wall now has a door, and anything you took from the wall is returned automatically when you leave the room, by whichever door you leave. You cannot forget, because returning is no longer your job.</p>
+<p>That automatic return is called <b>RAII</b>. It is the most important habit in C++ systems programming, and this chapter builds it from the destructor of <a href="#F2-10">F2-10</a>.</p>
+</div>
+
+<h2 id="F2-11-able">What you will be able to do</h2>
+<ul>
+<li>Explain what a resource is and why "acquire, use, release" by hand fails on early-return and error paths.</li>
+<li>Write an RAII wrapper class for a Linux file descriptor: acquire in the constructor, release in the destructor, copying forbidden.</li>
+<li>Measure a resource leak by counting a process's open file descriptors, and prove a fix with a test.</li>
+<li>Recognise RAII types in the standard library (<code>std::ofstream</code>, <code>std::lock_guard</code>) and use them instead of manual release.</li>
+<li>Diagnose "the file that stays locked" from a log and a list of open descriptors.</li>
+</ul>
+
+<div class="co jargon" id="F2-11-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Resource</dt><dd><b>Simple words:</b> Something your program borrows from the system and must give back. <b>Analogy:</b> A tool from the tool wall. <b>Precise:</b> Anything that must be acquired and later released: memory, open files, locks, network connections, GPU memory; if not released, it stays taken until the process ends. <sup class="src"><a href="#F2-11-src-D1">D1</a>, <a href="#F2-11-src-D3">D3</a></sup></dd>
+<dt>RAII (Resource Acquisition Is Initialisation)</dt><dd><b>Simple words:</b> Tie a resource to an object: the object takes it when it is made and gives it back when it ends. <b>Analogy:</b> Borrowing a tool from the tool wall, which is returned automatically when you leave the room. <b>Precise:</b> The technique of acquiring a resource in a constructor and releasing it in the destructor of an owning object, so that the release happens on every path out of the owner's scope, including early returns and exceptions. <sup class="src"><a href="#F2-11-src-D1">D1</a>, <a href="#F2-11-src-D3">D3</a>, <a href="#F2-11-src-R2">R2</a></sup></dd>
+<dt>File descriptor</dt><dd><b>Simple words:</b> A small number the operating system gives your program for each file it has open. <b>Analogy:</b> The number on the tag of a borrowed tool. <b>Precise:</b> On Linux and other POSIX systems, a non-negative integer returned by <code>open()</code> that indexes the process's table of open files; it stays valid until <code>close()</code> or the end of the process. <sup class="src"><a href="#F2-11-src-D4">D4</a>, <a href="#F2-11-src-R5">R5</a></sup></dd>
+<dt>Resource leak</dt><dd><b>Simple words:</b> Taking a resource and never giving it back. <b>Analogy:</b> The spice key forgotten in an apron pocket. <b>Precise:</b> A resource acquired and never released while the program keeps running; leaks accumulate until acquisition fails (R5: <code>Too many open files</code>). <sup class="src"><a href="#F2-11-src-R1">R1</a>, <a href="#F2-11-src-R5">R5</a></sup></dd>
+<dt>Early return</dt><dd><b>Simple words:</b> Leaving a function before its last line. <b>Analogy:</b> Leaving the room by the back door. <b>Precise:</b> A <code>return</code> statement before the end of a function body; any clean-up written after it does not run. <sup class="src"><a href="#F2-11-src-R1">R1</a></sup></dd>
+<dt>Lock (advisory file lock)</dt><dd><b>Simple words:</b> A sign that says "I am using this; others must wait". <b>Analogy:</b> The single key to the spice cabinet. <b>Precise:</b> Here: a lock taken with Linux's <code>flock()</code> on an open file; it is held through that open file and released by <code>flock(fd, LOCK_UN)</code> or when the file is closed; "advisory" means only programs that also ask for the lock are stopped. <sup class="src"><a href="#F2-11-src-D4">D4</a>, <a href="#F2-11-src-R6">R6</a></sup></dd>
+<dt>Owner (of a resource)</dt><dd><b>Simple words:</b> The one object responsible for giving a resource back. <b>Analogy:</b> The name written on the borrowing card. <b>Precise:</b> The object whose destructor releases the resource; with RAII each resource has exactly one owner at a time, which is why the wrapper forbids copying (<a href="#F2-13">F2-13</a> adds transfer of ownership by moving). <sup class="src"><a href="#F2-11-src-D3">D3</a></sup></dd>
+</dl></div>
+
+<h2 id="F2-11-pictures">The idea in pictures</h2>
+<p>Figure 1 compares the two versions of the same function. With release by hand, the clean-up sits at the bottom, and the early-return path never reaches it. With RAII, every path out of the function goes through the closing brace, and the compiler places the destructor call there.</p>
+<figure id="F2-11-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 330" role="img" aria-labelledby="F2-11-f1t F2-11-f1d">
+<title id="F2-11-f1t">Release by hand versus RAII on two exit paths</title>
+<desc id="F2-11-f1d">Two flowcharts side by side. Left, titled release by hand (Listing 1): open the file, then a decision "order empty?". The yes branch goes to "return false" and exits with the file still open, marked leak. The no branch goes to write, then close, then return; that exit is marked closed. Right, titled RAII (Listing 2): constructing File f opens the file, then the same decision. Both the yes branch (return false) and the no branch (write, return) pass through a bar labelled closing brace: destructor ~File() calls close, and both exits are marked closed.</desc>
+<text class="sv-tb" x="30" y="26">Release by hand (Listing 1)</text>
+<rect class="sv-b2" x="40" y="40" width="220" height="34" rx="6"/><text class="sv-tm" x="52" y="62">fd = ::open(...)</text>
+<line class="sv-line" x1="150" y1="74" x2="150" y2="94"/><polygon class="sv-head" points="150,100 145,90 155,90"/>
+<rect class="sv-b6" x="70" y="100" width="160" height="34" rx="6"/><text class="sv-tm" x="84" y="122">order empty?</text>
+<line class="sv-line" x1="70" y1="117" x2="40" y2="117"/><line class="sv-line" x1="40" y1="117" x2="40" y2="164"/><polygon class="sv-head" points="40,170 35,160 45,160"/>
+<text class="sv-ts" x="46" y="146">yes</text>
+<rect class="sv-b8" x="10" y="170" width="130" height="34" rx="6"/><text class="sv-tm" x="20" y="192">return false</text>
+<text class="sv-tb" x="10" y="230">✗ file still open</text><text class="sv-ts" x="10" y="248">(leak: nobody calls close)</text>
+<line class="sv-line" x1="230" y1="117" x2="270" y2="117"/><line class="sv-line" x1="270" y1="117" x2="270" y2="164"/><polygon class="sv-head" points="270,170 265,160 275,160"/>
+<text class="sv-ts" x="276" y="146">no</text>
+<rect class="sv-b2" x="200" y="170" width="150" height="34" rx="6"/><text class="sv-tm" x="212" y="192">::write(...)</text>
+<line class="sv-line" x1="275" y1="204" x2="275" y2="220"/><polygon class="sv-head" points="275,226 270,216 280,216"/>
+<rect class="sv-b5" x="200" y="226" width="150" height="34" rx="6"/><text class="sv-tm" x="212" y="248">::close(fd)</text>
+<text class="sv-tb" x="200" y="284">✓ closed</text>
+<line class="sv-dash" x1="440" y1="20" x2="440" y2="310"/>
+<text class="sv-tb" x="470" y="26">RAII (Listing 2)</text>
+<rect class="sv-b2" x="480" y="40" width="250" height="34" rx="6"/><text class="sv-tm" x="492" y="62">File f(...)  // opens</text>
+<line class="sv-line" x1="605" y1="74" x2="605" y2="94"/><polygon class="sv-head" points="605,100 600,90 610,90"/>
+<rect class="sv-b6" x="525" y="100" width="160" height="34" rx="6"/><text class="sv-tm" x="539" y="122">order empty?</text>
+<line class="sv-line" x1="525" y1="117" x2="495" y2="117"/><line class="sv-line" x1="495" y1="117" x2="495" y2="164"/><polygon class="sv-head" points="495,170 490,160 500,160"/>
+<text class="sv-ts" x="501" y="146">yes</text>
+<rect class="sv-b2" x="460" y="170" width="130" height="34" rx="6"/><text class="sv-tm" x="470" y="192">return false</text>
+<line class="sv-line" x1="685" y1="117" x2="725" y2="117"/><line class="sv-line" x1="725" y1="117" x2="725" y2="164"/><polygon class="sv-head" points="725,170 720,160 730,160"/>
+<text class="sv-ts" x="731" y="146">no</text>
+<rect class="sv-b2" x="650" y="170" width="200" height="34" rx="6"/><text class="sv-tm" x="660" y="192">return f.write_line(..)</text>
+<line class="sv-line" x1="525" y1="204" x2="525" y2="234"/><polygon class="sv-head" points="525,240 520,230 530,230"/>
+<line class="sv-line" x1="750" y1="204" x2="750" y2="234"/><polygon class="sv-head" points="750,240 745,230 755,230"/>
+<rect class="sv-b5" x="460" y="240" width="390" height="34" rx="6"/><text class="sv-tm" x="472" y="262">closing brace: ~File() calls ::close(fd_)</text>
+<text class="sv-tb" x="460" y="300">✓ closed on both paths</text>
+</svg></div><figcaption><b>Figure 1.</b> The same function with release by hand and with RAII. Arrows show control flow. Measured effect: after six calls with three empty orders, Listing 1 left 3 extra files open, Listing 2 left none. <sup class="src"><a href="#F2-11-src-R1">R1</a>, <a href="#F2-11-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F2-11-layer1">Layer 1 — the kid explanation</h2>
+<p>Some things in a computer are borrowed. When your program opens a file, the operating system lends it a numbered tag for that file. When your program locks something, it holds the only key. These borrowed things are called <b>resources</b>, and every one of them must be given back.</p>
+<p>Giving back "by hand" means writing <code>close</code> at the end of the function. That works only if the program always reaches the end. Real functions have many exits: "nothing to do, leave now", "bad input, leave now", "an error happened, leave now". Every exit is a back door where the key can walk out in someone's pocket.</p>
+<p>RAII is the automatic tool wall. You put the resource inside an object. The object's constructor borrows it; the object's destructor gives it back. And from <a href="#F2-10">F2-10</a> you know the destructor runs at the closing brace, whichever door you use. So the resource is always returned, and you never have to remember.</p>
+
+<h2 id="F2-11-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F2-11-l2-leak">Measuring a leak</h3>
+<p>On Linux every process can list its own open files in the folder <code>/proc/self/fd</code>; each entry is one file descriptor. The function <code>open_file_count()</code> in the listings counts those entries (the listing itself uses one descriptor while it reads the folder, which is why the count starts at 4: standard input, output, error, and the folder being read). <sup class="src"><a href="#F2-11-src-D4">D4</a>, <a href="#F2-11-src-R1">R1</a></sup></p>
+<p>Listing 1 appends orders to a file with the system calls <code>open</code>, <code>write</code> and <code>close</code>. For an empty order it returns early, between <code>open</code> and <code>close</code>. After six orders, three of them empty, the run printed <code>open files at start: 4</code> and <code>open files after 6 orders (3 empty): 7</code>: exactly one leaked descriptor per early return. Nothing crashed and no warning appeared; the program simply holds three files it will never use again. <sup class="src"><a href="#F2-11-src-R1">R1</a></sup></p>
+<p>How long can that go on? Listing 5 lowers its own limit to 32 open files and then opens without closing. The run printed <code>open failed after 29 leaked files: Too many open files</code>. A leak is a slow failure: the program works for a while, then a completely unrelated <code>open</code> somewhere else fails. <sup class="src"><a href="#F2-11-src-R5">R5</a>, <a href="#F2-11-src-D4">D4</a></sup></p>
+<h3 id="F2-11-l2-wrapper">The RAII wrapper</h3>
+<p>Listing 2 puts the descriptor inside a class <code>File</code> with four parts. The constructor calls <code>open</code> and throws if it fails, so a <code>File</code> object always owns an open file (its invariant). The destructor calls <code>close</code>. Copying is deleted, because two objects closing the same descriptor would be the "closed twice" bug of <a href="#F2-10">F2-10</a>. And a member function, <code>write_line</code>, does the work. <sup class="src"><a href="#F2-11-src-D1">D1</a>, <a href="#F2-11-src-D3">D3</a></sup></p>
+<p>Now <code>append_order</code> creates a local <code>File f</code>. The early return needs no extra code: <code>f</code>'s destructor runs on the way out. The run printed <code>open files after 6 orders (3 empty): 4</code>. Opening a file that does not exist threw, <code>main</code> caught it (<code>caught: File: cannot open no_such_folder/orders.txt</code>), and the count at the end was still 4. <sup class="src"><a href="#F2-11-src-R2">R2</a></sup></p>
+<h3 id="F2-11-l2-std">RAII is already everywhere in the standard library</h3>
+<p>You have used RAII types without knowing it. <code>std::string</code> and <code>std::vector</code> release their memory in their destructors. <code>std::ofstream</code> closes its file in its destructor, and <code>std::lock_guard</code> unlocks a mutex in its destructor. Listing 3 shows both: inside <code>write_menu</code> the count was 5, after it 4, and <code>try_lock</code> on the mutex succeeded, so the lock had been released at the closing brace. When a standard RAII type exists for your resource, use it; write your own wrapper only for resources the library does not cover, such as raw descriptors, device handles or, later, GPU memory. <sup class="src"><a href="#F2-11-src-R3">R3</a>, <a href="#F2-11-src-D1">D1</a>, <a href="#F2-11-src-D2">D2</a></sup></p>
+
+<h2 id="F2-11-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F2-11-l3-rules">Design rules for a wrapper</h3>
+<ul>
+<li><b>One resource, one owner.</b> A class that owns two resources needs care in its constructor: if the second acquisition throws, the destructor of the half-built object does not run (<a href="#F2-10">F2-10</a>), and the first resource leaks. Give each resource its own small wrapper and make them members; already-constructed members are destroyed even when the constructor throws. <sup class="src"><a href="#F2-11-src-D2">D2</a>, <a href="#F2-11-src-D3">D3</a></sup></li>
+<li><b>Establish the invariant or throw.</b> Listing 2 never holds an invalid descriptor, so its destructor need not check. <code>MenuLock</code> in Listing 4 chose differently: a failed lock is a normal outcome, so it records <code>locked_</code> and its destructor checks. Both are valid; the invariant comment must say which. <sup class="src"><a href="#F2-11-src-R2">R2</a>, <a href="#F2-11-src-R6">R6</a></sup></li>
+<li><b>Release must not fail loudly.</b> <code>close</code> can report an error, but a destructor must not throw (<a href="#F2-10">F2-10</a>). If a caller needs to know whether data reached the disk, offer an explicit <code>close()</code> or <code>flush()</code> member that returns an error, and let the destructor be the safety net. <sup class="src"><a href="#F2-11-src-D3">D3</a>, <a href="#F2-11-src-D4">D4</a></sup></li>
+<li><b>Copy is forbidden; move comes next.</b> A <code>File</code> cannot yet be returned from a function or stored in a <code>std::vector</code>. <a href="#F2-13">F2-13</a> adds move operations that transfer ownership. <sup class="src"><a href="#F2-11-src-D1">D1</a></sup></li>
+</ul>
+<h3 id="F2-11-l3-where">Where RAII goes later in this university</h3>
+<p>The same pattern wraps a mutex in SP203, a CUDA device allocation and stream on the host side in BR-01 and CU201, and an MMIO mapping or a DMA buffer in the driver courses. The systems curriculum asks kernel code to wrap C interfaces in small C++ classes; RAII is how those classes release what they acquire. <sup class="src"><a href="#F2-11-src-D5">D5</a></sup></p>
+
+<h2 id="F2-11-hardware">How the hardware actually does it</h2>
+<p>A file descriptor is not a hardware object. It is an index into a table that the operating system kernel keeps for each process. <code>open</code> and <code>close</code> are system calls: the program asks the kernel, through a special instruction, to add or remove an entry. The kernel only frees the entry when the program asks, or when the whole process ends. That is why a leak is invisible to the program itself: the table lives in the kernel, not in your variables. <sup class="src"><a href="#F2-11-src-D4">D4</a></sup></p>
+<p>Listing 5 shows the table's behaviour directly. After lowering the limit to 32, the descriptors handed out went up to 31 (<code>highest descriptor number handed out: 31</code>), and the 30th <code>open</code> failed. The three missing numbers, 0, 1 and 2, are standard input, output and error, which every process starts with. In the forensic lab you will read the table itself, entry by entry. <sup class="src"><a href="#F2-11-src-R5">R5</a>, <a href="#F2-11-src-R4">R4</a></sup></p>
+<figure id="F2-11-fig2"><div class="svgbox">
+<svg viewBox="0 0 800 240" role="img" aria-labelledby="F2-11-f2t F2-11-f2d">
+<title id="F2-11-f2t">A process's file descriptor table in the kernel, with one leaked entry holding a lock</title>
+<desc id="F2-11-f2d">On the left, a box labelled your program (user space) holds a variable fd that went out of scope, drawn with a dashed outline and labelled forgotten. On the right, a box labelled kernel holds the process's descriptor table with rows 0 to 4: 0 /dev/null, 1 and 2 the output file, 3 menu.lock marked held lock and leaked, 4 the folder listing. From row 3 an arrow goes to a box labelled open file menu.lock with an exclusive flock lock. A second program request, flock on a new open of menu.lock, is drawn arriving at the lock and bouncing with the label refused: would block.</desc>
+<rect class="sv-box" x="20" y="30" width="230" height="160" rx="8"/><text class="sv-tb" x="34" y="54">your program (user space)</text>
+<rect class="sv-box" x="40" y="80" width="190" height="40" rx="5"/><text class="sv-tm" x="52" y="105">int fd = 3  (out of scope)</text>
+<text class="sv-ts" x="40" y="140">the variable is gone,</text><text class="sv-ts" x="40" y="156">the table entry is not</text>
+<rect class="sv-b4" x="300" y="20" width="250" height="200" rx="8"/><text class="sv-tb" x="314" y="44">kernel: descriptor table</text>
+<rect class="sv-box" x="320" y="56" width="210" height="26"/><text class="sv-tm" x="330" y="74">0 → /dev/null</text>
+<rect class="sv-box" x="320" y="82" width="210" height="26"/><text class="sv-tm" x="330" y="100">1 → lock_bug.out</text>
+<rect class="sv-box" x="320" y="108" width="210" height="26"/><text class="sv-tm" x="330" y="126">2 → lock_bug.out</text>
+<rect class="sv-b8" x="320" y="134" width="210" height="26"/><text class="sv-tm" x="330" y="152">3 → menu.lock (leaked)</text>
+<rect class="sv-box" x="320" y="160" width="210" height="26"/><text class="sv-tm" x="330" y="178">4 → folder listing</text>
+<line class="sv-dash" x1="230" y1="100" x2="316" y2="146"/><polygon class="sv-head" points="320,148 309,148 313,140"/>
+<rect class="sv-b6" x="600" y="110" width="180" height="60" rx="8"/><text class="sv-tb" x="612" y="134">menu.lock</text><text class="sv-ts" x="612" y="154">exclusive flock held</text>
+<line class="sv-line" x1="530" y1="147" x2="594" y2="140"/><polygon class="sv-head" points="600,139 590,144 589,135"/>
+<text class="sv-ts" x="590" y="200">next update: flock(LOCK_EX | LOCK_NB)</text>
+<text class="sv-tb" x="590" y="220">✗ refused: lock already held</text>
+</svg></div><figcaption><b>Figure 2.</b> What the forensic evidence shows: descriptor 3 still refers to <code>menu.lock</code>, which still holds the exclusive lock, although the variable that held the number is long gone. Table contents from run R4; lock semantics as described in the Linux <code>flock</code> manual page (title only). <sup class="src"><a href="#F2-11-src-R4">R4</a>, <a href="#F2-11-src-D4">D4</a></sup></figcaption></figure>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Details of <code>flock</code> (that the lock belongs to the open file description and is released when the last descriptor referring to it is closed; that a second <code>open</code> in the same process gets a separate lock) were observed in runs R4 and R6 but not read in the Linux man-pages during this build. Behaviour on other systems (for example Windows, where locking works differently) was not tested. Check the Linux man-pages for <code>flock(2)</code>, <code>open(2)</code>, <code>close(2)</code> and <code>proc(5)</code>, and record the version in the dossier. <sup class="src"><a href="#F2-11-src-R4">R4</a>, <a href="#F2-11-src-R6">R6</a></sup></p></div>
+
+<h2 id="F2-11-worked">Worked example</h2>
+<p>Predict the open-file counts of Listing 1 and Listing 2 before running them. Orders: "rice", "", "soup", "", "", "tea".</p>
+<ol>
+<li>Start: descriptors 0, 1, 2, plus the one used while counting: 4.</li>
+<li>Listing 1, per call: a non-empty order opens and closes (net 0); an empty order opens and returns (net +1). Three empty orders: 4 + 3 = 7.</li>
+<li>Listing 2, per call: every call constructs and destroys one <code>File</code> (net 0 on both paths): 4.</li>
+<li>Listing 2, the missing file: the constructor's <code>open</code> fails, nothing is acquired, the exception is thrown before any object exists: still 4.</li>
+</ol>
+<p>The runs printed 7 for Listing 1 and 4, 4 for Listing 2, matching every step. <sup class="src"><a href="#F2-11-src-R1">R1</a>, <a href="#F2-11-src-R2">R2</a></sup></p>
+
+<h2 id="F2-11-code">Code walk-through</h2>
+<p>All listings were built and run with <code>university/labs/run_lab.sh university/labs/F2-11</code>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined &lt;file&gt;.cpp -o &lt;file&gt;</code>. The programs create their scratch files in the lab folder and delete them before they end.</p>
+<p><b>Listing 1</b> — <code>leak.cpp</code>: release by hand, with an early return</p>
+<pre class="listing" data-src="F2-11/leak.cpp"></pre>
+<div class="tw"><table><thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead><tbody>
+<tr><td class="n">1–2</td><td><code>#include &lt;fcntl.h&gt;</code><br><code>#include &lt;unistd.h&gt;</code></td><td>POSIX headers for <code>open</code>, <code>write</code>, <code>close</code>.</td><td>System calls, not standard C++.</td></tr>
+<tr><td class="n">4–6</td><td><code>#include &lt;filesystem&gt;</code><br><code>#include &lt;iostream&gt;</code><br><code>#include &lt;string&gt;</code></td><td>Standard headers.</td><td><code>&lt;filesystem&gt;</code> lists a folder.</td></tr>
+<tr><td class="n">8–17</td><td><code>// Counts the files this process has open right now (Linux: entries of /proc/self/fd).</code><br><code>int open_file_count()</code><br><code>{</code><br><code>int n = 0;</code><br><code>for (const auto&amp; entry : std::filesystem::directory_iterator("/proc/self/fd")) {</code><br><code>(void)entry;</code><br><code>n = n + 1;</code><br><code>}</code><br><code>return n;</code><br><code>}</code></td><td><code>open_file_count</code> counts entries in <code>/proc/self/fd</code>.</td><td>Our leak meter (Linux only).</td></tr>
+<tr><td class="n">19–21</td><td><code>// Appends one order line to orders.txt. Returns false for an empty order.</code><br><code>bool append_order(const std::string&amp; order)</code><br><code>{</code></td><td>Start of <code>append_order</code>.</td><td>One order per call.</td></tr>
+<tr><td class="n">22</td><td><code>int fd = ::open("orders.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);</code></td><td>Open (create if needed) for appending.</td><td>Acquire the resource.</td></tr>
+<tr><td class="n">23–25</td><td><code>if (fd &lt; 0) {</code><br><code>return false;</code><br><code>}</code></td><td>If <code>open</code> failed, return.</td><td>Nothing acquired, nothing to release.</td></tr>
+<tr><td class="n">26–28</td><td><code>if (order.empty()) {</code><br><code>return false;  // early return: the close() below is never reached</code><br><code>}</code></td><td>Empty order: return early.</td><td>Skips the <code>close</code> on line 31: the leak.</td></tr>
+<tr><td class="n">29–30</td><td><code>std::string line = order + "\n";</code><br><code>ssize_t written = ::write(fd, line.data(), line.size());</code></td><td>Write the line.</td><td>Use the resource.</td></tr>
+<tr><td class="n">31</td><td><code>::close(fd);</code></td><td>Close the descriptor.</td><td>Release, but only on this path.</td></tr>
+<tr><td class="n">32–33</td><td><code>return written == static_cast&lt;ssize_t&gt;(line.size());</code><br><code>}</code></td><td>Report whether every byte was written.</td><td>The normal exit.</td></tr>
+<tr><td class="n">35–45</td><td><code>int main()</code><br><code>{</code><br><code>std::cout &lt;&lt; "open files at start: " &lt;&lt; open_file_count() &lt;&lt; '\n';</code><br><code>const std::string orders[] = {"rice", "", "soup", "", "", "tea"};</code><br><code>for (const std::string&amp; o : orders) {</code><br><code>append_order(o);</code><br><code>}</code><br><code>std::cout &lt;&lt; "open files after 6 orders (3 empty): " &lt;&lt; open_file_count() &lt;&lt; '\n';</code><br><code>std::filesystem::remove("orders.txt");</code><br><code>return 0;</code><br><code>}</code></td><td>Count, append six orders, count again, delete the file.</td><td>Measures the leak.</td></tr>
+</tbody></table></div>
+<p><b>Output</b> (exit code 0):</p>
+<pre class="output" data-run="F2-11/leak"></pre>
+
+<p><b>Listing 2</b> — <code>raii_file.cpp</code>: the RAII <code>File</code> wrapper</p>
+<pre class="listing" data-src="F2-11/raii_file.cpp"></pre>
+<div class="tw"><table><thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead><tbody>
+<tr><td class="n">1–7</td><td><code>#include &lt;fcntl.h&gt;</code><br><code>#include &lt;unistd.h&gt;</code><br><code>#include &lt;filesystem&gt;</code><br><code>#include &lt;iostream&gt;</code><br><code>#include &lt;stdexcept&gt;</code><br><code>#include &lt;string&gt;</code></td><td>Headers.</td><td><code>&lt;stdexcept&gt;</code> for <code>std::runtime_error</code>.</td></tr>
+<tr><td class="n">9–17</td><td><code>int open_file_count()</code><br><code>{</code><br><code>int n = 0;</code><br><code>for (const auto&amp; entry : std::filesystem::directory_iterator("/proc/self/fd")) {</code><br><code>(void)entry;</code><br><code>n = n + 1;</code><br><code>}</code><br><code>return n;</code><br><code>}</code></td><td>The same leak meter.</td><td>For before and after counts.</td></tr>
+<tr><td class="n">19–22</td><td><code>// RAII wrapper: owns one open file descriptor. Invariant: fd_ &gt;= 0 while the object lives.</code><br><code>class File</code><br><code>{</code><br><code>public:</code></td><td>The invariant and the start of <code>File</code>.</td><td>One object owns one open descriptor.</td></tr>
+<tr><td class="n">23</td><td><code>File(const std::string&amp; path, int flags) : fd_(::open(path.c_str(), flags, 0644))</code></td><td>Constructor opens the file in the initialiser list.</td><td>Acquisition is initialisation.</td></tr>
+<tr><td class="n">24–28</td><td><code>{</code><br><code>if (fd_ &lt; 0) {</code><br><code>throw std::runtime_error("File: cannot open " + path);</code><br><code>}</code><br><code>}</code></td><td>Throw if <code>open</code> failed.</td><td>No <code>File</code> ever holds an invalid descriptor.</td></tr>
+<tr><td class="n">30–33</td><td><code>~File()</code><br><code>{</code><br><code>::close(fd_);  // runs on every way out of the owner's scope</code><br><code>}</code></td><td>Destructor closes.</td><td>Release on every path.</td></tr>
+<tr><td class="n">35–36</td><td><code>File(const File&amp;) = delete;             // one owner only (F2-13 adds moving)</code><br><code>File&amp; operator=(const File&amp;) = delete;</code></td><td>Copying deleted.</td><td>One owner; no double close.</td></tr>
+<tr><td class="n">38–43</td><td><code>bool write_line(const std::string&amp; text)</code><br><code>{</code><br><code>std::string line = text + "\n";</code><br><code>ssize_t written = ::write(fd_, line.data(), line.size());</code><br><code>return written == static_cast&lt;ssize_t&gt;(line.size());</code><br><code>}</code></td><td><code>write_line</code> writes text plus a newline.</td><td>Using the resource through the owner.</td></tr>
+<tr><td class="n">45–47</td><td><code>private:</code><br><code>int fd_;</code><br><code>};</code></td><td>The private descriptor.</td><td>Nobody else can close it.</td></tr>
+<tr><td class="n">49–56</td><td><code>bool append_order(const std::string&amp; order)</code><br><code>{</code><br><code>File f("orders.txt", O_WRONLY | O_CREAT | O_APPEND);</code><br><code>if (order.empty()) {</code><br><code>return false;  // early return: f's destructor still closes the file</code><br><code>}</code><br><code>return f.write_line(order);</code><br><code>}</code></td><td><code>append_order</code> with a local <code>File</code>.</td><td>The early return needs no clean-up code.</td></tr>
+<tr><td class="n">58–65</td><td><code>int main()</code><br><code>{</code><br><code>std::cout &lt;&lt; "open files at start: " &lt;&lt; open_file_count() &lt;&lt; '\n';</code><br><code>const std::string orders[] = {"rice", "", "soup", "", "", "tea"};</code><br><code>for (const std::string&amp; o : orders) {</code><br><code>append_order(o);</code><br><code>}</code><br><code>std::cout &lt;&lt; "open files after 6 orders (3 empty): " &lt;&lt; open_file_count() &lt;&lt; '\n';</code></td><td>Same six orders, same counts.</td><td>Compare with Listing 1.</td></tr>
+<tr><td class="n">67–71</td><td><code>try {</code><br><code>File missing("no_such_folder/orders.txt", O_RDONLY);</code><br><code>} catch (const std::runtime_error&amp; e) {</code><br><code>std::cout &lt;&lt; "caught: " &lt;&lt; e.what() &lt;&lt; '\n';</code><br><code>}</code></td><td>Open a missing file and catch the exception.</td><td>The failure path also leaks nothing.</td></tr>
+<tr><td class="n">72–75</td><td><code>std::cout &lt;&lt; "open files at the end: " &lt;&lt; open_file_count() &lt;&lt; '\n';</code><br><code>std::filesystem::remove("orders.txt");</code><br><code>return 0;</code><br><code>}</code></td><td>Final count; delete the file.</td><td>Should equal the first count.</td></tr>
+</tbody></table></div>
+<p><b>Output</b> (exit code 0):</p>
+<pre class="output" data-run="F2-11/raii_file"></pre>
+
+<p><b>Listing 3</b> — <code>std_raii.cpp</code>: standard library RAII types</p>
+<pre class="listing" data-src="F2-11/std_raii.cpp"></pre>
+<div class="tw"><table><thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead><tbody>
+<tr><td class="n">1–5</td><td><code>#include &lt;filesystem&gt;</code><br><code>#include &lt;fstream&gt;</code><br><code>#include &lt;iostream&gt;</code><br><code>#include &lt;mutex&gt;</code><br><code>#include &lt;string&gt;</code></td><td>Headers, including <code>&lt;fstream&gt;</code> and <code>&lt;mutex&gt;</code>.</td><td>Standard RAII types.</td></tr>
+<tr><td class="n">7–15</td><td><code>int open_file_count()</code><br><code>{</code><br><code>int n = 0;</code><br><code>for (const auto&amp; entry : std::filesystem::directory_iterator("/proc/self/fd")) {</code><br><code>(void)entry;</code><br><code>n = n + 1;</code><br><code>}</code><br><code>return n;</code><br><code>}</code></td><td>The leak meter.</td><td>As before.</td></tr>
+<tr><td class="n">17</td><td><code>std::mutex menu_mutex;</code></td><td>A global mutex.</td><td>The resource "lock" of this listing.</td></tr>
+<tr><td class="n">19–20</td><td><code>void write_menu(const std::string&amp; dish)</code><br><code>{</code></td><td>Start of <code>write_menu</code>.</td><td>One function, two resources.</td></tr>
+<tr><td class="n">21</td><td><code>std::lock_guard&lt;std::mutex&gt; guard(menu_mutex);  // locked here, unlocked at the closing brace</code></td><td><code>std::lock_guard</code> locks the mutex.</td><td>Unlocked by its destructor.</td></tr>
+<tr><td class="n">22</td><td><code>std::ofstream out("menu.txt");                    // opened here, closed at the closing brace</code></td><td><code>std::ofstream</code> opens <code>menu.txt</code>.</td><td>Closed by its destructor.</td></tr>
+<tr><td class="n">23–25</td><td><code>out &lt;&lt; dish &lt;&lt; '\n';</code><br><code>std::cout &lt;&lt; "  inside write_menu: open files = " &lt;&lt; open_file_count() &lt;&lt; '\n';</code><br><code>}</code></td><td>Write, count, end of function.</td><td>Count is one higher inside.</td></tr>
+<tr><td class="n">27–36</td><td><code>int main()</code><br><code>{</code><br><code>std::cout &lt;&lt; "before: open files = " &lt;&lt; open_file_count() &lt;&lt; '\n';</code><br><code>write_menu("lentil soup");</code><br><code>std::cout &lt;&lt; "after:  open files = " &lt;&lt; open_file_count() &lt;&lt; '\n';</code><br><code>std::cout &lt;&lt; "mutex free again: " &lt;&lt; (menu_mutex.try_lock() ? "yes" : "no") &lt;&lt; '\n';</code><br><code>menu_mutex.unlock();</code><br><code>std::filesystem::remove("menu.txt");</code><br><code>return 0;</code><br><code>}</code></td><td>Count before and after; check the mutex is free; tidy up.</td><td>Proves both were released.</td></tr>
+</tbody></table></div>
+<p><b>Output</b> (exit code 0):</p>
+<pre class="output" data-run="F2-11/std_raii"></pre>
+
+<p><b>Listing 4</b> — <code>lock_fixed.cpp</code>: an RAII lock owner (the fix of the forensic lab)</p>
+<pre class="listing" data-src="F2-11/lock_fixed.cpp"></pre>
+<div class="tw"><table><thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead><tbody>
+<tr><td class="n">1–7</td><td><code>#include &lt;fcntl.h&gt;</code><br><code>#include &lt;sys/file.h&gt;</code><br><code>#include &lt;unistd.h&gt;</code><br><code>#include &lt;filesystem&gt;</code><br><code>#include &lt;iostream&gt;</code><br><code>#include &lt;string&gt;</code></td><td>Headers; <code>&lt;sys/file.h&gt;</code> declares <code>flock</code>.</td><td>Linux file locks.</td></tr>
+<tr><td class="n">9–13</td><td><code>// RAII owner of an exclusive lock on a lock file.</code><br><code>// Invariant: if locked() is true, this object holds the lock and fd_ is open.</code><br><code>class MenuLock</code><br><code>{</code><br><code>public:</code></td><td>Invariant and start of <code>MenuLock</code>.</td><td>Records whether the lock is held.</td></tr>
+<tr><td class="n">14</td><td><code>explicit MenuLock(const std::string&amp; path) : fd_(::open(path.c_str(), O_RDWR | O_CREAT, 0644))</code></td><td>Constructor opens the lock file.</td><td>First acquisition: the descriptor.</td></tr>
+<tr><td class="n">15–19</td><td><code>{</code><br><code>if (fd_ &gt;= 0 &amp;&amp; ::flock(fd_, LOCK_EX | LOCK_NB) == 0) {</code><br><code>locked_ = true;</code><br><code>}</code><br><code>}</code></td><td>Try to take the exclusive lock without waiting.</td><td>Second acquisition: the lock.</td></tr>
+<tr><td class="n">21–29</td><td><code>~MenuLock()</code><br><code>{</code><br><code>if (locked_) {</code><br><code>::flock(fd_, LOCK_UN);</code><br><code>}</code><br><code>if (fd_ &gt;= 0) {</code><br><code>::close(fd_);</code><br><code>}</code><br><code>}</code></td><td>Destructor: unlock if locked, close if open.</td><td>Releases exactly what was acquired.</td></tr>
+<tr><td class="n">31–32</td><td><code>MenuLock(const MenuLock&amp;) = delete;</code><br><code>MenuLock&amp; operator=(const MenuLock&amp;) = delete;</code></td><td>Copying deleted.</td><td>One owner.</td></tr>
+<tr><td class="n">34</td><td><code>bool locked() const { return locked_; }</code></td><td><code>locked()</code> reports the result.</td><td>Callers decide what to do.</td></tr>
+<tr><td class="n">36–39</td><td><code>private:</code><br><code>int fd_;</code><br><code>bool locked_ = false;</code><br><code>};</code></td><td>The descriptor and the flag (default <code>false</code>).</td><td>Default member initialiser (F2-10).</td></tr>
+<tr><td class="n">41–47</td><td><code>bool update_menu(const std::string&amp; dish)</code><br><code>{</code><br><code>MenuLock lock("menu.lock");</code><br><code>if (!lock.locked()) {</code><br><code>std::cout &lt;&lt; "  menu is locked by someone else, giving up on '" &lt;&lt; dish &lt;&lt; "'\n";</code><br><code>return false;</code><br><code>}</code></td><td><code>update_menu</code>: give up if someone else holds the lock.</td><td>A refusal is a normal outcome.</td></tr>
+<tr><td class="n">48–51</td><td><code>if (dish == "same as yesterday") {</code><br><code>std::cout &lt;&lt; "  nothing to change\n";</code><br><code>return true;  // the destructor of lock unlocks and closes</code><br><code>}</code></td><td>The hurried early return, now harmless.</td><td>The destructor unlocks and closes.</td></tr>
+<tr><td class="n">52–54</td><td><code>std::cout &lt;&lt; "  menu updated: " &lt;&lt; dish &lt;&lt; '\n';</code><br><code>return true;</code><br><code>}</code></td><td>Normal update.</td><td>Same release.</td></tr>
+<tr><td class="n">56–69</td><td><code>int main()</code><br><code>{</code><br><code>const std::string requests[] = {"lentil soup", "same as yesterday", "rice and beans", "tea"};</code><br><code>int updated = 0;</code><br><code>for (const std::string&amp; r : requests) {</code><br><code>std::cout &lt;&lt; "request: " &lt;&lt; r &lt;&lt; '\n';</code><br><code>if (update_menu(r)) {</code><br><code>updated = updated + 1;</code><br><code>}</code><br><code>}</code><br><code>std::cout &lt;&lt; "requests handled: " &lt;&lt; updated &lt;&lt; " of 4\n";</code><br><code>std::filesystem::remove("menu.lock");</code><br><code>return updated == 4 ? 0 : 1;</code><br><code>}</code></td><td>Four requests; count those handled.</td><td>Returns 0 only if all four worked.</td></tr>
+</tbody></table></div>
+<p><b>Output</b> (exit code 0):</p>
+<pre class="output" data-run="F2-11/lock_fixed"></pre>
+
+<p><b>Listing 5</b> — <code>leak_until_fail.cpp</code>: how long a leak can last</p>
+<pre class="listing" data-src="F2-11/leak_until_fail.cpp"></pre>
+<div class="tw"><table><thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead><tbody>
+<tr><td class="n">1–10</td><td><code>#include &lt;fcntl.h&gt;</code><br><code>#include &lt;sys/resource.h&gt;</code><br><code>#include &lt;unistd.h&gt;</code><br><code>#include &lt;cerrno&gt;</code><br><code>#include &lt;cstring&gt;</code><br><code>#include &lt;filesystem&gt;</code><br><code>#include &lt;iostream&gt;</code><br><code>#include &lt;string&gt;</code><br><code>#include &lt;vector&gt;</code></td><td>Headers; <code>&lt;sys/resource.h&gt;</code> declares <code>setrlimit</code>.</td><td>Process limits.</td></tr>
+<tr><td class="n">12–13</td><td><code>// How long can a program leak file descriptors before open() fails?</code><br><code>// To get the same answer on every machine, we first lower this process's limit to 32 open files.</code></td><td>Comment.</td><td>Why the limit is lowered.</td></tr>
+<tr><td class="n">14–22</td><td><code>int main()</code><br><code>{</code><br><code>rlimit limit{};</code><br><code>limit.rlim_cur = 32;</code><br><code>limit.rlim_max = 32;</code><br><code>if (::setrlimit(RLIMIT_NOFILE, &amp;limit) != 0) {</code><br><code>std::cout &lt;&lt; "setrlimit failed: " &lt;&lt; std::strerror(errno) &lt;&lt; '\n';</code><br><code>return 1;</code><br><code>}</code></td><td>Lower this process's open-file limit to 32.</td><td>Same result on every machine.</td></tr>
+<tr><td class="n">23–25</td><td><code>std::vector&lt;int&gt; leaked;</code><br><code>leaked.reserve(64);</code><br><code>std::string reason;</code></td><td>A vector of leaked descriptors and the failure text.</td><td>Kept so we can clean up later.</td></tr>
+<tr><td class="n">26–33</td><td><code>while (true) {</code><br><code>int fd = ::open("leak_test.txt", O_WRONLY | O_CREAT, 0644);</code><br><code>if (fd &lt; 0) {</code><br><code>reason = std::strerror(errno);</code><br><code>break;</code><br><code>}</code><br><code>leaked.push_back(fd);  // "forgotten": not closed until the end of the experiment</code><br><code>}</code></td><td>Open again and again without closing, until <code>open</code> fails.</td><td>The leak, compressed into a loop.</td></tr>
+<tr><td class="n">34–36</td><td><code>for (int fd : leaked) {</code><br><code>::close(fd);  // clean up so the program (and its sanitizers) can work normally again</code><br><code>}</code></td><td>Close everything.</td><td>The sanitizers also need descriptors to report at exit.</td></tr>
+<tr><td class="n">37–41</td><td><code>std::cout &lt;&lt; "open failed after " &lt;&lt; leaked.size() &lt;&lt; " leaked files: " &lt;&lt; reason &lt;&lt; '\n';</code><br><code>std::cout &lt;&lt; "highest descriptor number handed out: " &lt;&lt; leaked.back() &lt;&lt; '\n';</code><br><code>std::filesystem::remove("leak_test.txt");</code><br><code>return 0;</code><br><code>}</code></td><td>Print how many leaked and the highest number; tidy up.</td><td>0, 1, 2 were already taken.</td></tr>
+</tbody></table></div>
+<p><b>Output</b> (exit code 0):</p>
+<pre class="output" data-run="F2-11/leak_until_fail"></pre>
+<div class="co note"><span class="lbl">Note</span><p>A first version of Listing 5 printed its result while all 32 descriptors were still taken. The run then failed inside the sanitizer runtime (it could not open files it needed), which is why lines 34–36 close everything before printing. Even debugging tools need resources. <sup class="src"><a href="#F2-11-src-R5">R5</a></sup></p></div>
+
+<h2 id="F2-11-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A tool wall returns tools when <i>you</i> leave the room. RAII returns the resource when the <i>owning object</i> ends, which is at the end of the object's scope, not of the function or the program. An object created early in <code>main</code> holds its resource until <code>main</code> ends, even if you stopped using it long before; give such objects a smaller block. <sup class="src"><a href="#F2-11-src-R3">R3</a></sup></li>
+<li>A forgotten key can be found and brought back. A leaked descriptor cannot be recovered by the program: the variable holding the number is gone, and only the end of the process frees the entry (R4). <sup class="src"><a href="#F2-11-src-R4">R4</a>, <a href="#F2-11-src-D4">D4</a></sup></li>
+<li>The registered analogy says RAII "only works if every resource has an owner object". That is literal: a raw <code>int fd</code> or a raw pointer is not an owner, and RAII does nothing for it. <sup class="src"><a href="#F2-11-src-R1">R1</a></sup></li>
+</ul>
+
+<h2 id="F2-11-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table><thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead><tbody>
+<tr><td>Works for hours, then <code>Too many open files</code>.</td><td>A descriptor leak on a rare path.</td><td>Count <code>/proc/self/fd</code> before and after each operation in a test (Listing 1); or run <code>ls -l /proc/&lt;pid&gt;/fd</code> on the running program.</td><td>Own every descriptor with an RAII object.</td></tr>
+<tr><td>"Locked by someone else" with nobody else running.</td><td>The lock is held by a leaked descriptor in your own process.</td><td>List the open descriptors (forensic lab).</td><td>RAII lock owner (Listing 4).</td></tr>
+<tr><td>A file is closed twice; later, a different file is closed by mistake.</td><td>The wrapper was copied; both copies close the same number, and the number may already be reused.</td><td>Search for copies; delete the copy operations so the compiler finds them.</td><td><code>= delete</code> copy operations (Listing 2).</td></tr>
+<tr><td>Leak when a constructor throws.</td><td>The class acquired two resources by hand; the second failed.</td><td>Review constructors that call two acquire functions.</td><td>One wrapper member per resource.</td></tr>
+<tr><td>Resource held far longer than needed.</td><td>Owner declared at the top of a long function.</td><td>Read where the owner is declared.</td><td>Put the owner in the smallest block that needs it.</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F2-11-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F2-10">F2-10</a> showed that a destructor runs at the closing brace on every path, in reverse order. <b>What carries over:</b> constructors that establish an invariant, deleted copies, and tracing to see what really happens. <b>What changes:</b> the destructor now releases something outside your program (a kernel table entry, a lock), so a mistake is not a wrong number in a variable but a leak that shows up much later and somewhere else; and you must decide who owns each resource. <sup class="src"><a href="#F2-11-src-R1">R1</a>, <a href="#F2-11-src-R5">R5</a></sup> <b>What comes next:</b> <a href="#F2-12">F2-12</a> explains references and <code>const</code>, which let functions use an owner's resource without copying the owner.</p>
+</div>
+
+<h2 id="F2-11-check">Check yourself</h2>
+<ol>
+<li>What does RAII stand for, and what are its two halves in code?</li>
+<li>Multiple choice. Why does Listing 1 leak? (a) <code>write</code> fails for empty strings (b) The early return skips <code>close</code> (c) The file is opened twice</li>
+<li>Why does the <code>File</code> wrapper delete its copy operations? What would happen otherwise?</li>
+<li>Why did the open-file count start at 4 and not 3?</li>
+<li>Explain in your own words why a leak is often noticed far from where it happens.</li>
+<li>Apply to a new case: a function takes a lock, then calls <code>parse()</code>, which may throw, then unlocks. Show how a leak happens, and rewrite it with <code>std::lock_guard</code>.</li>
+<li>Predict, then run: in Listing 1, move the line <code>if (order.empty()) { return false; }</code> above the <code>open</code> call. What will the second count print?</li>
+<li>Name three standard library types that use RAII and the resource each one owns.</li>
+</ol>
+
+<h2 id="F2-11-lab">Lab</h2>
+<h3 id="F2-11-lab-goal">Goal</h3>
+<p>Build the course's RAII file wrapper with writing and reading, and prove with tests that it never leaks, on normal paths, early paths and error paths.</p>
+<h3 id="F2-11-lab-hw">Hardware and software needed</h3>
+<p>A Linux computer (the leak meter reads <code>/proc/self/fd</code>). This build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> on Linux x86_64. On macOS or Windows the wrapper idea is the same but the system calls and the leak meter differ; that was not tested here. <sup class="src"><a href="#F2-11-src-R7">R7</a></sup></p>
+<h3 id="F2-11-lab-safety">Safety</h3>
+<p>None beyond normal computer use. Work in your own lab folder: the programs create and delete small files there. Never point the tests at files you care about.</p>
+<h3 id="F2-11-lab-steps">Steps</h3>
+<ol>
+<li>Run Listings 1 and 2 and compare the counts with the worked example.</li>
+<li>Write your <code>File</code> class: constructor with path and flags, destructor, deleted copies, <code>write_text</code>, and a new <code>read_all</code> that reads in a loop until <code>read</code> returns 0.</li>
+<li>Write tests with an <code>expect</code> helper: the count is one higher while a <code>File</code> lives and back to the start after its block; what you write is what you read; opening a missing file throws; 1,000 opens in a loop leave no file open.</li>
+<li>Break the destructor (comment out the <code>close</code>) and run the tests. Which tests fail?</li>
+<li>Restore it, then add an early return inside one of the test blocks and confirm the count still returns to the start.</li>
+</ol>
+<h3 id="F2-11-lab-expected">Expected observations</h3>
+<p>The reference solution <code>file_lab.cpp</code> printed (exit code 0):</p>
+<pre class="output" data-run="F2-11/file_lab"></pre>
+<p>Step 4 was run in this build as <code>file_lab_sabotage.cpp</code> (only the destructor changed); two tests caught it (exit code 1): <sup class="src"><a href="#F2-11-src-R8">R8</a></sup></p>
+<pre class="output" data-run="F2-11/file_lab_sabotage"></pre>
+<h3 id="F2-11-lab-verify">Verification</h3>
+<p><code>0 failures</code>, exit code 0, no warnings under the course flags, and the step 4 sabotage is detected by at least two tests.</p>
+<h3 id="F2-11-lab-trouble">Troubleshooting</h3>
+<ul>
+<li>The count is one higher than you expect → <code>open_file_count</code> uses a descriptor while it runs → compare counts with each other, never with a fixed number.</li>
+<li><code>read_all</code> returns an empty string → the file was opened write-only, or the writing <code>File</code> was still alive and not yet closed → read in a separate block after the writer's block ended.</li>
+<li>"use of deleted function" when returning a <code>File</code> from a function → copying is deleted and moving is not written yet → wait for <a href="#F2-13">F2-13</a>, or construct the <code>File</code> where it is used.</li>
+</ul>
+<h3 id="F2-11-lab-ext">Extension</h3>
+<p>Add an explicit <code>bool close()</code> that closes now, reports an error from <code>close</code>, and leaves the object owning nothing (descriptor -1); update the invariant and the destructor accordingly. Then write a tiny RAII class <code>ScopedChdir</code> that changes the working folder and changes back in its destructor.</p>
+
+<h2 id="F2-11-forensic">Forensic lab</h2>
+<h3 id="F2-11-for-scenario">Scenario: "The file that stays locked"</h3>
+<p>The restaurant's menu editor lets only one editor change the menu at a time, using a lock on the file <code>menu.lock</code>. This morning, the first change worked, the second request ("same as yesterday") was handled, and every request after that was refused with "menu is locked by someone else". Only one editor was running. A small change was made last week "in a hurry".</p>
+<h3 id="F2-11-for-evidence">Evidence pack</h3>
+<p>Evidence 1 — the editor's code, <code>lock_bug.cpp</code>:</p>
+<pre class="listing" data-src="F2-11/lock_bug.cpp"></pre>
+<p>Evidence 2 — the editor's log, including the list of open descriptors it printed at the end (real output, exit code 0):</p>
+<pre class="output" data-run="F2-11/lock_bug"></pre>
+<h3 id="F2-11-for-questions">Questions</h3>
+<ol>
+<li>Which request was the last one to succeed, and which was the first to be refused?</li>
+<li>The list at the end shows one descriptor that should not be there. Which one, and what does it refer to?</li>
+<li>Follow every path through <code>update_menu</code>. On which path is the lock never released and the file never closed?</li>
+<li>"Someone else" holds the lock. Who is it?</li>
+<li>Fix the code with RAII so that this kind of mistake cannot come back, and show the evidence that the fix works.</li>
+<li>What test would have caught this before release?</li>
+</ol>
+<h3 id="F2-11-for-hints">Method hints</h3>
+<p>Start from the symptom and go backwards: the refusal comes from the <code>flock</code> call failing, so ask what holds the lock. The descriptor list is the process's own view of its kernel table; compare it with the descriptors a healthy run should have (standard input, output, error, and the one the listing uses itself). Then trace each <code>return</code> in <code>update_menu</code> and mark which ones pass a <code>close</code>. State at least two hypotheses ("another program holds the lock", "this program leaked the lock") and use the evidence to rule one out.</p>
+
+<h2 id="F2-11-project">Mini-project</h2>
+<p>Write a small RAII library header <code>raii.h</code> with three wrappers: <code>File</code> (from the lab), <code>FileLock</code> (exclusive <code>flock</code> on a path, like Listing 4) and <code>TempFile</code> (creates a uniquely named file and deletes it in its destructor). For each, write the invariant, the tests (including an early-return test and an exception test) and a five-line usage note. You will add move operations to all three in <a href="#F2-13">F2-13</a>, and the course project can reuse them.</p>
+<p><b>Rubric:</b> each wrapper owns exactly one resource with a written invariant (3 points); copies deleted (1 point); tests prove no leak on normal, early and error paths (3 points); the header builds with no warnings under the course flags (1 point); clear usage notes (2 points).</p>
+
+<h2 id="F2-11-summary">Summary</h2>
+<ul>
+<li>A resource is anything acquired that must be released: files, locks, memory, connections.</li>
+<li>Releasing by hand fails on early returns and errors; leaks show up later and elsewhere.</li>
+<li>RAII: acquire in the constructor, release in the destructor; the compiler runs the destructor on every path.</li>
+<li>A wrapper owns one resource, establishes its invariant or throws, deletes copying, and never throws from its destructor.</li>
+<li>Use standard RAII types when they exist: <code>std::string</code>, <code>std::vector</code>, <code>std::ofstream</code>, <code>std::lock_guard</code>.</li>
+<li>On Linux, <code>/proc/self/fd</code> lists a process's open descriptors: a leak meter and a forensic tool.</li>
+</ul>
+
+<h2 id="F2-11-sources">Sources</h2>
+<ol>
+<li id="F2-11-src-R1"><b>R1</b> — Lab run of Listing 1 (<code>leak.cpp</code>) with <code>run_lab.sh</code> in this build: "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0", Linux x86_64, 2026-10-09, exit code 0.</li>
+<li id="F2-11-src-R2"><b>R2</b> — Lab run of Listing 2 (<code>raii_file.cpp</code>), same toolchain and date, exit code 0.</li>
+<li id="F2-11-src-R3"><b>R3</b> — Lab run of Listing 3 (<code>std_raii.cpp</code>), same toolchain and date, exit code 0.</li>
+<li id="F2-11-src-R4"><b>R4</b> — Lab run of the forensic evidence <code>lock_bug.cpp</code>, same toolchain and date, exit code 0.</li>
+<li id="F2-11-src-R5"><b>R5</b> — Lab run of Listing 5 (<code>leak_until_fail.cpp</code>), same toolchain and date, exit code 0; the note under the listing describes an earlier version's failed run in this build.</li>
+<li id="F2-11-src-R6"><b>R6</b> — Lab run of Listing 4 (<code>lock_fixed.cpp</code>), same toolchain and date, exit code 0.</li>
+<li id="F2-11-src-R7"><b>R7</b> — Lab run of the lab reference solution <code>file_lab.cpp</code>, same toolchain and date, exit code 0.</li>
+<li id="F2-11-src-R8"><b>R8</b> — Lab run of <code>file_lab_sabotage.cpp</code> (the reference solution with <code>close</code> removed from the destructor, lab step 4), same toolchain and date, exit code 1.</li>
+<li id="F2-11-src-D1"><b>D1</b> — Bjarne Stroustrup, "A Tour of C++" (edition to be recorded), chapters on classes, essential operations and resource management. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F2-11-src-D2"><b>D2</b> — ISO/IEC 14882, the C++ standard (or its public working draft), clauses on destructors, file streams (<code>basic_ofstream</code>) and <code>lock_guard</code>. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F2-11-src-D3"><b>D3</b> — Bjarne Stroustrup and Herb Sutter (editors), "C++ Core Guidelines", section on resource management (rules on RAII and on owners). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F2-11-src-D4"><b>D4</b> — The Linux man-pages project, manual pages <code>open(2)</code>, <code>close(2)</code>, <code>write(2)</code>, <code>read(2)</code>, <code>flock(2)</code>, <code>getrlimit(2)</code> (for <code>setrlimit</code>) and <code>proc(5)</code> (for <code>/proc/self/fd</code>). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i> Every behaviour stated in this chapter was also observed in runs R1–R7.</li>
+<li id="F2-11-src-D5"><b>D5</b> — Systems Curriculum (this project), sections 1.1 and 2 (Track A: "Wrap the C interfaces in small C++ classes"); guide section 6.2, bridge BR-01 ("RAII for host-side resources"). Used as a map only (guide AH-4).</li>
+</ol>
+
+<h2 id="F2-11-glossary">Glossary links</h2>
+<p><a href="#gl-resource">Resource</a> · <a href="#gl-raii-resource-acquisition-is-initialisation">RAII (Resource Acquisition Is Initialisation)</a> · <a href="#gl-file-descriptor">File descriptor</a> · <a href="#gl-resource-leak">Resource leak</a> · <a href="#gl-early-return">Early return</a> · <a href="#gl-lock-advisory-file-lock">Lock (advisory file lock)</a> · <a href="#gl-owner-of-a-resource">Owner (of a resource)</a> · <a href="#gl-destructor">Destructor</a></p>
+
+<h2 id="F2-11-next">Next chapter</h2>
+<p>Next: <a href="#F2-12">F2-12 References and const</a>. Previous: <a href="#F2-10">F2-10 Constructors and destructors</a>. Back to the course: <a href="#SP102">SP102</a>.</p>
+
+<h2 id="F2-11-answers">Answers to Check yourself</h2>
+<ol>
+<li>Resource Acquisition Is Initialisation: acquire the resource in a constructor, release it in the destructor of the same object. <sup class="src"><a href="#F2-11-src-D1">D1</a></sup></li>
+<li>(b). (a) is wrong: <code>write</code> is never called for empty orders. (c) is wrong: each call opens once; the problem is that one path never closes (R1 shows one leak per empty order). <sup class="src"><a href="#F2-11-src-R1">R1</a></sup></li>
+<li>Two copies would both call <code>close</code> on the same number. The second close might close nothing, or, worse, a different file that has since received the same number. One owner, one release.</li>
+<li>Descriptors 0, 1 and 2 (standard input, output, error) plus the one that <code>directory_iterator</code> itself holds while it reads <code>/proc/self/fd</code>. <sup class="src"><a href="#F2-11-src-R1">R1</a>, <a href="#F2-11-src-R4">R4</a></sup></li>
+<li>Leaking does not fail; it only uses up a shared limit. The failure comes when some later acquisition, possibly in unrelated code, hits the limit (R5) or finds a resource still held (R4).</li>
+<li>If <code>parse()</code> throws, the unlock line is skipped and the mutex stays locked forever. Rewrite: <code>{ std::lock_guard&lt;std::mutex&gt; guard(m); parse(); }</code>; the guard's destructor unlocks during the exception's unwinding. <sup class="src"><a href="#F2-11-src-R3">R3</a>, <a href="#F2-11-src-D2">D2</a></sup></li>
+<li>Prediction: 4. Empty orders now return before anything is acquired, so no path leaks. This fixes Listing 1 by reordering, but the next early return someone adds after <code>open</code> will leak again; RAII protects all future paths too.</li>
+<li>For example: <code>std::vector</code> (heap memory), <code>std::ofstream</code> (an open file), <code>std::lock_guard</code> (a locked mutex); also <code>std::string</code> (memory). <sup class="src"><a href="#F2-11-src-D2">D2</a>, <a href="#F2-11-src-R3">R3</a></sup></li>
+</ol>
+<h3 id="F2-11-key">Forensic lab answer key</h3>
+<ul>
+<li><b>Timeline:</b> "lentil soup" updated; "same as yesterday" returned "nothing to change"; "rice and beans" and "tea" were refused. <sup class="src"><a href="#F2-11-src-R4">R4</a></sup></li>
+<li><b>Extra descriptor:</b> <code>fd 3 -&gt; menu.lock</code>. A healthy editor has no open <code>menu.lock</code> between requests; 0, 1, 2 and the folder listing are expected.</li>
+<li><b>Path:</b> the "same as yesterday" branch (lines 23–26) returns <code>true</code> after taking the lock and before <code>flock(fd, LOCK_UN)</code> and <code>close(fd)</code> on lines 28–29. The descriptor and its lock stay held.</li>
+<li><b>"Someone else":</b> the editor itself. The next request opens <code>menu.lock</code> again, gets a new open file, and its non-blocking <code>flock</code> fails because the leaked one still holds the exclusive lock (see the unverified box about <code>flock</code> details).</li>
+<li><b>Fix:</b> an RAII owner of the descriptor and the lock, as in Listing 4; the early return is then harmless. Evidence: run R6 handled all four requests (<code>requests handled: 4 of 4</code>).</li>
+<li><b>Test:</b> run all request kinds in sequence, then assert that a final request succeeds and that the open-descriptor count equals the starting count.</li>
+<li><b>How the evidence was made:</b> Listing 4's logic was written with manual <code>open</code>/<code>flock</code>/<code>close</code>, and an early return was added to the "same as yesterday" branch before the release; output is real run R4.</li>
+<li><b>Wrong answers:</b> "another program holds the lock" (only one editor runs, and the leaked descriptor is in this process's own table); "the lock file is corrupted" (lock files carry no data here); "<code>flock</code> is broken" (it worked for the first request and works in R6).</li>
+</ul>

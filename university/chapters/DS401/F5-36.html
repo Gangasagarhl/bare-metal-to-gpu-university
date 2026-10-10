@@ -1,0 +1,394 @@
+<!--meta
+id: F5-36
+title: Verbs, queue pairs and memory registration
+course: DS401
+level: L4
+prereqs: F5-35; F5-34; SP201 (RAII, unique_ptr with custom deleters); SP203 (atomics); HW205 (F1-53 RDMA preview: keys, one-sided and two-sided operations)
+time: 12–16 hours including the lab, the forensic lab and the exam practice
+hardware: for the model labs: g++ only. For the real verbs ping-pong (Listing 1): two hosts with RDMA adapters (InfiniBand or RoCE) or two hosts with Soft-RoCE configured, plus libibverbs. The build compiled and linked Listing 1 against rdma-core 50.0 but had no RDMA device: untested on hardware.
+maps: Curriculum Track F, section 14.1 row "Inter-node networks" (verbs, queue pairs, memory registration) and milestone F5 (build: "a hierarchical version of your F2 all-reduce ... over MPI or verbs"); reading-list item 81; course DS401 lab "a ping-pong over verbs" and exam P "explain a verbs program line by line"
+analogy: F5 — friends in different towns (proposed mappings in NOTES.md: a protection domain = one household's key ring; a memory region = a labelled shelf; lkey and rkey = the household's own key and the key card given to a friend's courier; a queue pair = the pair of trays, outgoing and incoming, at the courier desk; a completion queue = the receipts box)
+-->
+
+<h2 id="F5-36-hook">Story hook</h2>
+<p>Amara and Wei agree on rules before the courier from <a href="#F5-34">F5-34</a> may carry anything. Amara labels a shelf "Wei's notes" and makes two keys: one she keeps for herself, and one key card she sends to Wei, which lets a courier put things on that shelf and nowhere else. Both of them put two trays on their hall table, "to send" and "to receive", and register the pair with the courier company under a number. They phone each other once, slowly, to swap tray numbers and the first parcel number. Only then do the couriers start.</p>
+<p>From now on, Wei writes a slip ("put this note on Amara's shelf, key card 0x1101"), drops it in his "to send" tray and rings the courier's bell. Later he finds a receipt in his receipts box: done, or a reason why not. If Wei sends a letter that Amara must read rather than a shelf delivery, Amara must have put an empty envelope in her "to receive" tray first, or the courier has nowhere to put it.</p>
+<p>The rules are the <b>verbs</b> interface. The trays are a <b>queue pair</b>, the labelled shelf is a <b>memory region</b>, the key card is a <b>remote key</b>, the receipts box is a <b>completion queue</b>. This chapter writes the program, line by line.</p>
+
+<h2 id="F5-36-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the verbs objects (device context, protection domain, memory region, completion queue, queue pair, address vector) and how they depend on each other.</li>
+<li><b>Write</b> and <b>explain line by line</b> a reliable-connection ping-pong over libibverbs, including the out-of-band exchange and the queue-pair state transitions (the course's practical exam).</li>
+<li><b>Register</b> memory with the right access flags and use local and remote keys correctly in work requests.</li>
+<li><b>Predict</b> the completions of SEND/RECV and RDMA WRITE, including receiver-not-ready, remote access errors and flushed work requests.</li>
+<li><b>Diagnose</b> a stalled replica from a completion log: find the first error, not the loudest one.</li>
+</ul>
+
+<div class="co jargon" id="F5-36-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Verbs</dt><dd><b>Simple words:</b> the list of operations a program can ask an RDMA adapter to do, and the C library that offers them. <b>Analogy:</b> the courier company's rulebook and forms. <b>Precise:</b> the abstract interface the InfiniBand architecture defines between a consumer and a channel adapter; on Linux it is implemented by the rdma-core library libibverbs (header <code>infiniband/verbs.h</code>, functions prefixed <code>ibv_</code>) with per-device user-space providers. <sup class="src"><a href="#F5-36-src-D1">D1</a></sup> <sup class="src"><a href="#F5-36-src-D3">D3</a></sup></dd>
+<dt>Protection domain (PD)</dt><dd><b>Simple words:</b> a group that memory regions and queue pairs belong to; a queue pair can only use memory of its own group. <b>Analogy:</b> one household's key ring: keys from another household's ring do not open your shelves. <b>Precise:</b> a verbs object (<code>struct ibv_pd</code>, from <code>ibv_alloc_pd</code>) that associates queue pairs, memory regions and other objects; the adapter allows a work request to use a memory region only if both belong to the same protection domain. <sup class="src"><a href="#F5-36-src-D1">D1</a></sup> <sup class="src"><a href="#F5-36-src-D3">D3</a></sup></dd>
+<dt>lkey and rkey</dt><dd><b>Simple words:</b> two numbers you get when you register memory: one you use yourself, one you give to the other side. <b>Analogy:</b> Amara's own key, and the key card she posts to Wei. <b>Precise:</b> the local key, placed in a scatter/gather element to let the local adapter access the region, and the remote key, sent to a peer and carried in the RETH of RDMA READ/WRITE so the remote adapter can check access; both are fields of <code>struct ibv_mr</code>. <sup class="src"><a href="#F5-36-src-D1">D1</a></sup> <sup class="src"><a href="#F5-36-src-D3">D3</a></sup></dd>
+<dt>Access flags</dt><dd><b>Simple words:</b> what a registered region allows: may the adapter write into it locally, may remote peers write or read it. <b>Analogy:</b> what the key card permits: put things on the shelf, or also take them. <b>Precise:</b> bits of <code>enum ibv_access_flags</code> passed to <code>ibv_reg_mr</code>: in the installed header <code>IBV_ACCESS_LOCAL_WRITE = 1</code>, <code>IBV_ACCESS_REMOTE_WRITE = 2</code>, <code>IBV_ACCESS_REMOTE_READ = 4</code>, <code>IBV_ACCESS_REMOTE_ATOMIC = 8</code>, among others. <sup class="src"><a href="#F5-36-src-D3">D3</a></sup> <sup class="src"><a href="#F5-36-src-D1">D1</a></sup></dd>
+<dt>Work request (WR) and scatter/gather element (SGE)</dt><dd><b>Simple words:</b> a slip that tells the adapter what to do (send, receive, write) and where the bytes are. <b>Analogy:</b> the slip Wei puts in his "to send" tray. <b>Precise:</b> <code>struct ibv_send_wr</code> or <code>struct ibv_recv_wr</code> posted with <code>ibv_post_send</code>/<code>ibv_post_recv</code>; it carries a 64-bit <code>wr_id</code> chosen by the program, an opcode (send queue only), flags, and a list of <code>struct ibv_sge</code> entries (address, length, lkey). <sup class="src"><a href="#F5-36-src-D3">D3</a></sup></dd>
+<dt>Work completion (WC)</dt><dd><b>Simple words:</b> the receipt for a finished work request, with "success" or an error. <b>Analogy:</b> the receipt in the receipts box. <b>Precise:</b> <code>struct ibv_wc</code> returned by <code>ibv_poll_cq</code>, carrying the <code>wr_id</code>, a <code>status</code> from <code>enum ibv_wc_status</code> (<code>IBV_WC_SUCCESS</code>, <code>IBV_WC_REM_ACCESS_ERR</code>, <code>IBV_WC_RNR_RETRY_EXC_ERR</code>, <code>IBV_WC_WR_FLUSH_ERR</code>, …), the opcode and the byte count. <sup class="src"><a href="#F5-36-src-D3">D3</a></sup></dd>
+<dt>Queue-pair state machine</dt><dd><b>Simple words:</b> a queue pair moves through steps (reset, initialised, ready to receive, ready to send) before it can be used, and falls into an error step when something goes wrong. <b>Analogy:</b> registering the trays, swapping numbers on the phone, then opening for business. <b>Precise:</b> the states of <code>enum ibv_qp_state</code> (<code>IBV_QPS_RESET</code>, <code>INIT</code>, <code>RTR</code>, <code>RTS</code>, <code>SQD</code>, <code>SQE</code>, <code>ERR</code>), changed with <code>ibv_modify_qp</code> and an attribute mask naming which fields of <code>struct ibv_qp_attr</code> are valid. <sup class="src"><a href="#F5-36-src-D1">D1</a></sup> <sup class="src"><a href="#F5-36-src-D3">D3</a></sup></dd>
+<dt>Receiver not ready (RNR)</dt><dd><b>Simple words:</b> a SEND arrived but the other side had not posted a receive buffer. <b>Analogy:</b> a letter arrives and Amara has no empty envelope in her "to receive" tray. <b>Precise:</b> the responder's negative acknowledgement for a SEND that finds no posted receive work request; the requester retries after a timer, up to the queue pair's RNR retry count, and then completes the work request with <code>IBV_WC_RNR_RETRY_EXC_ERR</code>. <sup class="src"><a href="#F5-36-src-D1">D1</a></sup> <sup class="src"><a href="#F5-36-src-D3">D3</a></sup></dd>
+<dt>Out-of-band exchange</dt><dd><b>Simple words:</b> swapping the connection details over some other channel before RDMA can be used. <b>Analogy:</b> the one slow phone call to swap tray numbers. <b>Precise:</b> transfer of queue-pair number, first PSN, LID and/or GID (and, for one-sided operations, buffer address, length and rkey) through a channel that already works, such as a TCP socket, before the queue pairs are moved to RTR and RTS; the rdma-cm library (librdmacm) automates this. <sup class="src"><a href="#F5-36-src-D4">D4</a></sup> <sup class="src"><a href="#F5-36-src-R1">R1</a></sup></dd>
+</dl>
+<p>Terms from earlier: <a href="#gl-memory-region-and-registration">Memory region and registration</a>, <a href="#gl-queue-pair-qp">queue pair</a>, <a href="#gl-completion-queue-cq-rdma">completion queue (CQ, RDMA)</a> (HW205); <a href="#gl-one-sided-operation">one-sided operation</a> and <a href="#gl-kernel-bypass">kernel bypass</a> (<a href="#F5-34">F5-34</a>); <a href="#gl-lid-and-gid">LID and GID</a>, <a href="#gl-packet-sequence-number-psn">PSN</a> and <a href="#gl-path-mtu-rdma">path MTU</a> (<a href="#F5-35">F5-35</a>).</p>
+</div>
+
+<h2 id="F5-36-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the objects a verbs program creates and how they refer to each other. Every arrow is a pointer you pass to a creation call in Listing 1.</p>
+<figure id="F5-36-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F5-36-f1t F5-36-f1d">
+<title id="F5-36-f1t">Figure 1: the verbs objects of one side of the ping-pong</title>
+<desc id="F5-36-f1d">At the top, the device list from ibv_get_device_list; an arrow to the device context from ibv_open_device. From the context, three arrows: to the protection domain (ibv_alloc_pd), to the send completion queue and to the receive completion queue (ibv_create_cq). From the protection domain, two arrows: to the memory region (ibv_reg_mr, with fields lkey, rkey and access flags, covering the application buffer of 128 bytes split into a send half and a receive half) and to the queue pair (ibv_create_qp, type RC). The queue pair contains a send queue and a receive queue; the send queue's completions go to the send CQ and the receive queue's to the receive CQ. The queue pair also holds an address vector naming the remote side: destination QP number, LID, and GID when a global route header is used. Work requests posted to the queues point at the memory region through scatter/gather elements carrying the lkey.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<rect class="sv-box" x="20" y="20" width="200" height="34" rx="5"/><text class="sv-t" x="30" y="42">device list</text>
+<rect class="sv-b4" x="20" y="80" width="200" height="40" rx="5"/><text class="sv-t" x="30" y="98">context</text><text class="sv-ts" x="30" y="113">ibv_open_device</text>
+<line class="sv-line" x1="120" y1="54" x2="120" y2="72"/><polygon class="sv-head" points="115,72 120,80 125,72"/>
+<rect class="sv-b1" x="20" y="160" width="200" height="40" rx="5"/><text class="sv-t" x="30" y="178">protection domain (PD)</text><text class="sv-ts" x="30" y="193">ibv_alloc_pd</text>
+<line class="sv-line" x1="120" y1="120" x2="120" y2="152"/><polygon class="sv-head" points="115,152 120,160 125,152"/>
+<rect class="sv-b5" x="280" y="20" width="200" height="40" rx="5"/><text class="sv-t" x="290" y="38">send CQ</text><text class="sv-ts" x="290" y="53">ibv_create_cq</text>
+<rect class="sv-b5" x="520" y="20" width="200" height="40" rx="5"/><text class="sv-t" x="530" y="38">receive CQ</text><text class="sv-ts" x="530" y="53">ibv_create_cq</text>
+<line class="sv-line" x1="220" y1="95" x2="272" y2="45"/><polygon class="sv-head" points="267,43 278,40 273,51"/>
+<line class="sv-line" x1="220" y1="100" x2="512" y2="48"/><polygon class="sv-head" points="508,44 520,46 510,54"/>
+<rect class="sv-b2" x="20" y="240" width="200" height="74" rx="5"/><text class="sv-t" x="30" y="258">memory region (MR)</text><text class="sv-ts" x="30" y="274">ibv_reg_mr: lkey, rkey,</text><text class="sv-ts" x="30" y="289">access flags</text><text class="sv-ts" x="30" y="304">buffer: send half | recv half</text>
+<line class="sv-line" x1="120" y1="200" x2="120" y2="232"/><polygon class="sv-head" points="115,232 120,240 125,232"/>
+<rect class="sv-b3" x="280" y="120" width="440" height="150" rx="6"/><text class="sv-tb" x="292" y="140">queue pair (QP), type RC — ibv_create_qp</text>
+<rect class="sv-box" x="300" y="152" width="190" height="34" rx="4"/><text class="sv-t" x="310" y="174">send queue (SQ)</text>
+<rect class="sv-box" x="510" y="152" width="190" height="34" rx="4"/><text class="sv-t" x="520" y="174">receive queue (RQ)</text>
+<rect class="sv-box" x="300" y="198" width="400" height="58" rx="4"/><text class="sv-t" x="310" y="218">address vector (set in RTR): destination QPN,</text><text class="sv-t" x="310" y="236">LID, GID + sgid_index (is_global), path MTU, PSNs</text>
+<line class="sv-line" x1="220" y1="180" x2="272" y2="180"/><polygon class="sv-head" points="272,175 280,180 272,185"/>
+<line class="sv-dash" x1="395" y1="152" x2="380" y2="68"/><polygon class="sv-head" points="375,70 380,60 385,70"/>
+<line class="sv-dash" x1="605" y1="152" x2="620" y2="68"/><polygon class="sv-head" points="615,70 620,60 625,70"/>
+<text class="sv-ts" x="400" y="100">completions</text><text class="sv-ts" x="620" y="100">completions</text>
+<line class="sv-dash" x1="300" y1="186" x2="228" y2="262"/><polygon class="sv-head" points="225,256 220,268 232,262"/>
+<text class="sv-ts" x="232" y="226">SGE: addr, length, lkey</text>
+<text class="sv-ts" x="280" y="296">Solid arrows: "is created from / belongs to". Dashed: where completions go, and which memory a work request uses.</text>
+</svg></div><figcaption><b>Figure 1.</b> The objects of Listing 1 (lines 215–258) and their relations. Object names, creation functions and fields from the installed header <code>infiniband/verbs.h</code> <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>; the relations (PD association, CQ per queue) after D1 (title only, pending verification) <sup class="src"><a href="#F5-36-src-D1">D1</a></sup>.</figcaption></figure>
+
+<p>Figure 2 is the queue-pair state machine as Listing 1 uses it, with the attribute-mask bits each transition sets, and the error state that any failure leads to.</p>
+<figure id="F5-36-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F5-36-f2t F5-36-f2d">
+<title id="F5-36-f2t">Figure 2: queue-pair states RESET, INIT, RTR, RTS and ERR</title>
+<desc id="F5-36-f2d">Four states in a row joined by arrows: RESET to INIT with mask bits STATE, PKEY_INDEX, PORT, ACCESS_FLAGS; INIT to RTR (ready to receive) with STATE, AV, PATH_MTU, DEST_QPN, RQ_PSN, MAX_DEST_RD_ATOMIC, MIN_RNR_TIMER, which needs the remote side's QPN, PSN and address from the out-of-band exchange; RTR to RTS (ready to send) with STATE, SQ_PSN, TIMEOUT, RETRY_CNT, RNR_RETRY, MAX_QP_RD_ATOMIC. Below, an ERR state with arrows from every state labelled "error completion or modify to ERR"; in ERR, outstanding and new work requests complete with WR_FLUSH_ERR. A note says receive requests may be posted from INIT on; send requests need RTS.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<rect class="sv-box" x="20" y="40" width="110" height="44" rx="22"/><text class="sv-tb" x="45" y="67">RESET</text>
+<rect class="sv-b1" x="220" y="40" width="110" height="44" rx="22"/><text class="sv-tb" x="254" y="67">INIT</text>
+<rect class="sv-b1" x="420" y="40" width="110" height="44" rx="22"/><text class="sv-tb" x="456" y="67">RTR</text>
+<rect class="sv-b5" x="620" y="40" width="110" height="44" rx="22"/><text class="sv-tb" x="656" y="67">RTS</text>
+<line class="sv-line2" x1="130" y1="62" x2="212" y2="62"/><polygon class="sv-head" points="212,57 220,62 212,67"/>
+<line class="sv-line2" x1="330" y1="62" x2="412" y2="62"/><polygon class="sv-head" points="412,57 420,62 412,67"/>
+<line class="sv-line2" x1="530" y1="62" x2="612" y2="62"/><polygon class="sv-head" points="612,57 620,62 612,67"/>
+<text class="sv-tm" x="20" y="106">STATE PKEY_INDEX</text><text class="sv-tm" x="20" y="122">PORT ACCESS_FLAGS</text>
+<text class="sv-tm" x="230" y="106">STATE AV PATH_MTU DEST_QPN</text><text class="sv-tm" x="230" y="122">RQ_PSN MAX_DEST_RD_ATOMIC</text><text class="sv-tm" x="230" y="138">MIN_RNR_TIMER</text>
+<text class="sv-ts" x="230" y="154">needs the peer's QPN, PSN, LID/GID</text>
+<text class="sv-tm" x="470" y="106">STATE SQ_PSN TIMEOUT</text><text class="sv-tm" x="470" y="122">RETRY_CNT RNR_RETRY</text><text class="sv-tm" x="470" y="138">MAX_QP_RD_ATOMIC</text>
+<rect class="sv-b8" x="320" y="186" width="130" height="44" rx="22"/><text class="sv-tb" x="370" y="213">ERR</text>
+<line class="sv-dash" x1="275" y1="84" x2="350" y2="182"/><line class="sv-dash" x1="475" y1="84" x2="400" y2="182"/><line class="sv-dash" x1="675" y1="84" x2="450" y2="196"/>
+<polygon class="sv-head" points="452,190 450,200 444,193"/>
+<text class="sv-ts" x="470" y="206">error completion, or modify to ERR:</text><text class="sv-ts" x="470" y="222">pending and new WRs complete with WR_FLUSH_ERR</text>
+<text class="sv-ts" x="20" y="180">RECV may be posted from INIT on;</text><text class="sv-ts" x="20" y="196">SEND / RDMA WRITE need RTS.</text>
+<text class="sv-ts" x="20" y="240">Mask names shown without the IBV_QP_ prefix. Any state can also go back to RESET.</text>
+</svg></div><figcaption><b>Figure 2.</b> The transitions of Listing 1 (<code>toInit</code>, <code>toRtr</code>, <code>toRts</code>, lines 122–165) with the mask bits it passes; state and mask names from the installed header <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>; which attributes each transition requires, and the flush behaviour, after D1 and D2 (title only, pending verification) <sup class="src"><a href="#F5-36-src-D1">D1</a></sup> <sup class="src"><a href="#F5-36-src-D2">D2</a></sup>. The toy model of Listing 2 enforces this simplified machine.</figcaption></figure>
+
+<p>Figure 3 follows one SEND and one RDMA WRITE through both sides, showing who gets a completion.</p>
+<figure id="F5-36-fig3"><div class="svgbox">
+<svg viewBox="0 0 760 260" role="img" aria-labelledby="F5-36-f3t F5-36-f3d">
+<title id="F5-36-f3t">Figure 3: completions of a two-sided SEND and a one-sided RDMA WRITE</title>
+<desc id="F5-36-f3d">Two message sequence diagrams side by side, time running downwards, each with lifelines for program A, adapter A, adapter B and program B. Left, SEND: program B first posts a RECV; program A posts a SEND; adapter A sends the data; adapter B places it in B's posted receive buffer and writes a receive completion to B's CQ; adapter B acknowledges; adapter A writes a send completion to A's CQ. Both programs get a completion. Right, RDMA WRITE: program A posts an RDMA WRITE with remote address and rkey; adapter A sends; adapter B checks the rkey, access flags and bounds, writes the data into B's registered region and acknowledges; adapter A writes a completion to A's CQ. Program B gets nothing.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="260"/>
+<text class="sv-tb" x="20" y="20">SEND / RECV (two-sided)</text><text class="sv-tb" x="400" y="20">RDMA WRITE (one-sided)</text>
+<text class="sv-ts" x="20" y="40">prog A</text><text class="sv-ts" x="105" y="40">NIC A</text><text class="sv-ts" x="215" y="40">NIC B</text><text class="sv-ts" x="300" y="40">prog B</text>
+<text class="sv-ts" x="400" y="40">prog A</text><text class="sv-ts" x="485" y="40">NIC A</text><text class="sv-ts" x="595" y="40">NIC B</text><text class="sv-ts" x="680" y="40">prog B</text>
+<line class="sv-dash" x1="35" y1="46" x2="35" y2="250"/><line class="sv-dash" x1="120" y1="46" x2="120" y2="250"/><line class="sv-dash" x1="230" y1="46" x2="230" y2="250"/><line class="sv-dash" x1="315" y1="46" x2="315" y2="250"/>
+<line class="sv-dash" x1="415" y1="46" x2="415" y2="250"/><line class="sv-dash" x1="500" y1="46" x2="500" y2="250"/><line class="sv-dash" x1="610" y1="46" x2="610" y2="250"/><line class="sv-dash" x1="695" y1="46" x2="695" y2="250"/>
+<line class="sv-line" x1="315" y1="62" x2="238" y2="62"/><polygon class="sv-head" points="238,57 230,62 238,67"/><text class="sv-ts" x="250" y="56">post RECV</text>
+<line class="sv-line" x1="35" y1="86" x2="112" y2="86"/><polygon class="sv-head" points="112,81 120,86 112,91"/><text class="sv-ts" x="40" y="80">post SEND</text>
+<line class="sv-line2" x1="120" y1="100" x2="222" y2="120"/><polygon class="sv-head" points="219,114 230,121 219,124"/><text class="sv-ts" x="140" y="104">data</text>
+<line class="sv-line" x1="230" y1="134" x2="307" y2="134"/><polygon class="sv-head" points="307,129 315,134 307,139"/><text class="sv-ts" x="236" y="152">RECV completion</text>
+<line class="sv-line2" x1="230" y1="166" x2="128" y2="186"/><polygon class="sv-head" points="131,180 120,187 131,190"/><text class="sv-ts" x="150" y="168">ACK</text>
+<line class="sv-line" x1="120" y1="204" x2="43" y2="204"/><polygon class="sv-head" points="43,199 35,204 43,209"/><text class="sv-ts" x="40" y="224">SEND completion</text>
+<line class="sv-line" x1="415" y1="86" x2="492" y2="86"/><polygon class="sv-head" points="492,81 500,86 492,91"/><text class="sv-ts" x="420" y="80">post WRITE (addr, rkey)</text>
+<line class="sv-line2" x1="500" y1="100" x2="602" y2="120"/><polygon class="sv-head" points="599,114 610,121 599,124"/><text class="sv-ts" x="520" y="104">data + RETH</text>
+<rect class="sv-b2" x="615" y="118" width="135" height="34" rx="4"/><text class="sv-ts" x="620" y="132">check rkey, access,</text><text class="sv-ts" x="620" y="146">bounds; DMA write</text>
+<line class="sv-line2" x1="610" y1="166" x2="508" y2="186"/><polygon class="sv-head" points="511,180 500,187 511,190"/><text class="sv-ts" x="530" y="168">ACK</text>
+<line class="sv-line" x1="500" y1="204" x2="423" y2="204"/><polygon class="sv-head" points="423,199 415,204 423,209"/><text class="sv-ts" x="420" y="224">WRITE completion</text>
+<text class="sv-ts" x="630" y="244">prog B: nothing</text>
+</svg></div><figcaption><b>Figure 3.</b> Who sees what. The SEND/RECV and RDMA WRITE completions as the model run R3 prints them (scenes 2 and 3) <sup class="src"><a href="#F5-36-src-R3">R3</a></sup>; the protocol (ACK from the responder, completion at the requester after the ACK for a reliable connection) after D1 (pending verification) <sup class="src"><a href="#F5-36-src-D1">D1</a></sup>. Untested on hardware.</figcaption></figure>
+
+<h2 id="F5-36-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Mapping (proposed): protection domain = a household's key ring; memory region = a labelled shelf; lkey = the household's own key; rkey = the key card given to a friend; access flags = what the key card allows; queue pair = the pair of trays "to send" and "to receive", registered under a number; work request = a slip in a tray; doorbell = the courier's bell; completion queue = the receipts box; the out-of-band exchange = the one slow phone call before the couriers start; receiver not ready = a letter arrives and there is no empty envelope in the "to receive" tray.</p></div>
+<p>Before any parcel moves, both friends do slow, careful set-up: label shelves, make keys, set out trays, swap numbers by phone. After that, sending is fast: write a slip, ring the bell, later check the receipts box. Two kinds of delivery exist. A letter ("SEND") needs the friend to have set out an empty envelope first, and both friends get a receipt. A shelf delivery ("RDMA WRITE") only needs the key card; the friend at home gets no receipt and is not disturbed.</p>
+
+<h2 id="F5-36-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F5-36-l2-objects">The objects, in the order you create them</h3>
+<p>Listing 1 creates every object in the order of Figure 1 <sup class="src"><a href="#F5-36-src-D3">D3</a></sup> <sup class="src"><a href="#F5-36-src-D1">D1</a></sup>:</p>
+<ol>
+<li><b>Device list and context.</b> <code>ibv_get_device_list</code> returns a NULL-terminated array of devices ("Return a NULL-terminated array of IB devices", the header's comment) and the count; <code>ibv_open_device</code> opens one and returns a <code>struct ibv_context</code> <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>.</li>
+<li><b>Port and address.</b> <code>ibv_query_port</code> fills <code>struct ibv_port_attr</code> (LID, active MTU, link layer); <code>ibv_query_gid</code> reads one entry of the port's GID table, selected by an index <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. On RoCE the GID is derived from an IP address of the interface, and several GIDs (for example for RoCE v1 and v2, IPv4 and IPv6) can exist; choosing the index is part of the configuration (see the unverified box below).</li>
+<li><b>Protection domain.</b> <code>ibv_alloc_pd</code>.</li>
+<li><b>Memory region.</b> <code>ibv_reg_mr(pd, addr, length, access)</code> registers an application buffer and returns <code>struct ibv_mr</code> with <code>lkey</code> and <code>rkey</code> <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. Registration pins the pages and gives the adapter their translations, so it is slow and is done once, ahead of time (<a href="#F5-38">F5-38</a>) <sup class="src"><a href="#F5-36-src-D4">D4</a></sup>.</li>
+<li><b>Completion queues.</b> <code>ibv_create_cq(context, cqe, cq_context, channel, comp_vector)</code>: the header's comment explains each parameter, including that <code>cqe</code> is the "Minimum number of entries required for CQ" and that the channel "May be NULL if completion events will not be used" <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. Listing 1 polls, so it passes NULL.</li>
+<li><b>Queue pair.</b> <code>ibv_create_qp(pd, &amp;init_attr)</code> with the two CQs, the capacities of the send and receive queues and the transport type <code>IBV_QPT_RC</code>. The new QP's number is in <code>qp-&gt;qp_num</code> <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>.</li>
+</ol>
+<h3 id="F5-36-l2-connect">Connecting two queue pairs</h3>
+<p>A reliable-connection QP talks to exactly one remote QP. Before it can, each side must know the other's QP number, first PSN and address (LID on InfiniBand, GID on RoCE) <sup class="src"><a href="#F5-36-src-D1">D1</a></sup>. RDMA cannot carry these yet, so Listing 1 exchanges them over a TCP connection (lines 266–268): the <b>out-of-band exchange</b>. Then each side moves its QP through the states of Figure 2 <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>:</p>
+<ul>
+<li><b>RESET → INIT:</b> which partition-key index and port to use, and which remote accesses the QP allows (<code>qp_access_flags</code>; 0 in Listing 1, because a ping-pong with SEND/RECV needs no remote access).</li>
+<li><b>INIT → RTR</b> (ready to receive): the remote QP number, the PSN the remote side will start with, the path MTU, and the address vector (<code>ah_attr</code>); with a non-zero GID, <code>is_global = 1</code> and the GRH fields. A QP in RTR can receive.</li>
+<li><b>RTR → RTS</b> (ready to send): our own first PSN, the transport timeout, the retry counts, and the number of outstanding RDMA READs it may issue.</li>
+</ul>
+<p>Every call names the fields it sets with the <b>attribute mask</b>, a bitwise OR of <code>enum ibv_qp_attr_mask</code> values such as <code>IBV_QP_STATE</code> (bit 0), <code>IBV_QP_AV</code> (bit 7) and <code>IBV_QP_PATH_MTU</code> (bit 8) <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. A missing bit means the field is ignored; a required one that is missing makes <code>ibv_modify_qp</code> fail.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The numbers in <code>toRtr</code> and <code>toRts</code> (<code>min_rnr_timer = 12</code>, <code>timeout = 14</code>, <code>retry_cnt = 7</code>, <code>rnr_retry = 7</code>, <code>hop_limit = 1</code>, <code>max_dest_rd_atomic = max_rd_atomic = 1</code>) were written by the author from memory of common examples. They compile (the fields exist in the installed header, D3), but their meanings are encoded: <code>timeout</code> and <code>min_rnr_timer</code> select time values from tables, and a retry count of 7 may have a special meaning for RNR retries. Check <code>ibv_modify_qp(3)</code> in the rdma-core documentation and the QP attribute tables of the InfiniBand specification (D1, D2) before using them, and choose the GID index for RoCE v2 from your system's GID table (how to list it is in the rdma-core documentation, not verified here).</p></div>
+<h3 id="F5-36-l2-post">Posting work and reaping completions</h3>
+<p>A work request names its buffers through scatter/gather elements: address, length and the <b>lkey</b> of the region that contains them (Listing 1, lines 169 and 183). A SEND (<code>IBV_WR_SEND</code>) consumes one receive request that the peer posted earlier; an RDMA WRITE (<code>IBV_WR_RDMA_WRITE</code>) also names a remote address and the peer's <b>rkey</b> in <code>wr.rdma</code>. The flag <code>IBV_SEND_SIGNALED</code> asks for a completion entry <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. The header's comment on <code>ibv_post_send</code> states the buffer rule in one line: "If IBV_SEND_INLINE flag is set, the data buffers can be reused immediately after the call returns" <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>; without that flag, the buffer belongs to the adapter until the completion arrives.</p>
+<p><code>ibv_poll_cq(cq, n, wc)</code> returns how many completions it wrote into <code>wc</code>, 0 if none, a negative value on error; per the header comment, a non-negative return smaller than <code>n</code> means the CQ was emptied <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. Each completion carries the <code>wr_id</code> you chose and a status. <b>Check the status of every completion</b>: an error does not come back from <code>ibv_post_send</code> (that only checks that the request was well formed and the queue had room); it comes back later, in the CQ <sup class="src"><a href="#F5-36-src-D1">D1</a></sup>.</p>
+<h3 id="F5-36-l2-model">The rules, demonstrated by a model you can run</h3>
+<p>The build has no RDMA device: Listing 1 compiles and links against rdma-core 50.0 but stops at <code>ibv_get_device_list</code> with 0 devices and errno 38 ("Function not implemented") <sup class="src"><a href="#F5-36-src-R1">R1</a></sup> <sup class="src"><a href="#F5-36-src-R2">R2</a></sup>. To watch the rules act, Listing 2 (<code>verbs_model.hpp</code>) is the university's own <b>toy verbs model</b>: in-process objects with the same names, the access-flag bits of the real header and the status names of <code>enum ibv_wc_status</code>, but executing the chapter's simplified reading of the rules. Its run (R3) shows five scenes:</p>
+<ol>
+<li>A QP cannot jump from RESET to RTS, and a SEND posted in INIT is rejected.</li>
+<li>An RDMA WRITE into B's region (registered with access 0x3 = LOCAL_WRITE | REMOTE_WRITE) succeeds; only A gets a completion; B's memory changes although B's program did nothing.</li>
+<li>A SEND that finds a RECV posted by B: both A and B get a completion.</li>
+<li>A SEND with no RECV posted: receiver not ready, retried, then <code>RNR_RETRY_EXC_ERR</code>; the QP goes to ERR and the RDMA WRITE queued behind it completes with <code>WR_FLUSH_ERR</code>.</li>
+<li>An RDMA WRITE of 64 bytes at offset 1000 of a 1024-byte region: <code>REM_ACCESS_ERR</code>, QP to ERR, the next request flushed.</li>
+</ol>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The model is the author's reading of rules that were not checked against the specification in this build: exactly which transitions are legal from which states (the model allows only RESET→INIT→RTR→RTS, any→RESET, any→ERR), that receive requests may be posted in INIT, that posting to a QP in ERR is accepted and then flushed, that a remote access violation is reported to the requester as <code>IBV_WC_REM_ACCESS_ERR</code>, and what happens to the <i>responder's</i> QP after such an error (the model leaves it alone). The status <i>names</i> are real (D3); the <i>behaviour</i> must be checked in D1 and D2 and on hardware.</p></div>
+
+<h2 id="F5-36-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F5-36-l3-transports">Transport types and what they cost</h3>
+<p>The installed header lists the QP types <code>IBV_QPT_RC</code>, <code>IBV_QPT_UC</code>, <code>IBV_QPT_UD</code>, <code>IBV_QPT_RAW_PACKET</code> and the XRC types <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. Reliable connection (RC) gives ordered, acknowledged delivery and all operations (SEND, RDMA READ and WRITE, atomics) between two QPs. Unreliable datagram (UD) lets one QP send to many peers with an address handle per destination, but only SENDs of at most one MTU and without acknowledgement. Unreliable connection sits between <sup class="src"><a href="#F5-36-src-D1">D1</a></sup>. The engineering consequence is the <b>connection-scaling problem</b>: with RC, N processes that all talk to each other need on the order of N² QPs in total, each with state that the adapter must cache; designs reduce this with shared receive queues, XRC, UD for control traffic, or a dynamically connected transport some vendors offer (vendor documentation, not verified here) <sup class="src"><a href="#F5-36-src-D4">D4</a></sup>.</p>
+<h3 id="F5-36-l3-reg">Registration, keys and security</h3>
+<p>An rkey is a capability: anyone who knows it and can reach a connected QP in the same protection domain can access the region with the rights its flags give, until it is deregistered <sup class="src"><a href="#F5-36-src-D1">D1</a></sup>. Rules that follow:</p>
+<ul>
+<li>Register with the least access the protocol needs, but no less: a region that peers write into with RDMA WRITE needs <code>IBV_ACCESS_REMOTE_WRITE</code>, and the adapter itself needs <code>IBV_ACCESS_LOCAL_WRITE</code> to write received data (the header shows <code>IBV_ACCESS_REMOTE_WRITE</code> is bit 1 and <code>IBV_ACCESS_LOCAL_WRITE</code> bit 0) <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. The forensic lab is about getting this wrong.</li>
+<li>Advertise the address, length and rkey of a region to a peer only through a trusted channel, and invalidate (deregister, or use memory windows) when the peer should lose access.</li>
+<li>Do not deregister or free memory while a peer may still write to it: the peer's next WRITE gets an error (good) or, if the memory was re-registered and the key reused, lands in new data (bad). HW205's "stale key" forensic lab showed this (<a href="#F1-53">F1-53</a>).</li>
+<li>Registration cost grows with the region's size (pages to pin and translate), so programs register pools at start-up and carve buffers from them. Registered memory counts against the process's locked-memory limit (<a href="#F5-38">F5-38</a> prints it) <sup class="src"><a href="#F5-36-src-D4">D4</a></sup>.</li>
+<li>Process creation: the header warns that unless <code>ibv_fork_init()</code> succeeded, "libibverbs data structures are not fork()-safe and the effect of an application calling fork() is undefined" <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. Fork before opening devices, or not at all.</li>
+</ul>
+<h3 id="F5-36-l3-flow">Flow control is your job</h3>
+<p>The kernel's TCP never refuses a message for lack of a receive buffer; it buffers. With SEND/RECV, the receiver must have posted enough receive requests before messages arrive, or the sender suffers RNR retries and eventually an error that breaks the connection <sup class="src"><a href="#F5-36-src-D1">D1</a></sup>. Protocols built on verbs therefore use credits: the receiver tells the sender how many receives it has posted, and the sender never exceeds that. Listing 1 avoids the problem by design (one message in flight, and the barrier at line 276 after both sides posted a receive). The same reasoning applies to completion queues: a CQ smaller than the number of completions that can be outstanding overflows, which is an error; size it as the sum of the queues that report into it.</p>
+<h3 id="F5-36-l3-oneside">Building protocols from one-sided operations</h3>
+<p>RDMA WRITE into a ring buffer on the peer is the fastest way to move data, but the peer learns nothing. Three standard patterns, each with a trade-off <sup class="src"><a href="#F5-36-src-D4">D4</a></sup>:</p>
+<ul>
+<li><b>Write, then a flag.</b> Write the payload, then write a flag or a sequence number; the receiver polls the flag. Correct only if the second write cannot become visible before the first; check the ordering guarantees for RC and the adapter's documentation, and remember the receiver's CPU caches (HW205).</li>
+<li><b>RDMA WRITE with immediate.</b> <code>IBV_WR_RDMA_WRITE_WITH_IMM</code> writes the data and consumes a posted receive at the target, producing a completion with 32 bits of immediate data <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>.</li>
+<li><b>Write, then SEND.</b> A SEND after the WRITE on the same RC QP arrives after it; the SEND's completion tells the receiver that the write is in place.</li>
+</ul>
+<p>The course project (replicated log append, <a href="#F5-38">F5-38</a>) is built from these patterns.</p>
+<div class="co note"><span class="lbl">Note</span><p>Connection management libraries exist so that programs do not have to write the out-of-band exchange, the GID choice and the state transitions themselves: rdma-cm (librdmacm, installed in the build as the package <code>librdmacm1t64</code>, R2) resolves an IP address to a device, port and GID and drives the transitions. Its header was not installed (no <code>librdmacm-dev</code>), so it is not used here; Listing 1 does everything by hand on purpose, because the exam asks you to explain each step.</p></div>
+
+<h2 id="F5-36-hardware">How the hardware actually does it</h2>
+<p>Posting a work request writes a descriptor into the send or receive queue, which lives in memory mapped for the process, and then writes a doorbell register in a page of the adapter's PCIe space mapped into the same process (kernel bypass, <a href="#F5-34">F5-34</a>) <sup class="src"><a href="#F5-36-src-D4">D4</a></sup>. The adapter fetches the descriptor by DMA, translates the SGE's address with the memory region identified by the lkey, reads the data by DMA, and runs the transport of <a href="#F5-35">F5-35</a>. On the responder, the adapter finds the QP from the BTH, checks the PSN, and for an RDMA WRITE looks up the rkey from the RETH in its table of regions, checks the access flags and the bounds and the protection domain, translates the address, and writes by DMA. Completions are written by DMA into the CQ's ring in host memory; <code>ibv_poll_cq</code> reads them there, which is why the header can make it a <code>static inline</code> call through the context's operation table <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>.</p>
+<p>The installed provider list shows where this device-specific code lives: <code>/usr/lib/x86_64-linux-gnu/libibverbs</code> holds one user-space driver per adapter family, including <code>librxe-rdmav34.so</code> for Soft-RoCE (rxe) and <code>libsiw-rdmav34.so</code> for software iWARP <sup class="src"><a href="#F5-36-src-R2">R2</a></sup>. The kernel half of those drivers was not available in the build container (no <code>/lib/modules</code>, no <code>/sys/class/infiniband</code>).</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 1 was compiled with <code>-Wall -Wextra -Wpedantic -Werror</code> and the sanitizers, linked against libibverbs 50.0 and started, and it stopped at the first call because there is no device (R1). Every call after line 215 is unexecuted. To test: two machines with RDMA adapters, or two machines (or virtual machines) with Soft-RoCE set up on an Ethernet interface (the set-up commands are in the rdma-core documentation and were not checked here); run <code>verbs_pingpong</code> on the server and <code>verbs_pingpong &lt;server-ip&gt; &lt;gid-index&gt;</code> on the client. Expected: "1000 round trips of 64 bytes: median … us (last message: "pong 999")". A measured median on real hardware must be recorded with the machine, adapter and versions (AH-23).</p></div>
+
+<h2 id="F5-36-worked">Worked example</h2>
+<p><b>Predict every completion of this sequence on QP A (connected to QP B, both RTS), then check against the model's rules.</b> B has registered region L (1024 bytes, access 0x3) and region I (256 bytes, access 0x1), and has posted no receive. A posts, in order: (1) RDMA WRITE 14 bytes to L+0 with L's rkey; (2) SEND 9 bytes; (3) RDMA WRITE 14 bytes to L+0.</p>
+<ol>
+<li>WR 1: rkey valid, REMOTE_WRITE set (0x3 &amp; 0x2 ≠ 0), 0 + 14 ≤ 1024: success; completion at A only.</li>
+<li>WR 2: SEND needs a receive request at B; none is posted: receiver not ready; after the RNR retries, <code>RNR_RETRY_EXC_ERR</code>; A's QP goes to ERR.</li>
+<li>WR 3: queued behind a failed request on a QP in ERR: <code>WR_FLUSH_ERR</code>, although by itself it would have succeeded.</li>
+</ol>
+<p>Scenes 2 and 4 of R3 show exactly these completions (wr 2 SUCCESS; wr 4 RNR_RETRY_EXC_ERR; wr 5 WR_FLUSH_ERR) <sup class="src"><a href="#F5-36-src-R3">R3</a></sup>. Two lessons: a flush error is a consequence, never a cause, so look for the first non-flush error; and after any error the QP is useless until it is reset and reconnected, so the RNR mistake also cost the WRITE behind it.</p>
+<p><b>Access-flag arithmetic.</b> A region registered with <code>IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ</code> has flags 1 + 4 = 5 = 0x5. It allows remote reads but not remote writes (0x5 &amp; 0x2 = 0). A region printed as "access 0x1" allows neither.</p>
+
+<h2 id="F5-36-code">Code walk-through</h2>
+<p>Listing 1 is built by the lab's <code>run.sh</code> with <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined verbs_pingpong.cc -o verbs_pingpong -libverbs</code> (it has the extension <code>.cc</code> so that <code>run_lab.sh</code>, which builds every <code>.cpp</code> without extra libraries, leaves it to <code>run.sh</code>). Every <code>ibv_</code> identifier, type, enumerator and field in it exists in the installed header, which the compiler checked <sup class="src"><a href="#F5-36-src-D3">D3</a></sup> <sup class="src"><a href="#F5-36-src-R1">R1</a></sup>; their behaviour is from D1, D2 and D4 (pending verification). This table is the model answer for the course's practical exam.</p>
+<p><b>Listing 1</b> — <code>verbs_pingpong.cc</code>: a reliable-connection SEND/RECV ping-pong over libibverbs.</p>
+<pre class="listing" data-src="F5-36/verbs_pingpong.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8</td><td><code>#include &lt;infiniband/verbs.h&gt;</code></td><td>The verbs API of rdma-core.</td><td>Link with <code>-libverbs</code>.</td></tr>
+<tr><td>27–30</td><td>constants</td><td>TCP port for the exchange, device port 1, 64-byte messages, 1000 round trips.</td><td>Ports of an RDMA device are numbered from 1.</td></tr>
+<tr><td>32–35</td><td><code>fail</code></td><td>Throws with <code>strerror(errno)</code>.</td><td>Verbs creation calls return NULL and set errno; <code>ibv_modify_qp</code> and the post calls return the error number instead (lines 117, 176, 192).</td></tr>
+<tr><td>37–48</td><td><code>Deleter</code>, <code>unique_ptr</code> aliases</td><td>Each object type gets its destroy function: <code>ibv_close_device</code>, <code>ibv_dealloc_pd</code>, <code>ibv_dereg_mr</code>, <code>ibv_destroy_cq</code>, <code>ibv_destroy_qp</code>; the device list gets <code>ibv_free_device_list</code>.</td><td>RAII (SP201): objects are destroyed in reverse order of creation (QP before CQs before MR before PD before context), which the dependencies require, also when an exception is thrown.</td></tr>
+<tr><td>50–56</td><td><code>struct Endpoint</code></td><td>LID, QP number, first PSN, GID.</td><td>Exactly what the peer needs for RTR.</td></tr>
+<tr><td>58–111</td><td><code>class Tcp</code></td><td>Server: listen and accept one connection; client: connect. <code>exchange</code> sends our <code>Endpoint</code> and receives theirs; <code>barrier</code> sends and receives one byte.</td><td>The out-of-band channel. Sending the raw struct works only because both sides run the same build; a real protocol defines a byte format (<a href="#F5-09">F5-09</a>).</td></tr>
+<tr><td>113–120</td><td><code>modify</code></td><td>Calls <code>ibv_modify_qp</code>; a non-zero return is an error number.</td><td>One place to report which transition failed.</td></tr>
+<tr><td>122–130</td><td><code>toInit</code></td><td>State INIT, P_Key index 0, port 1, access flags 0; mask STATE, PKEY_INDEX, PORT, ACCESS_FLAGS.</td><td>Remote access stays off: SEND/RECV does not need it.</td></tr>
+<tr><td>132–152</td><td><code>toRtr</code></td><td>State RTR; path MTU (the local port's active MTU); the peer's QP number and PSN; RDMA READ resources; RNR timer; address vector with the peer's LID, and the GID with <code>is_global</code> when the GID is non-zero.</td><td>Ready to receive. On RoCE the GRH is needed because addressing is by GID (the LID is expected to be 0); the GID index selects RoCE v1 or v2 and IPv4 or IPv6 (after D1 and D4, pending verification).</td></tr>
+<tr><td>154–165</td><td><code>toRts</code></td><td>State RTS; our first PSN; timeout, retry and RNR retry counts; outstanding RDMA READs.</td><td>Ready to send. The numbers are explained in the unverified box of Layer 2.</td></tr>
+<tr><td>167–179</td><td><code>postRecv</code></td><td>One SGE (address, 64, lkey) in a receive request with <code>wr_id</code> 1; <code>ibv_post_recv</code>.</td><td>A buffer for the next incoming SEND; it must be posted before that SEND arrives.</td></tr>
+<tr><td>181–195</td><td><code>postSend</code></td><td>One SGE, opcode <code>IBV_WR_SEND</code>, flag <code>IBV_SEND_SIGNALED</code>, <code>wr_id</code> 2; <code>ibv_post_send</code>.</td><td>Signalled: we get a completion and know when the buffer is free.</td></tr>
+<tr><td>197–209</td><td><code>waitOne</code></td><td>Busy-polls a CQ until <code>ibv_poll_cq</code> returns one completion; throws on a negative return or a non-success status, with <code>ibv_wc_status_str</code>.</td><td>Every completion's status is checked; polling instead of sleeping keeps latency low (<a href="#F5-38">F5-38</a>).</td></tr>
+<tr><td>213–221</td><td>device list</td><td>Gets the devices; with none, prints the count and errno and returns 2.</td><td>This is where the build container stopped (R1): 0 devices, errno 38.</td></tr>
+<tr><td>222–226</td><td>open</td><td><code>ibv_open_device</code> on the first device; prints its name.</td><td>A real program lets the user choose the device.</td></tr>
+<tr><td>227–235</td><td>port, GID</td><td><code>ibv_query_port</code> (LID, active MTU) and <code>ibv_query_gid</code> at the chosen index.</td><td>Our address for the peer.</td></tr>
+<tr><td>236–239</td><td>PD</td><td><code>ibv_alloc_pd</code>.</td><td>The MR and the QP must share it.</td></tr>
+<tr><td>240–244</td><td>buffer and MR</td><td>A 128-byte vector, registered with <code>IBV_ACCESS_LOCAL_WRITE</code>.</td><td>LOCAL_WRITE because the adapter writes received messages into the second half. The vector is declared before the MR, so it is freed after deregistration.</td></tr>
+<tr><td>245–249</td><td>two CQs</td><td>One for the send queue, one for the receive queue, 16 entries each.</td><td>A receive completion can arrive before the send completion of our own ping; separate CQs mean <code>waitOne</code> can never consume the wrong one.</td></tr>
+<tr><td>250–261</td><td>QP</td><td>Send and receive CQ, one outstanding request and one SGE per queue, type RC; <code>ibv_create_qp</code>.</td><td>Capacities sized for one message in flight.</td></tr>
+<tr><td>262–264</td><td>identity, INIT</td><td>Our QP number; a random 24-bit PSN; RESET → INIT.</td><td>Random first PSNs make packets of an old connection unlikely to be accepted by a new one.</td></tr>
+<tr><td>266–270</td><td>exchange, RTR, RTS</td><td>TCP connection; swap endpoints; print both; INIT → RTR → RTS.</td><td>After this the QPs are connected.</td></tr>
+<tr><td>272–276</td><td>first receive, barrier</td><td>Split the buffer; post a receive; wait until the peer has done the same.</td><td>Without the barrier the client's first SEND could reach a server that has not posted its receive: RNR.</td></tr>
+<tr><td>280–285</td><td>client loop body</td><td>Write "ping i"; post SEND; wait for its completion; wait for the pong's receive completion; post the next receive.</td><td>One round trip, timed.</td></tr>
+<tr><td>286–293</td><td>server loop body</td><td>Wait for a ping; copy it into the send half and change "ping" to "pong"; post the next receive; post the SEND; wait for its completion.</td><td>The receive is re-posted before replying, so the client's next ping always finds one.</td></tr>
+<tr><td>294–299</td><td>timing, report</td><td>Records each iteration and prints the median and the last message.</td><td>A median, not a mean (<a href="#F5-37">F5-37</a>).</td></tr>
+<tr><td>304–311</td><td><code>main</code></td><td>No argument: server; one argument: client to that IPv4 address; second argument: GID index. Exceptions become exit code 1.</td><td>Exit codes: 0 ok, 1 error, 2 no device.</td></tr>
+</tbody></table></div>
+<p><b>The run in the build container</b> (server role):</p>
+<pre class="output" data-run="F5-36/verbs_pingpong"></pre>
+<p><b>What the container has</b> for RDMA (packages, headers, providers, devices):</p>
+<pre class="output" data-run="F5-36/environment"></pre>
+
+<p><b>Listing 2</b> — <code>verbs_model.hpp</code>: the toy verbs model (not libibverbs).</p>
+<pre class="listing" data-src="F5-36/verbs_model.hpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>19–22</td><td>enums</td><td>Access bits with the real header's values; states; the five statuses the model can produce; three operations.</td><td>Names match <code>verbs.h</code> so the model's output reads like a real completion log.</td></tr>
+<tr><td>40–71</td><td><code>Mr</code>, <code>Sge</code>, <code>Wr</code>, <code>Wc</code></td><td>Region (offset, length, access, lkey, rkey); SGE (addr, length, lkey); work request; work completion.</td><td>Simplified versions of <code>ibv_mr</code>, <code>ibv_sge</code>, <code>ibv_send_wr</code>, <code>ibv_wc</code>.</td></tr>
+<tr><td>73–122</td><td><code>Node</code></td><td>A host: memory, registered regions, one CQ. <code>regMr</code> hands out unique keys; <code>byLkey</code>, <code>byRkey</code> look them up; <code>pollCq</code> returns one completion.</td><td>The adapter's region table, as a list.</td></tr>
+<tr><td>124–127</td><td><code>inside</code></td><td>Bounds check written so that it cannot overflow.</td><td>A WRITE must lie entirely inside the region.</td></tr>
+<tr><td>134–148</td><td><code>Qp::modify</code></td><td>Allows RESET→INIT→RTR→RTS, any→RESET, any→ERR; moving to ERR flushes.</td><td>Figure 2, enforced.</td></tr>
+<tr><td>150–170</td><td><code>postSend</code>, <code>postRecv</code></td><td>Reject sends unless RTS (or ERR, where they will be flushed), receives in RESET.</td><td>Errors at post time are immediate return codes, not completions.</td></tr>
+<tr><td>172–216</td><td><code>progress</code></td><td>Executes the send queue: flush in ERR; check the local lkey and bounds (LOC_PROT_ERR); for WRITE check rkey, REMOTE_WRITE and bounds at the peer (REM_ACCESS_ERR), copy, complete at the requester only; for SEND retry while no receive is posted (RNR), then copy into the receive buffer and complete at both ends.</td><td>The rules of Layer 2 in one function.</td></tr>
+<tr><td>221–244</td><td><code>fault</code>, <code>flushAll</code></td><td>An error completes the request with its status, moves the QP to ERR and flushes both queues.</td><td>The "first error, then flushes" pattern of the forensic lab.</td></tr>
+<tr><td>246–254</td><td><code>drain</code></td><td>Prints every completion of a node.</td><td>The model's completion log.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>model_demo.cpp</code>: the five scenes.</p>
+<pre class="listing" data-src="F5-36/model_demo.cpp"></pre>
+<pre class="output" data-run="F5-36/model_demo"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>29–31</td><td>registrations</td><td>A: 1 KiB local only; B: a 1 KiB log with remote write, a 256-byte inbox local only.</td><td>The inbox receives SENDs (adapter writes locally); the log receives WRITEs.</td></tr>
+<tr><td>36–41</td><td>scene 1</td><td>Illegal jump; early send; back to RESET; correct bring-up of both QPs.</td><td>Return codes at post and modify time.</td></tr>
+<tr><td>44–50</td><td>scene 2</td><td>RDMA WRITE of "entry 1: x=42" into B's log.</td><td>Completion at A only; B's memory changed.</td></tr>
+<tr><td>53–59</td><td>scene 3</td><td>B posts a RECV, A SENDs "commit 1".</td><td>Completions at both ends.</td></tr>
+<tr><td>62–65</td><td>scene 4</td><td>SEND without a posted RECV, then a WRITE.</td><td>RNR, error, flush.</td></tr>
+<tr><td>68–75</td><td>scene 5</td><td>New QPs; WRITE past the end of the region, then a valid WRITE.</td><td>Remote access error, then flush.</td></tr>
+</tbody></table></div>
+
+<h2 id="F5-36-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A friend whose letter finds no envelope would wait or leave a note. An RDMA SEND without a posted receive is retried a fixed number of times and then breaks the connection: there is no buffering at the receiver.</li>
+<li>A household's keys stay valid until you change the lock. An rkey is valid exactly as long as its registration; deregistering is "changing the lock", and a re-registration may produce a different key.</li>
+<li>Trays on a hall table hold any number of slips. Queues have fixed capacities chosen at creation (<code>max_send_wr</code>, <code>max_recv_wr</code>); posting beyond them fails at once.</li>
+<li>A courier who finds a problem with one parcel still delivers the others. After one error the QP goes to the error state and every later request is flushed, as R3 and the forensic lab show.</li>
+<li>The phone call to swap numbers happens once in the story. Real systems need it again after every reconnect, with new PSNs, and the exchange channel must itself be reliable and authenticated.</li>
+</ul>
+
+<h2 id="F5-36-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><code>IBV_WC_RNR_RETRY_EXC_ERR</code> on SENDs</td><td>The peer had no receive posted (too few, or posted too late).</td><td>Count receives posted versus messages sent; model scene 4.</td><td>Post receives before the peer can send; use credits; a barrier at start-up (Listing 1, line 276).</td></tr>
+<tr><td><code>IBV_WC_REM_ACCESS_ERR</code> on RDMA WRITE</td><td>Wrong rkey (often the lkey sent by mistake), region registered without <code>IBV_ACCESS_REMOTE_WRITE</code>, or address/length outside the region.</td><td>Log the advertised (addr, length, rkey, access) at the target and the WR at the source; compare.</td><td>Register with the right flags; send the rkey; check bounds at the source.</td></tr>
+<tr><td>Many <code>IBV_WC_WR_FLUSH_ERR</code></td><td>An earlier error moved the QP to ERR.</td><td>Find the first completion with another status.</td><td>Fix that error; reset and reconnect the QP.</td></tr>
+<tr><td><code>ibv_modify_qp</code> to RTR fails (EINVAL)</td><td>Missing mask bit, wrong port, GID index that does not exist, or MTU larger than the port's.</td><td>Print the attributes and mask; query the port and the GID table.</td><td>Set exactly the attributes the transition requires (Figure 2).</td></tr>
+<tr><td>A program hangs in its poll loop</td><td>Waiting on a CQ that will never receive the completion (unsignalled send, or the completion was consumed by another loop).</td><td>Count completions per <code>wr_id</code>; use one CQ per queue as Listing 1 does.</td><td>Signal what you wait for; never drop completions.</td></tr>
+<tr><td><code>ibv_reg_mr</code> fails with ENOMEM or EPERM</td><td>Locked-memory limit too low.</td><td>Compare the region size with RLIMIT_MEMLOCK (<a href="#F5-38">F5-38</a>, <code>zero_copy.out</code>).</td><td>Raise the limit for the service, register less, or use on-demand paging where supported.</td></tr>
+<tr><td>0 devices, errno 38 (as in R1)</td><td>No RDMA device or driver on the machine.</td><td><code>ls /sys/class/infiniband</code> (R2).</td><td>Use a machine with an adapter, or set up Soft-RoCE.</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F5-36-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F5-35">F5-35</a> read the packets (BTH, RETH, AETH); <a href="#F5-09">F5-09</a> and DS201 programmed sockets; SP201 taught RAII. <b>What carries over:</b> request ids (now <code>wr_id</code>), checking every error, RAII for every handle, an explicit protocol for the bytes you exchange, and the PSNs and keys you decoded on the wire <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. <b>What changes:</b> most dangerous first: errors arrive later in a completion queue, not as return values; a buffer belongs to the adapter until its completion; the receiver must post buffers in advance; one error breaks the connection and flushes everything behind it; and set-up (registration, out-of-band exchange, state transitions) is explicit and slow <sup class="src"><a href="#F5-36-src-D1">D1</a></sup>. <b>What comes next:</b> <a href="#F5-37">F5-37</a> measures what these programs achieve, with the protocol of the perftest tools, and explains a slow RoCE fabric from its configuration.</p></div>
+
+<h2 id="F5-36-check">Check yourself</h2>
+<ol>
+<li>List the verbs objects of Listing 1 in creation order, and say for each which earlier object it needs.</li>
+<li>What is exchanged out of band, and why can it not be sent with RDMA yet?</li>
+<li>For each transition RESET→INIT, INIT→RTR, RTR→RTS, name two attributes it sets and why that state needs them.</li>
+<li>Explain in your own words the difference between an lkey and an rkey, and which of them travels on the wire in which header (<a href="#F5-35">F5-35</a>).</li>
+<li>Predict the model's output: B registers its log with <code>LOCAL_WRITE | REMOTE_READ</code> (0x5) and A posts an RDMA WRITE into it. What is A's completion status, and what happens to the next request on A's QP?</li>
+<li>Apply to a new case: a client posts 8 SENDs in a burst; the server posts one receive at a time and re-posts it after processing each message. What happens, and give two fixes.</li>
+<li>Why does Listing 1 use two completion queues? Describe the bug a single CQ with a "wait for wr_id N, ignore others" loop could cause.</li>
+<li>When may an application reuse the buffer of a SEND posted without <code>IBV_SEND_INLINE</code>? Quote the header's comment that tells you about the inline case.</li>
+<li>A region is registered with flags 0x7. Which accesses does it allow?</li>
+</ol>
+
+<h2 id="F5-36-lab">Lab</h2>
+<p><b>Goal (course lab: a ping-pong over verbs).</b> Build Listing 1 against libibverbs, run it on two RDMA-capable hosts (or two Soft-RoCE hosts) and record the median round trip; in the build container and on any machine without RDMA, extend the toy model with RDMA READ and RDMA WRITE WITH IMMEDIATE and show their completions.</p>
+<p><b>Hardware and software needed.</b> Part A (model): g++ only; the build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>. Part B (real verbs): two Linux hosts with RDMA adapters on one InfiniBand or RoCE network, or two hosts or virtual machines with Soft-RoCE; rdma-core with libibverbs (the build had <code>libibverbs-dev 50.0-2ubuntu0.2</code>). Part B is <b>untested in this build</b> (no device). <b>Safety:</b> none beyond normal computer use; do not experiment on a production fabric (a misconfigured RoCE host can disturb others, <a href="#F5-35">F5-35</a>).</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F5-36</code>; expect exit status 0, <code>model_demo.out</code> as in this chapter and <code>verbs_pingpong.out</code> saying "no RDMA device found" unless your machine has one.</li>
+<li>Part A: add <code>Op::RDMA_READ</code> to the model: it needs <code>REMOTE_READ</code> at the target and <code>LOCAL_WRITE</code> on the local SGE's region (the adapter writes the fetched data locally). Add scenes for a successful READ and for a READ of a region without <code>REMOTE_READ</code>.</li>
+<li>Part A: add <code>RDMA_WRITE_WITH_IMM</code>: write like a WRITE, then consume a receive at the target and complete there with an immediate value. Show the RNR case when the target posted no receive.</li>
+<li>Part B: on host S run <code>./verbs_pingpong</code>; on host C run <code>./verbs_pingpong &lt;S's IPv4 address&gt; &lt;gid index&gt;</code>. Record the device names, QP numbers, PSNs and the median.</li>
+<li>Part B: break it on purpose three ways and record the error text: comment out the barrier (line 276); use GID index 99; change <code>IBV_ACCESS_LOCAL_WRITE</code> on line 241 to 0.</li>
+<li>Part B: change <code>kMsgSize</code> to 4096 and 65,536 and record the medians; compare with the TCP numbers of <a href="#F5-34">F5-34</a> on the same hosts.</li>
+</ol>
+<p><b>Expected observations.</b> Part A: completions exactly as your rules predict, flushes after every error. Part B (not observed in this build): "1000 round trips of 64 bytes: median … us (last message: "pong 999")" on both sides; with the barrier removed, an RNR error may or may not appear depending on timing (race); with a bad GID index, <code>ibv_query_gid</code> or the RTR transition fails; with no LOCAL_WRITE, the first receive completes with an error status.</p>
+<p><b>Verification.</b> Part A: a scene list whose output you predicted line by line before running. Part B: the median is reported with machine, adapter, rdma-core version, path MTU and message size; the last message is "pong 999".</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"no RDMA device found … errno 38" → no RDMA driver: this is the build container's result (R1). Check <code>/sys/class/infiniband</code>.</li>
+<li>Client error "tcp connect: Connection refused" → start the server first; open the TCP port in the firewall.</li>
+<li>Hang after "local QPN … remote QPN" → the two sides use different GID types or subnets, or the RoCE path MTU does not fit the Ethernet MTU (<a href="#F5-35">F5-35</a>); packets are being dropped.</li>
+<li><code>work completion error: RNR retry counter exceeded</code> or similar → a receive was not posted in time.</li>
+</ul>
+<p><b>Extension.</b> Replace SEND/RECV by RDMA WRITE into the peer's buffer plus a polled sequence number (exchange address, length and rkey out of band, register with <code>IBV_ACCESS_REMOTE_WRITE</code>), and compare the medians on hardware.</p>
+
+<h2 id="F5-36-forensic">Forensic lab</h2>
+<p><b>Scenario — "follower 2 never catches up".</b> A replicated log keeps three copies: the leader appends each entry to two followers with one-sided RDMA WRITEs into their log regions. After a rolling upgrade on 2026-10-02, follower F2 stays at index 0 while F1 follows the leader. The leader's log shows four errors per batch; an on-call engineer opened a ticket titled "flush errors on QP 0x102, adapter faulty?".</p>
+<p><b>Evidence pack.</b> The leader's start-up and completion log (generated with the toy verbs model):</p>
+<pre class="output" data-run="F5-36/replog_fault"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Which is the first error, on which QP, for which work request? How many of the errors are consequences of it?</li>
+<li>Compare what F1 and F2 advertised. Decode both access values into flags using the installed header's bit values.</li>
+<li>Is the ticket's hypothesis ("adapter faulty") consistent with the evidence? State at least two hypotheses and the evidence for or against each.</li>
+<li>What is the root cause and the fix? What must the leader do with QP 0x102 after the fix?</li>
+<li>Propose a check at connection set-up that would have caught this before any entry was written.</li>
+</ol>
+<p><b>Method hints.</b> Sort errors by time and ignore every flush until you have explained the first error. Then compare the target's advertisement with what the operation needs.</p>
+
+<h2 id="F5-36-project">Mini-project</h2>
+<p><b>Credit-based messaging on the model.</b> Using the toy model, build a message channel in which the receiver posts R receives and tells the sender R credits; the sender sends at most as many messages as it has credits and receives new credits piggy-backed on replies. Show with scenes that no RNR occurs for bursts of 1, R and 3R messages, and that removing the credit check reproduces RNR errors. If you have RDMA hardware, port it to verbs. <b>Rubric:</b> correct credit protocol (written specification) 30 %; scenes that demonstrate both the correct and the broken behaviour 30 %; code quality 20 %; explanation of how this maps to real verbs calls 20 %.</p>
+
+<h2 id="F5-36-summary">Summary</h2>
+<ul>
+<li>A verbs program creates, in order: device context, protection domain, memory regions, completion queues, queue pairs; RAII destroys them in reverse order.</li>
+<li>Memory registration returns an lkey (used in your SGEs) and an rkey (given to peers, carried in the RETH); access flags decide what peers may do.</li>
+<li>Connecting an RC queue pair needs an out-of-band exchange (QP number, PSN, LID/GID) and three transitions: INIT, RTR, RTS, each with an attribute mask.</li>
+<li>SEND needs a receive posted in advance and completes at both ends; RDMA WRITE completes only at the requester; the target program learns nothing unless the protocol tells it.</li>
+<li>Errors arrive as completion statuses; after the first error the QP is in ERR and later requests are flushed: find the first error.</li>
+<li>A buffer belongs to the adapter until its completion (unless sent inline); a receive buffer must exist before the message.</li>
+<li>Listing 1 compiled against rdma-core 50.0 but is untested on hardware; the rules were demonstrated with the university's toy model.</li>
+</ul>
+
+<h2 id="F5-36-sources">Sources</h2>
+<ol>
+<li id="F5-36-src-D1">D1 — InfiniBand Trade Association, "InfiniBand Architecture Specification" (tier 1; curriculum item 81): the software transport verbs chapter (protection domains, memory registration, keys and access rights, queue pairs and their states and attributes, work requests and completions, RNR, error handling and flushing), transport services. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-36-src-D2">D2 — rdma-core project, libibverbs manual pages (<code>ibv_get_device_list(3)</code>, <code>ibv_open_device(3)</code>, <code>ibv_alloc_pd(3)</code>, <code>ibv_reg_mr(3)</code>, <code>ibv_create_cq(3)</code>, <code>ibv_create_qp(3)</code>, <code>ibv_modify_qp(3)</code>, <code>ibv_post_send(3)</code>, <code>ibv_post_recv(3)</code>, <code>ibv_poll_cq(3)</code>) (tier 2). <i>Title only — not installed in the build container and not opened (dossier gate G1 open).</i></li>
+<li id="F5-36-src-D3">D3 — rdma-core project, header <code>infiniband/verbs.h</code> as installed by Ubuntu package <code>libibverbs-dev</code> <code>50.0-2ubuntu0.2</code> (tier 2). <i>Opened in this build (2026-10-09): <code>enum ibv_access_flags</code>, <code>enum ibv_qp_state</code>, <code>enum ibv_qp_attr_mask</code>, <code>enum ibv_wr_opcode</code>, <code>enum ibv_wc_status</code>, <code>enum ibv_qp_type</code>, <code>struct ibv_port_attr</code>, <code>union ibv_gid</code>, and the declarations and comments of <code>ibv_get_device_list</code>, <code>ibv_reg_mr</code>, <code>ibv_create_cq</code>, <code>ibv_poll_cq</code>, <code>ibv_post_send</code>, <code>ibv_post_recv</code>, <code>ibv_modify_qp</code>, <code>ibv_fork_init</code>; quotes are from those comments. Every identifier of Listing 1 compiled against it (R1).</i></li>
+<li id="F5-36-src-D4">D4 — NVIDIA, "RDMA Aware Networks Programming User Manual" (tier 1 for vendor material): the programming flow of a verbs application, QP attribute values, registration cost, connection establishment, transport types. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-36-src-R1">R1 — <code>university/labs/F5-36/verbs_pingpong.log</code>: Listing 1, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0; libibverbs-dev 50.0-2ubuntu0.2</code>, built with <code>-libverbs</code> and sanitizers, run as server; exit code 2 (no RDMA device); untested on hardware.</li>
+<li id="F5-36-src-R2">R2 — <code>university/labs/F5-36/environment.log</code>: packages, headers, provider libraries and device directories of the build container, exit code 0.</li>
+<li id="F5-36-src-R3">R3 — <code>university/labs/F5-36/model_demo.log</code>: Listings 2 and 3 (toy verbs model), same compiler, exit code 0.</li>
+<li id="F5-36-src-R4">R4 — <code>university/labs/F5-36/replog_fault.log</code>: the forensic evidence generator on the toy model, exit code 0.</li>
+</ol>
+
+<h2 id="F5-36-glossary">Glossary links</h2>
+<p><a href="#gl-verbs">Verbs</a> · <a href="#gl-protection-domain-pd">Protection domain (PD)</a> · <a href="#gl-lkey-and-rkey">lkey and rkey</a> · <a href="#gl-access-flags">Access flags</a> · <a href="#gl-work-request-wr-and-scatter-gather-element-sge">Work request (WR) and scatter/gather element (SGE)</a> · <a href="#gl-work-completion-wc">Work completion (WC)</a> · <a href="#gl-queue-pair-state-machine">Queue-pair state machine</a> · <a href="#gl-receiver-not-ready-rnr">Receiver not ready (RNR)</a> · <a href="#gl-out-of-band-exchange">Out-of-band exchange</a> · <a href="#gl-memory-region-and-registration">Memory region and registration</a> · <a href="#gl-queue-pair-qp">Queue pair (QP)</a> · <a href="#gl-completion-queue-cq-rdma">Completion queue (CQ, RDMA)</a></p>
+
+<h2 id="F5-36-next">Next chapter</h2>
+<p>Next: <a href="#F5-37">F5-37 Measuring with perftest</a>. Previous: <a href="#F5-35">F5-35 InfiniBand and RoCE</a>. Back to the course: <a href="#DS401">DS401</a>.</p>
+
+<h2 id="F5-36-answers">Answers to Check yourself</h2>
+<ol>
+<li>Device list (none) → context (a device from the list) → PD (context) → MR (PD and a buffer) → CQs (context) → QP (PD, CQs). The address vector is part of the QP's attributes, set in RTR.</li>
+<li>QP number, first PSN, LID and GID (and for one-sided operations the buffer address, length and rkey). RDMA needs a connected QP to send anything, and connecting needs exactly these values: a chicken-and-egg problem solved with a channel that already works (TCP, or rdma-cm).</li>
+<li>INIT: port and P_Key index (which port and partition the QP uses), access flags (what remote peers may do). RTR: destination QP number and RQ PSN (to accept the peer's packets), path MTU and address vector (where and how big). RTS: SQ PSN (our numbering), timeout and retry counts (what to do when ACKs do not come).</li>
+<li>The lkey authorises the <i>local</i> adapter to use a region named in your own SGEs; it never leaves the host. The rkey authorises a <i>remote</i> adapter's requests; you send it to the peer, and it travels in the RETH of each RDMA READ or WRITE request (F5-35, Figure 2: "Remote Key").</li>
+<li>0x5 &amp; 0x2 = 0: no REMOTE_WRITE, so the WRITE fails with <code>REM_ACCESS_ERR</code> at A; A's QP goes to ERR and the next request completes with <code>WR_FLUSH_ERR</code> (as in scene 5 and the forensic lab).</li>
+<li>The first SEND consumes the only receive; the others arrive before the server re-posts: receiver not ready, retries, and if the server is slower than the retries, <code>RNR_RETRY_EXC_ERR</code> and a broken connection. Fixes: post at least as many receives as the client may have in flight (and size <code>max_recv_wr</code> for it), and use credits so the client never sends more than the server has posted; a shared receive queue helps with many clients.</li>
+<li>A receive completion (the pong) can be in the CQ before the send completion of our own ping. A single-CQ loop waiting for the send's <code>wr_id</code> would read and discard the pong's completion, then wait forever for it. With one CQ per queue each wait consumes only completions of its own kind.</li>
+<li>After its completion has been polled (signalled sends), or after a later signalled completion on the same queue if it was unsignalled. The header: "If IBV_SEND_INLINE flag is set, the data buffers can be reused immediately after the call returns."</li>
+<li>0x7 = 1 + 2 + 4 = LOCAL_WRITE, REMOTE_WRITE, REMOTE_READ; not REMOTE_ATOMIC (8).</li>
+</ol>
+<h3 id="F5-36-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> The first error is "qp 0x102: error REM_ACCESS_ERR on wr 201 -&gt; state ERR": QP 0x102 is the leader's QP to F2, wr 201 its first append. wr 202, 203 and 204 complete with <code>WR_FLUSH_ERR</code>: three of the four errors are consequences. All four of F1's writes succeed <sup class="src"><a href="#F5-36-src-R4">R4</a></sup>.</p>
+<p><b>Decoding.</b> F1 advertised access 0x3 = <code>IBV_ACCESS_LOCAL_WRITE</code> (1) | <code>IBV_ACCESS_REMOTE_WRITE</code> (2); F2 advertised 0x1 = <code>IBV_ACCESS_LOCAL_WRITE</code> only <sup class="src"><a href="#F5-36-src-D3">D3</a></sup>. Addresses, lengths and rkeys are otherwise consistent: the leader used F2's own rkey 0x1201 and offsets inside the 2048-byte region.</p>
+<p><b>Hypotheses.</b> (1) Faulty adapter: against it, the error is a specific remote-access status on the very first request and the other QP on the same leader adapter works; a hardware fault would not choose the follower whose registration changed. (2) Wrong rkey sent by the leader: ruled out, the leader used 0x1201, F2's advertised rkey. (3) Out-of-bounds write: ruled out, offsets 0–255 inside 2048 bytes. (4) F2's region does not allow remote writes: consistent with access 0x1 and with the upgrade date (the region was re-registered with tighter flags).</p>
+<p><b>Root cause.</b> F2's new build registers its log region with <code>IBV_ACCESS_LOCAL_WRITE</code> only; one-sided appends need <code>IBV_ACCESS_REMOTE_WRITE</code>. The first WRITE fails with a remote access error, the leader's QP to F2 enters the error state, and every later append is flushed.</p>
+<p><b>Fix.</b> Register the log region with <code>IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE</code> (least privilege means "no REMOTE_READ", not "no REMOTE_WRITE"). The leader's QP 0x102 must be reset and reconnected (new out-of-band exchange, new PSNs), then the missing entries 1–4 re-sent. <b>Prevention.</b> At connection set-up, the leader checks each follower's advertised access value against the operations it will use and refuses to start with a clear message; an integration test appends one entry to every follower after each upgrade.</p>
+<p><b>How the evidence was produced.</b> <code>replog_fault.cpp</code> on the toy model: F2's region registered with <code>LOCAL_WRITE</code> only (line 21), four RDMA WRITEs per follower; output unedited.</p>
+<pre class="listing" data-src="F5-36/replog_fault.cpp"></pre>

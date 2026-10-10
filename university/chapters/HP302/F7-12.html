@@ -1,0 +1,282 @@
+<!--meta
+id: F7-12
+title: Cross-lane operations and 64-bit lane masks
+course: HP302
+level: L3
+prereqs: F7-08; F7-11; HW301 (F1-57); HP301 (F7-07)
+time: 8–12 hours including the lab
+hardware: none for the lane simulator, the ISA steps and the forensic lab (this build: no GPU); running Listing 2 needs an AMD GPU listed in the ROCm compatibility matrix
+maps: Curriculum E10 (AMD part: cross-lane and LDS-hardware instructions in the ISA); 13.1 vocabulary table (lock-step thread group: "shuffles, reductions and ballot masks depend on the width"); 13.2 topics "parallel primitives" and "HIP portability: 64-bit lane masks on wave64"; ISA guides (item 69)
+analogy: F7 — the great kitchen hall (second building: AMD)
+-->
+
+<h2 id="F7-12-hook">Story hook</h2>
+<p>A row of 64 helpers is filling jars. Only some helpers have something worth keeping, and the keepers must put their jars on a shelf in order, with no gaps. Nobody may walk to the table; the row can only pass things along the row and raise hands.</p>
+<p>Ana, the row leader, has a trick. "Everyone who has a jar to keep, raise your hand." She writes down who raised a hand: one tick per helper, 64 ticks in a long line. Each keeper then counts the raised hands to their left: that count is their place on the shelf. It works perfectly, until a new leader copies the trick onto a notepad with room for only 32 ticks. The 32 helpers on the right still count "the hands to my left", but on a sheet that ends at helper 31; they all get the same number, put their jars in the same place, and all but one jar are lost.</p>
+<p>This chapter is about passing values along a wave and raising hands in it: shuffles, ballots, lane masks and population counts, why on AMD wave64 every mask is 64 bits, and what the hardware really does when you call <code>__shfl_down</code>.</p>
+
+<h2 id="F7-12-able">What you will be able to do</h2>
+<ul>
+<li><b>Use</b> HIP's cross-lane functions (<code>__shfl</code>, <code>__shfl_down</code>, <code>__shfl_xor</code>, <code>__ballot</code>, <code>__popcll</code>, <code>__lane_id</code>) in code that works for any <code>warpSize</code>.</li>
+<li><b>Simulate</b> a wave in lock step to predict the result of a shuffle reduction, a butterfly and a ballot-based compaction.</li>
+<li><b>Explain</b> how HIP 5.7 implements shuffles on AMD (<code>ds_bpermute_b32</code> with a byte address) and ballots (a vector compare into a 64-bit scalar register pair).</li>
+<li><b>Find</b> a 32-bit mask truncation with a compiler warning, and predict exactly which lanes it breaks.</li>
+<li><b>Count</b> cross-lane instructions in the ISA for wave64 and wave32 and relate the count to <code>log2(warpSize)</code>.</li>
+</ul>
+
+<div class="co jargon" id="F7-12-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Shuffle (<code>__shfl</code> family)</dt><dd><b>Simple words:</b> each lane reads a value from another lane of the same wave, without going through memory the program can see. <b>Analogy:</b> passing a bowl a fixed number of places along the row. <b>Precise:</b> in HIP 5.7, <code>__shfl(var, srcLane, width)</code>, <code>__shfl_down(var, delta, width)</code>, <code>__shfl_up</code> and <code>__shfl_xor(var, laneMask, width)</code>, with <code>width</code> defaulting to <code>warpSize</code>; on AMD they are implemented with <code>__builtin_amdgcn_ds_bpermute(index &lt;&lt; 2, var)</code>; a lane whose source would fall outside its width-sized segment gets its own value back. <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> <sup class="src"><a href="#F7-12-src-D1">D1</a></sup></dd>
+<dt>Ballot</dt><dd><b>Simple words:</b> every lane answers yes or no, and the wave gets one number whose bits are the answers. <b>Analogy:</b> raising hands; the leader writes one tick per helper. <b>Precise:</b> HIP 5.7's <code>__ballot(predicate)</code> returns <code>unsigned long long</code>, bit <i>l</i> set if lane <i>l</i> is active and its predicate is non-zero; it is <code>__builtin_amdgcn_uicmp(predicate, 0, ICMP_NE)</code>, a vector compare whose per-lane results form the mask. <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> <sup class="src"><a href="#F7-12-src-D2">D2</a></sup></dd>
+<dt>Lane mask</dt><dd><b>Simple words:</b> a number with one bit per lane, saying which lanes are meant. <b>Analogy:</b> the line of ticks, one per helper. <b>Precise:</b> a bit set indexed by lane; on wave64 it needs 64 bits (<code>unsigned long long</code> or <code>uint64_t</code>); EXEC, VCC and ballot results are lane masks; HIP 5.7 provides <code>__lanemask_lt()</code>, <code>__lanemask_gt()</code> and <code>__lanemask_eq()</code> returning <code>uint64_t</code>. <sup class="src"><a href="#F7-12-src-H1">H1</a></sup></dd>
+<dt>Population count (<code>__popcll</code>)</dt><dd><b>Simple words:</b> how many bits of a number are 1. <b>Analogy:</b> counting the raised hands. <b>Precise:</b> HIP 5.7's <code>__popcll(unsigned long long)</code> is <code>__builtin_popcountll</code>; <code>__popc(unsigned int)</code> counts 32 bits only. In this build's gfx90a code it became <code>s_bcnt1_i32_b64</code> on a scalar mask and <code>v_bcnt_u32_b32</code> (twice) on a per-lane mask (R3). <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> <sup class="src"><a href="#F7-12-src-R3">R3</a></sup></dd>
+<dt>Stream compaction (wave-level)</dt><dd><b>Simple words:</b> packing the lanes that keep a value into consecutive places, with no gaps. <b>Analogy:</b> keepers putting jars on the shelf in order. <b>Precise:</b> each keeping lane writes to slot = popcount(ballot &amp; lanemask_lt), the number of keeping lanes below it; the count of kept values is popcount(ballot). <sup class="src"><a href="#F7-12-src-R1">R1</a></sup></dd>
+<dt><code>ds_bpermute_b32</code></dt><dd><b>Simple words:</b> the AMD instruction that lets each lane fetch a 32-bit value from any lane of its wave. <b>Analogy:</b> each helper names the helper whose bowl they want, and the table's machinery hands the bowls over. <b>Precise:</b> a "backward permute" instruction of the LDS hardware that takes a per-lane byte address (lane index × 4) and returns the source lane's value, without allocating LDS memory; HIP 5.7 builds every <code>__shfl</code> variant on it (H1, R3). <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> <sup class="src"><a href="#F7-12-src-D2">D2</a></sup></dd>
+</dl></div>
+
+<h2 id="F7-12-pictures">The idea in pictures</h2>
+<p>Figure 1 follows a ballot-based compaction through one 64-lane wave, with the predicate "lane % 3 == 0" of Listing 1. The ballot is one 64-bit mask, <code>0x9249249249249249</code>, with 22 bits set. Lane 36 keeps its value; it masks the ballot with "all lanes below me" and counts 12 bits: its slot is 12. If the mask had been stored in 32 bits, lane 36 would count only the 11 bits of lanes 0–31 and get slot 11, like every keeping lane from 33 up.</p>
+<figure id="F7-12-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 360" role="img" aria-labelledby="F7-12-f1t F7-12-f1d">
+<title id="F7-12-f1t">Figure 1: a 64-bit ballot used for compaction, and what a 32-bit copy loses</title>
+<desc id="F7-12-f1d">Top: a row of 64 lane boxes drawn as two halves, lanes 0 to 31 and lanes 32 to 63; every third lane (0, 3, 6, ...) is marked "keep". Arrow down to the ballot: a 64-bit mask, written as hexadecimal 0x9249249249249249, popcount 22, split into a low word for lanes 0 to 31 and a high word for lanes 32 to 63. Middle: for lane 36, the mask is ANDed with "lanes below 36", which keeps bits 0 to 35; popcount 12, so lane 36 writes slot 12. Bottom, labelled bug: the same mask kept in a 32-bit variable, the high word is cut off (crossed out), popcount 11; lane 36's count of lanes below it is 11, the same as for lanes 33, 39, 42 and every keeping lane above 32; they all write slot 11. Values from R1.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="360"/>
+<text class="sv-tb" x="20" y="22">one wave64: predicate lane % 3 == 0 (Listing 1)</text>
+<rect class="sv-b2" x="20" y="32" width="340" height="30"/><text class="sv-ts" x="28" y="52">lanes 0–31: keep 0, 3, 6, …, 30 (11 lanes)</text>
+<rect class="sv-b4" x="380" y="32" width="360" height="30"/><text class="sv-ts" x="388" y="52">lanes 32–63: keep 33, 36, …, 63 (11 lanes)</text>
+<line class="sv-line" x1="380" y1="62" x2="380" y2="84"/><polygon class="sv-head" points="380,90 375,80 385,80"/>
+<text class="sv-ts" x="390" y="80">__ballot(pred): one 64-bit value per wave</text>
+<rect class="sv-b2" x="20" y="92" width="340" height="30"/><text class="sv-ts" x="28" y="112">low word 0x49249249 (bits 0–31)</text>
+<rect class="sv-b4" x="380" y="92" width="360" height="30"/><text class="sv-ts" x="388" y="112">high word 0x92492492 (bits 32–63)</text>
+<text class="sv-ts" x="20" y="142">mask = 0x9249249249249249, popcount 22 (R1)</text>
+<rect class="sv-box" x="20" y="154" width="720" height="70"/>
+<text class="sv-tb" x="30" y="174">lane 36 (keeps): slot = popcount(mask &amp; lanes-below-36)</text>
+<rect class="sv-b5" x="30" y="184" width="380" height="28"/><text class="sv-ts" x="38" y="203">bits 0–35 kept: lanes 0, 3, …, 33 → 12 bits</text>
+<text class="sv-ts" x="430" y="203">→ writes slot 12 (correct)</text>
+<line class="sv-line2" x1="20" y1="240" x2="740" y2="240"/>
+<text class="sv-tb" x="20" y="262">bug: the mask kept in 32 bits (unsigned int)</text>
+<rect class="sv-b2" x="20" y="272" width="340" height="30"/><text class="sv-ts" x="28" y="292">0x49249249: popcount 11</text>
+<rect class="sv-dash" x="380" y="272" width="360" height="30"/><text class="sv-ts" x="388" y="292">high word lost (lanes 32–63)</text>
+<text class="sv-ts" x="20" y="326">lanes 33, 36, 39, …, 63 all count 11 lanes below them → all write slot 11;</text>
+<text class="sv-ts" x="20" y="344">10 of their 11 values are overwritten, and the wave reports 11 kept instead of 22 (R1).</text>
+</svg></div><figcaption><b>Figure 1.</b> Ballot, lane mask and population count in a wave64 compaction, and the 32-bit truncation bug. Arrows show data flow from the lanes' predicates to the mask. All mask values and slots are printed by Listing 1 (R1); the 64-bit return type of <code>__ballot</code> is from the HIP 5.7 header (H1). <sup class="src"><a href="#F7-12-src-R1">R1</a></sup> <sup class="src"><a href="#F7-12-src-H1">H1</a></sup></figcaption></figure>
+
+<h2 id="F7-12-layer1">Layer 1 — the kid explanation</h2>
+<p>Helpers in a row can do two things without walking to the table. They can pass a bowl a fixed number of places along the row, all at the same moment. And they can raise hands, so that the leader writes one tick per helper on a long line of paper.</p>
+<p>Passing bowls lets a row add up all its numbers quickly: pass half-way along and add, then a quarter, then an eighth, until the first helper holds the total. Raising hands lets every helper find out how many others said yes, and how many of them stand to their left. For a row of 64 helpers, the line of ticks must have 64 places. A sheet with 32 places forgets half the row.</p>
+
+<h2 id="F7-12-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F7-12-l2-shfl">Shuffles</h3>
+<p>A shuffle reads a register of another lane in the same wave. HIP 5.7 offers four forms, each with an optional <code>width</code> that defaults to <code>warpSize</code>: <code>__shfl</code> (from a given lane), <code>__shfl_up</code> and <code>__shfl_down</code> (from <i>delta</i> lanes below or above) and <code>__shfl_xor</code> (from lane <i>l</i> XOR <i>mask</i>). <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> The AMD side of HIP 5.7 has no <code>_sync</code> variants and no member mask; the NVIDIA side of the same installation defines <code>__shfl_down(...)</code> as <code>__shfl_down_sync(0xffffffff, ...)</code>, a full 32-lane mask (<code>nvidia_hip_runtime_api.h</code>). <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> HP301 (F7-07) showed what hipify does with CUDA's <code>_sync</code> shuffles. <sup class="src"><a href="#F7-12-src-D1">D1</a></sup> One detail of the HIP 5.7 code matters for algorithms: in <code>__shfl_down</code>, a lane whose source <code>self + delta</code> lies outside its width-sized segment receives its own value back. <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> Listing 1's <code>shflDown</code> models exactly that rule.</p>
+<p>The tree reduction of F7-08 uses <code>__shfl_down</code> with <i>d</i> = <code>warpSize</code> / 2, …, 1: after log<sub>2</sub>(<code>warpSize</code>) steps lane 0 holds the total. Listing 1 shows the result for 1, 2, …, 64: 2,080 with offsets from 32, and 528 with offsets copied from 32-lane code (R1). The butterfly with <code>__shfl_xor</code> and masks 32, 16, …, 1 gives every lane the total (2,080 in lanes 0, 37 and 63, R1), which saves a broadcast when all lanes need the result.</p>
+<h3 id="F7-12-l2-ballot">Ballots, masks and counts</h3>
+<p>A ballot returns one bit per lane. In HIP 5.7 its type is <code>unsigned long long</code> on every target (F7-09 showed the upper half is zero on wave32). <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> Combined with a mask of "lanes below me" and a population count, it gives each lane its rank among the lanes that said yes. Listing 2's compaction does exactly this: <code>keep = __ballot(in[i] &gt; 0)</code>, <code>below = keep &amp; ((1ull &lt;&lt; lane) - 1ull)</code>, slot = <code>__popcll(below)</code>. HIP 5.7 also offers <code>__lanemask_lt()</code>, which returns the same "lanes below me" mask intersected with the active lanes. <sup class="src"><a href="#F7-12-src-H1">H1</a></sup></p>
+<p>Every type in this chain must be 64 bits wide on wave64: the variable that holds the ballot, the constant <code>1ull</code> (a plain <code>1 &lt;&lt; lane</code> is an <code>int</code> shift, undefined for <code>lane</code> ≥ 32), and the count (<code>__popcll</code>, not <code>__popc</code>). Listing 1 prints what happens when only the variable is wrong: the 64-bit mask <code>0x9249249249249249</code> has 22 bits set; kept in 32 bits it becomes <code>0x49249249</code> with 11 (R1). The compaction slots of lanes 36, 39, 42 and 45 become 11, 11, 11, 11 instead of 12, 13, 14, 15 (R1).</p>
+<h3 id="F7-12-l2-compiler">Let the compiler catch it</h3>
+<p>The <code>mask32_quiet</code> step compiled the bug (Listing 3, <code>unsigned int mask = __ballot(…)</code>) with <code>-Wall -Wextra</code>: the compiler said nothing and exited with 0 (R4). The <code>mask32</code> step added <code>-Wshorten-64-to-32 -Werror</code>: the compile failed with "implicit conversion loses integer precision: 'unsigned long long' to 'unsigned int'" at the exact column of the ballot (R5). <sup class="src"><a href="#F7-12-src-R4">R4</a></sup> <sup class="src"><a href="#F7-12-src-R5">R5</a></sup> That flag belongs in the build of every hipified project.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Newer HIP versions.</b> This chapter's function list, types and the out-of-range rule come from the HIP 5.7 headers. Whether newer HIP versions add <code>_sync</code> variants with a 64-bit member mask, change the return type of <code>__ballot</code>, or change the semantics of <code>width</code>, must be checked in the HIP Programming Guide, warp cross-lane functions, for your ROCm version (D1).</p></div>
+
+<h2 id="F7-12-layer3">Layer 3 — the engineer's depth</h2>
+<p>In the analogy: the row does not really pass bowls hand to hand; each helper writes the number of the helper whose bowl they want, and the table's machinery delivers all bowls at once.</p>
+<h3 id="F7-12-l3-bpermute">What <code>__shfl_down</code> becomes</h3>
+<p>HIP 5.7 defines <code>__shfl_down(int var, unsigned int lane_delta, int width)</code> as: <code>self = __lane_id()</code>; <code>index = self + lane_delta</code>; if <code>(self &amp; (width - 1)) + lane_delta &gt;= width</code> then <code>index = self</code>; return <code>__builtin_amdgcn_ds_bpermute(index &lt;&lt; 2, var)</code>. <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> The <code>ops_isa</code> step shows the compiled form of Listing 2's <code>waveSum</code> on gfx90a (R2):</p>
+<ul>
+<li><code>v_mbcnt_lo_u32_b32</code> and <code>v_mbcnt_hi_u32_b32</code>: the lane id (F7-08).</li>
+<li><code>v_and_b32_e32 v0, 63, v1</code>: <code>self &amp; (width − 1)</code> with width 64.</li>
+<li><code>v_cmp_gt_u32_e32 vcc, 32, v0</code>, <code>v_cndmask_b32_e64 v3, 0, 1, vcc</code>, <code>v_lshlrev_b32_e32 v3, 5, v3</code>: "is my source inside the wave? then add 32, else add 0", without a branch.</li>
+<li><code>v_add_lshl_u32 v3, v3, v1, 2</code>: (delta + self) × 4, the byte address.</li>
+<li><code>ds_bpermute_b32 v3, v3, v2</code>, then <code>s_waitcnt lgkmcnt(0)</code> and <code>v_add_u32</code>: fetch, wait, add. <sup class="src"><a href="#F7-12-src-R2">R2</a></sup></li>
+</ul>
+<p>The pattern repeats with 48, 56, 60, 62 as the comparison limit (that is, 64 − delta for delta = 16, 8, 4, 2) and finally <code>v_cmp_ne_u32_e32 vcc, 63, v0</code> with <code>v_addc_co_u32</code>, which adds the carry bit as the +1 for delta = 1 (R2). The compiler interleaves the address computation of the next step with the wait of the current one. <sup class="src"><a href="#F7-12-src-R2">R2</a></sup></p>
+<p>The <code>ops_count</code> step counts the cross-lane instructions of the same kernel for both widths: 6 <code>ds_bpermute_b32</code> on gfx90a and 5 on gfx1100, that is log<sub>2</sub>(64) and log<sub>2</sub>(32) steps; both <code>mbcnt</code> halves on wave64, only the low one on wave32; <code>s_and_saveexec_b64</code> against <code>_b32</code> (R3). <sup class="src"><a href="#F7-12-src-R3">R3</a></sup> Because <code>__shfl_down</code> goes through <code>ds_bpermute</code>, a shuffle reduction uses the LDS hardware and waits on <code>lgkmcnt</code> like an LDS access (F7-11), even though no LDS memory is allocated. <sup class="src"><a href="#F7-12-src-D2">D2</a></sup></p>
+<h3 id="F7-12-l3-ballot">What <code>__ballot</code> becomes</h3>
+<p>In R2 there is no instruction called "ballot". The compare <code>v_cmp_lt_i32_e32 vcc, 0, v2</code> (<code>in[i] &gt; 0</code>) writes its 64 result bits into VCC, and the rest of the code uses VCC as the ballot (R2). <sup class="src"><a href="#F7-12-src-R2">R2</a></sup> The per-wave count <code>__popcll(keep)</code> is one scalar instruction, <code>s_bcnt1_i32_b64 s0, vcc</code>. The per-lane count <code>__popcll(below)</code> is computed in VGPRs, because <code>below</code> differs per lane: <code>v_lshlrev_b64 v[6:7], v1, -1</code> builds the "lane and above" mask, two <code>v_not_b32</code> invert it, two <code>v_and_b32</code> with <code>vcc_lo</code> and <code>vcc_hi</code> apply the ballot, and two <code>v_bcnt_u32_b32</code> count the halves and add them (R2). The 64-bit mask costs two 32-bit vector instructions per step on gfx90a.</p>
+<h3 id="F7-12-l3-other">Other cross-lane mechanisms</h3>
+<p>The AMD ISA has further ways to move data between lanes, which the compiler may use for other code or which libraries use explicitly: reading one lane's value into a scalar register, modifiers that let a vector instruction take an operand from a neighbouring lane within a row of lanes, and <code>ds_swizzle</code>. None of them appeared in this chapter's kernels. <sup class="src"><a href="#F7-12-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The names and exact semantics of these mechanisms (on CDNA: <code>v_readlane_b32</code>, <code>v_readfirstlane_b32</code>, <code>v_writelane_b32</code>, the DPP modifiers and their row sizes, <code>ds_swizzle_b32</code> patterns), and their costs compared with <code>ds_bpermute_b32</code>, were not read in a document in this build. Check: CDNA2 ISA guide, chapters on VOP DPP, lane-access instructions and data share operations (D2); RDNA3 ISA guide for wave32 differences (D4); the rocPRIM source for which mechanisms its warp primitives use (HP401, D3).</p></div>
+
+<h2 id="F7-12-hardware">How the hardware actually does it</h2>
+<p>Each lane's registers live in the VGPR file of the wave's SIMD (F7-10). A lane cannot address another lane's VGPR in an ordinary vector instruction; data crosses lanes through dedicated paths: the LDS crossbar for <code>ds_bpermute</code> and <code>ds_permute</code>, the scalar unit for values made uniform, and operand-routing modifiers. <sup class="src"><a href="#F7-12-src-D2">D2</a></sup> A ballot needs no crossing at all: a vector compare already produces one bit per lane, and the hardware writes the bits into a scalar register pair (VCC or an SGPR pair) that the scalar unit can test and count. <sup class="src"><a href="#F7-12-src-D2">D2</a></sup> <sup class="src"><a href="#F7-12-src-R2">R2</a></sup> Inactive lanes (EXEC bit 0) contribute 0 to a compare's result, which is why <code>__lanemask_lt()</code> in HIP 5.7 ANDs with <code>__ballot64(1)</code>, the mask of active lanes. <sup class="src"><a href="#F7-12-src-H1">H1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Whether inactive lanes really produce 0 bits in a VOPC compare result on gfx90a, what <code>ds_bpermute_b32</code> returns for a source lane that is inactive, and its latency and throughput compared with an LDS read, were not read in a document in this build. Check: CDNA2 ISA guide, VOPC and LDS chapters (D2). Until then, write code that does not depend on values from inactive lanes.</p></div>
+
+<h2 id="F7-12-worked">Worked example</h2>
+<p><b>Task.</b> A wave64 holds the values <i>l</i> + 1 in lane <i>l</i> (Listing 1). (a) After the first step of a <code>__shfl_down</code> reduction with <i>d</i> = 32, what do lanes 0, 31, 32 and 63 hold? (b) After all six steps, what does lane 0 hold? (c) Why does the second half of the wave hold "garbage", and does it matter? (d) With the predicate <code>lane % 3 == 0</code>, which slot does lane 63 get, and how many values does the wave keep?</p>
+<ol>
+<li>(a) Lane <i>l</i> &lt; 32 reads lane <i>l</i> + 32 and adds: lane 0 holds 1 + 33 = 34; lane 31 holds 32 + 64 = 96. Lanes 32–63 have no source inside the wave and get their own value back (H1), so they double: lane 32 holds 33 + 33 = 66, lane 63 holds 128.</li>
+<li>(b) The steps fold 32, 16, 8, 4, 2, 1 lanes; lane 0 ends with the sum of all 64 values, 64 × 65 / 2 = 2,080 (R1).</li>
+<li>(c) Lanes whose sources were out of range doubled their own values, and lanes above 0 accumulated partial sums of different subsets. Only lane 0's result is defined as the total; the code must read it from lane 0 (Listing 2 line 29) or use the butterfly, in which every lane ends with 2,080 (R1).</li>
+<li>(d) Keeping lanes are 0, 3, …, 63: 22 of them (popcount 22, R1). Lane 63 has 21 keeping lanes below it: slot 21. The wave keeps 22 values in slots 0–21.</li>
+</ol>
+
+<h2 id="F7-12-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>lane_sim.cpp</code>: a lock-step wave simulator for ballot, shuffles, reductions and compaction.</p>
+<pre class="listing" data-src="F7-12/lane_sim.cpp"></pre>
+<p><b>Build command</b> (the one actually used): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined lane_sim.cpp -o lane_sim</code>, then <code>./lane_sim</code>.</p>
+<pre class="output" data-run="F7-12/lane_sim"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–20</td><td><code>ballot</code></td><td>Sets bit <i>l</i> of a <code>std::uint64_t</code> for each true lane.</td><td>64 bits, as HIP's <code>__ballot</code>; <code>std::uint64_t{1} &lt;&lt; l</code> is a 64-bit shift.</td></tr>
+<tr><td>23–30</td><td><code>shflDown</code></td><td>Lane <i>l</i> takes lane <i>l</i> + delta; out-of-range lanes keep their value.</td><td>The rule of HIP 5.7's <code>__shfl_down</code> (H1).</td></tr>
+<tr><td>33–40</td><td><code>shflXor</code></td><td>Lane <i>l</i> takes lane <i>l</i> XOR mask.</td><td>The butterfly exchange.</td></tr>
+<tr><td>42–51</td><td><code>reduceDown</code></td><td>The halving tree from a given first delta.</td><td>Right (32) and wrong (16) start.</td></tr>
+<tr><td>55–69</td><td><code>compactSlots</code></td><td>Slot = popcount of the ballot bits below the lane; <code>maskBits == 32</code> truncates first.</td><td>The bug, reproduced on purpose (line 59).</td></tr>
+<tr><td>71–112</td><td><code>main</code></td><td>Prints mask, reductions, butterfly and slots for lanes 27–45.</td><td>Every number of Figure 1 and the worked example.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>wave_ops.hip</code>: a portable wave sum with <code>__shfl_down</code> and a wave-level compaction with <code>__ballot</code> (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-12/wave_ops.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a wave_ops.hip -o wave_ops</code>, then <code>./wave_ops</code>.</p>
+<pre class="output" data-run="F7-12/wave_ops"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 2 was built for real; its run stopped at the first runtime call with the runtime's own error (no AMD GPU in the build container). Expected on a gfx90a GPU, from the code: <code>warpSize 64, 4 waves, 0 errors</code>. Needed: an AMD GPU from the ROCm compatibility matrix (D8).</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–15</td><td><code>waveSum</code></td><td>Shuffle-down tree from <code>warpSize / 2</code>.</td><td>No literal width: 6 steps on wave64, 5 on wave32 (R3).</td></tr>
+<tr><td>21–22</td><td><code>wave</code>, <code>lane</code></td><td>Wave index from <code>warpSize</code>, lane from <code>__lane_id()</code>.</td><td>Correct for one-dimensional workgroups whose size is a multiple of <code>warpSize</code>.</td></tr>
+<tr><td>24</td><td><code>unsigned long long keep = __ballot(…)</code></td><td>64-bit mask of keeping lanes.</td><td>Became VCC directly (R2).</td></tr>
+<tr><td>25</td><td><code>keep &amp; ((1ull &lt;&lt; lane) - 1ull)</code></td><td>Keeping lanes below this one.</td><td><code>1ull</code>: a 64-bit shift; <code>1 &lt;&lt; lane</code> would be undefined for lane ≥ 32.</td></tr>
+<tr><td>26–28</td><td>compaction write</td><td>Writes to the wave's segment at slot <code>__popcll(below)</code>.</td><td>Two <code>v_bcnt_u32_b32</code> on gfx90a (R2).</td></tr>
+<tr><td>29–32</td><td>lane 0 writes</td><td>Sum and count per wave.</td><td>The count is <code>s_bcnt1_i32_b64</code> on VCC (R2).</td></tr>
+<tr><td>46–48</td><td><code>prop.warpSize</code></td><td>Host sizes per-wave arrays from the device.</td><td>F7-08's rule.</td></tr>
+</tbody></table></div>
+<p>The <code>ops_isa</code> step: <code>sumAndCompact</code> for gfx90a, comments removed.</p>
+<pre class="output" data-run="F7-12/ops_isa"></pre>
+<p>The <code>ops_count</code> step: cross-lane and mask instructions of the same kernel for wave64 and wave32.</p>
+<pre class="output" data-run="F7-12/ops_count"></pre>
+
+<p><b>Listing 3</b> — <code>bug/mask32.hip</code>: a ballot copied from 32-lane code (kernel only; compiled twice).</p>
+<pre class="listing" data-src="F7-12/bug/mask32.hip"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8</td><td><code>unsigned int mask = __ballot(…)</code></td><td>Stores a 64-bit result in 32 bits.</td><td>Lanes 32–63 vanish silently.</td></tr>
+<tr><td>10</td><td><code>__popc(mask)</code></td><td>Counts 32 bits.</td><td>Undercounts by the keeping lanes above 31.</td></tr>
+</tbody></table></div>
+<p>The <code>mask32_quiet</code> step: <code>-Wall -Wextra</code> only.</p>
+<pre class="output" data-run="F7-12/mask32_quiet"></pre>
+<p>The <code>mask32</code> step: with <code>-Wshorten-64-to-32 -Werror</code> (expected to fail).</p>
+<pre class="output" data-run="F7-12/mask32"></pre>
+
+<h2 id="F7-12-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Bowls are not passed one place at a time.</b> A shuffle by 32 lanes costs the same single <code>ds_bpermute_b32</code> as a shuffle by 1 (R2); the "distance" along the row is free.</li>
+<li><b>A helper who has nobody to take from does not end up empty-handed.</b> In HIP 5.7 an out-of-range shuffle returns the lane's own value (H1), which is why the upper lanes double their values in the worked example.</li>
+<li><b>Raising hands is not a separate event.</b> The ballot is the side effect of a compare that the code needed anyway (VCC in R2); there is no extra "vote" instruction.</li>
+</ul>
+
+<h2 id="F7-12-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Compaction loses values from lanes 32–63; counts too small; correct on NVIDIA</td><td>Ballot stored in 32 bits</td><td><code>-Wshorten-64-to-32</code> (R5); Listing 1's 32-bit line</td><td><code>unsigned long long</code> / <code>uint64_t</code>, <code>__popcll</code></td></tr>
+<tr><td>Rank wrong for lanes ≥ 32, sometimes garbage</td><td><code>(1 &lt;&lt; lane) - 1</code> with an <code>int</code> 1</td><td>UBSan on a host model (Listing 1 runs with it); code review</td><td><code>(1ull &lt;&lt; lane) - 1ull</code> or <code>__lanemask_lt()</code></td></tr>
+<tr><td>Reduction gives half the sum on AMD</td><td>First shuffle offset 16</td><td>Listing 1 (528 vs 2,080)</td><td>Start at <code>warpSize / 2</code></td></tr>
+<tr><td>Upper lanes hold "wrong" values after a reduction</td><td>Expected: only lane 0 is defined</td><td>Worked example (c)</td><td>Read lane 0, or use the XOR butterfly</td></tr>
+<tr><td>Sub-wave shuffle (<code>width</code> 16) mixes segments</td><td><code>width</code> not a power of two, or not dividing <code>warpSize</code></td><td>Read the header's index rule (H1)</td><td>Powers of two dividing <code>warpSize</code></td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F7-12-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F7-11">F7-11</a> moved data between lanes through LDS memory; <a href="#F1-57">F1-57</a> introduced warp votes; <a href="#F7-07">F7-07</a> hipified CUDA shuffles. <b>What carries over:</b> reductions by halving, votes as one bit per lane, the rule "never hard-code the width". <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> <b>What changes:</b> on wave64 every mask is 64 bits (variable, constant and count); HIP 5.7's shuffles have no <code>_sync</code> member mask and return the lane's own value when out of range; shuffles are <code>ds_bpermute_b32</code> on the LDS hardware; a ballot is a compare's VCC. <sup class="src"><a href="#F7-12-src-H1">H1</a></sup> <sup class="src"><a href="#F7-12-src-R2">R2</a></sup> <b>What comes next:</b> <a href="#F7-13">F7-13</a> reads whole kernels in AMD ISA, from the code object and its kernel descriptor down to the inner loop, with a census tool.</p></div>
+
+<h2 id="F7-12-check">Check yourself</h2>
+<ol>
+<li>What does HIP 5.7's <code>__shfl_down(v, 4)</code> return in lane 62 of a wave64 wave, and why?</li>
+<li>Which line is correct for "lanes below me that voted yes" on wave64? (a) <code>__ballot(p) &amp; ((1 &lt;&lt; lane) - 1)</code>; (b) <code>__ballot(p) &amp; ((1ull &lt;&lt; lane) - 1ull)</code>; (c) <code>(unsigned)__ballot(p) &amp; ((1u &lt;&lt; lane) - 1u)</code>; (d) <code>__popc(__ballot(p))</code>.</li>
+<li>Why does the gfx90a code count the per-wave total with one scalar instruction but each lane's rank with two vector instructions?</li>
+<li>How many <code>ds_bpermute_b32</code> does a full shuffle-down reduction need on wave64 and on wave32, and where do you see it?</li>
+<li>Explain in your own words why the 32-bit mask bug gives the same slot, 11, to every keeping lane from 33 up.</li>
+<li>Apply: a wave64 kernel counts, per wave, how many lanes found a match, with <code>atomicAdd(total, __popc(__ballot(found)))</code> in lane 0. On a test where every lane finds a match, what total does a workgroup of 256 add? What should it be?</li>
+<li>Predict, then run: change the predicate in Listing 1 to <code>l % 2 == 0</code>. Predict the 64-bit mask in hexadecimal, its 32-bit truncation and both popcounts; run it.</li>
+<li>Why does a shuffle reduction contain <code>s_waitcnt lgkmcnt(0)</code> although it touches no memory?</li>
+</ol>
+
+<h2 id="F7-12-lab">Lab</h2>
+<p><b>Goal.</b> Implement and verify wave-level reductions and compaction for any <code>warpSize</code>, read their machine code on two widths, and make the compiler catch a 32-bit mask (curriculum E10, AMD part).</p>
+<p><b>Hardware and software needed.</b> g++ 13.3; hipcc (HIP 5.7) driving clang 17.0.6, as in the run logs; folder <code>university/labs/F7-12</code>. No GPU for steps 1–5; an AMD GPU for step 6.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F7-12</code>. The <code>mask32</code> log says "compile failed as expected"; the others end with exit codes.</li>
+<li>In <code>ops_isa.out</code>, mark the six <code>ds_bpermute_b32</code>, the compare that is the ballot, and the two <code>v_bcnt_u32_b32</code>. For each <code>ds_bpermute</code>, write the delta it implements.</li>
+<li>Add <code>__shfl_up</code> and an inclusive wave scan to Listing 1 (each lane adds the value <i>d</i> lanes below for <i>d</i> = 1, 2, 4, …). Check that lane 63 holds 2,080 and lane 10 holds 66.</li>
+<li>Add the same scan to Listing 2 and predict how many <code>ds_bpermute_b32</code> it adds on gfx90a; re-run and count.</li>
+<li>Add <code>-Wshorten-64-to-32</code> to the build of a hipified project you know (or HP301's labs) and record what it finds.</li>
+<li>On a GPU: run Listing 2; then plant the 32-bit bug in a copy and compare its output.</li>
+</ol>
+<p><b>Expected observations.</b> log<sub>2</sub>(<code>warpSize</code>) permutes per reduction; the ballot as VCC; two 32-bit counts for a 64-bit per-lane mask; a silent compile without the flag and a hard error with it.</p>
+<p><b>Verification.</b> Milestone E10's acceptance test, verbatim: "For each listing you identify: global loads and their width, shared/LDS accesses, synchronization, the FMA or matrix instructions, any register spills; and you predict one change, make it, and confirm the predicted effect in the profiler." For Listing 2: one 4-byte global load per lane, LDS-hardware accesses (<code>ds_bpermute_b32</code>) without LDS memory, no barrier, no FMA, no spills; step 4 is the predicted change (the profiler part on a GPU, F7-14).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>UBSan reports "shift exponent 32 is too large" in your extension of Listing 1 → an <code>int</code> or 32-bit shift; use <code>std::uint64_t{1}</code>.</li>
+<li>Your scan gives correct values in lane 0 only → you used <code>__shfl_down</code> instead of <code>__shfl_up</code>.</li>
+<li><code>ops_count</code> shows more permutes than expected → the compiler did not unroll your loop, or you used a runtime width; check that the loop bound is <code>warpSize</code>.</li>
+</ul>
+<p><b>Extension.</b> Implement the compaction with <code>__lanemask_lt()</code> instead of the hand-made mask and compare the ISA of both versions.</p>
+
+<h2 id="F7-12-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A particle filter ported from CUDA keeps only the particles above a threshold, packed per wave. On AMD, the number of surviving particles is always about half the expected count, and some surviving particles appear with the value of a neighbour. The NVIDIA build is correct. Someone suggests a race in the global memory writes.</p>
+<p><b>Evidence pack.</b> The lane simulator run (R1), the team's build with default warnings (R4) and with the warning flag (R5):</p>
+<pre class="output" data-run="F7-12/lane_sim"></pre>
+<pre class="output" data-run="F7-12/mask32_quiet"></pre>
+<pre class="output" data-run="F7-12/mask32"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which lanes get wrong slots in the simulation, and what count is reported against the true one?</li>
+<li>Hypotheses: (a) a race in global writes; (b) a 32-bit mask; (c) a wrong shuffle offset. Which evidence speaks for or against each?</li>
+<li>Root cause: name the line and the type, and explain why the error is "about half".</li>
+<li>Fix and verification: what changes, and which line of the simulator output proves the fix?</li>
+<li>Prevention: two measures, one in the build and one in testing.</li>
+</ol>
+<p><b>Method hints.</b> Compare the 64-bit and 32-bit slot lines lane by lane. A race gives different results from run to run; a type error gives the same wrong result every time.</p>
+
+<h2 id="F7-12-project">Mini-project</h2>
+<p><b>Hardware passport and tuning notes, cross-lane section.</b> Record for your target: <code>warpSize</code>, the instruction your compiler uses for <code>__shfl_down</code> (TOOL: ISA), the number of permutes per full reduction (TOOL), and whether your HIP version offers <code>_sync</code> shuffles (DOC, D1). Add a portable header of your own with <code>waveSum</code>, <code>waveScan</code> and <code>waveCompact</code>, each tested on Listing 1's simulator for widths 32 and 64.</p>
+<p><b>Rubric.</b> Functions width-agnostic and tested for both widths (4). Passport entries tagged with records (3). Build uses <code>-Wshorten-64-to-32</code> and is clean (3).</p>
+
+<h2 id="F7-12-summary">Summary</h2>
+<ul>
+<li>HIP 5.7 shuffles (<code>__shfl</code>, <code>_up</code>, <code>_down</code>, <code>_xor</code>) take a <code>width</code> defaulting to <code>warpSize</code>; out-of-range lanes get their own value.</li>
+<li>On AMD they compile to <code>ds_bpermute_b32</code> with a byte address; a full reduction needs log<sub>2</sub>(<code>warpSize</code>) of them.</li>
+<li><code>__ballot</code> returns 64 bits; it is a compare's VCC; <code>__popcll</code> counts it (<code>s_bcnt1_i32_b64</code>).</li>
+<li>Compaction: slot = <code>__popcll(ballot &amp; lanemask_lt)</code>; every type in the chain must be 64-bit.</li>
+<li>A 32-bit ballot variable compiles silently with <code>-Wall -Wextra</code>; <code>-Wshorten-64-to-32</code> catches it.</li>
+</ul>
+
+<h2 id="F7-12-sources">Sources</h2>
+<ol>
+<li id="F7-12-src-D1">D1 — AMD, HIP documentation: HIP Programming Guide (warp cross-lane functions; porting notes on warp size and masks) and HIP API reference (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F7-12-src-D2">D2 — AMD, "AMD Instinct MI200" Instruction Set Architecture reference guide (CDNA2) (tier 1): VOPC compares and VCC, <code>ds_bpermute_b32</code>, lane-access instructions, DPP, <code>ds_swizzle_b32</code>, <code>s_bcnt1</code>, <code>v_bcnt</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-12-src-D3">D3 — AMD, rocPRIM documentation and source (warp-level primitives) (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-12-src-D4">D4 — AMD, RDNA3 Instruction Set Architecture reference guide (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-12-src-D8">D8 — AMD, ROCm documentation: compatibility matrix (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-12-src-H1">H1 — HIP 5.7 headers installed in the build container, read in this build (tier 4): <code>hip/amd_detail/amd_warp_functions.h</code> (<code>__shfl</code>, <code>__shfl_down</code>, <code>__shfl_xor</code> and their index rules), <code>hip/amd_detail/amd_device_functions.h</code> (<code>__ballot</code>, <code>__ballot64</code>, <code>__popc</code>, <code>__popcll</code>, <code>__lane_id</code>, <code>__lanemask_lt</code>, <code>__lanemask_gt</code>, <code>__lanemask_eq</code>), <code>hip/nvidia_detail/nvidia_hip_runtime_api.h</code> (the NVIDIA back end's <code>__shfl*</code> macros). Facts about HIP 5.7 only.</li>
+<li id="F7-12-src-R1">R1 — run of Listing 1 (<code>university/labs/F7-12/lane_sim.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0.</li>
+<li id="F7-12-src-R2">R2 — <code>ops_isa</code> step (<code>ops_isa.log</code>), Ubuntu clang 17.0.6 (the compiler hipcc drives; HIP 5.7), compiled only, exit code 0.</li>
+<li id="F7-12-src-R3">R3 — <code>ops_count</code> step (<code>ops_count.log</code>), same toolchain, compiled only, exit code 0.</li>
+<li id="F7-12-src-R4">R4 — <code>mask32_quiet</code> step (<code>mask32_quiet.log</code>), same toolchain, compiler exit code 0 with no diagnostics.</li>
+<li id="F7-12-src-R5">R5 — <code>mask32</code> step (<code>mask32.log</code>), same toolchain, compile failed as expected.</li>
+</ol>
+
+<h2 id="F7-12-glossary">Glossary links</h2>
+<p><a href="#gl-shuffle-shfl-family">Shuffle (__shfl family)</a> · <a href="#gl-ballot">Ballot</a> · <a href="#gl-warp-vote-ballot">Warp vote (ballot)</a> · <a href="#gl-lane-mask">Lane mask</a> · <a href="#gl-population-count-popcll">Population count (__popcll)</a> · <a href="#gl-stream-compaction-wave-level">Stream compaction (wave-level)</a> · <a href="#gl-ds-bpermute-b32">ds_bpermute_b32</a> · <a href="#gl-lane">Lane</a> · <a href="#gl-active-mask-exec">Active mask / EXEC</a></p>
+
+<h2 id="F7-12-next">Next chapter</h2>
+<p>Next: <a href="#F7-13">F7-13 Reading AMD ISA</a>. Previous: <a href="#F7-11">F7-11 The Local Data Share and its banks</a>. Course: <a href="#HP302">HP302</a>.</p>
+
+<h2 id="F7-12-answers">Answers to Check yourself</h2>
+<ol>
+<li>Its own value: (62 &amp; 63) + 4 = 66 ≥ 64, so the header sets <code>index = self</code> (H1). A common wrong answer is 0 (as if missing lanes contributed nothing); that is what a padded scan would assume, not what HIP 5.7 does.</li>
+<li>(b). (a) shifts an <code>int</code>: undefined for lane ≥ 32. (c) truncates the mask to 32 bits: the Figure 1 bug. (d) counts only the low 32 bits of the ballot (and is not a "below me" mask at all).</li>
+<li>The total is the same for the whole wave: VCC is a scalar register pair, and <code>s_bcnt1_i32_b64</code> counts it once. The rank differs per lane, so it must be computed in VGPRs, and a 64-bit value in VGPRs is two 32-bit halves, each counted by one <code>v_bcnt_u32_b32</code> (R2).</li>
+<li>6 on wave64, 5 on wave32: log<sub>2</sub> of the width; the <code>ops_count</code> step (R3).</li>
+<li>In 32 bits, the mask has no bits for lanes 32–63. Every lane above 32 counts the set bits below it in that truncated mask, which are all 11 bits of lanes 0–31. So the count stops growing at lane 32: lanes 33, 36, … all get 11 (R1).</li>
+<li><code>__ballot(found)</code> is all 64 bits; <code>__popc</code> takes an <code>unsigned int</code>, so the value is converted to 32 bits and counts 32. Four waves add 4 × 32 = 128. It should be 256. (Lab Engineer's arithmetic from H1's signatures; add <code>-Wshorten-64-to-32</code> to see the compiler flag the conversion.)</li>
+<li>Even lanes: bits 0, 2, 4, …: 64-bit mask <code>0x5555555555555555</code>, popcount 32; truncated <code>0x55555555</code>, popcount 16. (Lab Engineer's prediction; change line 78 and run.)</li>
+<li>The shuffle is a <code>ds_bpermute_b32</code>, an instruction of the LDS hardware whose result is counted in <code>lgkmcnt</code>; the wave must wait for it before adding (R2, D2).</li>
+</ol>
+<h3 id="F7-12-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> With the 32-bit mask, lanes 33, 36, 39, 42, 45 (and all keeping lanes above) get slot 11 instead of 11, 12, 13, 14, 15, …; the count is 11 instead of 22 (R1).</p>
+<p><b>Hypotheses.</b> (a) Against: the error is deterministic and appears in a host simulation with no memory race at all. (b) For: the 32-bit lines reproduce both symptoms, and the build with <code>-Wshorten-64-to-32</code> points at a 64-to-32 conversion of <code>__ballot</code> (R5). (c) Against: a wrong shuffle offset changes sums, not slots or counts; the reduction lines are not involved.</p>
+<p><b>Root cause.</b> <code>unsigned int mask = __ballot(…)</code> (Listing 3, line 8): HIP's ballot is 64-bit on wave64, the variable 32-bit. "About half": the keeping lanes are spread evenly over the wave, so the upper half's are lost from the count; the colliding writes to slot 11 explain the "neighbour's value" symptom (the last writer wins).</p>
+<p><b>Fix and verification.</b> <code>unsigned long long</code> (or <code>uint64_t</code>) for the mask, <code>1ull</code> in the shift, <code>__popcll</code> for the counts. The simulator's "64-bit mask" slot line and "popcount 22" are the expected behaviour; on a GPU, compare against a CPU compaction.</p>
+<p><b>Prevention.</b> Build: <code>-Wshorten-64-to-32 -Werror</code> for all device code (R4 shows the default warnings are silent). Testing: run wave-level unit tests compiled for a wave64 target and in a host simulator such as Listing 1, with predicates that set bits in both halves. <b>How the evidence was produced:</b> the Lab Engineer ran Listing 1 and compiled Listing 3 twice; the particle filter is a scenario.</p>

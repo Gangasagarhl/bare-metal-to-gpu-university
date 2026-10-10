@@ -1,0 +1,431 @@
+<!--meta
+id: F4-12
+title: HD Audio: controller, codec and a stream you can hear
+course: DR302
+level: L4
+prereqs: F4-08 (MSI, the DMA mapping layer, VT-d); DR301 F4-02 (PCI, BARs); F4-11 (reading a description at run time)
+time: 8–10 hours including the lab
+hardware: none for the lab (QEMU 8.2.2, q35, intel-hda with an hda-output codec, the "wav" audio backend; Python 3 with numpy on the host). A real HD Audio codec on the spare PC is optional and untested in this build.
+maps: Curriculum Track C, milestone C11 (HD Audio)
+analogy: F4 — the school and its visitors (the school's announcement system: a note tray to the sound desk, a tray for its replies, and a loop of tape the desk plays from)
+-->
+
+<h2 id="F4-12-hook">Story hook</h2>
+<p>The school has an announcement system. The head teacher's office does not touch the amplifiers. It writes short instructions on numbered slips and puts them in a tray: "desk 0, unit 2: play channel 1", "desk 0, unit 3: switch the speakers on". A technician at the sound desk takes the slips in order and puts a reply slip for each one in a second tray. For the music itself the office prepares a loop of tape cut into eight equal pieces, writes on a card where each piece starts and how long it is, and tells the desk: "play this loop on channel 1, ring the bell at the end of every piece".</p>
+<p>The office never hears the music. To know that the right music played at the right speed, someone has to record what came out of the speakers and compare it with the tape.</p>
+<p>An HD Audio controller works this way: commands go to the codec through one ring in memory, answers come back through another, and sound flows from a list of buffers by DMA. In this chapter you write the driver, play a two-tone test signal, record it with QEMU and prove on the host that every sample arrived unchanged.</p>
+
+<h2 id="F4-12-able">What you will be able to do</h2>
+<ul>
+<li><b>Reset</b> an HD Audio controller and find its codecs from STATESTS.</li>
+<li><b>Send</b> codec verbs through the CORB and read responses from the RIRB.</li>
+<li><b>Walk</b> a codec's widget graph and choose an output path from converter to pin.</li>
+<li><b>Build</b> a buffer descriptor list and run an output stream with one interrupt per period.</li>
+<li><b>Encode</b> a stream format word and set the same format on both sides of the link.</li>
+<li><b>Verify</b> audio output by recording it and comparing frequencies and samples with the source.</li>
+</ul>
+
+<div class="co jargon" id="F4-12-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>HD Audio controller</dt><dd><b>Simple words:</b> the PCI device that moves sound data and commands between memory and the audio chips. <b>Analogy:</b> the cable room between the office and the sound desk. <b>Precise:</b> a PCI function of class 04h subclass 03h whose BAR0 holds global registers, the CORB and RIRB registers and one descriptor per stream; it drives the HD Audio link to up to 15 codecs. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></dd>
+<dt>Codec</dt><dd><b>Simple words:</b> the chip that turns numbers into an analog signal (and back). <b>Analogy:</b> the sound desk itself. <b>Precise:</b> a device on the HD Audio link at an address 0–14, described as a tree of nodes: a root node, function groups and widgets, each read with "get parameter" verbs. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></dd>
+<dt>Verb</dt><dd><b>Simple words:</b> one command to one part of a codec. <b>Analogy:</b> a numbered slip in the tray. <b>Precise:</b> a 32-bit word: codec address (bits 31–28), node ID (27–20) and a 20-bit verb with payload: either a 12-bit verb and an 8-bit payload or a 4-bit verb and a 16-bit payload. Every verb gets exactly one 32-bit response. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></dd>
+<dt>CORB and RIRB</dt><dd><b>Simple words:</b> the two rings in memory for commands out and answers back. <b>Analogy:</b> the note tray and the reply tray. <b>Precise:</b> the Command Outbound Ring Buffer (up to 256 4-byte verbs; software advances the write pointer, the controller the read pointer) and the Response Inbound Ring Buffer (up to 256 8-byte entries: the response and a word with the codec address and a "solicited or not" bit; the controller advances its write pointer). <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></dd>
+<dt>Widget</dt><dd><b>Simple words:</b> one building block inside a codec. <b>Analogy:</b> one unit on the sound desk: a player, a mixer, a socket. <b>Precise:</b> a node of a function group with a type (audio output converter, audio input, mixer, selector, pin complex, power, volume knob, beep) in its Audio Widget Capabilities parameter, and a connection list naming the widgets that feed it. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></dd>
+<dt>Buffer descriptor list (BDL)</dt><dd><b>Simple words:</b> the list of memory pieces a stream plays, in order. <b>Analogy:</b> the card saying where each piece of the tape loop starts and how long it is. <b>Precise:</b> an array of 16-byte entries (64-bit address, 32-bit length, a flags word whose bit 0 is "interrupt on completion"), 128-byte aligned, at least two entries; the stream walks it cyclically up to the last valid index. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></dd>
+<dt>Stream format</dt><dd><b>Simple words:</b> the number that says how fast, how many bits and how many channels. <b>Analogy:</b> the tape speed written on the label. <b>Precise:</b> a 16-bit word (base rate 48 or 44.1 kHz, multiply, divide, sample size, channels minus one) written identically to the stream descriptor and to the converter widget (Figure 3). <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-12-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the controller, the link and the codec the lab programs. Figure 2 shows how the stream finds its samples. Figure 3 is the format word, the one number that the forensic lab gets wrong.</p>
+<figure id="F4-12-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 330" role="img" aria-labelledby="F4-12-f1t F4-12-f1d">
+<title id="F4-12-f1t">Figure 1: the HD Audio controller, the link and the codec</title>
+<desc id="F4-12-f1d">Left: the controller, a PCI device, with two command rings in memory: the CORB carries 32-bit verbs to the codecs, the RIRB brings 64-bit responses back. Below it, output stream descriptor SD4 reads PCM samples from memory by DMA, following a buffer descriptor list. Middle: the HD Audio link carries commands, responses and stream data in frames, each stream tagged with a number (tag 1 in the lab). Right: codec 0 (QEMU&#x27;s hda-output, vendor 0x1af4 device 0x0012) has an audio function group at node 1 with two widgets: widget 2, an audio output converter (DAC) set to listen to stream tag 1 with format 0x4011, and widget 3, a pin complex whose only input is widget 2 and whose default device is line out. The pin drives the output, which QEMU&#x27;s wav audio backend writes to a file.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="330"/>
+<rect class="sv-box" x="10" y="20" width="250" height="300" rx="6"/>
+<text class="sv-tb" x="20" y="40">HDA controller (PCI 00:01.0, BAR0)</text>
+<rect class="sv-b2" x="25" y="55" width="220" height="70" rx="6"/>
+<text class="sv-tb" x="35" y="75">CORB: 256 verbs (4 bytes)</text>
+<text class="sv-ts" x="35" y="92">CORBWP written by driver</text>
+<text class="sv-tm" x="35" y="109">cad|nid|verb|payload</text>
+<rect class="sv-b2" x="25" y="135" width="220" height="60" rx="6"/>
+<text class="sv-tb" x="35" y="155">RIRB: 256 responses (8 bytes)</text>
+<text class="sv-ts" x="35" y="172">RIRBWP written by controller</text>
+<rect class="sv-b1" x="25" y="205" width="220" height="105" rx="6"/>
+<text class="sv-tb" x="35" y="225">SD4: first output stream</text>
+<text class="sv-tm" x="35" y="242">BDL -&gt; 8 x 44160 bytes</text>
+<text class="sv-tm" x="35" y="259">FMT 0x4011, tag 1</text>
+<text class="sv-ts" x="35" y="276">LPIB: position in buffer</text>
+<text class="sv-ts" x="35" y="293">IOC -&gt; MSI per period</text>
+<rect class="sv-b7" x="300" y="120" width="140" height="110" rx="6"/>
+<text class="sv-tb" x="310" y="140">HDA link</text>
+<text class="sv-ts" x="310" y="157">frames carry:</text>
+<text class="sv-ts" x="310" y="174">commands, responses,</text>
+<text class="sv-ts" x="310" y="191">stream data (tag 1)</text>
+<line class="sv-line" x1="260" y1="150" x2="289" y2="157"/>
+<polygon class="sv-head" points="300,160 288,162 291,152"/>
+<line class="sv-line" x1="300" y1="190" x2="271" y2="197"/>
+<polygon class="sv-head" points="260,200 269,192 272,202"/>
+<rect class="sv-box" x="480" y="20" width="390" height="300" rx="6"/>
+<text class="sv-tb" x="490" y="40">codec 0: vendor 0x1af4, device 0x0012</text>
+<rect class="sv-b3" x="495" y="55" width="360" height="50" rx="6"/>
+<text class="sv-tb" x="505" y="85">node 0: root node -&gt; 1 function group from node 1</text>
+<rect class="sv-b3" x="495" y="115" width="360" height="50" rx="6"/>
+<text class="sv-tb" x="505" y="145">node 1: audio function group (AFG), widgets 2..3</text>
+<rect class="sv-b5" x="495" y="185" width="160" height="100" rx="6"/>
+<text class="sv-tb" x="505" y="205">widget 2</text>
+<text class="sv-ts" x="505" y="222">audio output (DAC)</text>
+<text class="sv-tm" x="505" y="239">stream tag 1</text>
+<text class="sv-tm" x="505" y="256">format 0x4011</text>
+<text class="sv-ts" x="505" y="273">output amp 0x4a</text>
+<rect class="sv-b4" x="700" y="185" width="155" height="100" rx="6"/>
+<text class="sv-tb" x="710" y="205">widget 3</text>
+<text class="sv-ts" x="710" y="222">pin complex</text>
+<text class="sv-ts" x="710" y="239">input from: 2</text>
+<text class="sv-ts" x="710" y="256">default: line out</text>
+<text class="sv-ts" x="710" y="273">PIN_CTL out on</text>
+<line class="sv-line" x1="655" y1="235" x2="689" y2="235"/>
+<polygon class="sv-head" points="700,235 689,240 689,230"/>
+<line class="sv-line" x1="440" y1="175" x2="488" y2="227"/>
+<polygon class="sv-head" points="495,235 484,230 491,224"/>
+<line class="sv-line" x1="780" y1="285" x2="780" y2="307"/>
+<polygon class="sv-head" points="780,318 775,307 785,307"/>
+<text class="sv-ts" x="600" y="312">-&gt; QEMU wav backend (file)</text>
+</svg></div><figcaption><b>Figure 1.</b> The pieces the lab programs. Codec numbers from the lab run (R2); register and verb names from memory of D1, pending verification. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> <sup class="src"><a href="#F4-12-src-R2">R2</a></sup></figcaption></figure>
+<figure id="F4-12-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 250" role="img" aria-labelledby="F4-12-f2t F4-12-f2d">
+<title id="F4-12-f2t">Figure 2: the buffer descriptor list and the stream position</title>
+<desc id="F4-12-f2d">A row of eight buffer descriptor list entries, each 16 bytes: address, length 44160 bytes and the interrupt-on-completion bit. They point to eight consecutive parts of one 353280-byte PCM buffer, about 0.25 s each. The stream descriptor&#x27;s LVI register is 7 (the last valid index) and CBL is 353280 (the cyclic buffer length). The controller reads the parts in order and wraps around after the last; LPIB is its byte position in the cyclic buffer. At the end of each part with IOC set it sets BCIS in the stream status and raises an interrupt (an MSI in the lab).</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="250"/>
+<rect class="sv-b2" x="20" y="30" width="98" height="62" rx="6"/>
+<text class="sv-tb" x="26" y="48">BDE 0</text>
+<text class="sv-ts" x="26" y="64">len 44160</text>
+<text class="sv-ts" x="26" y="80">IOC 1</text>
+<rect class="sv-b5" x="20" y="140" width="98" height="40" rx="3"/>
+<text class="sv-ts" x="28" y="165">part 0</text>
+<line class="sv-line" x1="69" y1="92" x2="69" y2="129"/>
+<polygon class="sv-head" points="69,140 64,129 74,129"/>
+<rect class="sv-b2" x="125" y="30" width="98" height="62" rx="6"/>
+<text class="sv-tb" x="131" y="48">BDE 1</text>
+<text class="sv-ts" x="131" y="64">len 44160</text>
+<text class="sv-ts" x="131" y="80">IOC 1</text>
+<rect class="sv-b5" x="125" y="140" width="98" height="40" rx="3"/>
+<text class="sv-ts" x="133" y="165">part 1</text>
+<line class="sv-line" x1="174" y1="92" x2="174" y2="129"/>
+<polygon class="sv-head" points="174,140 169,129 179,129"/>
+<rect class="sv-b2" x="230" y="30" width="98" height="62" rx="6"/>
+<text class="sv-tb" x="236" y="48">BDE 2</text>
+<text class="sv-ts" x="236" y="64">len 44160</text>
+<text class="sv-ts" x="236" y="80">IOC 1</text>
+<rect class="sv-b5" x="230" y="140" width="98" height="40" rx="3"/>
+<text class="sv-ts" x="238" y="165">part 2</text>
+<line class="sv-line" x1="279" y1="92" x2="279" y2="129"/>
+<polygon class="sv-head" points="279,140 274,129 284,129"/>
+<rect class="sv-b2" x="335" y="30" width="98" height="62" rx="6"/>
+<text class="sv-tb" x="341" y="48">BDE 3</text>
+<text class="sv-ts" x="341" y="64">len 44160</text>
+<text class="sv-ts" x="341" y="80">IOC 1</text>
+<rect class="sv-b5" x="335" y="140" width="98" height="40" rx="3"/>
+<text class="sv-ts" x="343" y="165">part 3</text>
+<line class="sv-line" x1="384" y1="92" x2="384" y2="129"/>
+<polygon class="sv-head" points="384,140 379,129 389,129"/>
+<rect class="sv-b2" x="440" y="30" width="98" height="62" rx="6"/>
+<text class="sv-tb" x="446" y="48">BDE 4</text>
+<text class="sv-ts" x="446" y="64">len 44160</text>
+<text class="sv-ts" x="446" y="80">IOC 1</text>
+<rect class="sv-b5" x="440" y="140" width="98" height="40" rx="3"/>
+<text class="sv-ts" x="448" y="165">part 4</text>
+<line class="sv-line" x1="489" y1="92" x2="489" y2="129"/>
+<polygon class="sv-head" points="489,140 484,129 494,129"/>
+<rect class="sv-b2" x="545" y="30" width="98" height="62" rx="6"/>
+<text class="sv-tb" x="551" y="48">BDE 5</text>
+<text class="sv-ts" x="551" y="64">len 44160</text>
+<text class="sv-ts" x="551" y="80">IOC 1</text>
+<rect class="sv-b5" x="545" y="140" width="98" height="40" rx="3"/>
+<text class="sv-ts" x="553" y="165">part 5</text>
+<line class="sv-line" x1="594" y1="92" x2="594" y2="129"/>
+<polygon class="sv-head" points="594,140 589,129 599,129"/>
+<rect class="sv-b2" x="650" y="30" width="98" height="62" rx="6"/>
+<text class="sv-tb" x="656" y="48">BDE 6</text>
+<text class="sv-ts" x="656" y="64">len 44160</text>
+<text class="sv-ts" x="656" y="80">IOC 1</text>
+<rect class="sv-b5" x="650" y="140" width="98" height="40" rx="3"/>
+<text class="sv-ts" x="658" y="165">part 6</text>
+<line class="sv-line" x1="699" y1="92" x2="699" y2="129"/>
+<polygon class="sv-head" points="699,140 694,129 704,129"/>
+<rect class="sv-b2" x="755" y="30" width="98" height="62" rx="6"/>
+<text class="sv-tb" x="761" y="48">BDE 7</text>
+<text class="sv-ts" x="761" y="64">len 44160</text>
+<text class="sv-ts" x="761" y="80">IOC 1</text>
+<rect class="sv-b5" x="755" y="140" width="98" height="40" rx="3"/>
+<text class="sv-ts" x="763" y="165">part 7</text>
+<line class="sv-line" x1="804" y1="92" x2="804" y2="129"/>
+<polygon class="sv-head" points="804,140 799,129 809,129"/>
+<text class="sv-ts" x="20" y="205">PCM buffer: 353280 bytes = 88320 stereo 16-bit frames = 2.003 s at 44.1 kHz; CBL = 353280, LVI = 7</text>
+<line class="sv-line2" x1="70" y1="230" x2="369" y2="230"/>
+<polygon class="sv-head" points="380,230 369,235 369,225"/>
+<text class="sv-ts" x="390" y="234">LPIB advances; at each part&#x27;s end: BCIS + MSI, then the next part (wraps after part 7)</text>
+</svg></div><figcaption><b>Figure 2.</b> The stream DMA structures of <code>hda.cc</code> (R2). Field layout from memory of D1. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> <sup class="src"><a href="#F4-12-src-R2">R2</a></sup></figcaption></figure>
+<figure id="F4-12-fig3"><div class="svgbox">
+<svg viewBox="0 0 880 200" role="img" aria-labelledby="F4-12-f3t F4-12-f3d">
+<title id="F4-12-f3t">Figure 3: the 16-bit stream format word</title>
+<desc id="F4-12-f3d">Bits from 15 down to 0. Bit 15: stream type, 0 for PCM. Bit 14: base rate, 0 = 48 kHz, 1 = 44.1 kHz. Bits 13 to 11: multiply minus one. Bits 10 to 8: divide minus one. Bit 7: reserved. Bits 6 to 4: bits per sample, 1 = 16 bits. Bits 3 to 0: number of channels minus one. The lab&#x27;s value 0x4011 has base 1, multiply and divide 0, size 1 and channels 1: 44.1 kHz, 16-bit, stereo. The forensic build&#x27;s 0x0011 differs only in bit 14: 48 kHz.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="200"/>
+<rect class="sv-b2" x="20" y="40" width="46" height="60" rx="3"/>
+<text class="sv-ts" x="26" y="32">15</text>
+<text class="sv-tb" x="26" y="62">type</text>
+<text class="sv-tm" x="26" y="88">0</text>
+<rect class="sv-b6" x="70" y="40" width="46" height="60" rx="3"/>
+<text class="sv-ts" x="76" y="32">14</text>
+<text class="sv-tb" x="76" y="62">BASE</text>
+<text class="sv-tm" x="76" y="88">1</text>
+<rect class="sv-b2" x="120" y="40" width="146" height="60" rx="3"/>
+<text class="sv-ts" x="126" y="32">13-11</text>
+<text class="sv-tb" x="126" y="62">MULT</text>
+<text class="sv-tm" x="126" y="88">000</text>
+<rect class="sv-b2" x="270" y="40" width="146" height="60" rx="3"/>
+<text class="sv-ts" x="276" y="32">10-8</text>
+<text class="sv-tb" x="276" y="62">DIV</text>
+<text class="sv-tm" x="276" y="88">000</text>
+<rect class="sv-b2" x="420" y="40" width="46" height="60" rx="3"/>
+<text class="sv-ts" x="426" y="32">7</text>
+<text class="sv-tb" x="426" y="62">-</text>
+<text class="sv-tm" x="426" y="88">0</text>
+<rect class="sv-b2" x="470" y="40" width="146" height="60" rx="3"/>
+<text class="sv-ts" x="476" y="32">6-4</text>
+<text class="sv-tb" x="476" y="62">BITS</text>
+<text class="sv-tm" x="476" y="88">001</text>
+<rect class="sv-b2" x="620" y="40" width="196" height="60" rx="3"/>
+<text class="sv-ts" x="626" y="32">3-0</text>
+<text class="sv-tb" x="626" y="62">CHAN</text>
+<text class="sv-tm" x="626" y="88">0001</text>
+<text class="sv-tm" x="20" y="130">0x4011 = 0100 0000 0001 0001: 44100 Hz x 1 / 1, 16-bit, 2 channels (the lab)</text>
+<text class="sv-tm" x="20" y="155">0x0011 = 0000 0000 0001 0001: 48000 Hz, 16-bit, 2 channels (the forensic build: BASE lost)</text>
+<text class="sv-ts" x="20" y="185">Every tone plays 48000 / 44100 = 1.088 times too fast: 440 Hz -&gt; 478.9 Hz (R7).</text>
+</svg></div><figcaption><b>Figure 3.</b> The format word written to SD4FMT and to the converter (SET_FORMAT). Bit layout from memory of D1, confirmed by QEMU reading back the same value and by the recorded pitch (R2, R7). <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> <sup class="src"><a href="#F4-12-src-R7">R7</a></sup></figcaption></figure>
+
+<h2 id="F4-12-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The office writes slips and gets a reply for every slip. It prepares a tape loop cut into equal pieces and a card listing the pieces. The desk plays the pieces in order and rings a bell after each one, so the office knows which piece it may record over next. If the office writes the wrong tape speed on the label, every note comes out higher, and the whole tape ends sooner.</p></div>
+<p>A computer's sound chip is a small machine of its own. The computer sends it short typed commands ("turn on", "use this speed", "listen to channel 1") and reads its replies. The music is a long list of numbers in memory, one for each tiny moment of time, and the sound hardware fetches those numbers by itself while the computer does something else. A bell (an interrupt) tells the computer each time a piece of the list has been used.</p>
+
+<h2 id="F4-12-layer2">Layer 2 — the student explanation</h2>
+<h3>Finding and resetting the controller</h3>
+<p>The controller is a PCI function with class 04h, subclass 03h. In the lab it is QEMU's intel-hda at 00:01.0 with BAR0 at 0xfebf8000; GCAP 0x4401 says 4 input streams, 4 output streams, no bidirectional ones and 64-bit addressing (R2). <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> <sup class="src"><a href="#F4-12-src-R2">R2</a></sup> Reset: clear CRST (bit 0 of GCTL), wait until it reads 0, set it, wait until it reads 1, then wait for the codecs to announce themselves. Each codec that answers sets its bit in STATESTS: 0x0001 means one codec, at address 0 (R2). <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></p>
+<h3>Talking to the codec</h3>
+<p>The CORB and RIRB are rings in memory. The driver tells the controller where they are and how big (256 entries each here), resets the pointers and sets both to run. To send a verb it writes the 32-bit word into the next CORB slot and moves CORBWP; the controller sends the verb on the link, and when the codec answers, it writes the response into the RIRB and moves RIRBWP. The driver waits until RIRBWP has moved and reads the response. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> The lab sends about 25 verbs this way, each answered within the 100 ms limit (R2).</p>
+<h3>Walking the widget graph</h3>
+<p>The root node (node 0) gives the vendor and device ID and the range of function groups; each function group gives its range of widgets. QEMU's hda-output codec (vendor 0x1af4, device 0x0012) has one audio function group at node 1 with two widgets: widget 2, an audio output converter (the DAC) with an output amplifier, and widget 3, a pin complex whose connection list names widget 2 and whose default configuration says "line out" (R2). <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> <sup class="src"><a href="#F4-12-src-R2">R2</a></sup> The output path is "converter 2 → pin 3". A laptop codec has dozens of widgets, mixers and selectors between converters and pins; the walk is the same, the search is longer.</p>
+<h3>The stream</h3>
+<p>Output stream descriptors come after the input ones, so with 4 input streams the first output stream is SD4. The driver resets the stream, fills a BDL with 8 entries of 44160 bytes (about 0.25 s of 44.1 kHz stereo 16-bit each), writes the BDL address, the cyclic buffer length (353280), the last valid index (7) and the format (0x4011), and sets the stream number ("tag") to 1. On the codec side it tells converter 2 to listen to tag 1 with the same format, unmutes its amplifier at 0 dB and enables the pin's output. Then it sets RUN and IOCE. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></p>
+<p>In R2 the stream completed 8 of 8 buffer entries in 1951 ms by the kernel's PIT clock, with 8 interrupts, one MSI per entry and no FIFO error. <sup class="src"><a href="#F4-12-src-R2">R2</a></sup> The nominal length is 2.003 s; both clocks are emulated under TCG, as in <a href="#F4-11">F4-11</a>.</p>
+<h3>Proving it</h3>
+<p>QEMU's "wav" audio backend writes what the codec outputs into a WAV file. On the host, <code>wavcheck.py</code> finds the strongest frequency in each channel and rebuilds the kernel's samples with the same table and arithmetic. R3: left 440.0 Hz, right 660.0 Hz, and 86753 of 86753 recorded frames identical to the kernel's buffer, starting at frame 0 of the file. <sup class="src"><a href="#F4-12-src-R3">R3</a></sup> The recording ends 1567 frames (36 ms) before the end of the buffer; this changes from run to run (1548 in R5, 1366 and 1611 in earlier runs). <sup class="src"><a href="#F4-12-src-R5">R5</a></sup> The kernel ends QEMU within milliseconds of the last interrupt, and the missing tail is probably still in QEMU's audio buffers at that moment. That explanation was not checked.</p>
+
+<h2 id="F4-12-layer3">Layer 3 — the engineer's depth</h2>
+<h3>Verb encodings</h3>
+<p>Verbs with a 12-bit ID take an 8-bit payload: Get Parameter (F00h), Get Connection List Entry (F02h), Set Power State (705h), Set Converter Stream/Channel (706h: stream in bits 7–4, lowest channel in bits 3–0), Set Pin Widget Control (707h: bit 6 out enable, bit 5 in enable), Get Configuration Default (F1Ch). Verbs with a 4-bit ID take a 16-bit payload: Set Converter Format (2h), Set Amplifier Gain/Mute (3h), and the matching "get" verbs (Ah, Bh). <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> The amplifier payload has bit 15 "output", bit 14 "input", bit 13 "left", bit 12 "right", bit 7 mute and the gain step in bits 6–0. The Output Amplifier Capabilities parameter (12h) says where 0 dB is (offset, bits 6–0), how many steps there are (bits 14–8) and how big a step is (bits 22–16, in 0.25 dB units minus one). QEMU's DAC reports 0x80034a4a: mute capable, step 1 dB, 0 dB at step 74 (R2). <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> <sup class="src"><a href="#F4-12-src-R2">R2</a></sup></p>
+<h3>Solicited and unsolicited responses</h3>
+<p>The second word of each RIRB entry holds the codec address in bits 3–0 and bit 4 "unsolicited". Codecs send unsolicited responses on their own, for example when a headphone is plugged in (jack detection), after the driver enables them with a verb. A driver that assumes "the next RIRB entry answers my last verb" breaks as soon as one arrives; the lab's driver makes that assumption and enables no unsolicited responses. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></p>
+<h3>Positions, periods and latency</h3>
+<p>LPIB (link position in buffer) is the stream's byte offset in the cyclic buffer, updated as data goes to the link. An audio driver uses it, with the completion interrupts, to know which part of the buffer it may refill. The lab plays the buffer once and stops after eight completions; LPIB was 12 at stop (R2; 0 in R4): the stream had wrapped and started the first entry again before RUN was cleared. A player that streams a long file refills each part after its completion interrupt and never stops the stream between parts. Smaller parts lower the delay between "write samples" and "hear them" but cost more interrupts; 0.25 s parts are long for interactive sound and fine for a test. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> <sup class="src"><a href="#F4-12-src-R2">R2</a></sup></p>
+<h3>DMA, the IOMMU and caches</h3>
+<p>The controller reads the CORB, the BDL and the samples and writes the RIRB by DMA. The lab maps each one with the <code>dma::map</code> layer of <a href="#F4-08">F4-08</a>. With QEMU's intel-iommu the same kernel ran with all controller DMA translated: CORB at IOVA 0x800300, BDL at 0x85d900, and the recording again identical sample for sample (R4, R5). <sup class="src"><a href="#F4-12-src-R4">R4</a></sup> <sup class="src"><a href="#F4-12-src-R5">R5</a></sup> On x86, PCI DMA is cache-coherent, so the driver needs only compiler barriers between writing a CORB entry and moving CORBWP. Some controllers have a "snoop" control that can turn coherence off for streams; drivers that use it must flush caches themselves. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></p>
+<h3>Format conversion</h3>
+<p>The format word must match on both sides: the stream descriptor packs samples onto the link at its rate, and the converter turns them into sound at its own. The converter's Supported PCM Size, Rates parameter (0Ah) lists what it accepts: QEMU's codec reports 0x000201fc (R2). Read with D1's bit table from memory, that includes 44.1 and 48 kHz and 16-bit samples. A real driver checks this before choosing a format and converts the data in software when the source rate is not supported. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> <sup class="src"><a href="#F4-12-src-R2">R2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The register offsets, bit positions, verb IDs, parameter IDs and payload layouts in <code>hda.h</code>, Figures 1–3 and this chapter are from the author's memory of D1 (High Definition Audio Specification rev. 1.0a), which was not opened in this build. They are confirmed only by QEMU 8.2.2's intel-hda and hda-output models behaving as expected (codecs found, a sensible widget walk, a stream that plays and a recording identical to the source: R2–R5). The decoding of the PCM-rates word 0x000201fc and of the amplifier capability 0x80034a4a was not checked against a second source. The explanation for the missing tail of the recording is an inference.</p></div>
+
+<h2 id="F4-12-hardware">How the hardware actually does it</h2>
+<p>The HD Audio link is a serial bus with a 24 MHz bit clock and a 48 kHz frame: every 20.83 µs one frame carries a command slot to the codecs and, from each codec, a response slot, and then the sample data of every running stream, each stream's data packed in a block that starts with its tag. A 44.1 kHz stream cannot fill every 48 kHz frame; the controller leaves some frames without a sample for it, in a fixed pattern. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup> Each stream has a FIFO in the controller; the DMA engine fills it from memory ahead of the link, and a FIFO error means the memory reads fell behind (an underrun for output). <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></p>
+<p>In the codec, a converter widget's DAC turns the samples into a voltage at the rate the converter's format says; amplifiers, mixers and selectors route and scale the signal, and a pin complex drives a jack or an internal speaker. The pin's default configuration, written by the board maker into the codec at boot, tells the driver what each pin is wired to: "line out, rear, green" or "internal speaker". Laptop speakers often need an extra "external amplifier power down" (EAPD) bit before any sound comes out. <sup class="src"><a href="#F4-12-src-D1">D1</a></sup></p>
+<p>QEMU's model is simpler: it moves samples from the stream to its audio layer, which can play them on the host or, with <code>-audiodev wav</code>, write them to a file. <sup class="src"><a href="#F4-12-src-D2">D2</a></sup> Two details of the model mattered in the lab. A byte write to the stream descriptor's third byte (the stream number) had no effect, so the driver writes SD_CTL as 32 bits with a zero top byte (whose status bits are cleared only by writing 1). And the pin widget has no output amplifier (caps 0x00400101, bit 2 clear), so the driver sets gain only on widgets that report one. <sup class="src"><a href="#F4-12-src-R2">R2</a></sup></p>
+
+<h2 id="F4-12-worked">Worked example</h2>
+<p><b>Task.</b> Build by hand the three 32-bit words the driver sends to point converter 2 of codec 0 at the stream: (1) the stream ID, tag 1, channel 0; (2) the format 0x4011; (3) output amplifier, both channels, 0 dB, unmuted. Then (4) work out how long one BDL entry plays.</p>
+<p><b>Step 1.</b> Codec 0 → bits 31–28 = 0. Node 2 → bits 27–20 = 0x02, which gives 0x00200000. Verb 706h with an 8-bit payload: 0x706 &lt;&lt; 8 = 0x70600. Payload: stream 1 in bits 7–4, channel 0 in bits 3–0 = 0x10. Word: 0x00200000 | 0x70600 | 0x10 = <b>0x00270610</b>.</p>
+<p><b>Step 2.</b> The 4-bit verb 2h takes a 16-bit payload: 0x2 &lt;&lt; 16 = 0x20000, plus 0x4011. Word: 0x00200000 | 0x24011 = <b>0x00224011</b>.</p>
+<p><b>Step 3.</b> Verb 3h: 0x30000. Payload: output (bit 15) 0x8000, left (bit 13) 0x2000, right (bit 12) 0x1000, gain step 74 = 0x4A, mute bit clear: 0xB04A. Word: 0x00200000 | 0x30000 | 0xB04A = <b>0x0023B04A</b>.</p>
+<p><b>Step 4.</b> One stereo 16-bit frame is 4 bytes. 44160 / 4 = 11040 frames; 11040 / 44100 = 0.2503 s. Eight entries: 2.003 s. 44160 = 345 × 128, so each part is a multiple of 128 bytes.</p>
+<p><b>Check.</b> The converter read back format 0x4011 and amplifier gain 0x4a on both channels (R2); 8 interrupts came in 1951 ms by the kernel's clock, close to 2.003 s. <sup class="src"><a href="#F4-12-src-R2">R2</a></sup> The lab does not print the verb words themselves; add a <code>kprintf</code> in <code>command()</code> to see them (lab step 2).</p>
+
+<h2 id="F4-12-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F4-12/</code>: <code>hda.h/.cc</code> (the driver), <code>f412_main.cc</code> (the test kernel), <code>wavcheck.py</code> (the host check) and <code>run.sh</code>. The kernel links the PCI, ACPI, interrupt, MSI, VT-d and DMA code of DR301 and <a href="#F4-08">F4-08</a>.</p>
+<p><b>Listing 1</b> — <code>hda.cc</code>: the driver.</p>
+<pre class="listing" data-src="F4-12/hda.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">16–19</td><td><code>alignas(128)</code></td><td>CORB, RIRB and BDL in static memory, 128-byte aligned.</td><td>The controller ignores the low address bits of these bases.</td></tr>
+<tr><td class="n">60–84</td><td><code>format</code></td><td>Builds the format word from rate, size and channels.</td><td>Figure 3; lines 74–77 are the forensic build's bug.</td></tr>
+<tr><td class="n">141–147</td><td>CRST</td><td>Controller reset and codec discovery through STATESTS.</td><td>Without the wait after CRST=1, codecs may not have announced themselves.</td></tr>
+<tr><td class="n">150–172</td><td>CORB/RIRB setup</td><td>Stop both rings, size them, set bases, reset the pointers, start.</td><td>The CORB read pointer reset is a handshake: set, wait, clear, wait.</td></tr>
+<tr><td class="n">181–200</td><td><code>command</code></td><td>Writes a verb, moves CORBWP, waits for RIRBWP, reads the response.</td><td>The barrier keeps the CORB write ahead of the pointer write.</td></tr>
+<tr><td class="n">204–249</td><td><code>walk</code></td><td>Root node, function groups, widgets; chooses converter and pin.</td><td>The widget graph dump of the milestone.</td></tr>
+<tr><td class="n">251–258</td><td><code>irq</code></td><td>Counts BCIS, clears the stream status by writing 1.</td><td>One MSI per completed BDL entry.</td></tr>
+<tr><td class="n">268–272</td><td>SRST</td><td>Stream reset: set, wait, clear, wait.</td><td>Starts the stream from a known state.</td></tr>
+<tr><td class="n">275–285</td><td>BDL</td><td>Maps the samples, writes eight entries with IOC, sets BDL address, CBL, LVI.</td><td>Figure 2.</td></tr>
+<tr><td class="n">287–290</td><td>32-bit SD_CTL write</td><td>Sets the stream tag with a zero top byte.</td><td>A byte write was ignored by QEMU; zero leaves status bits alone.</td></tr>
+<tr><td class="n">294–302</td><td>codec verbs</td><td>Stream ID, format, DAC amplifier, pin control.</td><td>The worked example's words; the pin gets gain only if it has an amplifier.</td></tr>
+<tr><td class="n">316–328</td><td>RUN, IOCE, wait</td><td>Clears stale status, enables the stream interrupt, runs until 8 completions.</td><td>Falls back to polling BCIS when there is no MSI.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>f412_main.cc</code>: the test kernel.</p>
+<pre class="listing" data-src="F4-12/f412_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">19–41</td><td><code>consteval</code> sine table</td><td>The compiler computes 1024 sine values.</td><td>The kernel is built without floating point; the host check rebuilds the same table.</td></tr>
+<tr><td class="n">43–46</td><td>constants</td><td>44.1 kHz, stereo, 8 parts of 44160 bytes.</td><td>Worked example step 4.</td></tr>
+<tr><td class="n">49–60</td><td><code>fill</code></td><td>A 32-bit phase accumulator per channel, 440 Hz and 660 Hz at half scale.</td><td>Exact, repeatable samples: the recording can be compared bit for bit.</td></tr>
+<tr><td class="n">73–79</td><td>IOMMU or identity</td><td>Attaches the controller to a VT-d domain when a DMAR table exists.</td><td>The same kernel runs in both QEMU setups (R2, R4).</td></tr>
+<tr><td class="n">80–84</td><td>MSI</td><td>One vector, handler <code>hda::irq</code>.</td><td>The interrupt layer of <a href="#F4-08">F4-08</a>.</td></tr>
+<tr><td class="n">94–100</td><td>play and report</td><td>Plays, prints the counts, exits QEMU with 33 on success.</td><td>The exit code is what <code>run.sh</code> checks.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>wavcheck.py</code>: the host check.</p>
+<pre class="listing" data-src="F4-12/wavcheck.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">12–33</td><td><code>kernel_samples</code></td><td>Rebuilds the kernel's PCM with the same series, rounding and truncation.</td><td>An independent second implementation; any difference shows.</td></tr>
+<tr><td class="n">47–51</td><td>sound start and end</td><td>Finds where the level rises above 1 % of full scale.</td><td>Measures the played duration.</td></tr>
+<tr><td class="n">54–72</td><td>FFT peak</td><td>Hann window, strongest bin, parabolic refinement; 1 % tolerance.</td><td>Catches a wrong rate even when the samples are resampled.</td></tr>
+<tr><td class="n">76–90</td><td>alignment and comparison</td><td>Finds the offset of the source in the file, compares every frame.</td><td>The milestone's "matches the source samples".</td></tr>
+</tbody></table></div>
+<p><b>Build</b> (R1; flags as in <a href="#F4-08">F4-08</a>):</p>
+<pre class="output" data-run="F4-12/build"></pre>
+<p><b>The run</b> (R2):</p>
+<pre class="output" data-run="F4-12/audio"></pre>
+<p><b>The recording, measured on the host</b> (R3):</p>
+<pre class="output" data-run="F4-12/wav"></pre>
+<p><b>The same with the IOMMU</b> (R4, R5):</p>
+<pre class="output" data-run="F4-12/audio_iommu"></pre>
+<pre class="output" data-run="F4-12/wav_iommu"></pre>
+
+<h2 id="F4-12-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The trays are rings, not stacks.</b> Slips are never removed; the office and the desk each keep a pointer, and old slips are overwritten when the pointer comes round again.</li>
+<li><b>The tape is not cut.</b> The buffer is one area of memory; the "pieces" are entries in a list, and two entries may even point to the same memory.</li>
+<li><b>The desk does not decide anything.</b> A codec does what each verb says and reports facts; choosing the path and the levels is the driver's job.</li>
+<li><b>The bell does not wait.</b> The completion interrupt says a part is used; the stream is already playing the next part, and the driver has until that part ends to refill the old one.</li>
+</ul>
+
+<h2 id="F4-12-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> STATESTS is 0 after reset. <b>Cause:</b> CRST never went back to 1, or the driver read STATESTS too soon. <b>Find it:</b> print GCTL after each step. <b>Fix:</b> wait for CRST to read 1, then wait at least the time D1 gives (the lab waits 2 ms).</li>
+<li><b>Symptom:</b> the first verb times out. <b>Cause:</b> CORB or RIRB not running, a wrong ring size, or the CORB read pointer still in reset. <b>Find it:</b> read CORBRP, RIRBWP and both control registers. <b>Fix:</b> follow the reset handshake in lines 163–172.</li>
+<li><b>Symptom:</b> the stream runs (interrupts arrive) but the recording is silent. <b>Cause:</b> the converter listens to a different stream tag, the amplifier is muted, or the pin output is disabled. <b>Find it:</b> read back the stream ID, amplifier and pin control with "get" verbs. <b>Fix:</b> the codec side of lines 294–302.</li>
+<li><b>Symptom:</b> sound plays at the wrong pitch and length. <b>Cause:</b> stream format and actual sample rate disagree. <b>Find it:</b> measure the frequency on the host. <b>Fix:</b> the forensic lab.</li>
+<li><b>Symptom:</b> a FIFO error or crackling. <b>Cause:</b> BDL entries not 128-byte aligned, a buffer not mapped for DMA, or (on hardware) an underrun from refilling too late. <b>Find it:</b> FIFOE in the stream status; with the IOMMU, a DMAR fault record. <b>Fix:</b> align and map; refill earlier or use larger parts.</li>
+<li><b>Symptom:</b> one response seems to belong to the wrong verb. <b>Cause:</b> an unsolicited response in the RIRB. <b>Find it:</b> bit 4 of the RIRB entry's second word. <b>Fix:</b> dispatch unsolicited responses separately.</li>
+</ul>
+
+<div class="co transition" id="F4-12-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F4-08">F4-08</a> gave you MSI and a DMA mapping layer; <a href="#F4-09">F4-09</a> and <a href="#F4-10">F4-10</a> drove rings of descriptors with ownership handed back and forth; <a href="#F4-11">F4-11</a> read a machine description at run time. <b>What carries over:</b> rings with producer and consumer pointers, write-1-to-clear status, MSI per completion, reading capabilities instead of assuming them. <b>What changes:</b> there are two devices in one: a controller you program through registers and a codec you program only through verbs carried by the controller; and the result must be checked by its timing and content, not by a reply. <b>What comes next:</b> <a href="#F4-13">F4-13</a> drives a device whose whole job is answering commands: the TPM, used to measure what the machine booted.</p></div>
+
+<h2 id="F4-12-check">Check yourself</h2>
+<ol>
+<li>GCAP reads 0x4401. Which stream descriptor is the first output stream, and at which BAR0 offset does it start?</li>
+<li>Why does every verb need exactly one response, and what in the RIRB tells the driver a response has arrived?</li>
+<li>Encode the verb "codec 0, node 3, Set Pin Widget Control, output enable".</li>
+<li>What is the format word for 48 kHz, 16-bit, stereo? For 22.05 kHz, 16-bit, mono?</li>
+<li>LPIB was 12 when the lab stopped the stream. What does that tell you?</li>
+<li>Multiple choice: the stream runs and 8 interrupts arrive, but the WAV file is silent. Which is the most likely cause? (a) The BDL is not 128-byte aligned. (b) The converter's stream ID is 0. (c) MSI is not enabled.</li>
+<li>Why does <code>wavcheck.py</code> compare frequencies and samples, rather than one of the two?</li>
+<li>What would change in the driver for a laptop codec with 30 widgets?</li>
+</ol>
+
+<h2 id="F4-12-lab">Lab</h2>
+<p><b>Goal.</b> Milestone C11: "Play PCM audio through an HD Audio controller and codec." <sup class="src"><a href="#F4-12-src-D4">D4</a></sup></p>
+<p><b>Hardware and software needed.</b> QEMU 8.2.2 with <code>-device intel-hda -device hda-output,audiodev=snd0 -audiodev wav,id=snd0,path=…</code>, Python 3 with numpy. Run <code>university/labs/run_lab.sh university/labs/F4-12</code> (about a minute: three QEMU runs and three checks).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>On real hardware, a stream started at full gain into headphones can be loud enough to hurt. Start at a low gain step, keep headphones off your ears for the first test, and never unmute an amplifier you have not identified from the pin configuration. On laptops, wrong verbs to vendor-specific widgets can switch internal speaker amplifiers into states the firmware does not expect.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In <code>audio.out</code>, decode GCAP, the widget capabilities 0x0000001d and 0x00400101, and the pin's default device by hand with D1.</li>
+<li>Print every verb word in <code>command()</code> and check the three of the worked example.</li>
+<li>Change the gain to step 64 (−10 dB by the amplifier capability). Predict the RMS level <code>wavcheck.py</code> will print; run it.</li>
+<li>Change the tones to 1000 Hz and 1500 Hz in <code>f412_main.cc</code> and in the <code>--expect</code> option in <code>run.sh</code>; confirm that the sample comparison still passes.</li>
+<li>Turn the single playback into a continuous one: refill each part in the interrupt handler from a longer source and play for 10 s.</li>
+<li>Milestone steps not done here: read a WAV file from the kernel's file system instead of generating the tone, and give user programs a simple audio device interface.</li>
+</ol>
+<p><b>Expected observations</b> (QEMU 8.2.2, TCG): GCAP 0x4401; STATESTS 0x0001; codec 1af4:0012 with widgets 2 (DAC) and 3 (pin, line out); format 0x4011 read back; 8 of 8 completions with 8 interrupts in about 1.9–2.0 s; recording 440.0 Hz and 660.0 Hz, every recorded frame identical to the source, the last 30–40 ms missing (R2, R3).</p>
+<p><b>Verification</b> (the acceptance tests, verbatim, with this build's result). "In QEMU with the intel-hda controller and an hda-output codec, a WAV file played by your kernel is captured by QEMU's audio backend to a file and matches the source samples (allowing for format conversion you document)." — met for a generated tone rather than a WAV file read by the kernel: every captured frame matches the source with no conversion (44.1 kHz, 16-bit stereo on both sides); the capture is about 35 ms short at the end (R3, R5). "The widget graph dump matches the codec description you derive from the spec." — the dump is in R2; the description derived from D1 in this chapter matches it, but D1 was read from memory. <sup class="src"><a href="#F4-12-src-D4">D4</a></sup> <sup class="src"><a href="#F4-12-src-R3">R3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not tested in this build</span><p>No WAV file read from disk, no user audio interface, no continuous playback or refilling, no input streams, no unsolicited responses or jack detection, no EAPD, no codec with mixers or selectors. Only QEMU's two-widget codec was tested; nothing ran on real hardware.</p></div>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"no HD Audio controller" → QEMU started without <code>-device intel-hda</code> → check the command line in <code>audio.log</code> → add both devices.</li>
+<li>"no codec answered the reset" → no <code>hda-output</code> (or <code>hda-duplex</code>) device, or the CRST handshake failed → print GCTL and STATESTS → add the codec device; check lines 141–147.</li>
+<li>"wav: silence only" → the codec side was not set up, or the audiodev is not the wav backend → read back the converter's stream ID → compare the verbs with the worked example.</li>
+<li><code>ModuleNotFoundError: numpy</code> → install numpy for the host Python.</li>
+</ul>
+<p><b>Extension.</b> Add an input stream with <code>hda-duplex</code> and QEMU's wav or "none" backend, record from the codec's input converter, and measure what QEMU supplies.</p>
+
+<h2 id="F4-12-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A student ported a format table from an older driver. The kernel still reports "8 of 8 buffer completions", no FIFO error, "F4-12 done". A listener says the test tone sounds "a bit sharp and short". The student's view: the kernel is fine, so QEMU's audio backend must be resampling badly.</p>
+<p><b>Evidence pack.</b> The kernel log (R6) and the host measurement of the recording (R7):</p>
+<pre class="output" data-run="F4-12/forensic"></pre>
+<pre class="output" data-run="F4-12/forensic_wav"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>By how much is each tone off, and is the error the same for both channels?</li>
+<li>Compare the duration of the sound and the time for 8 completions with those of R2 and R3. What do they suggest?</li>
+<li>Find the line in the kernel log that states the cause directly.</li>
+<li>Find the bug in <code>hda.cc</code>. Which bit is wrong?</li>
+<li>Why are 0 of 79542 frames identical even though the kernel's samples are correct?</li>
+<li>Why is "QEMU resamples badly" not supported by the evidence?</li>
+</ol>
+<p><b>Method hints.</b> Divide 478.9 by 440 and 718.4 by 660. Then divide 48000 by 44100.</p>
+<p>Grading follows the forensic rubric of guide 11.2.</p>
+
+<h2 id="F4-12-project">Mini-project</h2>
+<p>Build a small audio subsystem for the lab kernel: a ring of four 10 ms parts refilled from the interrupt handler, a <code>write(samples)</code> interface that blocks when the ring is full, and a test that plays 10 s of a sweep from 200 Hz to 2 kHz. Record it with QEMU and show on the host that no sample was lost or repeated (compare the recording with the generated sweep).</p>
+<p><b>Rubric.</b> Refill logic correct at the part boundaries (30 %); blocking interface (20 %); 10 s with no lost or repeated samples, shown by comparison (30 %); latency measured and explained (10 %); code quality (10 %).</p>
+
+<h2 id="F4-12-summary">Summary</h2>
+<ul>
+<li>An HD Audio controller is reset with CRST; STATESTS shows which codecs answered (R2).</li>
+<li>Codecs are programmed only by verbs: the CORB carries them, the RIRB carries one response for each.</li>
+<li>The widget graph is read at run time; the output path runs from a converter to a pin (R2).</li>
+<li>A stream plays a cyclic buffer described by a BDL and raises an interrupt per completed entry; LPIB tracks the position.</li>
+<li>The format word must say the truth on both sides: one wrong bit plays everything 8.8 % fast (R7).</li>
+<li>Audio is verified by recording it: frequency for the rate, sample comparison for the data (R3).</li>
+</ul>
+
+<h2 id="F4-12-sources">Sources</h2>
+<ol>
+<li id="F4-12-src-D1">Intel, "High Definition Audio Specification", revision 1.0a (curriculum C11 reading: controller registers, CORB/RIRB command rings, stream descriptors and buffer descriptor lists, stream format, codec verbs, parameters and the widget graph, the link protocol). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and sections (dossier gate G1 open).</i></li>
+<li id="F4-12-src-D2">QEMU documentation: the intel-hda and hda-output devices and the <code>-audiodev wav</code> backend. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F4-12-src-D3">Linux kernel, <code>sound/pci/hda/</code> (snd-hda-intel and the codec drivers; the curriculum names them as the practical reference for real codecs). <i>Not opened during this build; listed for the lab's real-hardware step.</i></li>
+<li id="F4-12-src-D4">This project's Systems Curriculum: milestone C11 (goal, reading, build, acceptance tests) (opened in this build; the project's own page; a map, not a technical source).</li>
+<li id="F4-12-src-R1">R1 — lab run, step <code>build</code>: <code>university/labs/F4-12/build.out</code>, <code>build.log</code>.</li>
+<li id="F4-12-src-R2">R2 — lab run, step <code>audio</code>: <code>audio.out</code>, <code>audio.log</code> (QEMU 8.2.2, q35, TCG; exit code 33 = pass).</li>
+<li id="F4-12-src-R3">R3 — lab run, step <code>wav</code>: <code>wav.out</code>, <code>wav.log</code> (the R2 recording measured on the host).</li>
+<li id="F4-12-src-R4">R4 — lab run, step <code>audio_iommu</code>: <code>audio_iommu.out</code>, <code>audio_iommu.log</code> (with <code>-device intel-iommu</code>).</li>
+<li id="F4-12-src-R5">R5 — lab run, step <code>wav_iommu</code>: <code>wav_iommu.out</code>, <code>wav_iommu.log</code>.</li>
+<li id="F4-12-src-R6">R6 — lab run, step <code>forensic</code>: <code>forensic.out</code>, <code>forensic.log</code> (built with <code>-DF412_RATE_BUG</code>).</li>
+<li id="F4-12-src-R7">R7 — lab run, step <code>forensic_wav</code>: <code>forensic_wav.out</code>, <code>forensic_wav.log</code> (exit code 1 expected).</li>
+</ol>
+<p>The QEMU model details rest on D2 <sup class="src"><a href="#F4-12-src-D2">D2</a></sup>; real codecs on D3 <sup class="src"><a href="#F4-12-src-D3">D3</a></sup>; the build is R1 <sup class="src"><a href="#F4-12-src-R1">R1</a></sup>; the forensic kernel log is R6 <sup class="src"><a href="#F4-12-src-R6">R6</a></sup>.</p>
+
+<h2 id="F4-12-glossary">Glossary links</h2>
+<p><a href="#gl-hd-audio-controller">HD Audio controller</a> · <a href="#gl-codec-hd-audio">Codec</a> · <a href="#gl-verb-hd-audio">Verb</a> · <a href="#gl-corb-and-rirb">CORB and RIRB</a> · <a href="#gl-widget-hd-audio">Widget</a> · <a href="#gl-pin-complex">Pin complex</a> · <a href="#gl-buffer-descriptor-list-bdl">BDL</a> · <a href="#gl-stream-format-hd-audio">Stream format</a> · <a href="#gl-stream-tag">Stream tag</a> · <a href="#gl-lpib-link-position-in-buffer">LPIB</a> · <a href="#gl-period-audio">Period</a> · <a href="#gl-unsolicited-response">Unsolicited response</a></p>
+
+<h2 id="F4-12-next">Next chapter</h2>
+<p>Next: <a href="#F4-13">F4-13 TPM 2.0</a>. Back to the course: <a href="#DR302">DR302</a>. Before this chapter: <a href="#F4-11">F4-11</a>.</p>
+
+<h2 id="F4-12-answers">Answers to Check yourself</h2>
+<ol>
+<li>Input streams come first: SD0–SD3 are input, so SD4 is the first output stream, at 0x80 + 4 × 0x20 = 0x100.</li>
+<li>The driver matches responses to verbs by order; a missing response would shift every later answer. The controller advances RIRBWP (and can raise an interrupt after RINTCNT responses).</li>
+<li>Node 3 → 0x00300000; verb 707h → 0x70700; payload 0x40 (bit 6). Word 0x00370740.</li>
+<li>48 kHz: base 0, mult 0, div 0, 16-bit (1 in bits 6–4), stereo (1): 0x0011. 22.05 kHz mono: base 1, divide by 2 (1 in bits 10–8), 16-bit, channels 0: 0x4110.</li>
+<li>The stream kept running after the last completion interrupt: it wrapped to the start of the buffer and had fetched 12 bytes (3 frames) of entry 0 (in R4 it was stopped exactly at the wrap, LPIB 0) before RUN was cleared. A one-shot player must stop the stream promptly or point the last part at silence.</li>
+<li>(b). Interrupts show the controller is moving data; the codec output stays silent if the converter is not listening to tag 1. (a) would give a FIFO or descriptor error; (c) would leave polling or no interrupts, not silence.</li>
+<li>The frequency checks the rate even if the data were converted; the sample comparison checks every value but fails for any conversion. Together they say "right data at the right speed" and, when one fails, which one.</li>
+<li>Nothing in the protocol: the walk is the same. The path search must follow connection lists through mixers and selectors, choose among several pins using the default configuration (and jack sensing), set selector inputs and unmute every amplifier on the path, and possibly set EAPD.</li>
+</ol>
+<h3 id="F4-12-forensic-key">Forensic answer key</h3>
+<p><b>Observation.</b> R7: 478.9 Hz and 718.4 Hz, both "+8.8 % WRONG"; 478.9 / 440 = 718.4 / 660 = 1.088, the same ratio for both channels. Sound lasts 1.807 s against 1.967 s in R3, and 8 completions took 1805 ms against 1951 ms in R2. R6: "format 0x0011 = 48000 Hz, 16-bit, 2 ch; converter reads back 0x0011", while the PCM line says the buffer holds 44100 Hz samples.</p>
+<p><b>Root cause.</b> 48000 / 44100 = 1.088: the 44.1 kHz samples were played at 48 kHz, so every frequency rises by 8.8 % and 88320 frames take 1.840 s instead of 2.003 s. The format word lost bit 14 (BASE): 0x4011 → 0x0011. <code>hda.cc</code> lines 74–77, active with <code>-DF412_RATE_BUG</code>, set <code>base = 0</code> for 44100 Hz. Both the stream descriptor and the converter received the same wrong value, so the hardware is consistent and reports no error.</p>
+<p><b>Why no frame matches.</b> The wav backend writes a 44.1 kHz file (R7's header). QEMU converted the 48 kHz stream to the file's rate, so the recorded values are interpolated, not the kernel's samples. That is the conversion, not the cause.</p>
+<p><b>Injection.</b> Built with <code>-DF412_RATE_BUG</code>.</p>
+<p><b>Fix and verification.</b> Remove the block (or build without the flag): format 0x4011, 440.0 / 660.0 Hz and every frame identical (R2, R3).</p>
+<p><b>Wrong answers.</b> "QEMU resamples badly": a resampler error would not produce an exact 48000/44100 ratio in both channels together with a shorter playing time measured by the guest's own clock; the guest's log names 48000 Hz. "A lost interrupt": 8 of 8 arrived.</p>
+<p><b>Prevention.</b> Print the decoded format next to the source's rate and fail when they differ; check the rate against the converter's supported-rates parameter; keep a host test that measures pitch.</p>

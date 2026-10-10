@@ -1,0 +1,286 @@
+<!--meta
+id: F4-29
+title: RISC-V interrupts, timer and SMP
+course: DR402
+level: L4
+prereqs: F4-28 (S-mode entry, traps, SBI); F4-25 (GIC, tick); F4-26 (SMP, ticket lock); OS303 B8–B11
+time: 10–12 hours including the lab (more with a real board for D7)
+hardware: none (QEMU 8.2.2 riscv64 virt with 1–8 harts, and sifive_u as a board stand-in; bundled OpenSBI). Real boards (VisionFive 2, HiFive): untested in this build.
+maps: Curriculum Track D, milestone D6 (PLIC, SBI timer, HSM SMP); milestone D7 (optional, RISC-V board) as an untested description
+analogy: F4 — the school (and its visitors): the doorbell panel, the alarm clock through the caretaker, waking the other teachers
+-->
+
+<h2 id="F4-29-hook">Story hook</h2>
+<p>Mei's RISC-V kernel received exactly one character from the keyboard. The first key she pressed appeared on the screen; after that, nothing, no matter how much she typed. The timer kept ticking, the other harts kept running their tests, nothing crashed. The UART's receive buffer was full of her typing. The interrupt controller had been told about it. But the kernel had never told the interrupt controller that it had finished with the first interrupt, and a RISC-V interrupt controller takes that silence literally.</p>
+<p>This chapter completes the RISC-V port's core for milestone D6: device interrupts through the Platform-Level Interrupt Controller (PLIC), a periodic tick through the SBI timer, harts started through SBI's Hart State Management, inter-processor interrupts through SBI, and per-hart data. It then looks at a board: QEMU's <code>sifive_u</code>, a model of a real development board, stands in for the optional milestone D7, and teaches the lesson boards always teach: not every hart in the devicetree is a hart your kernel can run on.</p>
+
+<h2 id="F4-29-able">What you will be able to do</h2>
+<ul>
+<li><b>Find</b> each hart's PLIC context from the devicetree's <code>interrupts-extended</code>, and drive the PLIC: priority, enable, threshold, claim, complete.</li>
+<li><b>Run</b> a periodic tick with the SBI TIME extension (and explain where Sstc changes this).</li>
+<li><b>Start</b> harts with SBI HSM <code>hart_start</code>, and give each one a stack and per-hart data through <code>tp</code>.</li>
+<li><b>Send</b> inter-processor interrupts with SBI <code>send_ipi</code> and handle them as supervisor software interrupts.</li>
+<li><b>Choose</b> which harts to use from the devicetree's <code>status</code> and <code>mmu-type</code>, and pick a UART driver by its compatible string.</li>
+<li><b>Diagnose</b> a device that interrupts once and never again.</li>
+</ul>
+
+<div class="co jargon" id="F4-29-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>PLIC (Platform-Level Interrupt Controller)</dt><dd><b>Simple words:</b> RISC-V's standard controller for device interrupts. <b>Analogy:</b> the doorbell panel with a light per door and a "taken" register per teacher. <b>Precise:</b> per-source priority registers, per-context enable bits and priority threshold, and a per-context claim/complete register; reading claim returns the highest-priority pending source and marks it in service; writing its number back completes it. A context is one hart in one privilege mode. <sup class="src"><a href="#F4-29-src-D1">D1</a></sup></dd>
+<dt>Claim and complete</dt><dd><b>Simple words:</b> "I am taking this interrupt" and "I have finished with it". <b>Analogy:</b> lifting the receiver, and hanging it up. <b>Precise:</b> a read of the context's claim register (claim) and a write of the same source ID to it (complete); until completion, the PLIC does not forward that source again. <sup class="src"><a href="#F4-29-src-D1">D1</a></sup></dd>
+<dt>SBI TIME and Sstc</dt><dd><b>Simple words:</b> two ways to set a timer alarm from S-mode: ask the firmware, or write a CSR directly. <b>Analogy:</b> asking the caretaker to set the alarm, or having your own alarm clock. <b>Precise:</b> SBI <code>set_timer(stime_value)</code> programs the next timer interrupt and clears the pending one; the Sstc extension adds the <code>stimecmp</code> CSR so S-mode can do this without an <code>ecall</code>. The <code>time</code> CSR counts at the devicetree's <code>timebase-frequency</code>. <sup class="src"><a href="#F4-29-src-D2">D2</a></sup></dd>
+<dt>SBI HSM (Hart State Management)</dt><dd><b>Simple words:</b> SBI calls to start, stop and query harts. <b>Analogy:</b> asking the caretaker to wake another teacher. <b>Precise:</b> <code>hart_start(hartid, start_addr, opaque)</code> starts a stopped hart in S-mode at <code>start_addr</code> with a0 = hart ID, a1 = opaque and translation off; <code>hart_status</code> returns 0 (started), 1 (stopped) or a transition state. <sup class="src"><a href="#F4-29-src-D2">D2</a></sup></dd>
+<dt>IPI (RISC-V)</dt><dd><b>Simple words:</b> an interrupt one hart sends to another. <b>Analogy:</b> a note under another teacher's door. <b>Precise:</b> SBI <code>send_ipi(hart_mask, hart_mask_base)</code> raises a supervisor software interrupt (cause 1) on each hart in the mask; the receiver clears <code>sip.SSIP</code>. <sup class="src"><a href="#F4-29-src-D2">D2</a></sup></dd>
+<dt><code>interrupts-extended</code></dt><dd><b>Simple words:</b> a devicetree list that says which interrupt controller and line each output goes to. <b>Analogy:</b> the wiring chart from the panel's outputs to each teacher's room. <b>Precise:</b> pairs of (phandle of a hart's <code>riscv,cpu-intc</code> node, cause number); on the PLIC node, the n-th pair describes context n: cause 11 means M-mode external, 9 S-mode external. <sup class="src"><a href="#F4-29-src-D3">D3</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-29-pictures">The idea in pictures</h2>
+<p>Figure 1 is the path of the UART's interrupt through the PLIC on QEMU virt, with the forensic bug marked. Figure 2 is the mapping from PLIC contexts to harts that the kernel reads from the devicetree.</p>
+<figure id="F4-29-fig1"><div class="svgbox">
+<svg viewBox="0 0 860 270" role="img" aria-labelledby="F4-29-f1t F4-29-f1d">
+<title id="F4-29-f1t">Figure 1: a UART interrupt through the PLIC</title>
+<desc id="F4-29-f1d">The ns16550a UART raises source 10 when it has received data. The PLIC sets pending bit 10. If the source's priority (1) is above context 1's threshold (0) and context 1's enable bit 10 is set, the PLIC raises the S-mode external interrupt on hart 0. The hart traps with scause 9. The handler reads the claim register of context 1, gets 10, which clears the pending bit and marks source 10 in service; it drains the UART's receive buffer; it writes 10 to the claim register to complete. The PLIC can then forward source 10 again. A red branch shows the forensic case: without the complete write, source 10 stays in service; the UART keeps receiving, the pending bit becomes 1 again, but the PLIC never forwards it, so only one character is ever read.</desc>
+<rect class="sv-bg" x="0" y="0" width="860" height="270"/>
+<rect class="sv-b5" x="20" y="40" width="140" height="60" rx="4"/><text class="sv-tb" x="30" y="62">ns16550a</text><text class="sv-ts" x="30" y="82">RX data → source 10</text>
+<rect class="sv-b2" x="200" y="20" width="230" height="110" rx="4"/><text class="sv-tb" x="210" y="42">PLIC (0xc000000)</text><text class="sv-ts" x="210" y="64">pending[10] = 1</text><text class="sv-ts" x="210" y="84">priority 1 &gt; threshold 0</text><text class="sv-ts" x="210" y="104">enable ctx 1, bit 10</text>
+<rect class="sv-b1" x="480" y="20" width="360" height="150" rx="4"/><text class="sv-tb" x="490" y="42">hart 0, S-mode: scause 9</text><text class="sv-ts" x="490" y="66">1 src = claim(ctx 1) → 10</text><text class="sv-ts" x="490" y="88">   (pending cleared, in service)</text><text class="sv-ts" x="490" y="110">2 read UART until empty</text><text class="sv-ts" x="490" y="132">3 complete(ctx 1, 10)</text><text class="sv-ts" x="490" y="154">   → source 10 may fire again</text>
+<line class="sv-line" x1="160" y1="70" x2="196" y2="70"/><polygon class="sv-head" points="188,64 188,76 200,70"/>
+<line class="sv-line" x1="430" y1="75" x2="476" y2="75"/><polygon class="sv-head" points="468,69 468,81 480,75"/><text class="sv-ts" x="436" y="68">SEIP</text>
+<line class="sv-line2" x1="660" y1="170" x2="660" y2="196"/>
+<rect class="sv-b6" x="200" y="196" width="640" height="56" rx="4"/><text class="sv-tb" x="210" y="218">forensic: step 3 missing</text><text class="sv-ts" x="210" y="238">source 10 stays in service; pending bit 1 again (R6), never forwarded: 1 character</text>
+</svg></div><figcaption><b>Figure 1.</b> One external interrupt on QEMU virt, values from R1 and R6. PLIC semantics after the PLIC specification (unverified box in Layer 3). <sup class="src"><a href="#F4-29-src-D1">D1</a></sup> <sup class="src"><a href="#F4-29-src-R6">R6</a></sup></figcaption></figure>
+
+<figure id="F4-29-fig2"><div class="svgbox">
+<svg viewBox="0 0 860 220" role="img" aria-labelledby="F4-29-f2t F4-29-f2d">
+<title id="F4-29-f2t">Figure 2: PLIC contexts mapped to harts through interrupts-extended</title>
+<desc id="F4-29-f2d">Top, QEMU virt with 4 harts: the PLIC's interrupts-extended lists, in order, context 0 = hart 0 cause 11 (M-mode), context 1 = hart 0 cause 9 (S-mode), context 2 = hart 1 M, context 3 = hart 1 S, and so on: the S-mode context of hart n is 2n + 1. Bottom, sifive_u with 2 harts: context 0 = hart 0 M only (hart 0 is a monitor core without S-mode), context 1 = hart 1 M, context 2 = hart 1 S. So the S-mode context of hart 1 is 2 here, not 3. The kernel reads the list instead of computing a formula.</desc>
+<rect class="sv-bg" x="0" y="0" width="860" height="220"/>
+<text class="sv-tb" x="20" y="30">virt -smp 4 (R2)</text>
+<rect class="sv-b8" x="20" y="44" width="90" height="34" rx="3"/><text class="sv-ts" x="28" y="65">ctx0 h0 M</text>
+<rect class="sv-b1" x="115" y="44" width="90" height="34" rx="3"/><text class="sv-ts" x="123" y="65">ctx1 h0 S</text>
+<rect class="sv-b8" x="210" y="44" width="90" height="34" rx="3"/><text class="sv-ts" x="218" y="65">ctx2 h1 M</text>
+<rect class="sv-b1" x="305" y="44" width="90" height="34" rx="3"/><text class="sv-ts" x="313" y="65">ctx3 h1 S</text>
+<rect class="sv-b8" x="400" y="44" width="90" height="34" rx="3"/><text class="sv-ts" x="408" y="65">ctx4 h2 M</text>
+<rect class="sv-b1" x="495" y="44" width="90" height="34" rx="3"/><text class="sv-ts" x="503" y="65">ctx5 h2 S</text>
+<text class="sv-ts" x="600" y="65">… ctx7 = hart 3 S</text>
+<text class="sv-tb" x="20" y="120">sifive_u -smp 2 (R4)</text>
+<rect class="sv-b8" x="20" y="134" width="150" height="34" rx="3"/><text class="sv-ts" x="28" y="155">ctx0 h0 M (monitor)</text>
+<rect class="sv-b8" x="175" y="134" width="90" height="34" rx="3"/><text class="sv-ts" x="183" y="155">ctx1 h1 M</text>
+<rect class="sv-b1" x="270" y="134" width="90" height="34" rx="3"/><text class="sv-ts" x="278" y="155">ctx2 h1 S</text>
+<text class="sv-ts" x="380" y="155">hart 0: no S context (-1), status disabled, no mmu-type</text>
+<text class="sv-ts" x="20" y="200">read the list; do not compute 2n + 1</text>
+</svg></div><figcaption><b>Figure 2.</b> PLIC contexts per hart, as <code>plic::probe</code> printed them (R2, R4). The cause numbers 9 and 11 after the privileged specification (unverified box in Layer 3). <sup class="src"><a href="#F4-29-src-R2">R2</a></sup> <sup class="src"><a href="#F4-29-src-R4">R4</a></sup></figcaption></figure>
+
+<h2 id="F4-29-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The doorbell panel (PLIC) has a light for every door and, for every teacher, a list of which doors they answer. When a bell rings, the panel lights it and calls a teacher who answers that door. The teacher says "I'm taking door 10", deals with the visitor, and says "door 10 done". Until the teacher says "done", the panel will not call anyone for door 10 again, even if the visitor keeps ringing. The alarm clock is kept by the caretaker: the principal asks "wake me at this time". To wake the other teachers, the principal asks the caretaker too. Some rooms in the building belong to the caretaker's assistant, not to teachers; the building plan says which.</p></div>
+<p>Mapping: doorbell panel = PLIC; a teacher's list = a context's enable bits; "taking door 10" = claim; "door 10 done" = complete; caretaker's alarm = SBI <code>set_timer</code>; waking teachers = SBI HSM and <code>send_ipi</code>; the assistant's room = <code>sifive_u</code>'s monitor hart.</p>
+
+<h2 id="F4-29-layer2">Layer 2 — the student explanation</h2>
+<p>RISC-V separates interrupts by source. Timer and software interrupts belong to each hart and arrive as supervisor timer (cause 5) and supervisor software (cause 1) interrupts, set up through SBI. Device interrupts arrive through the PLIC as supervisor external interrupts (cause 9), and the kernel then asks the PLIC which device it was. F4-28's single trap vector already distinguishes them by <code>scause</code>; F4-29's handler is one function with three branches. <sup class="src"><a href="#F4-29-src-D4">D4</a></sup></p>
+<p>The PLIC works per context: one context per hart and privilege mode that can take external interrupts. Each context has enable bits for the sources it wants and a threshold below which it ignores them. Which context belongs to which hart is not a formula: the PLIC's devicetree node lists, in context order, the hart interrupt controller and the cause number each context drives. On QEMU virt with 4 harts the S-mode contexts are 1, 3, 5, 7; on <code>sifive_u</code>, hart 1's S-mode context is 2 (R2, R4). <sup class="src"><a href="#F4-29-src-D3">D3</a></sup> <sup class="src"><a href="#F4-29-src-R2">R2</a></sup></p>
+<p>The timer is set through the SBI TIME extension: the kernel asks "interrupt me when <code>time</code> reaches T", and in the handler asks again for T + interval. <code>time</code> counts at the devicetree's <code>timebase-frequency</code>: 10 MHz on virt, 1 MHz on <code>sifive_u</code> (R1, R4). Harts other than the boot hart wait in the firmware until the kernel calls SBI HSM <code>hart_start</code>; they then begin at the address given, in S-mode, with their hart ID in a0 and a value of the kernel's choosing in a1. The lab passes an index used for the stack and per-hart data, which each hart then finds through the <code>tp</code> register. <sup class="src"><a href="#F4-29-src-D2">D2</a></sup></p>
+<p>Boards add variation. The lab's UART driver picks between the 16550 of QEMU virt and the SiFive UART of <code>sifive_u</code> by the compatible string. And on <code>sifive_u</code>, hart 0 is a small monitor core without S-mode or an MMU; its devicetree node says so (<code>status = "disabled"</code>, no <code>mmu-type</code>), and a kernel that ignores this waits forever for a hart that cannot arrive.</p>
+
+<h2 id="F4-29-layer3">Layer 3 — the engineer's depth</h2>
+<h3>PLIC register model and the context mapping</h3>
+<p>The PLIC's register block (0xc000000 on both QEMU machines here) has: source priorities at 4 × source; pending bits at 0x1000; per-context enable bits at 0x2000 + 0x80 × context; and per-context threshold at 0x200000 + 0x1000 × context, with the claim/complete register 4 bytes after it. Source 0 does not exist, so a claim returning 0 means "nothing pending". <code>plic::probe</code> builds the context table: it walks the <code>cpu</code> nodes, records the phandle of each one's <code>riscv,cpu-intc</code> child, then reads the PLIC's <code>interrupts-extended</code> as pairs (phandle, cause) and keeps, for each hart, the context whose cause is 9 (S-mode external). <sup class="src"><a href="#F4-29-src-D1">D1</a></sup> <sup class="src"><a href="#F4-29-src-D3">D3</a></sup></p>
+<p>Enabling the UART's interrupt takes four steps in two devices: the UART's own interrupt-enable register (receive data available), the source's priority (non-zero: priority 0 means "never"), the context's enable bit and threshold, and finally the hart's <code>sie.SEIE</code> and <code>sstatus.SIE</code>. Any one missing gives silence. R1's PLIC dump after the test shows each: priority 1, pending 0, enable 1, threshold 0. <sup class="src"><a href="#F4-29-src-R1">R1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The PLIC register offsets (priority, pending, enable, threshold, claim/complete), the meaning of priority 0 and of a claim value of 0, the claim/complete gateway behaviour and the cause numbers 9 and 11 in <code>interrupts-extended</code> are recalled from the "RISC-V Platform-Level Interrupt Controller Specification" (D1), the privileged specification (D4) and the Linux devicetree binding <code>sifive,plic-1.0.0</code> / <code>riscv,plic0</code> (D3), none opened. QEMU 8.2.2's PLIC model delivered interrupts with this code on virt; on <code>sifive_u</code> the UART interrupt was not tested (the console there has no receive test). Vendor PLICs (for example on some SoCs the T-Head variant) differ in details and need their own drivers.</p></div>
+
+<h3>Claim, complete, and why "once" happens</h3>
+<p>When a source's interrupt line rises, the PLIC's gateway for that source sets its pending bit and then forwards nothing more from that source until the source is completed. A claim returns the highest-priority pending enabled source for the context and clears its pending bit; completion re-opens the gateway. The ns16550a raises its line while received data is waiting. If the handler drains the UART and completes, the next character raises the line and a new interrupt arrives. If the handler drains but never completes, the next character sets the UART's line again and the PLIC sets the pending bit again, but the source stays "in service" and no new interrupt reaches the hart: R6 shows exactly one character and "pending bit 1". <sup class="src"><a href="#F4-29-src-D1">D1</a></sup> <sup class="src"><a href="#F4-29-src-R6">R6</a></sup></p>
+<p>Compare F4-25: on the GIC, a missing end-of-interrupt also blocks further interrupts of the same or lower priority, while a missing re-arm of a level source gives a storm. The two controllers differ in detail and agree on the rule: every acknowledge has exactly one completion, and the device's condition must be cleared before completion if it is level-triggered.</p>
+
+<h3>The timer: SBI TIME, and Sstc</h3>
+<p><code>sbi::set_timer(now() + interval)</code> asks OpenSBI to raise a supervisor timer interrupt when <code>time</code> reaches the value; calling it again moves the deadline and clears the pending interrupt. With <code>timebase-frequency</code> 10000000 Hz, 10 ms is 100000 units; R1 counts 20 ticks in 2029396 units (202 ms of <code>time</code>). On <code>sifive_u</code> the timebase is 1 MHz and the same code gives 20 ticks in 207336 units (207 ms). The handler re-arms on every tick, so the tick keeps running until the kernel clears <code>sie.STIE</code> before its verdict. <sup class="src"><a href="#F4-29-src-R1">R1</a></sup> <sup class="src"><a href="#F4-29-src-R4">R4</a></sup></p>
+<p>R1's ISA string lists <code>sstc</code>, and F4-28's OpenSBI banner said "Boot HART ISA Extensions: time,sstc". With Sstc the kernel can write the deadline into <code>stimecmp</code> itself and avoid one <code>ecall</code> (two privilege switches) per tick; OpenSBI, when Sstc is present, implements <code>set_timer</code> with it. The lab uses the SBI call because every SBI 0.2+ firmware offers it; using <code>stimecmp</code> when the devicetree's ISA string lists Sstc is step 3 of the lab. <sup class="src"><a href="#F4-29-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That <code>set_timer</code> clears the pending timer interrupt, that Sstc's <code>stimecmp</code> must also be enabled by M-mode (a bit in <code>menvcfg</code>) before S-mode can use it, and that OpenSBI uses Sstc internally when available, are recalled from the SBI specification (D2), the Sstc extension and OpenSBI's behaviour, not checked. The tick counts above are measured on QEMU under TCG and say nothing about hardware timing.</p></div>
+
+<h3>HSM: starting harts, and the boot hart lottery</h3>
+<p><code>hart_start(hartid, secondary_entry, index)</code> returns 0 when the firmware has accepted the request. The hart starts at <code>secondary_entry</code> in S-mode with <code>satp</code> = 0 (no translation), a0 = hart ID, a1 = index. <code>smp.S</code> loads <code>gp</code>, sets a stack 16 KiB × index below the top, installs <code>stvec</code>, and calls <code>secondary_main</code>, which writes the address of its <code>Hart</code> structure into <code>tp</code>, enables Sv39 with the shared root table, initialises its PLIC context, and reports online. <code>hart_status</code> = 0 means started. <sup class="src"><a href="#F4-29-src-D2">D2</a></sup> <sup class="src"><a href="#F4-29-src-R2">R2</a></sup></p>
+<p>The boot hart is not always hart 0. OpenSBI on QEMU picks the first hart to reach a certain point (a "lottery"), and R3 shows boot hart 1 with 8 harts; one earlier run in this build had boot hart 7. The kernel therefore uses a0 as the boot hart ID, starts every other usable hart, and builds the IPI mask from hart IDs: R3's mask 0xfd is every hart except hart 1. A kernel that assumes "I am hart 0" works most of the time and fails on the run where it is not. <sup class="src"><a href="#F4-29-src-R3">R3</a></sup></p>
+<p>The <code>tp</code> register is the ABI's thread pointer. In the kernel it holds the per-hart pointer; when the kernel runs user programs, it must swap the user's <code>tp</code> with its own on every trap, usually through <code>sscratch</code> (the next chapter's checklist row "syscall/context"). This lab's kernel never enters U-mode, so <code>tp</code> is never disturbed. <sup class="src"><a href="#F4-29-src-D5">D5</a></sup></p>
+
+<h3>IPIs</h3>
+<p><code>sbi::send_ipi(mask, 0)</code> raises a supervisor software interrupt on each hart whose bit is set in the mask (relative to <code>hart_mask_base</code>). The receiver's handler clears <code>sip.SSIP</code> and counts. R2 and R3: every other hart took exactly one. On hardware with the Ssaia extension or a memory-mapped software-interrupt device, IPIs can be sent without the firmware; through SBI they always work. <sup class="src"><a href="#F4-29-src-D2">D2</a></sup> <sup class="src"><a href="#F4-29-src-R3">R3</a></sup></p>
+
+<h3>Which harts to use</h3>
+<p><code>find_harts</code> uses a hart only if its node's <code>status</code> is "okay" (or absent) and it has an <code>mmu-type</code>. On <code>sifive_u</code> hart 0's node reads isa <code>rv64imac</code>, no <code>mmu-type</code>, status "disabled": it is the board's monitor core (on the modelled FU540 SoC, an E51 core without S-mode). R4 skips it and passes with one hart. The <code>all_harts</code> build ignores the properties: <code>hart_start(0)</code> returns 0 and <code>hart_status(0)</code> reports 0 (started), but the hart never reaches <code>secondary_main</code> (it cannot run S-mode code), and the kernel reports "only 1 of 2 harts came online" (R7). A successful SBI return means the firmware accepted the request, not that your code runs. <sup class="src"><a href="#F4-29-src-R4">R4</a></sup> <sup class="src"><a href="#F4-29-src-R7">R7</a></sup></p>
+<p>Also visible in R1: QEMU virt's harts report <code>mmu-type</code> "riscv,sv57", and the kernel uses Sv39. A hart that supports Sv57 also supports Sv48 and Sv39, so the smaller mode is valid; the property names the largest. <sup class="src"><a href="#F4-29-src-D4">D4</a></sup></p>
+
+<h2 id="F4-29-hardware">How the hardware actually does it</h2>
+<p>On real SoCs the PLIC is a block of logic between peripherals' interrupt lines and the harts' external-interrupt inputs, with a gateway per source that converts a level or edge into a single request, as described above. The <code>time</code> CSR is usually a read of a memory-mapped counter shared by all harts (on many systems inside the CLINT or ACLINT); M-mode firmware programs its compare registers when S-mode calls <code>set_timer</code>, unless Sstc lets S-mode program a per-hart compare CSR directly. HSM's <code>hart_start</code> on a board releases a hart that the boot ROM or firmware parked, often in a <code>wfi</code> loop. <sup class="src"><a href="#F4-29-src-D1">D1</a></sup> <sup class="src"><a href="#F4-29-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Untested on hardware</span><p><b>Milestone D7 (optional): a RISC-V board.</b> Goal: "Boot on a board such as a VisionFive 2 from U-Boot, with console, timer and SMP." Build: "Board-specific UART and interrupt-controller details (vendor variants of PLIC and UART are common)." Accept: "Serial log on the board with hart count and memory size; B9/B10 tests pass on all application harts." No RISC-V board was available for this build. The lab's <code>sifive_u</code> runs are a stand-in: QEMU's model of a SiFive HiFive Unleashed board (FU540), with a monitor hart to skip, a vendor UART (<code>sifive,uart0</code>) and a 1 MHz timebase. What the stand-in cannot show: U-Boot as the loader, the real SoC's UART variant and its clock, DRAM size detection, the real board's devicetree, cache and memory-ordering behaviour, and timing. For a VisionFive 2 (JH7110), the curriculum names OpenSBI plus U-Boot as the boot path; the board's UART is a DesignWare 8250-compatible part with <code>reg-shift</code> 2 and 32-bit accesses (recalled, unverified); check every detail against the board's devicetree as the firmware passes it, which your kernel can dump with F4-23's tool. The same safety rules as F4-27 apply: a separate boot medium, a 3.3 V serial adapter wired with the power off, no machine you depend on.</p></div>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The sifive_u details (hart 0 as an E51 monitor core without S-mode, the FU540's UART register layout in <code>uart_any.cc</code>) are recalled from the SiFive FU540-C000 manual (D6), not opened; QEMU's model behaves as the runs show. OpenSBI's SRST returned error −2 on <code>sifive_u</code> in this build (R4: "SBI system reset returned (error -2)"), which the lab treats as "not supported" (the SBI error code −2 is recalled as NOT_SUPPORTED); the run therefore ends at its time limit, and the pass condition is the "D6 ok" line.</p></div>
+
+<h2 id="F4-29-worked">Worked example</h2>
+<p><b>Task.</b> For QEMU virt with 8 harts, compute the enable-register and claim-register addresses for the UART (source 10) in the boot hart's S-mode context in R3, and the IPI mask; then check against R3.</p>
+<p><b>Context.</b> R3's boot hart is 1; its S-mode context is 3 (R3's context list: "hart 1 -&gt; 3"). <b>Enable register:</b> 0xc000000 + 0x2000 + 0x80 × 3 + 4 × (10 / 32) = 0xc000000 + 0x2000 + 0x180 + 0 = 0xc002180; bit 10. <b>Threshold:</b> 0xc000000 + 0x200000 + 0x1000 × 3 = 0xc203000; <b>claim/complete:</b> 0xc203004. R3's PLIC dump shows "context 3 enable bit 1, threshold 0". <sup class="src"><a href="#F4-29-src-R3">R3</a></sup></p>
+<p><b>IPI mask.</b> All harts 0–7 except the boot hart 1: 0xff &amp; ~0x02 = 0xfd. R3: "hart mask 0xfd". <sup class="src"><a href="#F4-29-src-R3">R3</a></sup></p>
+<p><b>Lock test.</b> 8 harts × 500 rounds = 4000; R3's locked counter is 4000 and the racy counter 3997: three lost updates. With more rounds the run took minutes, for the reason F4-26 gave (eight vCPUs on four host CPUs with a fair lock); <code>run.sh</code> passes <code>rounds=500</code> for that reason. <sup class="src"><a href="#F4-29-src-R3">R3</a></sup></p>
+
+<h2 id="F4-29-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F4-29/</code>. Reused unchanged: F4-28's <code>boot.S</code>, <code>trapvec.S</code>, <code>trap.cc</code>, <code>sbi.cc</code> and headers; F4-26's <code>spinlock.h</code>; F4-23's <code>fdt.h</code>; F3-18's files.</p>
+<p><b>Listing 1</b> — <code>plic.h</code>, <code>plic.cc</code></p>
+<pre class="listing" data-src="F4-29/plic.h"></pre>
+<pre class="listing" data-src="F4-29/plic.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–15</td><td>offsets</td><td>Enable, threshold, claim per context.</td><td>All of the PLIC's layout in three functions.</td></tr>
+<tr><td>21–71</td><td><code>probe</code></td><td>Phandle of each hart's intc; <code>interrupts-extended</code> pairs; cause 9 → S context.</td><td>No 2n + 1 formula: <code>sifive_u</code> breaks it.</td></tr>
+<tr><td>78–94</td><td><code>init_hart</code>, <code>enable</code></td><td>Threshold 0; priority; enable bit.</td><td>Priority 0 would mean "never".</td></tr>
+<tr><td>96–108</td><td><code>claim</code>, <code>complete</code></td><td>Read and write the same register.</td><td>The pair the forensic lab breaks.</td></tr>
+<tr><td>110–116</td><td><code>dump</code></td><td>Priority, pending, enable, threshold.</td><td>The evidence line in R1 and R6.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>uart_any.h</code>, <code>uart_any.cc</code></p>
+<pre class="listing" data-src="F4-29/uart_any.h"></pre>
+<pre class="listing" data-src="F4-29/uart_any.cc"></pre>
+<p>Lines 30–49 choose the driver by compatible string; the SiFive UART's transmit and receive registers carry a "full" or "empty" flag in bit 31 next to the data (lines 67–73, 99–103), a different design from the 16550's separate status register.</p>
+<p><b>Listing 3</b> — <code>smp.S</code></p>
+<pre class="listing" data-src="F4-29/smp.S"></pre>
+<p><b>Listing 4</b> — <code>d6_main.cc</code></p>
+<pre class="listing" data-src="F4-29/d6_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>41–44</td><td><code>me</code>, <code>now</code></td><td>Per-hart data through <code>tp</code>; <code>time</code> CSR.</td><td>The RISC-V counterparts of TPIDR_EL1 and CNTPCT_EL0.</td></tr>
+<tr><td>46–72</td><td><code>irq</code></td><td>Cause 5: count, re-arm. Cause 1: clear SSIP, count. Cause 9: claim, drain, complete.</td><td>Lines 66–70 are the forensic switch.</td></tr>
+<tr><td>74–83</td><td><code>hart_setup</code></td><td><code>tp</code>, <code>satp</code>, PLIC context, handler, <code>sie</code>.</td><td>Run on every hart, boot hart included.</td></tr>
+<tr><td>125–153</td><td><code>find_harts</code></td><td>Use a hart only with status okay and an <code>mmu-type</code>.</td><td>Lines 139–141 are the <code>all_harts</code> switch.</td></tr>
+<tr><td>197–230</td><td>timer</td><td>Timebase from the devicetree; 20 ticks of 10 ms; checked against <code>time</code>.</td><td>The scheduler tick (B8/B9) on RISC-V.</td></tr>
+<tr><td>232–247</td><td>UART receive</td><td>PLIC enable, UART IER; wait for six characters.</td><td>"virtio-blk interrupts arrive through the PLIC" uses the same path.</td></tr>
+<tr><td>249–268</td><td>HSM</td><td><code>hart_start</code> each other usable hart; wait; <code>hart_status</code>.</td><td>A clear failure if a hart does not arrive.</td></tr>
+<tr><td>270–296</td><td>lock and IPIs</td><td>All harts on one ticket lock; <code>send_ipi</code> to the others.</td><td>B11's SMP tests on RISC-V.</td></tr>
+</tbody></table></div>
+<p><b>Listing 5</b> — <code>run.sh</code></p>
+<pre class="listing" data-src="F4-29/run.sh"></pre>
+<p>A small "typist" feeds "hello" and a newline 0.3 s apart, so characters arrive one by one as from a keyboard. One hart (R1), four (R2), eight (R3) and <code>sifive_u</code> (R4):</p>
+<pre class="output" data-run="F4-29/virt1"></pre>
+<pre class="output" data-run="F4-29/virt4"></pre>
+<pre class="output" data-run="F4-29/virt8"></pre>
+<pre class="output" data-run="F4-29/sifive_u"></pre>
+
+<h2 id="F4-29-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The panel does not call "a teacher".</b> Every context whose enable bit is set is signalled; if several harts enable the same source, several may trap and race to claim it, and only one gets the source (the others read 0). The analogy's single call hides that race.</li>
+<li><b>The caretaker's alarm can be your own.</b> With Sstc the alarm is a register of the hart itself, not a request to the firmware. The analogy describes SBI TIME only.</li>
+<li><b>The assistant's room is a real processor.</b> The monitor hart is a full CPU running firmware; it is excluded because it lacks S-mode and an MMU, not because it is a different kind of thing.</li>
+</ul>
+
+<h2 id="F4-29-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Starting every hart in the devicetree.</b> While writing this lab the first version did. On <code>sifive_u</code>, <code>hart_start(0)</code> returned 0 and the status said started, but hart 0 never arrived. Evidence (R7):
+<pre class="output" data-run="F4-29/all_harts"></pre></li>
+<li><b>Waiting with <code>wfi</code> while no interrupt can come.</b> Also from writing this lab: an early version cleared <code>sie.STIE</code> after the timer test and then waited for UART input with <code>wfi</code>; with no keystroke and no timer, the hart slept for ever and the time-limit check never ran. Fix: keep the tick running (line 228) or poll.</li>
+<li><b>Computing the PLIC context as 2 × hart + 1.</b> Right on virt, wrong on <code>sifive_u</code> (Figure 2). Fix: <code>interrupts-extended</code>.</li>
+<li><b>Priority 0.</b> A source with priority 0 never interrupts. Fix: any non-zero priority above the threshold.</li>
+<li><b>Assuming the boot hart is hart 0.</b> R3's boot hart is 1. Fix: use a0.</li>
+<li><b>Forgetting to clear <code>sip.SSIP</code> in the IPI handler.</b> The software interrupt stays pending: an IPI storm, like F4-25's timer storm.</li>
+<li><b>Ending the run with SRST and assuming it worked.</b> On <code>sifive_u</code> it returned −2. Fix: <code>sbi::shutdown</code> prints the error and halts; CI uses the verdict line.</li>
+</ul>
+
+<div class="co transition" id="F4-29-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F4-25/F4-26 on AArch64: GICv3 with acknowledge/end-of-interrupt, the generic timer programmed directly, PSCI CPU_ON, SGIs, TPIDR_EL1; OS303 on x86-64: IOAPIC and local APIC, the APIC timer, INIT-SIPI-SIPI, IPIs through the APIC, GS base. <b>What carries over:</b> the shape of the interrupt path (acknowledge, handle, complete); a tick re-armed first; the ticket lock and the online counter; per-CPU data through a register; devicetree-driven discovery; the safety rules for boards from F4-27. <b>What changes:</b> three kinds of interrupt by cause (software, timer, external); a PLIC whose claim/complete pair blocks a source until completion; contexts per hart and mode, mapped by the devicetree; the timer and IPIs through SBI (or Sstc); <code>hart_start</code> with an opaque argument; a random boot hart; harts that exist but cannot run the kernel. <b>What comes next:</b> F4-30 steps back from single ports: the arch-neutrality checklist, the same code on ten CPUs including 32-bit and big-endian ones, and the optional milestones X1 and X2.</p></div>
+
+<h2 id="F4-29-check">Check yourself</h2>
+<ol>
+<li>Name the three supervisor interrupt causes this kernel handles and their numbers.</li>
+<li>What does a claim return, and what does writing to the same register do?</li>
+<li>Why can the kernel not compute a hart's PLIC context from its hart ID?</li>
+<li>What are a0 and a1 at <code>secondary_entry</code>, and what does the lab use a1 for?</li>
+<li>Why does the lab check ticks against <code>time</code> and not against the run's duration?</li>
+<li>Which two devicetree properties decide whether a hart is used, and what are their values for <code>sifive_u</code>'s hart 0?</li>
+<li>Apply to a new case: a board's PLIC lists contexts (hart0 M), (hart1 M), (hart1 S), (hart2 M), (hart2 S). Which context does the kernel use for hart 2, and what is its threshold register's address with the PLIC at 0xc000000?</li>
+<li>Predict, then run: set the UART source's priority to 0 in <code>enable</code>. What do the UART line and the PLIC dump show?</li>
+<li>Explain what SBI's <code>hart_status</code> = 0 for <code>sifive_u</code>'s hart 0 in R7 does and does not tell you.</li>
+</ol>
+
+<h2 id="F4-29-lab">Lab</h2>
+<p><b>Goal.</b> Milestone D6: "PLIC external interrupts, SBI timer (or Sstc), harts started through SBI HSM." Build: "PLIC driver, timer, IPIs through SBI, secondary-hart startup." <b>Accept:</b> "B8–B11 tests pass with 1–8 harts. virtio-blk interrupts arrive through the PLIC and the file-system tests pass." <sup class="src"><a href="#F4-29-src-D7">D7</a></sup></p>
+<p><b>What this lab covers and what remains.</b> The lab shows the PLIC delivering UART interrupts, a 10 ms SBI tick, harts started through HSM with 1, 4 and 8 harts, per-hart data, a lock and IPIs, and a board stand-in (<code>sifive_u</code>). Your part: your B8–B11 tests on this arch layer, and virtio-blk over virtio-mmio (F4-26's transport) with its interrupts through the PLIC (QEMU virt's virtio-mmio slots are PLIC sources too; find them in the devicetree) and the file-system tests on top.</p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2 with its OpenSBI, the riscv64 cross toolchain. Run <code>university/labs/run_lab.sh university/labs/F4-29</code> from the repository root (about two minutes; several runs wait for their typed input).</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In R2 and R3, find the boot hart, the context list and the IPI mask, and check them against the rules above.</li>
+<li>Route the UART to a hart other than the boot hart (enable it in that hart's context only) and show which hart receives the characters.</li>
+<li>Use <code>stimecmp</code> when the ISA string lists <code>sstc</code>; compare the trap counts with <code>-d int</code> for SBI TIME and Sstc.</li>
+<li>Add virtio-blk over virtio-mmio: find the slot's PLIC source in its node's <code>interrupts</code>, complete each claim, and read a sector with an interrupt instead of polling.</li>
+<li>Run your B9/B10 multi-thread tests with 1, 4 and 8 harts.</li>
+<li>(D7, real board, optional) Boot on a VisionFive 2 or similar from U-Boot; record the hart count and memory size from the serial log.</li>
+</ol>
+<p><b>Expected observations.</b> R1–R3: D6 ok; timebase 10 MHz, 20 ticks about 202–205 ms of <code>time</code>; "hello/" through PLIC source 10; contexts 1, 3, 5, …; IPIs taken once each. R4: <code>sifive,uart0</code>, timebase 1 MHz, hart 0 skipped, D6 ok, then SRST error −2 and the time limit (exit code 124). <sup class="src"><a href="#F4-29-src-R1">R1</a></sup> <sup class="src"><a href="#F4-29-src-R4">R4</a></sup></p>
+
+<h2 id="F4-29-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Mei's kernel receives the first character typed and nothing more. Timer, harts and IPIs all pass; the UART test fails. She suspects the UART ("its FIFO must be stuck") or the typist script.</p>
+<p><b>Evidence pack.</b> The serial log of the kernel built with <code>-DFORENSIC_NO_COMPLETE</code>, with the same typed input as the passing runs (R6).</p>
+<pre class="output" data-run="F4-29/forensic_nocomplete"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: how many characters arrived, which one, and what does the PLIC dump say about source 10?</li>
+<li>Why is "the typist sends only one character" ruled out by the other runs?</li>
+<li>Form two hypotheses ("the UART stopped raising its interrupt" and "the PLIC stopped forwarding it") and decide between them with the PLIC dump.</li>
+<li>Which line of <code>d6_main.cc</code> is missing in this build, and what state does its absence leave source 10 in?</li>
+<li>Why did the timer and the IPIs keep working?</li>
+<li>Prevention: an assertion or test that makes this failure obvious at the second interrupt.</li>
+</ol>
+<p><b>Method hints.</b> "pending bit 1" with "enable bit 1" and "threshold 0" means the PLIC knows about the source and the context wants it. Ask what else must be true for the PLIC to forward it.</p>
+
+<h2 id="F4-29-project">Mini-project</h2>
+<p><b>One interrupt-controller interface, three controllers.</b> Define an interrupt-controller interface (enable source for a CPU, acknowledge, complete, send IPI) and implement it for F4-25's GICv3, this chapter's PLIC plus SBI IPIs, and your OS303 IOAPIC/LAPIC. Move the UART receive test into arch-neutral code that uses only the interface, and run it on all three.</p>
+<p><b>Rubric</b> (10 points): the same receive test passes on x86-64, AArch64 and RISC-V (4); no architecture names in the test file (2); each implementation's acknowledge/complete contract documented, with the difference in what "complete" means on each (2); an unverified table for every register used (2).</p>
+
+<h2 id="F4-29-summary">Summary</h2>
+<ul>
+<li>RISC-V interrupts come by cause: software (1), timer (5), external (9); external ones come through the PLIC.</li>
+<li>The PLIC works per context; map contexts to harts from <code>interrupts-extended</code>; claim, handle, complete, every time.</li>
+<li>The timer is set through SBI TIME (or <code>stimecmp</code> with Sstc) at the devicetree's <code>timebase-frequency</code>; re-arm on every tick.</li>
+<li>HSM <code>hart_start</code> starts harts with an opaque argument; per-hart data through <code>tp</code>; the boot hart may be any hart.</li>
+<li>Use only harts whose devicetree node is okay and has an <code>mmu-type</code>; an SBI success is not proof the hart runs your code.</li>
+<li>D7 on a real board is described, not tested; <code>sifive_u</code> is a model, not a board.</li>
+</ul>
+
+<h2 id="F4-29-sources">Sources</h2>
+<ol>
+<li id="F4-29-src-D1">RISC-V International, "RISC-V Platform-Level Interrupt Controller Specification". <i>Title only — not opened during this build; the Source Researcher must confirm the version and section (dossier gate G1 open).</i></li>
+<li id="F4-29-src-D2">RISC-V International, "RISC-V Supervisor Binary Interface Specification" (TIME, IPI, HSM, SRST; error codes). <i>Title only — not opened during this build; the Source Researcher must confirm the version and section (dossier gate G1 open).</i></li>
+<li id="F4-29-src-D3">The Linux kernel's devicetree bindings for the RISC-V PLIC (<code>sifive,plic-1.0.0</code>, <code>riscv,plic0</code>), <code>riscv,cpu-intc</code> and RISC-V <code>cpus</code> (<code>mmu-type</code>, <code>riscv,isa</code>). <i>Title only — not opened during this build; the Source Researcher must confirm the version (dossier gate G1 open).</i></li>
+<li id="F4-29-src-D4">RISC-V International, "The RISC-V Instruction Set Manual, Volume II: Privileged Architecture" (interrupt causes, <code>sie</code>/<code>sip</code>, Sv39/Sv48/Sv57, Sstc). <i>Title only — not opened during this build; the Source Researcher must confirm the version and section (dossier gate G1 open).</i></li>
+<li id="F4-29-src-D5">RISC-V International, "RISC-V ABIs Specification" (<code>tp</code>, <code>gp</code>). <i>Title only — not opened during this build; the Source Researcher must confirm the version (dossier gate G1 open).</i></li>
+<li id="F4-29-src-D6">SiFive, "SiFive FU540-C000 Manual" (E51 monitor core, UART). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-29-src-D7">This project's Systems Curriculum, milestones D6 and D7, and section 9.4 (VisionFive 2 with OpenSBI and U-Boot). Opened in this build (the project's own page).</li>
+<li id="F4-29-src-R1">R1 — lab run, step <code>virt1</code> (QEMU 8.2.2 <code>-M virt -smp 1</code>, typed input).</li>
+<li id="F4-29-src-R2">R2 — lab run, step <code>virt4</code>.</li>
+<li id="F4-29-src-R3">R3 — lab run, step <code>virt8</code> (<code>-append rounds=500</code>).</li>
+<li id="F4-29-src-R4">R4 — lab run, step <code>sifive_u</code> (<code>-M sifive_u -smp 2</code>; exit code 124 expected, see the SRST line).</li>
+<li id="F4-29-src-R5">R5 — lab run, step <code>build</code> (symbol addresses).</li>
+<li id="F4-29-src-R6">R6 — lab run, step <code>forensic_nocomplete</code> (<code>-DFORENSIC_NO_COMPLETE</code>; D6 FAILED expected).</li>
+<li id="F4-29-src-R7">R7 — lab run, step <code>all_harts</code> (<code>-DFORENSIC_ALL_HARTS</code> on <code>sifive_u</code>; D6 FAILED expected).</li>
+</ol>
+
+<h2 id="F4-29-glossary">Glossary links</h2>
+<p><a href="#gl-plic-platform-level-interrupt-controller">PLIC</a> · <a href="#gl-claim-and-complete">Claim and complete</a> · <a href="#gl-sbi-time-and-sstc">SBI TIME and Sstc</a> · <a href="#gl-sbi-hsm-hart-state-management">SBI HSM</a> · <a href="#gl-ipi-risc-v">IPI (RISC-V)</a> · <a href="#gl-interrupts-extended">interrupts-extended</a> · <a href="#gl-hart">Hart</a></p>
+
+<h2 id="F4-29-next">Next chapter</h2>
+<p>Next: <a href="#F4-30">F4-30 More architectures and arch-neutrality</a>. Previous: <a href="#F4-28">F4-28 RISC-V essentials</a>. Back to the course: <a href="#DR402">DR402</a>. Related: <a href="#F4-25">F4-25</a> (GIC and timer storm), <a href="#F4-26">F4-26</a> (SMP and virtio-mmio), <a href="#F4-27">F4-27</a> (board safety). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackD">Track D</a> (milestones D6 and D7).</p>
+
+<h2 id="F4-29-answers">Answers to Check yourself</h2>
+<ol>
+<li>Supervisor software interrupt (1), supervisor timer interrupt (5), supervisor external interrupt (9).</li>
+<li>A claim returns the ID of the highest-priority pending, enabled source for that context (0 if none) and clears its pending bit; writing that ID back completes it, so the PLIC may forward that source again.</li>
+<li>The context numbering depends on how many privilege modes each hart has wired to the PLIC and in which order; harts without S-mode have no S context. Only <code>interrupts-extended</code> says which context belongs to which hart and mode.</li>
+<li>a0 = the hart's ID, a1 = the opaque value passed to <code>hart_start</code>; the lab passes the hart's index, used to choose its stack and its <code>Hart</code> structure.</li>
+<li><code>time</code> is the clock the timer compares against; the host's run time depends on emulation speed and load.</li>
+<li><code>status</code> (must be "okay" or absent) and <code>mmu-type</code> (must exist). Hart 0 of <code>sifive_u</code>: status "disabled", no <code>mmu-type</code>.</li>
+<li>Context 4 (the fifth pair: hart2 S). Threshold at 0xc000000 + 0x200000 + 0x1000 × 4 = 0xc204000; claim at 0xc204004.</li>
+<li>No characters arrive (the UART line says 0 characters) and the dump shows priority 0 with the pending bit 1: the PLIC knows the source is pending but never forwards a priority-0 source. D6 fails.</li>
+<li>It tells you the firmware considers the hart started (it accepted <code>hart_start</code> and moved its state). It does not tell you the hart executes your entry code in S-mode; hart 0 cannot, so the online counter, which only your code increments, is the real test.</li>
+</ol>
+<h3 id="F4-29-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>One character, "h"; the PLIC dump: priority 1, pending bit 1, context 1 enable bit 1, threshold 0. The source is pending, enabled and above the threshold, yet not delivered.</li>
+<li>R1–R3 use the same typist and receive all six characters ("hello/"). The input is the same; the kernel differs.</li>
+<li>"UART stopped": the pending bit is 1, so the UART's line did rise again after the first character and the PLIC registered it. "PLIC stopped forwarding": consistent with pending 1, enabled, above threshold and no interrupt: the source's gateway is still closed because the first claim was never completed. The second is proven.</li>
+<li>Line 68, <code>plic::complete(me().hartid, src)</code> (compiled out by lines 66 and 70). Source 10 stays "in service" (claimed, not completed) for ever.</li>
+<li>Timer (cause 5) and IPIs (cause 1) do not go through the PLIC; only external interrupts do.</li>
+<li>Count claims and completions per source and assert they are equal when the handler returns; or in the test, check that two characters typed one second apart both arrive. Wrong answers: "the UART FIFO is stuck" (the FIFO had data; pending 1 shows the UART signalled), "raise the priority" (priority 1 is already above threshold 0).</li>
+</ol>

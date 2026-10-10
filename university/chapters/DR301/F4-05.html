@@ -1,0 +1,386 @@
+<!--meta
+id: F4-05
+title: virtio block and network
+course: DR301
+level: L3
+prereqs: F4-01, F4-02, F4-03; OS302; HW205 (F1-50, F1-52) recommended; OS304 (F3-31 to F3-33) for the file-system acceptance test
+time: 7–9 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with TCG, q35 machine). Virtio devices exist mainly in virtual machines; no physical device was tested in this build.
+maps: Curriculum Track C, milestone C4 (virtio: block and network devices)
+analogy: F4 — the school and its visitors (the delivery truck that brings goods to the shelf the school marked)
+-->
+
+<h2 id="F4-05-hook">Story hook</h2>
+<p>Until now every visitor to the school has handed things over at the front desk, one at a time: a byte through the UART's window, a scan code through the keyboard's hatch, a date read card by card off the hall clock. That works for letters. It does not work for furniture. When the school orders a hundred boxes of books, nobody wants the secretary to carry them in one by one.</p>
+<p>So the school does what every real school does: it fills in delivery notes, pins them to an order board, and the delivery truck comes, reads the notes, drives the goods straight to the shelves the notes name, and writes in the receipt book what it delivered. The secretary only checks the receipt book. This chapter builds that arrangement for two virtual devices, a disk and a network card, using the cleanest interface there is for it: virtio. By the end your kernel will have written and checked four thousand random blocks of a 1 GiB disk at two queue depths, and sent an ARP request that you can see in a packet capture.</p>
+
+<h2 id="F4-05-able">What you will be able to do</h2>
+<ul>
+<li><b>Find</b> a modern virtio device's register blocks by walking its PCI vendor-specific capabilities.</li>
+<li><b>Bring up</b> a device through the status handshake: reset, acknowledge, driver, feature negotiation, features OK, driver OK.</li>
+<li><b>Build</b> a split virtqueue (descriptor table, available ring, used ring) and explain who writes which part.</li>
+<li><b>Write</b> a virtio-blk driver with up to 32 requests in flight and a virtio-net driver with receive and transmit queues.</li>
+<li><b>Prove</b> a block driver correct with a reproducible random-I/O test whose result the host checks independently.</li>
+<li><b>Diagnose</b> a driver whose device reports success for every request while the data is wrong.</li>
+</ul>
+
+<div class="co jargon" id="F4-05-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>DMA (direct memory access)</dt><dd><b>Simple words:</b> a device reading or writing the computer's memory itself, without the CPU copying each byte. <b>Analogy:</b> the delivery truck driving the goods to the shelf. <b>Precise:</b> memory transactions started by a device (a PCI bus master) at addresses the driver gave it; the CPU only sets up the transfer and learns when it is done. <sup class="src"><a href="#F4-05-src-D4">D4</a></sup></dd>
+<dt>virtio</dt><dd><b>Simple words:</b> a family of devices designed for virtual machines, with one shared way of talking to all of them. <b>Analogy:</b> suppliers who all accept the same order form. <b>Precise:</b> the OASIS "Virtual I/O Device (VIRTIO)" standard: common device status and feature negotiation, virtqueues for data, and transports (PCI, MMIO, channel I/O) that carry them. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></dd>
+<dt>virtqueue</dt><dd><b>Simple words:</b> the queue in shared memory through which a driver hands buffers to a virtio device and gets them back. <b>Analogy:</b> the order board plus the receipt book. <b>Precise:</b> in the split layout, a descriptor table, an available ring written by the driver and a used ring written by the device. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></dd>
+<dt>Descriptor (virtio)</dt><dd><b>Simple words:</b> one entry saying "here is a buffer, this long". <b>Analogy:</b> a delivery note naming a shelf and how much fits on it. <b>Precise:</b> a 16-byte entry: 64-bit physical address, 32-bit length, flags NEXT (another descriptor follows) and WRITE (the device writes this buffer), and the index of the next descriptor. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></dd>
+<dt>Feature negotiation</dt><dd><b>Simple words:</b> device and driver agreeing which optional abilities they will both use. <b>Analogy:</b> the supplier lists the services it can offer; the school ticks the ones it will use. <b>Precise:</b> the driver reads the device's 64 feature bits, writes back a subset it understands, and sets FEATURES_OK; the device confirms by keeping the bit set. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></dd>
+<dt>Device status (virtio)</dt><dd><b>Simple words:</b> a byte both sides use to record how far start-up has got. <b>Analogy:</b> the stamps on a supplier's contract: seen, assigned, terms agreed, active. <b>Precise:</b> a register in the common configuration with bits ACKNOWLEDGE (1), DRIVER (2), DRIVER_OK (4), FEATURES_OK (8), NEEDS_RESET (0x40) and FAILED (0x80); writing 0 resets the device. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></dd>
+<dt>Notification (virtio)</dt><dd><b>Simple words:</b> the driver telling the device "look at the queue, there is new work". <b>Analogy:</b> phoning the depot. <b>Precise:</b> a write of the queue index to the queue's notify address, at notify-capability offset + <code>queue_notify_off</code> × <code>notify_off_multiplier</code>; also called a kick. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-05-pictures">The idea in pictures</h2>
+<p>Figure 1 is the whole chapter in one drawing: the three parts of a split virtqueue and one block-read request travelling through them. Figure 2 shows how the driver finds the device's registers and the order in which it brings the device up.</p>
+<figure id="F4-05-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 330" role="img" aria-labelledby="F4-05-f1t F4-05-f1d">
+<title id="F4-05-f1t">Figure 1: a split virtqueue carrying one block read</title>
+<desc id="F4-05-f1d">Left, the driver in the guest kernel; right, the device. In the middle, three areas of guest memory. The descriptor table holds a chain of three descriptors: descriptor 0 points to a 16-byte request header that the device reads, with flag NEXT; descriptor 1 points to a 4096-byte data buffer with flags NEXT and WRITE, because on a read the device writes it; descriptor 2 points to a one-byte status that the device writes, flag WRITE. The available ring, written only by the driver, receives the head index 0 and its idx is incremented; the driver then writes the queue number to the notify address. The device reads the chain, writes the data by DMA into the buffer, writes status 0, and appends an element (id 0, length) to the used ring, written only by the device, incrementing its idx. The driver polls the used ring's idx, reads the element, and frees the three descriptors.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="330"/>
+<rect class="sv-b1" x="20" y="40" width="140" height="250" rx="6"/><text class="sv-tb" x="34" y="64">driver</text><text class="sv-ts" x="34" y="84">(guest kernel)</text>
+<rect class="sv-b2" x="720" y="40" width="140" height="250" rx="6"/><text class="sv-tb" x="734" y="64">device</text><text class="sv-ts" x="734" y="84">(QEMU here)</text>
+<text class="sv-tb" x="200" y="30">descriptor table</text>
+<rect class="sv-b3" x="200" y="40" width="250" height="34" rx="3"/><text class="sv-ts" x="208" y="61">0: header 16 B · NEXT → 1</text>
+<rect class="sv-b3" x="200" y="78" width="250" height="34" rx="3"/><text class="sv-ts" x="208" y="99">1: data 4096 B · NEXT|WRITE → 2</text>
+<rect class="sv-b3" x="200" y="116" width="250" height="34" rx="3"/><text class="sv-ts" x="208" y="137">2: status 1 B · WRITE</text>
+<text class="sv-tb" x="200" y="186">available ring (driver writes)</text>
+<rect class="sv-b4" x="200" y="196" width="250" height="34" rx="3"/><text class="sv-ts" x="208" y="217">ring[idx] = 0, then idx + 1</text>
+<text class="sv-tb" x="200" y="262">used ring (device writes)</text>
+<rect class="sv-b5" x="200" y="272" width="250" height="34" rx="3"/><text class="sv-ts" x="208" y="293">ring[idx] = {id 0, len}, idx + 1</text>
+<rect class="sv-b6" x="490" y="40" width="190" height="110" rx="4"/><text class="sv-tb" x="500" y="62">guest memory</text><text class="sv-ts" x="500" y="82">header {type 0, sector}</text><text class="sv-ts" x="500" y="102">data: 4 KiB buffer</text><text class="sv-ts" x="500" y="122">status: 0xFF → 0</text><text class="sv-ts" x="500" y="142">(DMA: the truck)</text>
+<line class="sv-line" x1="160" y1="213" x2="196" y2="213"/><polygon class="sv-head" points="186,207 186,219 198,213"/>
+<text class="sv-ts" x="164" y="244">① publish</text>
+<line class="sv-dash" x1="160" y1="170" x2="716" y2="170"/><polygon class="sv-head" points="706,164 706,176 718,170"/>
+<text class="sv-ts" x="480" y="164">② notify: write queue number</text>
+<line class="sv-line2" x1="716" y1="95" x2="684" y2="95"/><polygon class="sv-head" points="694,89 694,101 682,95"/>
+<text class="sv-ts" x="690" y="186">③ read chain,</text><text class="sv-ts" x="690" y="200">write data</text>
+<line class="sv-line" x1="716" y1="289" x2="454" y2="289"/><polygon class="sv-head" points="464,283 464,295 452,289"/>
+<text class="sv-ts" x="560" y="281">④ complete</text>
+<line class="sv-dash" x1="196" y1="300" x2="164" y2="300"/><polygon class="sv-head" points="174,294 174,306 162,300"/>
+<text class="sv-ts" x="20" y="318">⑤ poll used idx, check status, free descriptors 0–2</text>
+</svg></div><figcaption><b>Figure 1.</b> One virtio-blk read. The driver owns the descriptor table and the available ring; the device owns the used ring. The data never passes through a register: the device moves it by DMA into the buffer that descriptor 1 names. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup> <sup class="src"><a href="#F4-05-src-R2">R2</a></sup></figcaption></figure>
+
+<figure id="F4-05-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 260" role="img" aria-labelledby="F4-05-f2t F4-05-f2d">
+<title id="F4-05-f2t">Figure 2: finding the registers and bringing the device up</title>
+<desc id="F4-05-f2d">Top: the PCI configuration space of a modern virtio device holds a capability list. Four vendor-specific capabilities (ID 0x09) each name a BAR and an offset: common configuration (type 1), notifications (type 2, with a multiplier), ISR status (type 3) and device-specific configuration (type 4). They all point into one memory BAR. Bottom: the status handshake as a sequence of writes to device_status: 0 (reset, wait until it reads 0), ACKNOWLEDGE, ACKNOWLEDGE|DRIVER, read the 64 offered feature bits in two halves, write the accepted subset, add FEATURES_OK and read it back, set up each queue, then add DRIVER_OK. Failure at any step: write FAILED.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="260"/>
+<rect class="sv-b7" x="20" y="20" width="200" height="100" rx="5"/><text class="sv-tb" x="30" y="42">PCI config space</text><text class="sv-ts" x="30" y="62">capability pointer</text><text class="sv-ts" x="30" y="80">→ cap 0x09 type 1, 2, 3, 4</text><text class="sv-ts" x="30" y="98">each: BAR, offset, length</text>
+<rect class="sv-b3" x="300" y="20" width="560" height="100" rx="5"/><text class="sv-tb" x="310" y="42">one memory BAR</text>
+<rect class="sv-b1" x="310" y="54" width="130" height="54" rx="3"/><text class="sv-ts" x="316" y="76">common cfg</text><text class="sv-ts" x="316" y="96">status, features</text>
+<rect class="sv-b4" x="450" y="54" width="130" height="54" rx="3"/><text class="sv-ts" x="456" y="76">ISR status</text><text class="sv-ts" x="456" y="96">(unused: polling)</text>
+<rect class="sv-b5" x="590" y="54" width="130" height="54" rx="3"/><text class="sv-ts" x="596" y="76">device cfg</text><text class="sv-ts" x="596" y="96">capacity / MAC</text>
+<rect class="sv-b2" x="730" y="54" width="120" height="54" rx="3"/><text class="sv-ts" x="736" y="76">notify</text><text class="sv-ts" x="736" y="96">kick addresses</text>
+<line class="sv-line" x1="220" y1="70" x2="296" y2="70"/><polygon class="sv-head" points="286,64 286,76 298,70"/>
+<text class="sv-tb" x="20" y="152">status handshake (writes to device_status)</text>
+<rect class="sv-b8" x="20" y="164" width="96" height="40" rx="3"/><text class="sv-ts" x="28" y="188">0 = reset</text>
+<rect class="sv-b8" x="124" y="164" width="96" height="40" rx="3"/><text class="sv-ts" x="132" y="188">ACK</text>
+<rect class="sv-b8" x="228" y="164" width="96" height="40" rx="3"/><text class="sv-ts" x="236" y="188">+DRIVER</text>
+<rect class="sv-b6" x="332" y="164" width="150" height="40" rx="3"/><text class="sv-ts" x="340" y="182">read offer,</text><text class="sv-ts" x="340" y="198">write subset</text>
+<rect class="sv-b8" x="490" y="164" width="120" height="40" rx="3"/><text class="sv-ts" x="498" y="182">+FEATURES_OK</text><text class="sv-ts" x="498" y="198">read back</text>
+<rect class="sv-b6" x="618" y="164" width="110" height="40" rx="3"/><text class="sv-ts" x="626" y="188">set up queues</text>
+<rect class="sv-b8" x="736" y="164" width="124" height="40" rx="3"/><text class="sv-ts" x="744" y="188">+DRIVER_OK</text>
+<text class="sv-ts" x="20" y="232">Any failure: write FAILED (0x80). Bit values checked against Linux's headers (R5); the order is from D1 (unverified).</text>
+</svg></div><figcaption><b>Figure 2.</b> Modern virtio-pci: four vendor capabilities locate the register blocks in a BAR; the status byte records the handshake. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup> <sup class="src"><a href="#F4-05-src-R5">R5</a></sup></figcaption></figure>
+
+<h2 id="F4-05-layer1">Layer 1 — the kid explanation</h2>
+<p>When a computer wants a lot of data from a disk, it does not ask for it one letter at a time. It writes little notes in its own memory: "please put block number 500 here, in this box". Then it pokes the disk to say "there are new notes". The disk reads the notes, puts the data straight into the boxes, and writes "done" in a list. The computer looks at the list and knows the data is there. Sending a message on the network works the same way, with notes that say "please send what is in this box".</p>
+
+<h2 id="F4-05-layer2">Layer 2 — the student explanation</h2>
+<p>Virtio devices were designed for virtual machines, where the "hardware" is a program on the host. Because the designers could choose freely, the interface is simple and regular, which makes it the best first DMA driver. All virtio devices share one start-up procedure and one queue format; only the meaning of the buffers differs between a disk and a network card. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></p>
+<p>On PCI, a modern virtio device has vendor ID 0x1AF4 and device ID 0x1040 plus its type: 0x1042 for block, 0x1041 for network (R2 found both). Its registers are not at fixed places: the device's PCI capability list contains vendor-specific entries that say "the common configuration is at offset X of BAR Y", and likewise for notifications, interrupt status and device-specific settings. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup> <sup class="src"><a href="#F4-05-src-R2">R2</a></sup></p>
+<p>Start-up is a handshake through the device-status byte: reset, acknowledge, announce a driver, agree on features, confirm, set up the queues, and declare the driver ready. A queue is three tables in the driver's memory: descriptors that describe buffers, an available ring where the driver lists new requests, and a used ring where the device lists finished ones. The driver tells the device about new requests by writing to a notify address; the device tells the driver about finished ones by writing to the used ring (and, if the driver wants, by an interrupt; this chapter polls instead). <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></p>
+<p>A virtio-blk request is a chain of three buffers: a 16-byte header (read or write, and the sector), the data, and a status byte the device fills in. A virtio-net packet is one buffer with a 12-byte header in front of the Ethernet frame; queue 0 receives and queue 1 transmits. Milestone C4 asks for exactly these: the generic transport, virtqueues, a block device and a network device. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup> <sup class="src"><a href="#F4-05-src-D8">D8</a></sup></p>
+
+<h2 id="F4-05-layer3">Layer 3 — the engineer's depth</h2>
+<h3>The transport: capabilities and the common configuration</h3>
+<p>The driver enables memory decoding and bus mastering in the PCI command register first; without bus mastering the device cannot do DMA at all, and the failure is silent (requests never complete). It then walks the capability list from F4-02. Each vendor capability (ID 0x09) carries a type at byte 3, a BAR number at byte 4 and a 32-bit offset at byte 8; the notification capability adds a 32-bit multiplier at byte 16. The common configuration is a 56-byte structure: feature selectors and windows, the queue count, the status byte, and a "queue window" (<code>queue_select</code> chooses which queue the following fields describe). <sup class="src"><a href="#F4-05-src-D1">D1</a></sup> <sup class="src"><a href="#F4-05-src-R5">R5</a></sup></p>
+<p>Feature bits are 64 bits read through a 32-bit window: write 0 to the selector and read the low half, write 1 and read the high half. Bit 32, VERSION_1, marks a modern device; a driver that does not accept it is talking the legacy protocol, with different layouts. The driver must accept only bits it understands. After writing its subset it sets FEATURES_OK and reads the status back: a device that cannot work with the subset clears the bit, and the driver must give up. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Written from the author's memory of the VIRTIO specification (D1), not from the document: the capability byte offsets (3, 4, 8, 16), the status bit values, the feature bit numbers, the device IDs 0x1040 + type, and the order of the handshake. All the numbers were compared with the Linux UAPI headers installed on the build machine (38 values, 0 differences, R5) and the devices worked in QEMU 8.2.2 (R2); two independent implementations agreeing is evidence, not the specification. The handshake order and the rule "read FEATURES_OK back" are from memory only.</p></div>
+<h3>Split virtqueues</h3>
+<p>The descriptor table is an array of 16-byte descriptors. A request that needs several buffers links them with NEXT and the <code>next</code> index, forming a chain; the chain's first index (the head) identifies the request. The available ring holds <code>flags</code>, <code>idx</code> and an array of heads: the driver writes the head at <code>ring[idx % size]</code> and then increments <code>idx</code>. The used ring holds <code>flags</code>, <code>idx</code> and an array of (id, len) elements: the device writes the head it finished and the number of bytes it wrote into device-writable buffers, then increments its <code>idx</code>. Both indices are free-running 16-bit counters; only the array position is reduced modulo the queue size. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></p>
+<p>Ownership is the rule that makes this safe without locks: the driver writes descriptors and the available ring and only reads the used ring; the device does the opposite. Two orderings matter. The driver must write the ring entry before the new <code>idx</code> (otherwise the device may read a stale head), and must read the used element only after it has seen the new used <code>idx</code>. On x86, ordinary stores are seen by other agents in program order and loads are not reordered with older loads, so a compiler barrier suffices in this lab; on weakly ordered processors, Linux's virtio code uses real memory barriers at the same places. <sup class="src"><a href="#F4-05-src-D2">D2</a></sup> <sup class="src"><a href="#F4-05-src-D9">D9</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The x86 ordering statement is from memory of the Intel SDM's memory-ordering section (D9), and it holds for normal write-back memory, which is what the rings are here. The claim that Linux places barriers at these points is from memory of <code>drivers/virtio/virtio_ring.c</code> (D2), not opened during this build. The lab passed in QEMU with TCG on one virtual CPU, which does not exercise reordering at all: the lab cannot show that the barriers are sufficient. Also from memory of D1 only: the alignment rules for the three ring areas, the meaning of the available ring's flag bit 0, and that the used element's <code>len</code> counts the bytes written into device-writable buffers.</p></div>
+<p>The available ring's <code>flags</code> bit 0 asks the device not to interrupt; this driver sets it because it polls (interrupts and MSI-X come in DR302, milestone C7). The ring layout requires the descriptor table to be 16-byte aligned, the available ring 2-byte aligned and the used ring 4-byte aligned in the modern layout; the lab puts the table and the used ring on 4 KiB boundaries, which satisfies stricter legacy rules as well. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></p>
+<h3>virtio-blk</h3>
+<p>Every request is header + data + status. The header is <code>{type, reserved, sector}</code>; type 0 reads (IN, from the device's point of view the data goes in to the driver), type 1 writes. Sectors are always 512 bytes in this header, whatever the disk's logical block size. The status byte is 0 for OK, 1 for an I/O error and 2 for unsupported. The data descriptor of a read must carry WRITE, because the device writes it; the status descriptor always carries WRITE. The capacity, in 512-byte sectors, is the first 64-bit field of the device configuration. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup> <sup class="src"><a href="#F4-05-src-R5">R5</a></sup></p>
+<p>Several requests may be in flight, and the device may finish them in any order. The driver therefore keeps a table from head index to request (here: to a slot with its own buffer, header and status byte), and the test never has two requests on the same block in flight at once, because their order of completion is not defined.</p>
+<h3>virtio-net</h3>
+<p>The network device needs buffers before any packet arrives, so the driver posts receive buffers (device-writable) to queue 0 at start-up and gives each back after reading it. Transmit buffers go to queue 1 and are device-readable. Each packet starts with a virtio-net header; with VERSION_1 negotiated it is 12 bytes (R5), and with no offloads negotiated it is all zeros on transmit. The driver accepts only the MAC feature, so it can read the MAC address from the device configuration. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup> <sup class="src"><a href="#F4-05-src-R5">R5</a></sup></p>
+<h3>Proving a block driver correct</h3>
+<p>"The reads returned no errors" proves nothing: Section "Forensic lab" shows a driver for which every request succeeds and nearly every read is wrong. The test in <code>iotest.cc</code> writes a pattern that depends on the block number and a per-block generation counter, so every read has a known expected content, including "all zero" for never-written blocks. It is driven by a seeded xorshift generator, so the host can replay the same sequence and check the disk image after QEMU exits, an independent check that does not trust the kernel's own reading code. The curriculum's test is "random-read and random-write test over 1 GiB with checksum, with queue depth 1 and 32"; the lab runs 4000 operations at each depth, chosen uniformly over the 262144 blocks of 4 KiB, and compares the full contents instead of a checksum. <sup class="src"><a href="#F4-05-src-D8">D8</a></sup> <sup class="src"><a href="#F4-05-src-R2">R2</a></sup> <sup class="src"><a href="#F4-05-src-R3">R3</a></sup></p>
+
+<h2 id="F4-05-hardware">How the hardware actually does it</h2>
+<p>In this lab the "device" is code inside the QEMU process. A write to the notify address is an MMIO access that QEMU intercepts; QEMU then reads the guest's rings from the guest's memory, which for QEMU is ordinary host memory, performs the read or write on the image file, writes the data into the guest buffers and updates the used ring. That is DMA in effect: the guest CPU never copies the data. With KVM, the notify write causes an exit from the guest to the hypervisor, which is why virtio drivers try to batch requests and kick once per batch; mechanisms that avoid even that (event index suppression, the vhost kernel back-end, devices implemented in hardware) are beyond this chapter. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup> <sup class="src"><a href="#F4-05-src-D7">D7</a></sup></p>
+<p>On a real PCIe device, DMA is a bus-master memory read or write request travelling up through the root complex to the memory controller. The addresses the driver puts in descriptors are physical (here: paging is off, so virtual = physical); with an IOMMU, they become I/O-virtual addresses that the IOMMU translates, which is milestone C7. <sup class="src"><a href="#F4-05-src-D4">D4</a></sup> <sup class="src"><a href="#F4-05-src-D8">D8</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That KVM exits on the notify write, that vhost and hardware virtio implementations exist, and what they do, are from the author's general knowledge, not from a source opened in this build. Nothing in this chapter ran on physical hardware or under KVM (the build container has no KVM).</p></div>
+
+<h2 id="F4-05-worked">Worked example</h2>
+<p><b>Decoding the feature offer.</b> R2 shows the block device offering <code>0x10130006e54</code>. Write it in binary and list the set bits: 2, 4, 6, 9, 10, 11, 13, 14, 28, 29, 32, 40. Looking each number up in the installed Linux headers (<code>&lt;linux/virtio_blk.h&gt;</code>, <code>&lt;linux/virtio_ring.h&gt;</code>, <code>&lt;linux/virtio_config.h&gt;</code>, D3) gives: SEG_MAX, GEOMETRY, BLK_SIZE, FLUSH, TOPOLOGY, CONFIG_WCE, DISCARD, WRITE_ZEROES (device-specific, bits below 24), INDIRECT_DESC, EVENT_IDX (ring features), VERSION_1 and RING_RESET (transport features). The driver asked for nothing optional, so it accepted only bit 32: <code>0x100000000</code>. The network device offered <code>0x10130bf8024</code>, which includes MAC (bit 5); the driver accepted MAC and VERSION_1: <code>0x100000020</code> = bit 32 + bit 5. <sup class="src"><a href="#F4-05-src-R2">R2</a></sup> <sup class="src"><a href="#F4-05-src-D3">D3</a></sup></p>
+<p><b>Where the queue lives.</b> R2's line <code>virtio queue 0: size 128 (device max 256), desc 0x136000 avail 0x136800 used 0x137000</code>. The device offered 256 entries; the driver wrote 128, the size of its arrays. Descriptor table: 128 × 16 = 2048 bytes, so the available ring follows at 0x136000 + 0x800 = 0x136800. The available ring needs 2 + 2 + 128 × 2 + 2 = 262 bytes, and the used ring is aligned up to the next 4 KiB: 0x137000. <sup class="src"><a href="#F4-05-src-R2">R2</a></sup></p>
+<p><b>A request in numbers.</b> Block 1000 (4 KiB blocks) is sector 1000 × 8 = 8000. A read of it is: header <code>{0, 0, 8000}</code> (16 bytes, device-readable), data (4096 bytes, NEXT | WRITE = 3), status (1 byte, WRITE = 2). When the device completes it, the used element's <code>len</code> counts the bytes it wrote: 4096 + 1. <sup class="src"><a href="#F4-05-src-D1">D1</a></sup></p>
+<p><b>The ARP request.</b> 42 bytes: destination ff:ff:ff:ff:ff:ff, source 52:54:00:12:34:56, EtherType 0x0806, then hardware type 1, protocol 0x0800, lengths 6 and 4, operation 1, sender MAC and IP 10.0.2.15, target MAC zero, target IP 10.0.2.2 (QEMU's user-mode network gateway). The device receives 12 + 42 = 54 bytes. R4 shows the request and the reply exactly as tshark decodes them. <sup class="src"><a href="#F4-05-src-D6">D6</a></sup> <sup class="src"><a href="#F4-05-src-R4">R4</a></sup></p>
+
+<h2 id="F4-05-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F4-05/</code>. The kernel reuses F4-01's base (<code>kbase</code>, boot code), F4-02's PCI code and F4-03's interrupts and PIT (for the millisecond clock). <code>virtio_net.h</code> declares the four functions of <code>virtio_net.cc</code>.</p>
+<p><b>Listing 1</b> — <code>virtio.h</code>, layouts and the transport's interface</p>
+<pre class="listing" data-src="F4-05/virtio.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–19</td><td>constants</td><td>Status bits, VERSION_1, capability types, descriptor flags.</td><td>Every value checked against Linux's headers (R5).</td></tr>
+<tr><td>21–29</td><td><code>CommonCfg</code></td><td>The 56-byte common configuration, field by field.</td><td>The <code>static_assert</code> catches a missing or mistyped field at compile time.</td></tr>
+<tr><td>31–33</td><td><code>Desc</code>, <code>UsedElem</code></td><td>16-byte descriptor, 8-byte used element.</td><td>Shared with the device: sizes must be exact.</td></tr>
+<tr><td>38–46</td><td><code>Queue</code></td><td>Descriptor table and used ring on 4 KiB boundaries, available ring between them; then the driver's private bookkeeping (free list, last used index, notify address).</td><td>One object per queue in static memory: physical address = virtual address because paging is off.</td></tr>
+<tr><td>48–56</td><td><code>Device</code></td><td>Pointers into the BAR for the four register blocks, and the agreed features.</td><td>Filled by the capability walk.</td></tr>
+<tr><td>60–68</td><td>functions</td><td>Transport (init, queues, driver OK) and ring operations.</td><td>virtio-blk and virtio-net use only these.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>virtio.cc</code>, the transport and the rings</p>
+<pre class="listing" data-src="F4-05/virtio.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>7–12</td><td><code>bar_address</code></td><td>Sizes the BARs (F4-02) and returns one BAR's address.</td><td>The capability only names a BAR number and an offset.</td></tr>
+<tr><td>19</td><td><code>pci::enable</code></td><td>Memory decoding and bus mastering on.</td><td>Without bus mastering, no DMA: requests would never complete.</td></tr>
+<tr><td>21–37</td><td>capability walk</td><td>Vendor capabilities (0x09): type, BAR, offset; the notify capability's multiplier at byte 16. A guard of 48 steps stops a looped list.</td><td>Figure 2, top row. First capability of each type wins.</td></tr>
+<tr><td>38</td><td>required blocks</td><td>No common, notify or ISR block: not a modern device.</td><td>Fail early with a clear error.</td></tr>
+<tr><td>41–44</td><td>reset, ACK, DRIVER</td><td>Write 0, wait until it reads 0; then two status steps.</td><td>Figure 2, bottom row.</td></tr>
+<tr><td>46–51</td><td>read the offer</td><td>Two 32-bit halves; keep only wanted bits plus VERSION_1; refuse a device without VERSION_1.</td><td>The driver never accepts a feature it does not implement.</td></tr>
+<tr><td>52–57</td><td>accept</td><td>Write the subset, set FEATURES_OK, read it back.</td><td>The device has the last word.</td></tr>
+<tr><td>64–72</td><td>queue size</td><td>Select the queue, read the device's maximum, write a smaller size if needed.</td><td>R2: maximum 256, chosen 128.</td></tr>
+<tr><td>75–81</td><td>free list, indices</td><td>All descriptors free; indices 0; available flags 1 (no interrupts).</td><td>The driver polls.</td></tr>
+<tr><td>84–88</td><td>addresses, enable</td><td>Physical addresses of the three areas; notify address = base + <code>queue_notify_off</code> × multiplier; enable.</td><td>The device reads the rings from these addresses from now on.</td></tr>
+<tr><td>96–124</td><td><code>alloc_chain</code>, <code>free_chain</code></td><td>Take n descriptors from the free list and link them with NEXT; give a chain back.</td><td>The free list is the driver's own: the device never sees it.</td></tr>
+<tr><td>126–133</td><td><code>submit</code></td><td>Write the head into the available ring, barrier, then increment <code>idx</code>.</td><td>The publication order of Layer 3.</td></tr>
+<tr><td>135–139</td><td><code>kick</code></td><td>Write the queue number to its notify address.</td><td>"Phone the depot".</td></tr>
+<tr><td>141–151</td><td><code>get_used</code></td><td>Volatile read of the used <code>idx</code>; if it moved, read one element.</td><td>The volatile read stops the compiler from caching <code>idx</code> in a register forever.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>virtio_blk.cc</code>, the block driver</p>
+<pre class="listing" data-src="F4-05/virtio_blk.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–11</td><td><code>ReqHeader</code></td><td>Type, reserved, sector: 16 bytes.</td><td>Size checked twice (here and in R5).</td></tr>
+<tr><td>13–19</td><td>slots</td><td>32 slots, each with a 4 KiB buffer, a header and a status byte; a map from head to slot.</td><td>Requests can complete in any order.</td></tr>
+<tr><td>23–34</td><td><code>init</code></td><td>Transport with no optional features, one queue, capacity from the device configuration, DRIVER_OK.</td><td>R2: 2097152 sectors = 1 GiB.</td></tr>
+<tr><td>41–46</td><td>start</td><td>Header, status preset to 0xFF, a chain of three descriptors.</td><td>0xFF is not a valid status: a request the device never touched is visible.</td></tr>
+<tr><td>47–56</td><td>three buffers</td><td>Header (read by the device), data (WRITE on reads), status (always WRITE).</td><td>Lines 51–53 are the forensic lab's switch.</td></tr>
+<tr><td>57–59</td><td>submit, kick</td><td>Remember the slot, publish, notify.</td><td>One kick per request: simple, not efficient.</td></tr>
+<tr><td>62–70</td><td><code>wait_any</code></td><td>Poll for a used element, read the slot's status, free the chain.</td><td>The status byte is the device's verdict, but see the forensic lab.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>virtio_net.cc</code>, the network driver</p>
+<pre class="listing" data-src="F4-05/virtio_net.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–16</td><td>constants, buffers</td><td>MAC feature bit 5; 12-byte header; 16 receive buffers of 2 KiB; one transmit buffer.</td><td>2 KiB holds a full Ethernet frame plus the header.</td></tr>
+<tr><td>18–25</td><td><code>post_rx</code></td><td>One device-writable descriptor per receive buffer.</td><td>The device can only deliver into buffers it was given.</td></tr>
+<tr><td>29–41</td><td><code>init</code></td><td>Negotiate MAC, set up queues 0 and 1, read the MAC, post 16 buffers, DRIVER_OK, kick the receive queue.</td><td>R2: MAC 52:54:00:12:34:56, the value given on QEMU's command line.</td></tr>
+<tr><td>45–58</td><td><code>send</code></td><td>Zero header + frame in one descriptor; kick; wait until the device has used it.</td><td>Waiting keeps the single transmit buffer safe to reuse.</td></tr>
+<tr><td>60–74</td><td><code>receive</code></td><td>Poll with a spin limit; find which buffer came back from its address; copy the frame without the header; repost the buffer.</td><td>Reposting at once keeps the device supplied.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 5</b> — <code>iotest.h</code>, the random-I/O test shared by F4-05 to F4-07</p>
+<pre class="listing" data-src="F4-05/iotest.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9</td><td><code>kBlocks</code></td><td>262144 blocks of 4 KiB = 1 GiB.</td><td>The acceptance test's range.</td></tr>
+<tr><td>11–17</td><td><code>xorshift32</code></td><td>A tiny reproducible generator.</td><td>The host replays the same sequence (Listing 8).</td></tr>
+<tr><td>19–23</td><td><code>fill</code></td><td>Pattern from block, generation and word index.</td><td>A block written to the wrong place or a stale generation cannot match.</td></tr>
+<tr><td>26–31</td><td><code>Disk</code></td><td>Three function pointers: buffer, start, wait.</td><td>The same test drives virtio-blk, AHCI and NVMe.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 6</b> — <code>iotest.cc</code>, the test loop</p>
+<pre class="listing" data-src="F4-05/iotest.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–20</td><td><code>check</code></td><td>Never written: all zero; otherwise equal to the expected pattern.</td><td>Full comparison, stronger than a checksum.</td></tr>
+<tr><td>29–40</td><td><code>complete_one</code></td><td>Wait for any request; count errors and bad reads; free its slot.</td><td>Prints only the first three bad reads.</td></tr>
+<tr><td>42–43</td><td>choice</td><td>Random block and random read or write.</td><td>Uniform over 1 GiB.</td></tr>
+<tr><td>45–47</td><td>ordering rules</td><td>A request on a block already in flight drains the queue first; full queue: wait for one.</td><td>Completion order is not defined, so two requests on one block would make the expected content ambiguous.</td></tr>
+<tr><td>48–59</td><td>start</td><td>Record what is expected; writes bump the generation (1–255) and fill the buffer.</td><td>The expectation is fixed when the request starts.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 7</b> — <code>f405_main.cc</code>, the kernel</p>
+<pre class="listing" data-src="F4-05/f405_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–21</td><td><code>find</code></td><td>Vendor 0x1AF4; device 0x1042 block, 0x1041 network.</td><td>Matching by ID, the driver model of F4-02 in miniature.</td></tr>
+<tr><td>23–31</td><td>adapters</td><td>Block number × 8 = sector; status 0 = OK.</td><td>Connect virtio-blk to the generic test.</td></tr>
+<tr><td>33–59</td><td><code>arp_test</code></td><td>Builds a 42-byte ARP request, sends it, and waits for an ARP reply, ignoring other frames.</td><td>Worked example; R4 is the same packet seen from outside.</td></tr>
+<tr><td>69–71</td><td>probe</td><td>Enumerate, initialise, require at least 1 GiB.</td><td>A small disk would make the test meaningless.</td></tr>
+<tr><td>73–83</td><td>the test</td><td>4000 operations at depth 1 and 4000 at depth 32, different seeds; PASS only with no bad reads and no errors.</td><td>The acceptance test's two depths.</td></tr>
+<tr><td>85–87</td><td>network, exit</td><td>ARP, then exit 33 (pass) or 3 (fail).</td><td>The run script checks the exit code.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 8</b> — <code>verify_image.py</code>, the host's independent check</p>
+<pre class="listing" data-src="F4-05/verify_image.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–30</td><td>replay</td><td>The kernel's generator and seeds; the last generation of every written block.</td><td>No communication with the kernel needed.</td></tr>
+<tr><td>32–40</td><td>written blocks</td><td>Every written block must hold exactly its last pattern.</td><td>Catches writes to the wrong sector, short writes and lost writes.</td></tr>
+<tr><td>43–52</td><td>unwritten sample</td><td>Every 997th block that was never written must be zero.</td><td>Catches writes that landed somewhere unexpected.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 9</b> — <code>virtio_check.cc</code> (and <code>linux_values.c</code>, which prints the Linux values)</p>
+<pre class="listing" data-src="F4-05/virtio_check.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–17</td><td>read Linux's values</td><td>Name/value pairs from <code>linux_values.c</code>, which uses <code>offsetof</code> and <code>sizeof</code> on Linux's structures.</td><td>Some UAPI headers compile only as C, hence two programs.</td></tr>
+<tr><td>18–45</td><td>our values</td><td>The same 38 quantities from <code>virtio.h</code> and the drivers.</td><td>Offsets, sizes and constants all in one table.</td></tr>
+<tr><td>46–55</td><td>compare</td><td>Prints both and fails on any difference.</td><td>R5: 0 differences.</td></tr>
+</tbody></table></div>
+<pre class="listing" data-src="F4-05/linux_values.c"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>6–10</td><td>includes</td><td>The five Linux UAPI headers for virtio.</td><td>The second, independent source of the layouts (D3).</td></tr>
+<tr><td>12</td><td><code>P</code></td><td>Prints a name and a value.</td><td>The format <code>virtio_check</code> reads.</td></tr>
+<tr><td>16 onwards</td><td><code>offsetof</code>, <code>sizeof</code>, constants</td><td>Linux's offsets for the common configuration, sizes of descriptors and headers, status and feature constants. Linux names some fields differently (<code>guest_feature</code> for <code>driver_feature</code>).</td><td>Comparing by meaning, not by name.</td></tr>
+</tbody></table></div>
+<p>The runs: build (R1), the kernel (R2), the host's image check (R3), the packet capture (R4) and the layout check (R5). The millisecond figures in R2 are emulated QEMU TCG time on a shared build machine; they change from run to run and say nothing about a real disk.</p>
+<pre class="output" data-run="F4-05/build"></pre>
+<pre class="output" data-run="F4-05/virtio"></pre>
+<pre class="output" data-run="F4-05/image"></pre>
+<pre class="output" data-run="F4-05/capture"></pre>
+<pre class="output" data-run="F4-05/virtio_check"></pre>
+
+<h2 id="F4-05-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A truck that is not there.</b> In this lab the "device" is a program on the same machine, and its "truck" is a memory copy by the host. The analogy suggests distance and travel time that do not exist here, which is why virtio is fast in a VM and why the emulated timings in R2 say nothing about real disks.</li>
+<li><b>The truck reads the notes whenever it likes.</b> A real delivery company waits for the phone call; a virtio device may look at the available ring at any moment, even before the kick. That is why the order of writes (entry before index) matters and why the analogy's "fill in the note, then pin it up" must be taken literally.</li>
+<li><b>Delivery notes are reused at once.</b> The school keeps old delivery notes; the driver recycles descriptors as soon as the device returns them. A descriptor freed too early (before the used ring says so) is a bug the analogy does not warn about.</li>
+</ul>
+
+<h2 id="F4-05-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Bus mastering not enabled.</b> Symptom: the first request never completes; the used <code>idx</code> stays 0. Check the PCI command register.</li>
+<li><b>WRITE flag missing on a read's data buffer.</b> Symptom: status OK, data unchanged (forensic lab).</li>
+<li><b>Index published before the entry.</b> Symptom: rare, load-dependent wrong requests; often invisible on x86 and in emulation.</li>
+<li><b>Comparing ring indices modulo the size.</b> Symptom: the driver stops after 65536 or after <code>size</code> requests. The indices are free-running 16-bit counters; only the array position is reduced.</li>
+<li><b>Accepting all offered features.</b> Symptom: the device changes behaviour (for example, event-index notification rules, a different header size) and the driver hangs. Accept only what you implement.</li>
+<li><b>Forgetting to post receive buffers.</b> Symptom: the transmit works (the capture shows the request) but nothing is ever received.</li>
+<li><b>Two requests on one block in flight.</b> Symptom: the random test reports a few bad reads that move from run to run. The test or the block layer must order them.</li>
+</ul>
+
+<div class="co transition" id="F4-05-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F4-02's capability walk and BAR sizing, F4-03's PIT clock, F3-31 (OS304), where a kernel gets a block-device interface on a RAM disk (if you have taken it), and F1-50 and F1-52 (HW205), where queues, doorbells and descriptor rings were introduced from the hardware side. <b>What carries over:</b> matching devices by ID, the driver-model shape (probe, then use), printing raw values, host-side tests. <b>What changes:</b> data no longer passes through registers: the driver writes descriptions of memory and the device moves the data itself, so correctness now depends on memory layout, ownership and ordering, and the proof of correctness has to look at the data. <b>Next:</b> F4-06 drives AHCI, a real hardware interface with the same ideas (command lists, physical region descriptors, a status register) and much more ceremony, and runs the same test on it.</p></div>
+
+<h2 id="F4-05-check">Check yourself</h2>
+<ol>
+<li>Which PCI capability ID marks a virtio vendor capability, and which four types does the driver look for?</li>
+<li>Why must the driver read the status byte back after setting FEATURES_OK?</li>
+<li>Name the three parts of a split virtqueue and say who writes each.</li>
+<li>Why does the driver write the ring entry before incrementing the available <code>idx</code>?</li>
+<li>Write the three descriptors (address, length, flags) for a virtio-blk <em>write</em> of block 7 from a buffer at 0x200000.</li>
+<li>The used ring's <code>idx</code> reads 3 and the driver's <code>last_used</code> is 65535. How many completions are waiting?</li>
+<li>Apply to a new case: a virtio console device has receive and transmit queues like virtio-net. Which of the chapter's functions can you reuse unchanged?</li>
+<li>Why is "every request returned status 0" not enough to accept a block driver?</li>
+<li>The device offers RING_RESET (bit 40). What does the lab's driver accept, and why is that safe?</li>
+</ol>
+
+<h2 id="F4-05-lab">Lab</h2>
+<p><b>Goal.</b> Milestone C4: "Your first DMA-capable drivers, on the cleanest real interface: modern virtio over PCI with split virtqueues." Build: "Generic virtio-pci transport (capabilities, common configuration, notifications), virtqueue management, virtio-blk as a block device under B14, virtio-net with transmit and receive rings." <sup class="src"><a href="#F4-05-src-D8">D8</a></sup></p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2 (<code>q35</code> machine, modern-only devices with <code>disable-legacy=on</code>), g++ 13.3, GNU ld 2.42, Python 3, tshark 4.2.2, and the Linux UAPI headers (package <code>linux-libc-dev</code>). Run <code>university/labs/run_lab.sh university/labs/F4-05</code> from the repository root (under a minute). The disk image is a sparse 1 GiB file deleted at the end.</p>
+<div class="co safety"><span class="lbl">Safety</span><p>The curriculum's warning applies from this chapter on: "Expect that a bad driver can corrupt disks (wrong LBA, wrong DMA address)... Disconnect disks you care about while testing storage drivers on real hardware." In this lab the disk is an image file that the script creates and deletes. Never point the <code>-drive file=</code> option at a real disk device or at an image you want to keep.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In R2, decode both feature offers as in the worked example, and check the queue addresses against the arithmetic.</li>
+<li>Read R3: how many distinct blocks did the test write, and how were the never-written blocks checked?</li>
+<li>Open the capture (<code>cap.pcap</code>, written by QEMU's <code>filter-dump</code>; keep it by removing it from the clean-up line of <code>run.sh</code>) in Wireshark and find the request and the reply of R4.</li>
+<li>Change <code>QMAX</code> to 8 and rerun. Which depth-32 behaviour do you expect, and what does the test print?</li>
+<li>Make <code>submit</code> kick only once for a batch of requests (start eight, then kick) and compare the emulated time of the depth-32 test over three runs each. Report the spread, not one number.</li>
+</ol>
+<p><b>Expected observations.</b> R1: the kernel links. R2: both devices found; features as in the worked example; 2000 reads and 2000 writes at depth 1, 1966 reads and 2034 writes at depth 32 (the seeds fix these counts), 0 bad reads, 0 errors, PASS; the ARP reply from 52:55:0a:00:02:02. R3: 3982 distinct blocks written, 0 differ, 261 sampled unwritten blocks all zero. R4: request and reply. R5: 0 differences in 38 values.</p>
+<p><b>Verification</b> (the milestone's acceptance tests, verbatim): "Random-read and random-write test over 1 GiB with checksum, with queue depth 1 and 32." — R2 (both depths, PASS) and R3 (the host's check of the image), with full comparison instead of a checksum and 4000 operations per depth. "virtio-net: ARP request sent by the kernel appears in a QEMU packet capture opened in Wireshark." — R4, read with tshark, Wireshark's command-line program, which uses the same dissectors. "FAT32 (B15) and ext2 (B16) tests run on virtio-blk instead of the RAM disk and pass." — not done in this lab; see the box below. <sup class="src"><a href="#F4-05-src-D8">D8</a></sup></p>
+<div class="co unverified"><span class="lbl">Not tested in this build</span><p>The first acceptance test of C4 (FAT32 and ext2 tests on virtio-blk) was not run: the lab kernel has no block layer or file systems; those come from your own work on B14–B16 (F3-31 to F3-33). Wire <code>vblk</code> under your block-device interface and run your existing tests to complete C4. The random test covers 4000 operations per depth over the whole 1 GiB range, not every block of it.</p></div>
+<p><b>Troubleshooting.</b> "no virtio-blk": the device ID is 0x1001 (legacy) because <code>disable-legacy=on</code> is missing. Hang at the first request: bus mastering, or the queue was not enabled. "disk smaller than 1 GiB": the image was not created with <code>truncate -s 1G</code>. No ARP reply: receive buffers not posted, or the receive queue not kicked after DRIVER_OK.</p>
+<p><b>Extension.</b> Negotiate EVENT_IDX (bit 29) and implement its notification rules, or use the ISR capability with a legacy interrupt line instead of polling. Mark every rule you use as unverified until you have read the "Virtqueues" chapter of D1.</p>
+
+<h2 id="F4-05-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Tomás "cleaned up" the block driver: "the data descriptor is the same for reads and writes, so why special-case it?" His tests all pass: every write lands on disk exactly right (he checked the image on the host), and every request returns status 0. The file system on top, however, reports corrupt directories after every boot.</p>
+<p><b>Evidence pack.</b> The same kernel built with <code>-DF405_READ_WITHOUT_WRITE_FLAG</code>, plus QEMU's own trace of request completions (R6):</p>
+<pre class="output" data-run="F4-05/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what do the device's status bytes and QEMU's completion trace say, and what does the data check say?</li>
+<li>Why are the writes correct while the reads are wrong?</li>
+<li>All the printed bad reads expect generation 0 (never written, so zero). What does the buffer contain instead, and why?</li>
+<li>Why did one read at queue depth 1 pass?</li>
+<li>Why did the device not report an error? What would have made the driver notice?</li>
+<li>Prevention: which test would have caught the change, and what single field of the used ring would have revealed it?</li>
+</ol>
+<p><b>Method hints.</b> Look at Listing 3, lines 51–53. Ask which buffers the device is allowed to write. Remember that each slot reuses its buffer.</p>
+
+<h2 id="F4-05-project">Mini-project</h2>
+<p><b>A virtio-blk block device with a request queue.</b> Put <code>vblk</code> under your kernel's block-device interface (B14, F3-31): requests of any length up to 64 KiB, split into descriptor chains with several data descriptors; a per-device request queue with completion callbacks; batching with one kick per batch. Run your FAT32 and ext2 tests on it (the missing C4 acceptance test) and the random test from this chapter at depth 32.</p>
+<p><b>Rubric</b> (10 points): FAT32 and ext2 tests pass on virtio-blk (3); multi-descriptor requests correct at the 4 KiB and 64 KiB edges, checked by the host (2); completion out of order handled (2); fewer kicks than requests, shown by counting (1); the ordering rules of Layer 3 commented in the code (2).</p>
+
+<h2 id="F4-05-summary">Summary</h2>
+<ul>
+<li>A modern virtio-pci device is found by its vendor capabilities; the common configuration carries status, features and the queue window.</li>
+<li>Start-up is a handshake: reset, ACKNOWLEDGE, DRIVER, feature subset, FEATURES_OK (read back), queues, DRIVER_OK.</li>
+<li>A split virtqueue is a descriptor table and an available ring written by the driver, and a used ring written by the device; write order and ownership make it safe.</li>
+<li>virtio-blk requests are header + data + status chains; virtio-net packets carry a 12-byte header and need receive buffers posted in advance.</li>
+<li>A block driver is proved by checking data, not status: a seeded random test checked by the kernel and again by the host.</li>
+<li>A missing WRITE flag gives success statuses and wrong data: the device can only write where the driver allows.</li>
+</ul>
+
+<h2 id="F4-05-sources">Sources</h2>
+<ol>
+<li id="F4-05-src-D1">OASIS, "Virtual I/O Device (VIRTIO)" specification (curriculum item 38; C4 reading: "Basic Facilities of a Virtio Device", "Virtio Transport Options: Virtio Over PCI Bus", "Block Device", "Network Device"). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-05-src-D2">The Linux kernel source (curriculum item 40): <code>drivers/virtio/virtio_pci_modern.c</code>, <code>drivers/virtio/virtio_ring.c</code>, <code>drivers/block/virtio_blk.c</code>, <code>drivers/net/virtio_net.c</code>. <i>Title only — not opened during this build; the Source Researcher must confirm the version and the files (dossier gate G1 open).</i></li>
+<li id="F4-05-src-D3">Linux UAPI headers as installed on the build machine (package <code>linux-libc-dev</code> 6.8.0-146.146): <code>&lt;linux/virtio_pci.h&gt;</code>, <code>&lt;linux/virtio_ring.h&gt;</code>, <code>&lt;linux/virtio_config.h&gt;</code>, <code>&lt;linux/virtio_blk.h&gt;</code>, <code>&lt;linux/virtio_net.h&gt;</code>. Opened in this build: compiled by the lab (R5), and the feature-bit names of the worked example were looked up in them. An implementation, not the specification.</li>
+<li id="F4-05-src-D4">Jonathan Corbet, Alessandro Rubini, Greg Kroah-Hartman, "Linux Device Drivers", 3rd edition (curriculum item 39), chapter on memory mapping and DMA. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-05-src-D5">PCI-SIG, "PCI Local Bus Specification" (curriculum item 37): command register (bus master enable), capabilities list, vendor-specific capability ID. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-05-src-D6">IETF RFC 826, "An Ethernet Address Resolution Protocol" (curriculum, network stack row). <i>Title only — not opened during this build; the Source Researcher must confirm it (dossier gate G1 open).</i></li>
+<li id="F4-05-src-D7">QEMU documentation: <code>virtio-blk-pci</code> and <code>virtio-net-pci</code> device options, user-mode networking (gateway 10.0.2.2), <code>filter-dump</code>, trace events. <i>Title only — not opened during this build; the Source Researcher must confirm the version and pages (dossier gate G1 open).</i></li>
+<li id="F4-05-src-D8">This project's Systems Curriculum, milestone C4 (goal, reading, build, acceptance tests) and the safety box on storage drivers (opened in this build; the project's own page).</li>
+<li id="F4-05-src-D9">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual" (curriculum item 10), Volume 3, memory ordering. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-05-src-R1">R1 — lab run, step <code>build</code>: <code>university/labs/F4-05/build.out</code>, <code>build.log</code>.</li>
+<li id="F4-05-src-R2">R2 — lab run, step <code>virtio</code>: <code>virtio.out</code>, <code>virtio.log</code> (QEMU 8.2.2, q35, TCG; exit code 33 = pass).</li>
+<li id="F4-05-src-R3">R3 — lab run, step <code>image</code>: <code>image.out</code>, <code>image.log</code> (Listing 8 on the image R2 wrote).</li>
+<li id="F4-05-src-R4">R4 — lab run, step <code>capture</code>: <code>capture.out</code>, <code>capture.log</code> (tshark 4.2.2 on QEMU's <code>filter-dump</code> capture).</li>
+<li id="F4-05-src-R5">R5 — lab run, step <code>virtio_check</code>: <code>virtio_check.out</code>, <code>virtio_check.log</code> (Listing 9 against D3).</li>
+<li id="F4-05-src-R6">R6 — lab run, step <code>forensic</code>: <code>forensic.out</code>, <code>forensic.log</code> (built with <code>-DF405_READ_WITHOUT_WRITE_FLAG</code>; exit code 3 expected).</li>
+</ol>
+
+<h2 id="F4-05-glossary">Glossary links</h2>
+<p><a href="#gl-dma-direct-memory-access">DMA (direct memory access)</a> · <a href="#gl-virtio">virtio</a> · <a href="#gl-virtqueue">virtqueue</a> · <a href="#gl-descriptor-virtio">Descriptor (virtio)</a> · <a href="#gl-feature-negotiation">Feature negotiation</a> · <a href="#gl-device-status-virtio">Device status (virtio)</a> · <a href="#gl-notification-virtio">Notification (virtio)</a> · <a href="#gl-bus-mastering">Bus mastering</a> · <a href="#gl-capability-list-pci">Capability list (PCI)</a></p>
+
+<h2 id="F4-05-next">Next chapter</h2>
+<p>Next: <a href="#F4-06">F4-06 AHCI SATA</a>. Previous: <a href="#F4-04">F4-04 RTC and wall-clock time</a>. Back to the course: <a href="#DR301">DR301</a>. Related: <a href="#F4-02">F4-02 PCI enumeration</a>, <a href="#F1-50">F1-50</a> and <a href="#F1-52">F1-52</a> (queues and rings from the hardware side), <a href="#F3-31">F3-31</a> to <a href="#F3-33">F3-33</a> (block cache, FAT32, ext2), <a href="#DR302">DR302</a> (MSI-X and the IOMMU, milestone C7). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackC">Track C</a> (milestone C4).</p>
+
+<h2 id="F4-05-answers">Answers to Check yourself</h2>
+<ol>
+<li>Capability ID 0x09 (vendor-specific); types 1 common configuration, 2 notifications, 3 ISR status, 4 device-specific configuration.</li>
+<li>The device may not support the subset the driver chose; it shows refusal by leaving FEATURES_OK clear. Without the read-back, the driver would continue with a device that has not agreed.</li>
+<li>Descriptor table (driver), available ring (driver), used ring (device).</li>
+<li>The device may read the ring as soon as it sees the new <code>idx</code>; if the entry came later, it would read an old head and process the wrong request.</li>
+<li>Header at its address, 16 bytes, flags NEXT, contents <code>{1, 0, 56}</code> (block 7 × 8 = sector 56); data 0x200000, 4096 bytes, flags NEXT (no WRITE: the device reads it); status byte, 1 byte, flags WRITE.</li>
+<li>4: the counters are 16-bit and free-running; 3 − 65535 = 4 modulo 65536 (65535 → 0, 1, 2, 3).</li>
+<li>All of <code>virtio.cc</code> (init with the console's wanted features, <code>setup_queue</code>, the ring operations); the receive posting and send patterns of <code>virtio_net.cc</code> carry over with a different header (or none).</li>
+<li>A device writes status for the request it understood, which may not be the request you meant: wrong sector, missing WRITE flag, wrong buffer address. Only checking the data (in the kernel and on the host image) shows that the right bytes went to the right place.</li>
+<li>Only VERSION_1 (and nothing else for the block device): the driver never uses the queue-reset feature, and a device must work without any optional feature the driver did not accept.</li>
+</ol>
+<h3 id="F4-05-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>The trace shows every request completed with status 0 (8000 completion events for 8000 operations), and the kernel saw status 0 too (0 errors); but nearly every read fails the content check: 1999 of 2000 at depth 1 and most of the depth-32 reads, and the run fails (exit code 3).</li>
+<li>Write requests never needed the WRITE flag on the data descriptor (the device reads that buffer), so writes are unchanged; only reads require the device to write into the buffer, and without the flag that buffer is device-readable only.</li>
+<li>The buffer still holds what the slot held before: the pattern of the last block written through that slot. The device did not overwrite it. (A likely mechanism in QEMU is that it sees no device-writable data buffer, so it transfers zero bytes and still completes with status 0; this is inferred from the evidence, not checked in QEMU's source.)</li>
+<li>At depth 1 every request uses slot 0. The first read happened before slot 0 had ever been used for a write, so its buffer was still the zero-filled static memory, and the block expected was never written (zero): the check passed by accident.</li>
+<li>From the device's point of view the request was well formed: it read nothing into a buffer it was not allowed to write, which is not an error. The used element's <code>len</code> field should have shown it: for a correct read it counts the bytes written into device-writable buffers, 4097 (data + status); here only the status byte was writable, so it should be 1. The lab does not print <code>len</code>, so this is a prediction to check (lab step: print it). A driver that compares <code>len</code> with the expected length notices.</li>
+<li>Any test that reads data back and compares it, like the chapter's random test; Tomás's test checked writes and statuses only. The used ring's <code>len</code> field should reveal it without any content check (a prediction: the lab does not print it).</li>
+</ol>

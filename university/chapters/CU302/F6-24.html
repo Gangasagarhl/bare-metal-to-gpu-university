@@ -1,0 +1,298 @@
+<!--meta
+id: F6-24
+title: Double buffering and asynchronous copies to shared memory
+course: CU302
+level: L3–L4
+prereqs: F6-23; F6-22; F6-20; F6-12 (barriers)
+time: 10–14 hours including the lab and the forensic lab
+hardware: none for the CPU-emulator test, the timeline model, the PTX/SASS reading and the forensic lab (g++ 13.3, nvcc 12.0 in the build container); asynchronous copies in hardware need an NVIDIA GPU of compute capability 8.0 or newer (the toolkit header's own condition), untested on hardware in this build
+maps: Curriculum E6 (step 5: double buffering); 13.2 topic 6 (double buffering, asynchronous copies to shared memory)
+analogy: F6 — the great kitchen hall (registered: shared memory = the table; global memory = the big pantry far away; latency hiding = while one row waits for the pantry, another row cooks); proposed for registration: two trays on the table — one being cooked from, one being filled
+-->
+
+<h2 id="F6-24-hook">Story hook</h2>
+<p>Amara's table group in <a href="#F6-23">F6-23</a> works fast: every helper holds a square of bowls and cooks sixteen or sixty-four dishes from each handful of jars. But watch the rhythm of the evening. The runners leave for the pantry; everyone waits. The jars arrive; everyone cooks; the runners stand idle. Then the runners leave again, and everyone waits again.</p>
+<p>Yusuf suggests a second tray. While the group cooks from the first tray, the runners are already on their way to fill the second. When cooking ends, the second tray is (with luck) already full, and the runners turn around to refill the first. Neither the stove nor the road should ever stand still for long.</p>
+<p>There is a new danger. With two trays, it is easy to start cooking from a tray that only looks full because nobody checked that the runners are back. A tray of last round's jars looks exactly like a tray of this round's jars. This chapter builds the two-tray kitchen with the GPU's asynchronous copies, models how much it can gain, and shows on the university's emulator what happens when someone skips the check.</p>
+
+<h2 id="F6-24-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> double buffering as software pipelining: the load of tile t + 1 overlaps the computation of tile t, and predict its best-case gain with a timeline model.</li>
+<li><b>Write</b> a double-buffered SGEMM with <code>__pipeline_memcpy_async</code>, <code>__pipeline_commit</code> and <code>__pipeline_wait_prior</code>, with the waits and barriers in the right places.</li>
+<li><b>Read</b> the PTX (<code>cp.async</code>, <code>commit_group</code>, <code>wait_group</code>) and SASS (<code>LDGSTS</code>, <code>LDGDEPBAR</code>, <code>DEPBAR</code>) of an asynchronous-copy kernel, and recognise the fallback for older targets.</li>
+<li><b>Account</b> for the cost: twice the shared memory, more registers, lower occupancy.</li>
+<li><b>Diagnose</b> a missing wait from a test log in which only some shapes fail.</li>
+</ul>
+
+<div class="co jargon" id="F6-24-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Double buffering</dt><dd><b>Simple words:</b> using two buffers so that one can be filled while the other is used. <b>Analogy:</b> two trays: cook from one while the runners fill the other. <b>Precise:</b> a scheme with two shared-memory stages per operand; in iteration t the kernel computes from stage t mod 2 while the copies for tile t + 1 fill stage (t + 1) mod 2. <sup class="src"><a href="#F6-24-src-D2">D2</a></sup> <sup class="src"><a href="#F6-24-src-D5">D5</a></sup></dd>
+<dt>Software pipelining</dt><dd><b>Simple words:</b> starting the next piece of work before the current one is finished, so that different stages overlap. <b>Analogy:</b> runners already on the road while the cooks cook. <b>Precise:</b> restructuring a loop so that operations of iteration t + 1 (here, its loads) are issued during iteration t; with S stages, up to S − 1 tiles are in flight. <sup class="src"><a href="#F6-24-src-D5">D5</a></sup></dd>
+<dt>Asynchronous copy (cp.async)</dt><dd><b>Simple words:</b> a copy from global memory straight into shared memory that the thread starts and does not wait for. <b>Analogy:</b> sending a runner without standing at the door until she is back. <b>Precise:</b> the PTX instruction family <code>cp.async</code>, exposed in CUDA C++ through <code>__pipeline_memcpy_async(dst_shared, src_global, size)</code> with sizes 4, 8 or 16 bytes (header <code>cuda_pipeline_primitives.h</code> of CUDA 12.0); the data does not pass through the thread's registers. <sup class="src"><a href="#F6-24-src-H1">H1</a></sup> <sup class="src"><a href="#F6-24-src-D4">D4</a></sup></dd>
+<dt>Commit group</dt><dd><b>Simple words:</b> a bundle of copies that you will later wait for together. <b>Analogy:</b> all the runners sent out for one tray. <b>Precise:</b> <code>__pipeline_commit()</code> closes the copies issued since the previous commit into one group (PTX <code>cp.async.commit_group</code>); groups complete in order. <sup class="src"><a href="#F6-24-src-H1">H1</a></sup> <sup class="src"><a href="#F6-24-src-D4">D4</a></sup></dd>
+<dt>Wait prior</dt><dd><b>Simple words:</b> wait until all bundles except the newest N have arrived. <b>Analogy:</b> "I can cook as soon as every runner except the ones for the next tray is back." <b>Precise:</b> <code>__pipeline_wait_prior(N)</code> (PTX <code>cp.async.wait_group N</code>) blocks the calling thread until at most N of its most recent committed groups are still pending; it covers only the calling thread's own copies, so a block-wide barrier must follow before other threads read the data. <sup class="src"><a href="#F6-24-src-H1">H1</a></sup> <sup class="src"><a href="#F6-24-src-D4">D4</a></sup> <sup class="src"><a href="#F6-24-src-D1">D1</a></sup></dd>
+<dt>Stage</dt><dd><b>Simple words:</b> one of the buffers in the pipeline. <b>Analogy:</b> one tray. <b>Precise:</b> one set of shared-memory tiles (here <code>As[s]</code> and <code>Bs[s]</code>, s ∈ {0, 1}); a kernel with S stages needs S times the shared memory of a single-buffered one. <sup class="src"><a href="#F6-24-src-R3">R3</a></sup></dd>
+</dl></div>
+<p>Terms from earlier chapters: <a href="#gl-latency-hiding">latency hiding</a>, <a href="#gl-occupancy">occupancy</a> and <a href="#gl-little-s-law">Little's law</a> (F6-20); <a href="#gl-register-tiling">register tiling</a> (F6-23).</p>
+
+<h2 id="F6-24-pictures">The idea in pictures</h2>
+<p>Figure 1 compares one block's timeline with one buffer and with two, using the timeline model of Listing 4. With one buffer, load and compute alternate. With two, the copy for the next tile is issued before the current tile is computed, so the longer of the two activities sets the pace.</p>
+<figure id="F6-24-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 240" role="img" aria-labelledby="F6-24-f1t F6-24-f1d">
+<title id="F6-24-f1t">Figure 1: single-buffered versus double-buffered timeline of one block</title>
+<desc id="F6-24-f1d">Two timelines. The upper one, "single buffer", alternates boxes: load tile 0, compute tile 0, load tile 1, compute tile 1, load tile 2, compute tile 2, in one row, with nothing overlapping. The lower one, "double buffer", has two rows: the copy row shows load 0, then load 1 starting when compute 0 starts, load 2 starting when compute 1 starts; the compute row shows compute 0 after load 0, compute 1 after load 1 has arrived, compute 2 after load 2. The lower timeline ends earlier. A note: when load time equals compute time the model gives nearly 2 times; when one dominates, the gain is smaller. Not to scale; times are model inputs, not GPU measurements.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="240"/>
+<text class="sv-tb" x="10" y="20">single buffer: load, wait, compute, repeat</text>
+<rect class="sv-b2" x="20" y="30" width="100" height="24"/><text class="sv-ts" x="26" y="47">load 0</text>
+<rect class="sv-b3" x="120" y="30" width="80" height="24"/><text class="sv-ts" x="126" y="47">compute 0</text>
+<rect class="sv-b2" x="200" y="30" width="100" height="24"/><text class="sv-ts" x="206" y="47">load 1</text>
+<rect class="sv-b3" x="300" y="30" width="80" height="24"/><text class="sv-ts" x="306" y="47">compute 1</text>
+<rect class="sv-b2" x="380" y="30" width="100" height="24"/><text class="sv-ts" x="386" y="47">load 2</text>
+<rect class="sv-b3" x="480" y="30" width="80" height="24"/><text class="sv-ts" x="486" y="47">compute 2</text>
+<line class="sv-dash" x1="560" y1="26" x2="560" y2="60"/><text class="sv-ts" x="566" y="47">end</text>
+<text class="sv-tb" x="10" y="92">double buffer: copy of tile t + 1 issued before computing tile t</text>
+<text class="sv-ts" x="10" y="118">copies</text><text class="sv-ts" x="10" y="152">compute</text>
+<rect class="sv-b2" x="70" y="104" width="100" height="24"/><text class="sv-ts" x="76" y="121">load 0 (stage 0)</text>
+<rect class="sv-b2" x="170" y="104" width="100" height="24"/><text class="sv-ts" x="176" y="121">load 1 (stage 1)</text>
+<rect class="sv-b2" x="270" y="104" width="100" height="24"/><text class="sv-ts" x="276" y="121">load 2 (stage 0)</text>
+<rect class="sv-b3" x="170" y="138" width="80" height="24"/><text class="sv-ts" x="176" y="155">compute 0</text>
+<rect class="sv-b3" x="270" y="138" width="80" height="24"/><text class="sv-ts" x="276" y="155">compute 1</text>
+<rect class="sv-b3" x="370" y="138" width="80" height="24"/><text class="sv-ts" x="376" y="155">compute 2</text>
+<line class="sv-dash" x1="450" y1="100" x2="450" y2="168"/><text class="sv-ts" x="456" y="155">end</text>
+<line class="sv-line" x1="20" y1="190" x2="740" y2="190"/><polygon class="sv-head" points="740,185 750,190 740,195"/><text class="sv-ts" x="690" y="184">time</text>
+<text class="sv-ts" x="20" y="212">Each compute waits for its own tile; a stage is refilled only after the compute that read it has finished (second barrier).</text>
+<text class="sv-ts" x="20" y="230">Not to scale. Load and compute durations are model inputs (Listing 4), not GPU measurements.</text>
+</svg></div><figcaption><b>Figure 1.</b> One block, single versus double buffering, in the timeline model of Listing 4. Other blocks on the same SM also hide latency in reality; the model ignores them on purpose. <sup class="src"><a href="#F6-24-src-R4">R4</a></sup></figcaption></figure>
+<p>Figure 2 shows how the two stages and the commit groups line up in iteration t. The wait leaves exactly one group pending: the one just committed for tile t + 1.</p>
+<figure id="F6-24-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 210" role="img" aria-labelledby="F6-24-f2t F6-24-f2d">
+<title id="F6-24-f2t">Figure 2: stages, commit groups and the wait in iteration t</title>
+<desc id="F6-24-f2d">A row of committed groups from left to right: group for tile t minus 1 (complete), group for tile t (must be complete), group for tile t plus 1 (just committed, may be pending). Below them two shared-memory stages: stage t mod 2 is read by the compute of iteration t; stage (t+1) mod 2 is being filled by the asynchronous copies of tile t plus 1. Four steps of iteration t are listed: 1 issue copies of tile t+1 into the other stage; 2 commit them as a group; 3 wait_prior(1): all my groups except the newest are complete; then __syncthreads(): everybody's copies are complete; 4 compute from stage t mod 2, then __syncthreads() so the stage can be refilled in iteration t+1.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="210"/>
+<text class="sv-tb" x="20" y="20">committed groups of one thread (oldest left)</text>
+<rect class="sv-b1" x="20" y="30" width="150" height="26"/><text class="sv-ts" x="28" y="48">tile t − 1: complete</text>
+<rect class="sv-b3" x="180" y="30" width="170" height="26"/><text class="sv-ts" x="188" y="48">tile t: must be complete</text>
+<rect class="sv-b2" x="360" y="30" width="200" height="26"/><text class="sv-ts" x="368" y="48">tile t + 1: may be pending</text>
+<text class="sv-ts" x="570" y="48">← wait_prior(1) allows one</text>
+<rect class="sv-b3" x="60" y="90" width="200" height="40"/><text class="sv-t" x="70" y="115">stage t mod 2: read</text>
+<rect class="sv-b2" x="320" y="90" width="230" height="40"/><text class="sv-t" x="330" y="115">stage (t + 1) mod 2: filling</text>
+<line class="sv-line" x1="265" y1="56" x2="160" y2="88"/><polygon class="sv-head" points="158,82 154,92 164,88"/>
+<line class="sv-line" x1="460" y1="56" x2="435" y2="88"/><polygon class="sv-head" points="430,84 433,93 440,86"/>
+<text class="sv-ts" x="20" y="156">1 issue copies of tile t + 1 into the other stage   2 commit them as one group</text>
+<text class="sv-ts" x="20" y="174">3 wait_prior(1) — my copies of tile t are done; __syncthreads() — everybody's are</text>
+<text class="sv-ts" x="20" y="192">4 compute from stage t mod 2; __syncthreads() — nobody reads it any more, so iteration t + 1 may refill it</text>
+</svg></div><figcaption><b>Figure 2.</b> The order of operations in one iteration of Listing 1. The semantics of commit and wait are those of the toolkit header and the PTX instructions it emits. <sup class="src"><a href="#F6-24-src-H1">H1</a></sup> <sup class="src"><a href="#F6-24-src-D4">D4</a></sup></figcaption></figure>
+
+<h2 id="F6-24-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Stage = a tray on the table; double buffering = two trays; asynchronous copy = sending the runners and not waiting at the door; commit = "these runners belong to the next tray"; wait = "are the runners for this tray back?"; barrier = "is everybody's part of the tray here?"</p></div>
+<p>With one tray, the kitchen either cooks or waits for jars. With two trays, the runners fill one tray while the cooks use the other. If cooking and fetching take the same time, the evening can take about half as long. If one of them takes much longer, the longer one decides, and the second tray helps less.</p>
+<p>Two checks keep it safe. Before cooking, everyone checks that the runners for <i>this</i> tray are back. After cooking, everyone checks that everybody has finished with the tray before the runners refill it. A tray from last round looks just like a full tray, so skipping the first check gives wrong dishes, quietly.</p>
+
+<h2 id="F6-24-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-24-l2-structure">The loop, restructured</h3>
+<p>Listing 1 keeps F6-23's register tiling and changes only how the tiles get into shared memory. Before the loop, it issues the copies for tile 0 into stage 0 and commits them. In iteration t it issues the copies for tile t + 1 into stage (t + 1) mod 2 (when there is a tile t + 1), commits them (an empty group on the last iteration keeps the counting uniform), waits until all of its groups except the newest have completed, synchronises the block, computes from stage t mod 2 exactly as F6-23 did, and synchronises again. <sup class="src"><a href="#F6-24-src-D5">D5</a></sup> <sup class="src"><a href="#F6-24-src-H1">H1</a></sup></p>
+<p>The copies are 16 bytes each: <code>__pipeline_memcpy_async(&amp;As[stage][m][k], &amp;A[r * K + c], 16)</code>. The header asserts that the size is 4, 8 or 16 bytes and that both addresses are aligned to that size, and that the destination is shared and the source global. <sup class="src"><a href="#F6-24-src-H1">H1</a></sup> Hence the same rule as F6-23's <code>float4</code> loads: K and N must be multiples of 4, and the launcher falls back to F6-23's scalar kernel otherwise.</p>
+<h3 id="F6-24-l2-layout">A layout consequence</h3>
+<p>An asynchronous copy moves bytes as they are; it cannot transpose. F6-23 stored A transposed (<code>As[k][m]</code>) by splitting each <code>float4</code> into four scalar stores. Listing 1 stores A as it is in memory (<code>As[s][m][k]</code>), 16 bytes at a time, and reads a thread's A values with index <code>[tRow * TM + i][k]</code>. Does that cost shared-memory instructions? The SASS answers: the compute part of the 64 × 64 / 4 × 4 kernel has 128 <code>FFMA</code> and 16 <code>LDS.128</code> in both versions — the compiler reads each thread's eight consecutive k values of a row with two 16-byte loads instead. <sup class="src"><a href="#F6-24-src-R6">R6</a></sup> (The same listing contains 72 lines <code>@!PT LDS RZ, [RZ]</code>: <code>PT</code> is the always-true predicate, so <code>@!PT</code> instructions never execute; they are not loads, and the count excludes them.)</p>
+<h3 id="F6-24-l2-model">How much can it gain?</h3>
+<p>Listing 4 models one block with T tiles, a load time L and a compute time C per tile (model inputs, not GPU measurements). Single buffering takes T(L + C). Double buffering takes L + T·C when compute dominates and T·L + C when loads dominate, i.e. about T·max(L, C). The speed-up is (L + C) ÷ max(L, C) for large T: at most 2, reached when L = C. The run prints 1.25 for L = 400, C = 100 and for L = 100, C = 400, 2.00 for L = C = 400, and 1.40 for L = 400, C = 1,000. <sup class="src"><a href="#F6-24-src-R4">R4</a></sup> In a real SM, other resident blocks already overlap one block's loads with another block's compute; double buffering adds overlap <i>inside</i> a block, which matters most when few blocks are resident — exactly the situation that register tiling created (25–37.5 % theoretical occupancy in F6-23).</p>
+
+<h2 id="F6-24-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F6-24-l3-semantics">What the primitives compile to</h3>
+<p>The CUDA 12.0 header <code>cuda_pipeline_helpers.h</code>, read in this build, defines the hardware path only when <code>__CUDA_ARCH__ &gt;= 800</code>; there, a 16-byte copy emits <code>cp.async.cg.shared.global</code>, a 4- or 8-byte copy emits <code>cp.async.ca.shared.global</code>, <code>__pipeline_commit()</code> emits <code>cp.async.commit_group</code>, and <code>__pipeline_wait_prior(N)</code> emits <code>cp.async.wait_group N</code> (N capped at a default maximum of 8 stages). <sup class="src"><a href="#F6-24-src-H1">H1</a></sup> For older targets the header selects another implementation without these instructions. The PTX of Listing 1 for <code>sm_80</code> contains 24 <code>cp.async.cg.shared.global</code>, 2 <code>cp.async.commit_group</code>, 1 <code>cp.async.wait_group</code> and 2 <code>bar.sync</code>. <sup class="src"><a href="#F6-24-src-R5">R5</a></sup> The SASS for <code>sm_80</code> shows the copies as 24 <code>LDGSTS.E.BYPASS.128</code>, the commits as 2 <code>LDGDEPBAR</code> and the wait as 1 <code>DEPBAR.LE</code>; the SASS for <code>sm_75</code> of the same source has no such instructions: 24 <code>LDG.E.128.SYS</code> and 48 <code>STS.128</code>, i.e. ordinary loads into registers and stores to shared memory. <sup class="src"><a href="#F6-24-src-R5">R5</a></sup> The code is correct on both; only the newer target gets the asynchronous hardware path. Reading the SASS is the only way to be sure which you got.</p>
+<p>What <code>.cg</code> and <code>.ca</code> mean for caching, and exactly what <code>BYPASS</code> denotes in the SASS mnemonic, are defined in the PTX ISA's <code>cp.async</code> section and the SASS instruction reference; this build could not open them (unverified box below).</p>
+<h3 id="F6-24-l3-correctness">The correctness argument</h3>
+<p>In iteration t, a thread has committed groups for tiles 0 … t + 1 (the last one possibly empty). <code>wait_prior(1)</code> returns when at most the newest group (tile t + 1) is pending, so all of this thread's copies for tile t are complete. <sup class="src"><a href="#F6-24-src-H1">H1</a></sup> Other threads copied other parts of the tile; the first <code>__syncthreads()</code> makes sure each of them has passed its own wait and makes their writes visible. <sup class="src"><a href="#F6-24-src-D1">D1</a></sup> After the compute, the second <code>__syncthreads()</code> guarantees that nobody still reads stage t mod 2 when iteration t + 1 issues copies of tile t + 2 into it. Zero-filled edge elements are written with ordinary stores in <code>loadTile</code>, which the first barrier also orders. The header also offers a <code>zfill</code> argument that copies fewer source bytes and fills the rest with zeros (it is the fourth parameter of <code>__pipeline_memcpy_async</code> in CUDA 12.0); Listing 1 does not use it, so the edge rule is visible in the source. <sup class="src"><a href="#F6-24-src-H1">H1</a></sup></p>
+<h3 id="F6-24-l3-emulator">Testing an asynchronous copy without a GPU</h3>
+<p>A missing wait is a race: on a GPU the copy usually lands before a few hundred FMAs finish, so a test can pass for a long time. The university's emulator (<code>cuda_shim.hpp</code> of F6-21) is deliberately pessimistic: each <code>__pipeline_memcpy_async</code> is queued and performed only when the thread waits for its group (or ends), the latest moment the primitives allow. A kernel that reads a stage before waiting therefore reads stale data every time, deterministically. <sup class="src"><a href="#F6-24-src-R1">R1</a></sup> This is a model of the specification's worst case, not of any GPU's timing.</p>
+<h3 id="F6-24-l3-cost">The cost side</h3>
+<p>Two stages double the shared memory: 8,192 bytes for 64 × 64 (against 4,096) and 16,384 for 128 × 128 (against 8,192). The compiler report gives 72 registers for the 64 × 64 double-buffered kernel (78 for F6-23's vector version) and 143 for 128 × 128 (124 before). <sup class="src"><a href="#F6-24-src-R3">R3</a></sup> On F6-20's example device that is 37.5 % and 12.5 % theoretical occupancy (F6-23's Listing 4). <sup class="src"><a href="#F6-24-src-R7">R7</a></sup> Deeper pipelines (three or four stages) are common in library kernels and cost proportionally more shared memory; the CUTLASS designs of <a href="#F6-27">F6-27</a> make the stage count a parameter. <sup class="src"><a href="#F6-24-src-D5">D5</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>(1) The caching behaviour of <code>cp.async.cg</code> versus <code>cp.async.ca</code>, and whether the hardware performs the copy without using registers, are stated in the PTX ISA (<code>cp.async</code>) and the CUDA C++ Programming Guide (asynchronous data copies); not opened in this build. (2) The meaning of the SASS suffixes <code>BYPASS</code>, <code>.SYS</code> and of <code>LDGDEPBAR</code> / <code>DEPBAR.LE</code> is inferred here from their position next to the PTX they replace; check the CUDA Binary Utilities instruction reference. (3) Newer GPUs add further copy mechanisms (for example a tensor memory accelerator); this chapter does not cover them, and their names and requirements must be taken from the Programming Guide for your toolkit.</p></div>
+
+<h2 id="F6-24-hardware">How the hardware actually does it</h2>
+<p>Without asynchronous copies, moving a value from global to shared memory takes two instructions per thread: a global load into a register, then a shared store from that register, and the store cannot issue until the load's data has arrived — so the warp stalls there unless the compiler moves the load far ahead (which needs registers to hold the data in flight). <sup class="src"><a href="#F6-24-src-D1">D1</a></sup> The <code>sm_75</code> SASS shows exactly this pair: <code>LDG.E.128</code> then <code>STS.128</code>. <sup class="src"><a href="#F6-24-src-R5">R5</a></sup> With <code>cp.async</code>, one instruction (<code>LDGSTS</code> in the <code>sm_80</code> SASS) names both the global source and the shared destination, and the thread continues; the memory system writes shared memory when the data arrives, and a dependency barrier (<code>DEPBAR</code>) is what the thread waits on. <sup class="src"><a href="#F6-24-src-R5">R5</a></sup> <sup class="src"><a href="#F6-24-src-D4">D4</a></sup> That is why double buffering became cheap on these GPUs: the prefetched data occupies shared memory, which is already allocated as a stage, instead of registers, which register tiling has already used up.</p>
+
+<h2 id="F6-24-worked">Worked example</h2>
+<p><b>Task.</b> A block of the 128 × 128 / 8 × 8 kernel at K = 4,096 runs 512 tiles. Suppose (as model inputs) one tile's copies take L = 400 cycles to arrive and its compute takes C = 400 cycles. Compute the single- and double-buffered times, the speed-up, and what changes if C = 1,000.</p>
+<ol>
+<li>Tiles: 4,096 ÷ 8 = 512.</li>
+<li>Single: 512 × (400 + 400) = 409,600 cycles.</li>
+<li>Double: the model gives L·T + C = 400 × 512 + 400 = 205,200 cycles; speed-up 409,600 ÷ 205,200 = 1.996, printed as 2.00. <sup class="src"><a href="#F6-24-src-R4">R4</a></sup></li>
+<li>C = 1,000: single 512 × 1,400 = 716,800; double L + T·C = 400 + 512,000 = 512,400; speed-up 1.40. <sup class="src"><a href="#F6-24-src-R4">R4</a></sup></li>
+<li>Interpretation: the compute-bound case gains only the hidden load time. Real L and C come from your GPU: C from the FFMA count per tile and the issue rate, L from the profiler's memory latency. Write your estimates here: L = ______, C = ______, predicted gain ______; then compare with the measured step.</li>
+</ol>
+
+<h2 id="F6-24-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>gemm_dbuf.cuh</code>: the double-buffered kernel and its launcher.</p>
+<pre class="listing" data-src="F6-24/gemm_dbuf.cuh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–13</td><td><code>As[2][BM][BK]</code>, <code>Bs[2][BK][BN]</code></td><td>Two stages per operand; A not transposed.</td><td>Twice F6-23's shared memory; the copy cannot transpose.</td></tr>
+<tr><td>20–39</td><td><code>loadTile(stage, k0)</code></td><td>Issues 16-byte asynchronous copies; zero-fills edges with ordinary stores.</td><td>Does not wait: the point of the whole chapter.</td></tr>
+<tr><td>25, 34</td><td><code>__pipeline_memcpy_async(..., 16)</code></td><td>One <code>cp.async</code> per <code>float4</code>.</td><td>Size and alignment must be 16 (header assertions).</td></tr>
+<tr><td>42–44</td><td>prologue</td><td>Copies for tile 0, committed.</td><td>The pipeline needs one tile in flight before the loop.</td></tr>
+<tr><td>46–47</td><td>prefetch tile t + 1</td><td>Fills the other stage.</td><td>Overlaps the next load with this compute.</td></tr>
+<tr><td>49</td><td><code>__pipeline_commit()</code></td><td>Closes the group (possibly empty).</td><td>Keeps "newest group = tile t + 1" true on the last iteration too.</td></tr>
+<tr><td>50</td><td><code>__pipeline_wait_prior(1)</code></td><td>This thread's tile-t copies are done.</td><td>The line the forensic lab's kernel lacks.</td></tr>
+<tr><td>51</td><td><code>__syncthreads()</code></td><td>Everybody's copies are done and visible.</td><td>The wait covers only the calling thread.</td></tr>
+<tr><td>52–71</td><td>compute from stage <code>t % 2</code></td><td>F6-23's outer products.</td><td>Unchanged arithmetic: 128 or 512 FFMA per tile per thread.</td></tr>
+<tr><td>72</td><td><code>__syncthreads()</code></td><td>Stage free.</td><td>Iteration t + 1 refills this stage.</td></tr>
+<tr><td>86–96</td><td><code>launchDoubleBuffer</code></td><td>Falls back to the scalar F6-23 kernel when K or N is not a multiple of 4.</td><td>16-byte copies need 16-byte aligned rows.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>sgemm_dbuf.cu</code>: E6 step 5 in the harness, next to the best F6-23 kernels.</p>
+<pre class="listing" data-src="F6-24/sgemm_dbuf.cu"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>5</td><td><code>#include &lt;cuda_pipeline.h&gt;</code></td><td>The pipeline primitives.</td><td>The header chooses the asynchronous or fallback path by target.</td></tr>
+<tr><td>6–10</td><td>harness, F6-23 kernels, this kernel</td><td>Reuse.</td><td>The step table compares like with like.</td></tr>
+<tr><td>20–29</td><td><code>runE6({...})</code></td><td>Four variants.</td><td>The speed table's step 5 next to step 4.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F6-24/sgemm_dbuf"></pre>
+<pre class="output" data-run="F6-24/build_sm80"></pre>
+<p><b>Listing 3</b> — <code>check_dbuf.cpp</code>: the kernel on the emulator, whose copies land at the latest allowed moment.</p>
+<pre class="listing" data-src="F6-24/check_dbuf.cpp"></pre>
+<pre class="output" data-run="F6-24/check_dbuf"></pre>
+<p>Shapes 64³ and 96 × 132 × 36 run the asynchronous kernel; the others (N or K not a multiple of 4) run the fallback, which is also tested.</p>
+<p><b>Listing 4</b> — <code>pipeline_sim.cpp</code>: the timeline model behind Figure 1, with its input file.</p>
+<pre class="listing" data-src="F6-24/pipeline_sim.cpp"></pre>
+<pre class="listing" data-src="F6-24/pipeline_sim.in"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17</td><td><code>single = tiles * (load + compute)</code></td><td>No overlap.</td><td>The F6-23 kernel's structure.</td></tr>
+<tr><td>18–25</td><td>the loop</td><td>Wait for tile i, issue tile i + 1, compute tile i.</td><td>Exactly the order of Listing 1.</td></tr>
+<tr><td>26–27</td><td>print</td><td>Times and ratio.</td><td>Model cycles, never GPU cycles.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F6-24/pipeline_sim"></pre>
+<p>The compiler's view (<code>sm_80</code>, and <code>sm_75</code> for comparison; compiled only). <sup class="src"><a href="#F6-24-src-R3">R3</a></sup> <sup class="src"><a href="#F6-24-src-R5">R5</a></sup> <sup class="src"><a href="#F6-24-src-R6">R6</a></sup></p>
+<pre class="output" data-run="F6-24/resources"></pre>
+<pre class="output" data-run="F6-24/ptx_async"></pre>
+<pre class="output" data-run="F6-24/sass_async"></pre>
+<pre class="output" data-run="F6-24/sass_mix"></pre>
+
+<h2 id="F6-24-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A tray in the kitchen is filled by a few runners; a shared-memory stage is filled by every thread of the block, each copying its own 16-byte pieces, and each thread can only wait for its own copies. "Is the tray full?" therefore needs two steps on a GPU: each thread's wait, then the block barrier.</li>
+<li>The story suggests the runners are separate people. The copies are started by the same threads that compute; what is separate is the hardware that completes them while the threads continue.</li>
+<li>Two trays at most halve the evening in the story. On a GPU other resident blocks may already overlap loads and compute, so the measured gain of double buffering can be much smaller than the model's single-block prediction — or larger, if it lets a low-occupancy kernel keep its loads in flight.</li>
+</ul>
+
+<h2 id="F6-24-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Missing wait.</b> Symptom: some shapes wrong, others right (the forensic lab); on a GPU, results that depend on timing. Find it: the emulator, which lands copies at the latest moment; on a GPU, Compute Sanitizer's racecheck (D6). Fix: <code>__pipeline_wait_prior</code> before the barrier.</li>
+<li><b>Wait without barrier.</b> Symptom: rare wrong results. Cause: a thread reads elements copied by another thread whose copies are not complete. Fix: <code>__syncthreads()</code> after the wait.</li>
+<li><b>Wrong count in <code>wait_prior</code>.</b> Symptom: <code>wait_prior(2)</code> with two stages lets tile t be pending. Rule: with S stages, one group per tile, and the newest tile issued before the wait, use <code>wait_prior(S - 1)</code>.</li>
+<li><b>Skipping the empty commit.</b> Symptom: last tile wrong. Cause: on the last iteration no group is committed, so "all but the newest" excludes tile t itself. Fix: commit unconditionally.</li>
+<li><b>Built for an old target.</b> Symptom: correct but no gain. Find it: no <code>LDGSTS</code> in the SASS (compare the <code>sm_75</code> output above). Fix: build for your GPU's architecture.</li>
+<li><b>Misaligned 16-byte copies.</b> Symptom: an error on the GPU (the header asserts alignment in debug builds). Fix: the launcher's fallback or padded rows.</li>
+</ul>
+
+<div class="co transition" id="F6-24-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-23">F6-23</a> made each thread compute an outer product per k, which raised registers and lowered occupancy; <a href="#F6-20">F6-20</a> showed that latency is hidden by independent work in flight. <b>What carries over:</b> the block and thread tiles, the arithmetic, the edge rules, the harness and the emulator. <sup class="src"><a href="#F6-24-src-R1">R1</a></sup> <b>What changes:</b> loads become asynchronous, so correctness now depends on explicit waits plus barriers, with no compiler error when one is missing; shared memory doubles; the hardware path exists only for newer targets, so the SASS must be checked. <sup class="src"><a href="#F6-24-src-H1">H1</a></sup> <sup class="src"><a href="#F6-24-src-R5">R5</a></sup> <b>What comes next:</b> <a href="#F6-25">F6-25</a> changes the numbers themselves: narrower formats (TF32, FP16, BF16, FP8) and the tolerances that make tests of such kernels honest, before <a href="#F6-26">F6-26</a> feeds them to tensor cores.</p></div>
+
+<h2 id="F6-24-check">Check yourself</h2>
+<ol>
+<li>In iteration t of Listing 1, which groups has a thread committed, and which of them may still be pending after <code>__pipeline_wait_prior(1)</code>?</li>
+<li>Explain in your own words why the wait alone is not enough and a <code>__syncthreads()</code> must follow it.</li>
+<li>Which statement is correct? (a) Double buffering halves the run time of any kernel. (b) Double buffering overlaps the next tile's loads with this tile's compute and costs a second stage of shared memory. (c) <code>cp.async</code> transposes data while copying. (d) Building for <code>sm_75</code> makes Listing 1 incorrect.</li>
+<li>Predict, then check in <code>sass_async.out</code>: what replaces <code>LDGSTS</code> when the same source is compiled for <code>sm_75</code>?</li>
+<li>Apply it to a new case: a three-stage pipeline. Which argument do you pass to <code>__pipeline_wait_prior</code>, how many tiles are in flight, and how much shared memory does the 64 × 64 kernel need?</li>
+<li>Use the model: L = 300, C = 600, T = 100. Compute the single and double times and the speed-up, and say which is the bottleneck.</li>
+<li>Why does the last iteration commit an empty group?</li>
+<li>Why does the 128 × 128 double-buffered kernel have a lower theoretical occupancy than F6-23's version on the example device?</li>
+</ol>
+
+<h2 id="F6-24-lab">Lab</h2>
+<p><b>Goal.</b> Add the double-buffering step to your E6 speed table and test whether the measured gain matches your model's prediction. E6: "Steps logged with a speed table: … vectorized loads; double buffering; tuned tile sizes per GPU; edge handling", with register usage and occupancy per step. <sup class="src"><a href="#F6-24-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–3: none (this build: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>Cuda compilation tools, release 12.0, V12.0.140</code>). Steps 4–6: an NVIDIA GPU of compute capability 8.0 or newer for the asynchronous path (older GPUs run the fallback), CUDA Toolkit and cuBLAS recorded in your dossier. <b>Safety:</b> none beyond normal computer use.</p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-24</code>; confirm "all shapes ok", the <code>cp.async</code> counts in the PTX and <code>LDGSTS</code> in the <code>sm_80</code> SASS.</li>
+<li>In a copy of Listing 1, move <code>__pipeline_wait_prior(1)</code> after the <code>__syncthreads()</code>, run the emulator test, and explain the result.</li>
+<li>Make the stage count a template parameter S (ring of S stages, prologue of S − 1 tiles, <code>wait_prior(S - 1)</code>) and test S = 3 on the emulator.</li>
+<li>On a GPU: build Listing 2 for your architecture with cuBLAS, run, and add step 5 to your table. Check the SASS of your build for <code>LDGSTS</code>.</li>
+<li>Estimate L and C for one tile from the profiler (memory latency; FFMA count ÷ issue rate) and compare the model's predicted gain with the measured one.</li>
+<li>Profile both versions: compare stall reasons ("waiting for memory" style reasons versus barrier stalls) and achieved occupancy.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: emulator passes; PTX has 24 <code>cp.async.cg.shared.global</code>, 2 commit groups, 1 wait; SASS has 24 <code>LDGSTS.E.BYPASS.128</code> for <code>sm_80</code> and none for <code>sm_75</code>; GPU runs stop with <code>cudaErrorNoDevice</code>. On a GPU (untested here): the double-buffered steps pass all shapes; whether they are faster than step 4 depends on how much latency other blocks already hid.</p>
+<p><b>Verification.</b> "ALL CHECKS PASSED" from the harness on your GPU; the emulator test passes for S = 2 and S = 3; your log contains predicted and measured gain side by side.</p>
+<p><b>Troubleshooting.</b> No <code>LDGSTS</code> in SASS → wrong <code>-arch</code>. Emulator test fails on 64³ and 96 × 132 × 36 only → those are the shapes that use the asynchronous path: check waits and commits. Build error about <code>__pipeline_memcpy_async</code> → include <code>cuda_pipeline.h</code> (Listing 2, line 5).</p>
+<p><b>Extension.</b> Use the <code>zfill</code> argument of <code>__pipeline_memcpy_async</code> for the edge elements instead of ordinary stores (check its exact semantics in the header and the Programming Guide first) and remove the scalar fallback for shapes where only the last <code>float4</code> of a row is partial.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 2 was built twice (default target; <code>sm_80</code> with cuBLAS); both runs stop with <code>cudaErrorNoDevice</code>. Correctness comes from the emulator's worst-case model of asynchronous copies; the gain figures are from a timeline model with chosen inputs. No GPU time was measured.</p></div>
+
+<h2 id="F6-24-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Ines receives a pull request from a colleague: "Removed one line that looked redundant in the double-buffered kernel; my GPU run looks fine and it should be slightly faster." CI runs the emulator test and fails. Ines has to explain the failure, and why the colleague's GPU run proves nothing.</p>
+<p><b>Evidence pack.</b> (1) The proposed kernel, <code>dbuf_fast.cuh</code>:</p>
+<pre class="listing" data-src="F6-24/dbuf_fast.cuh"></pre>
+<p>(2) CI's emulator log <sup class="src"><a href="#F6-24-src-R8">R8</a></sup>:</p>
+<pre class="output" data-run="F6-24/forensic_fast"></pre>
+<p>(The "largest error" column counts only elements inside the bound, so a row with every element outside it prints 0.000.)</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which shapes fail, how many elements, and what do the failing shapes have in common that the passing ones do not? (Hint: the launcher.)</li>
+<li>Find the line that was removed by comparing with Listing 1. State two hypotheses for the failure (for example "an indexing error introduced at the same time" and "a missing wait") and the evidence that separates them.</li>
+<li>Explain the mechanism on the emulator: which data does iteration 0 compute from?</li>
+<li>Why can the same kernel pass on a GPU? What does that say about using a GPU run as a correctness test for asynchronous code?</li>
+<li>Propose the fix and a test (or tool run) that would catch this class of bug on real hardware.</li>
+</ol>
+<p><b>Method hints.</b> Diff the two kernels; then list which shapes take the asynchronous path (K % 4 == 0 and N % 4 == 0); then trace iteration 0 with the emulator's rule "a copy lands when its thread waits".</p>
+
+<h2 id="F6-24-project">Mini-project</h2>
+<p><b>A configurable pipeline.</b> For the GEMM part of MP3, turn Listing 1 into a kernel with template parameters BM, BN, BK, TM, TN and stages S ∈ {1, 2, 3, 4} (S = 1 meaning no asynchronous copies). Test every configuration on the emulator in CI; generate the resource ledger of F6-23 for all of them; and, with GPU access, measure them and pick the best per matrix size. Record the model's prediction next to every measurement. <sup class="src"><a href="#F6-24-src-C1">C1</a></sup></p>
+<p><b>Rubric.</b> All S pass in CI (3). Ledger includes shared memory and occupancy per S (2). Prediction recorded before measurement (2). A written conclusion on when more stages stopped helping, with evidence (3).</p>
+
+<h2 id="F6-24-summary">Summary</h2>
+<ul>
+<li>Double buffering overlaps the copy of tile t + 1 with the compute of tile t, using two shared-memory stages.</li>
+<li>In the single-block timeline model the best gain is (L + C) ÷ max(L, C): 2.00 for L = C, 1.25 for a 4 : 1 imbalance.</li>
+<li><code>__pipeline_memcpy_async</code> / <code>commit</code> / <code>wait_prior</code> become <code>cp.async</code>, <code>commit_group</code>, <code>wait_group</code> in PTX and <code>LDGSTS</code>, <code>LDGDEPBAR</code>, <code>DEPBAR</code> in <code>sm_80</code> SASS; <code>sm_75</code> gets ordinary loads and stores.</li>
+<li>Correctness needs the thread's wait (<code>wait_prior(1)</code> with two stages) <i>and</i> a barrier before reading a stage, and a barrier before refilling it.</li>
+<li>Costs: twice the shared memory, 143 registers for the 128 × 128 version, 12.5 % theoretical occupancy on the example device.</li>
+<li>A missing wait is invisible to most GPU runs; the emulator lands copies at the latest legal moment and fails deterministically.</li>
+</ul>
+
+<h2 id="F6-24-sources">Sources</h2>
+<ol>
+<li id="F6-24-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): asynchronous data copies, the pipeline primitives interface, <code>__syncthreads()</code>. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F6-24-src-D2">D2 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors" (tier 3): tiling and latency tolerance. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-24-src-D4">D4 — NVIDIA, "Parallel Thread Execution ISA" (<code>cp.async</code>, <code>cp.async.commit_group</code>, <code>cp.async.wait_group</code>) and "CUDA Binary Utilities" (SASS reference) (tier 1). <i>Titles only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-24-src-D5">D5 — NVIDIA, CUTLASS documentation, "Efficient GEMM in CUDA" (tier 2; named in curriculum E6): software pipelining, multistage mainloops. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-24-src-D6">D6 — NVIDIA, "Compute Sanitizer" documentation (tier 1): racecheck, synccheck. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-24-src-H1">H1 — CUDA Toolkit 12.0 headers <code>cuda_pipeline_primitives.h</code> and <code>cuda_pipeline_helpers.h</code> as installed in the build container (<code>/usr/include</code>), read during this build: signature of <code>__pipeline_memcpy_async(dst_shared, src_global, size_and_align, zfill = 0)</code> and its assertions; the <code>__CUDA_ARCH__ &gt;= 800</code> condition; the PTX emitted for copies, commit and wait; the default maximum of 8 stages. Vendor source code, tier 1 for what it declares; semantics beyond the code remain to be confirmed in D1 and D4.</li>
+<li id="F6-24-src-C1">C1 — Systems Curriculum (this project), milestone E6 (build steps and acceptance tests quoted), local file <code>SYSTEMS_CURRICULUM.html</code>. A map, not a source (AH-4).</li>
+<li id="F6-24-src-R1">R1 — run of Listing 3 (<code>university/labs/F6-24/check_dbuf.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with ASan and UBSan, exit code 0.</li>
+<li id="F6-24-src-R3">R3 — <code>ptxas -v</code> report for <code>sm_80</code> (<code>resources.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>, compiled only.</li>
+<li id="F6-24-src-R4">R4 — run of Listing 4 (<code>pipeline_sim.log</code>, input <code>pipeline_sim.in</code>), g++, exit code 0; all times are model inputs.</li>
+<li id="F6-24-src-R5">R5 — PTX and SASS of Listing 1 (<code>ptx_async.log</code>, <code>sass_async.log</code>), <code>sm_80</code> and <code>sm_75</code>, compiled only.</li>
+<li id="F6-24-src-R6">R6 — SASS instruction mix of the compute part (<code>sass_mix.log</code>), <code>sm_80</code>, compiled only.</li>
+<li id="F6-24-src-R7">R7 — run of F6-23 Listing 4 (<code>university/labs/F6-23/occupancy_steps.log</code>), exit code 0; example device.</li>
+<li id="F6-24-src-R8">R8 — run of the forensic program (<code>forensic_fast.log</code>), g++, exit code 0 (the program reports failures but exits 0 on purpose so the evidence is recorded).</li>
+<li id="F6-24-src-R9">R9 — builds and runs of Listing 2 (<code>sgemm_dbuf.log</code>, <code>build_sm80.log</code>); untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+</ol>
+
+<h2 id="F6-24-glossary">Glossary links</h2>
+<p><a href="#gl-double-buffering">Double buffering</a> · <a href="#gl-software-pipelining">Software pipelining</a> · <a href="#gl-asynchronous-copy-cp-async">Asynchronous copy (cp.async)</a> · <a href="#gl-commit-group">Commit group</a> · <a href="#gl-wait-prior">Wait prior</a> · <a href="#gl-stage-pipeline">Stage (pipeline)</a> · <a href="#gl-latency-hiding">Latency hiding</a> · <a href="#gl-register-tiling">Register tiling</a></p>
+
+<h2 id="F6-24-next">Next chapter</h2>
+<p><a href="#F6-25">F6-25 Mixed precision: FP32, TF32, FP16, BF16, FP8 and tolerances</a>. Previous: <a href="#F6-23">F6-23</a>. Back to the course: <a href="#CU302">CU302</a>.</p>
+
+<h2 id="F6-24-answers">Answers to Check yourself</h2>
+<ol>
+<li>Groups for tiles 0, 1, …, t + 1 (the last possibly empty). After <code>wait_prior(1)</code> only the newest, tile t + 1, may be pending.</li>
+<li>The wait covers only the calling thread's own copies. Each tile is copied by many threads, so a thread must also know that all other threads have passed their waits; the barrier provides that and makes their shared-memory writes visible.</li>
+<li>(b). (a) is false: the model's maximum is 2 and only when L = C; compute-bound kernels gain little. (c) is false: the copy moves bytes as they are, which is why A is not transposed in Listing 1. (d) is false: the header's fallback keeps it correct, just without asynchronous hardware copies.</li>
+<li><code>LDG.E.128.SYS</code> loads into registers followed by <code>STS.128</code> stores: 24 and 48 in the output.</li>
+<li><code>wait_prior(2)</code>: in iteration t the thread issues tile t + 2 into the third stage and commits it, so the groups of tiles t + 1 and t + 2 may stay pending while tile t is computed — two tiles in flight. Shared memory: 3 × 4,096 = 12,288 bytes for 64 × 64 × 8. (Writing the ring is Lab step 3.)</li>
+<li>Single 100 × 900 = 90,000; double 300 + 100 × 600 = 60,300 (compute dominates); speed-up 1.49. The compute is the bottleneck; only the load time is hidden.</li>
+<li>So that "all groups but the newest" still means "everything up to tile t" on the last iteration. Without it, the newest group would be tile t itself and <code>wait_prior(1)</code> would not wait for it.</li>
+<li>It uses 143 registers instead of 124 (and twice the shared memory). 143 × 256 threads needs more than half the example register file, so only one block fits: 12.5 %.</li>
+</ol>
+<h3 id="F6-24-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>64³ (4,095 of 4,096 elements outside the bound) and 96 × 132 × 36 (all 12,672) fail. They are the only shapes with K and N multiples of 4, i.e. the only ones that run the asynchronous kernel; the others run F6-23's fallback.</li>
+<li>Line 50 of Listing 1, <code>__pipeline_wait_prior(1)</code>, is missing; the comment "… and everybody else's too" on the barrier still refers to it. An indexing error is ruled out by the diff: only that line and the names differ.</li>
+<li>In iteration 0 the thread has committed tile 0 and tile 1 but never waited, so on the emulator neither group has landed; it computes from stage 0 as left by the previous launch (zeros for the first launch of this kernel instantiation, then stale data). Copies land only at the thread's end. The single element of 64³ inside the bound is a coincidence of the stale data.</li>
+<li>On a GPU, the copies are usually complete long before a thread reaches the reads, especially after a barrier; the race is real but rarely visible. A passing GPU run is evidence about one timing, not about correctness.</li>
+<li>Restore the wait before the barrier. Keep the emulator test in CI (it fails deterministically). On hardware, run Compute Sanitizer's racecheck and synccheck tools on a shape that uses the asynchronous path (check the tools' support for asynchronous copies in D6).</li>
+</ol>
+<p>How the evidence was produced: <code>forensic_fast.cpp</code> runs <code>dbuf_fast.cuh</code> (Listing 1 with line 50 deleted and the kernel renamed) on the emulator with the standard shape matrix. Wrong answers: "the emulator is wrong because the GPU run passes" (the emulator implements the latest legal landing time; the GPU's earlier landing is allowed but not promised); "the fallback kernel is broken" (the fallback shapes pass).</p>

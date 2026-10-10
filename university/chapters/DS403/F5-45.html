@@ -1,0 +1,380 @@
+<!--meta
+id: F5-45
+title: Lessons from Plan 9 and Amoeba
+course: DS403
+level: L4
+prereqs: F5-44; OS304 (VFS, file descriptors); DR301 or DR302 (PCI and DMA rings); F5-09 (remote procedure calls)
+time: 12–16 hours including the lab and the forensic lab
+hardware: none required: one emulated PC in QEMU 8.2.2 (TCG) with QEMU's virtio-9p-pci device sharing a host directory; untested on hardware
+maps: Curriculum section 7.1 row "9P and virtio-fs"; goal 1 "distributed computers in servers"; Plan 9 papers and manual section 5; Amoeba papers (all pending verification)
+analogy: F5 — friends in different towns (registered: letters = message passing; phoning = RPC); proposed: 9P = letters asking the library friend to read you a page, a fid = a numbered bookmark the library keeps for you; Amoeba capability = a tamper-proof club card (see NOTES.md)
+-->
+
+<h2 id="F5-45-hook">Story hook</h2>
+<p>Bao keeps the club's books, Dalia keeps the club's records, and Chidi has the only good printer. In most clubs you would have to learn three different ways of asking: a phone call for books, a form for records, a visit for printing. Bao's town library had a better idea. Everything there is asked for with the same five or six kinds of letter: "find this", "open it", "read me this part", "write this part", "I am finished with it". The library even gives you a numbered bookmark for each thing you are using, so your next letter can say "bookmark 3, read the next page" instead of the whole path again.</p>
+<p>Dalia's own club tried something different: instead of a list of members, every member gets a card printed with what it allows ("may read", "may borrow"), and the card has a seal that only the club can make. Whoever holds the card has the rights; nobody needs to check a list.</p>
+<p>Two research operating systems of the 1980s and 1990s took these two ideas as far as they would go. <b>Plan 9</b> made every resource a file and every file reachable with one small protocol, 9P. <b>Amoeba</b> made every resource an object on some server, named and protected by an unforgeable capability. In this chapter your kernel will speak real 9P to a real 9P server, and you will model Amoeba's capabilities and Plan 9's private name spaces, so that you can judge which ideas your own cluster should keep.</p>
+
+<h2 id="F5-45-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> Plan 9's three central ideas (resources as files, one file protocol, per-process name spaces) and Amoeba's (a processor pool, objects on servers, sparse capabilities), and compare each with the single-system image of <a href="#F5-44">F5-44</a>.</li>
+<li><b>Encode and decode</b> 9P messages byte by byte, and <b>run</b> a complete 9P session (version, attach, walk, open, read, create, write, clunk) from your own kernel over a legacy virtio transport.</li>
+<li><b>Read</b> a server-side protocol trace together with the client's log and match every request to its reply by tag.</li>
+<li><b>Model</b> capabilities with a check field and show by experiment that rights cannot be widened by editing bits.</li>
+<li><b>Diagnose</b> a failed walk from a hex dump and an error reply.</li>
+</ul>
+
+<div class="co jargon" id="F5-45-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Plan 9 (from Bell Labs)</dt><dd><b>Simple words:</b> a research operating system in which every resource on every machine is a file, reached with one protocol. <b>Analogy:</b> a town where every service, from books to printing, answers the same kinds of letter. <b>Precise:</b> a distributed operating system built at Bell Labs in which terminals, CPU servers and file servers share resources through the 9P file protocol, and each process assembles its own name space from local and remote file servers. <sup class="src"><a href="#F5-45-src-D1">D1</a></sup></dd>
+<dt>9P</dt><dd><b>Simple words:</b> Plan 9's small protocol for using files on another machine. <b>Analogy:</b> the library's six kinds of letter: find, open, read, write, stat, finished. <b>Precise:</b> a request–reply file protocol in which each T-message (request) is answered by an R-message (reply) or Rerror with the same tag; messages are size[4] type[1] tag[2] followed by type-specific fields, little-endian; 9P2000 is the classic revision, 9P2000.u and 9P2000.L are Unix and Linux extensions. <sup class="src"><a href="#F5-45-src-D3">D3</a></sup> <sup class="src"><a href="#F5-45-src-D9">D9</a></sup></dd>
+<dt>Fid</dt><dd><b>Simple words:</b> a small number the client picks to stand for one file it is using on the server. <b>Analogy:</b> a numbered bookmark the library keeps for you. <b>Precise:</b> a 32-bit handle, chosen by the client, that the server associates with a file in the client's session from attach or walk until clunk; most 9P requests name a fid instead of a path. <sup class="src"><a href="#F5-45-src-D3">D3</a></sup></dd>
+<dt>Tag (9P)</dt><dd><b>Simple words:</b> the number that matches a reply to its request. <b>Analogy:</b> the reference number written on a letter and repeated on the answer. <b>Precise:</b> a 16-bit request identifier chosen by the client, unique among its outstanding requests and copied by the server into the reply, allowing many requests in flight on one connection; NOTAG (0xFFFF) is used only by Tversion. <sup class="src"><a href="#F5-45-src-D3">D3</a></sup></dd>
+<dt>Qid</dt><dd><b>Simple words:</b> the server's unique identity for a file. <b>Analogy:</b> the library's own shelf number, which stays the same even if the book is renamed. <b>Precise:</b> a 13-byte value of type[1] (directory, append-only and other bits), version[4] (changes when the file changes) and path[8] (unique per file on that server); two files are the same file exactly when their qids' paths are equal. <sup class="src"><a href="#F5-45-src-D3">D3</a></sup></dd>
+<dt>Per-process name space</dt><dd><b>Simple words:</b> each program has its own private map from path names to files. <b>Analogy:</b> each friend arranges their own shelf of borrowed books, from any library, in their own order. <b>Precise:</b> in Plan 9, a mount table per process (group) built with bind and mount, so that the same path can name different files in different processes; union directories let several directories appear at one path. <sup class="src"><a href="#F5-45-src-D2">D2</a></sup></dd>
+<dt>Amoeba</dt><dd><b>Simple words:</b> a research distributed operating system in which programs run on a pool of processors and every resource is an object kept by some server. <b>Analogy:</b> a club where any free member does a job and every item has a sealed card instead of a member list. <b>Precise:</b> a distributed operating system from the Vrije Universiteit Amsterdam and CWI, built around a microkernel, a processor pool, RPC between clients and object servers, and capabilities for naming and protection. <sup class="src"><a href="#F5-45-src-D4">D4</a></sup></dd>
+<dt>Capability (sparse)</dt><dd><b>Simple words:</b> an unforgeable ticket that names an object and says what its holder may do. <b>Analogy:</b> a tamper-proof club card that says "may read". <b>Precise:</b> a bit string containing a server port, an object number, a rights field and a check field derived from a server-held secret with a one-way function, so that holders can pass it on but cannot raise its rights or guess a valid one; "sparse" because valid values are a tiny fraction of the possible ones. <sup class="src"><a href="#F5-45-src-D5">D5</a></sup></dd>
+<dt>Processor pool</dt><dd><b>Simple words:</b> a set of computers with no owner that the system hands out for running programs. <b>Analogy:</b> whichever friend is free does the next job. <b>Precise:</b> in Amoeba, processors not attached to users' terminals, allocated to processes by the system at run time, so that the user's view is of one large computer rather than of personal machines. <sup class="src"><a href="#F5-45-src-D4">D4</a></sup></dd>
+<dt>Virtqueue (split)</dt><dd><b>Simple words:</b> the shared memory rings through which a virtual device and its driver pass buffers. <b>Analogy:</b> an in-tray and an out-tray between you and the library clerk. <b>Precise:</b> a descriptor table, an available ring written by the driver and a used ring written by the device, in guest memory; the driver queues chains of descriptors and notifies the device, the device returns finished chains with the number of bytes it wrote. <sup class="src"><a href="#F5-45-src-D7">D7</a></sup></dd>
+</dl></div>
+<p>Terms from earlier chapters used here without redefinition: <a href="#gl-virtio">virtio</a>, <a href="#gl-descriptor-virtio">descriptor (virtio)</a>, <a href="#gl-remote-procedure-call-rpc">remote procedure call</a>, <a href="#gl-idempotent-operation">idempotent operation</a>, <a href="#gl-single-system-image-ssi">single-system image</a>, <a href="#gl-transparency-distributed-systems">transparency</a>.</p>
+
+<h2 id="F5-45-pictures">The idea in pictures</h2>
+<p>Figure 1 compares the two systems' pictures of "many machines as one". Plan 9 keeps personal terminals and makes everything else a file server; Amoeba hides the machines behind a pool and talks to objects through capabilities.</p>
+<figure id="F5-45-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 340" role="img" aria-labelledby="F5-45-f1t F5-45-f1d">
+<title id="F5-45-f1t">Figure 1: Plan 9 and Amoeba side by side</title>
+<desc id="F5-45-f1d">Left half, Plan 9: a terminal box at the top contains two processes, each with its own name space shown as a small path list; process 1 shows /bin, /usr and /net from the terminal, process 2 shows /net from a gateway. Arrows labelled 9P go from the terminal down to three servers: a file server holding /bin and /usr, a CPU server, and a gateway holding /net. Right half, Amoeba: a row of user workstations at the top, a block of processor-pool machines in the middle, and object servers at the bottom: a file server called Bullet, a directory server and a process server. Arrows labelled RPC with capability go from processes in the pool to the servers. A capability is drawn as a bar of four fields: server port, object, rights, check.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="340"/>
+<text class="sv-tb" x="20" y="24">Plan 9: everything is a file, one protocol</text>
+<rect class="sv-b1" x="20" y="38" width="330" height="110"/>
+<text class="sv-tb" x="30" y="56">terminal</text>
+<rect class="sv-box" x="30" y="64" width="150" height="76"/><text class="sv-ts" x="38" y="80">process 1 name space</text>
+<text class="sv-tm" x="38" y="98">/bin = local + fs</text><text class="sv-tm" x="38" y="114">/usr = fs</text><text class="sv-tm" x="38" y="130">/net = local</text>
+<rect class="sv-box" x="190" y="64" width="150" height="76"/><text class="sv-ts" x="198" y="80">process 2 name space</text>
+<text class="sv-tm" x="198" y="98">/bin = local + fs</text><text class="sv-tm" x="198" y="114">/usr = fs</text><text class="sv-tm" x="198" y="130">/net = gateway</text>
+<rect class="sv-b2" x="20" y="200" width="100" height="56"/><text class="sv-ts" x="28" y="222">file server</text><text class="sv-tm" x="28" y="242">/bin /usr</text>
+<rect class="sv-b2" x="135" y="200" width="100" height="56"/><text class="sv-ts" x="143" y="222">CPU server</text><text class="sv-tm" x="143" y="242">runs jobs</text>
+<rect class="sv-b2" x="250" y="200" width="100" height="56"/><text class="sv-ts" x="258" y="222">gateway</text><text class="sv-tm" x="258" y="242">/net</text>
+<path class="sv-line" d="M70,148 L70,194"/><polygon class="sv-head" points="70,200 64,188 76,188"/>
+<path class="sv-line" d="M185,148 L185,194"/><polygon class="sv-head" points="185,200 179,188 191,188"/>
+<path class="sv-line" d="M300,148 L300,194"/><polygon class="sv-head" points="300,200 294,188 306,188"/>
+<text class="sv-ts" x="80" y="178">9P</text><text class="sv-ts" x="195" y="178">9P</text><text class="sv-ts" x="310" y="178">9P</text>
+<text class="sv-ts" x="20" y="282">each server exports a file tree;</text>
+<text class="sv-ts" x="20" y="298">each process binds the trees it wants</text>
+<text class="sv-tb" x="400" y="24">Amoeba: objects, capabilities, a processor pool</text>
+<rect class="sv-b3" x="400" y="38" width="80" height="34"/><text class="sv-ts" x="408" y="60">workstation</text>
+<rect class="sv-b3" x="495" y="38" width="80" height="34"/><text class="sv-ts" x="503" y="60">workstation</text>
+<rect class="sv-b4" x="400" y="96" width="340" height="56"/><text class="sv-ts" x="410" y="114">processor pool (no owners)</text>
+<rect class="sv-box" x="410" y="122" width="54" height="22"/><rect class="sv-box" x="474" y="122" width="54" height="22"/><rect class="sv-box" x="538" y="122" width="54" height="22"/><rect class="sv-box" x="602" y="122" width="54" height="22"/><rect class="sv-box" x="666" y="122" width="54" height="22"/>
+<path class="sv-dash" d="M440,72 L440,96"/><path class="sv-dash" d="M535,72 L535,96"/>
+<rect class="sv-b5" x="400" y="200" width="100" height="56"/><text class="sv-ts" x="408" y="222">file server</text><text class="sv-ts" x="408" y="242">(Bullet)</text>
+<rect class="sv-b5" x="520" y="200" width="100" height="56"/><text class="sv-ts" x="528" y="222">directory</text><text class="sv-ts" x="528" y="242">server</text>
+<rect class="sv-b5" x="640" y="200" width="100" height="56"/><text class="sv-ts" x="648" y="222">process</text><text class="sv-ts" x="648" y="242">server</text>
+<path class="sv-line" d="M450,152 L450,194"/><polygon class="sv-head" points="450,200 444,188 456,188"/>
+<path class="sv-line" d="M570,152 L570,194"/><polygon class="sv-head" points="570,200 564,188 576,188"/>
+<path class="sv-line" d="M690,152 L690,194"/><polygon class="sv-head" points="690,200 684,188 696,188"/>
+<text class="sv-ts" x="458" y="178">RPC + capability</text>
+<rect class="sv-b6" x="400" y="282" width="80" height="26"/><text class="sv-ts" x="408" y="300">server port</text>
+<rect class="sv-b6" x="480" y="282" width="80" height="26"/><text class="sv-ts" x="488" y="300">object</text>
+<rect class="sv-b6" x="560" y="282" width="80" height="26"/><text class="sv-ts" x="568" y="300">rights</text>
+<rect class="sv-b6" x="640" y="282" width="100" height="26"/><text class="sv-ts" x="648" y="300">check</text>
+<text class="sv-ts" x="400" y="326">a capability (field sizes left to the sources)</text>
+</svg></div><figcaption><b>Figure 1.</b> Left: Plan 9. Every resource is a file tree served over 9P; each process binds the trees it wants into its own name space, so process 2 can use a gateway's network while process 1 uses the terminal's. Right: Amoeba. Users' workstations start work on an ownerless processor pool; every resource is an object on a server, reached by RPC and named and protected by a capability. Simplified from the systems' papers as described in the text (pending verification). <sup class="src"><a href="#F5-45-src-D1">D1</a></sup> <sup class="src"><a href="#F5-45-src-D2">D2</a></sup> <sup class="src"><a href="#F5-45-src-D4">D4</a></sup> <sup class="src"><a href="#F5-45-src-D5">D5</a></sup></figcaption></figure>
+
+<p>Figure 2 shows the lab's path for one 9P request: from the kernel's buffer, through a virtqueue, to QEMU's 9P server, which turns it into an operation on a directory of the host.</p>
+<figure id="F5-45-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F5-45-f2t F5-45-f2d">
+<title id="F5-45-f2t">Figure 2: one 9P request in the lab, from kernel to host directory</title>
+<desc id="F5-45-f2d">Four columns from left to right: the DS403 kernel, guest memory with the virtqueue, QEMU's 9P server, and the host directory "export". Numbered steps: 1, the kernel builds Twalk in a request buffer and an empty reply buffer; 2, it writes descriptor 0 (request, device reads) chained to descriptor 1 (reply, device writes), puts 0 in the available ring and writes the queue number to the notify register; 3, QEMU reads the request, logs v9fs_walk in its trace, and looks up hello.txt in the host directory; 4, QEMU writes Rwalk into the reply buffer and adds an entry with the length to the used ring; 5, the kernel, which has been polling the used ring index, sees it change and reads the reply.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<rect class="sv-b1" x="20" y="30" width="160" height="230"/><text class="sv-tb" x="30" y="50">DS403 kernel</text>
+<rect class="sv-b3" x="210" y="30" width="190" height="230"/><text class="sv-tb" x="220" y="50">guest memory</text>
+<rect class="sv-b5" x="430" y="30" width="170" height="230"/><text class="sv-tb" x="440" y="50">QEMU 9P server</text>
+<rect class="sv-b2" x="630" y="30" width="110" height="230"/><text class="sv-tb" x="640" y="50">host dir</text>
+<rect class="sv-box" x="220" y="62" width="170" height="24"/><text class="sv-tm" x="228" y="79">desc 0: Twalk (read)</text>
+<rect class="sv-box" x="220" y="90" width="170" height="24"/><text class="sv-tm" x="228" y="107">desc 1: reply (write)</text>
+<rect class="sv-box" x="220" y="130" width="170" height="24"/><text class="sv-tm" x="228" y="147">avail ring: [0]</text>
+<rect class="sv-box" x="220" y="190" width="170" height="24"/><text class="sv-tm" x="228" y="207">used ring: {0, len}</text>
+<text class="sv-tm" x="640" y="80">export/</text><text class="sv-tm" x="648" y="100">hello.txt</text><text class="sv-tm" x="648" y="120">from-kernel.txt</text>
+<text class="sv-ts" x="30" y="76">1 build Twalk</text>
+<path class="sv-line" d="M180,90 L214,90"/><polygon class="sv-head" points="220,90 208,84 208,96"/>
+<text class="sv-ts" x="30" y="140">2 queue + notify</text>
+<path class="sv-line" d="M180,142 L214,142"/><polygon class="sv-head" points="220,142 208,136 208,148"/>
+<path class="sv-line2" d="M390,142 L424,142"/><polygon class="sv-head" points="430,142 418,136 418,148"/>
+<text class="sv-ts" x="440" y="100">3 read request,</text><text class="sv-ts" x="440" y="116">trace v9fs_walk,</text><text class="sv-ts" x="440" y="132">look up file</text>
+<path class="sv-line" d="M600,110 L624,110"/><polygon class="sv-head" points="630,110 618,104 618,116"/>
+<text class="sv-ts" x="440" y="190">4 write Rwalk,</text><text class="sv-ts" x="440" y="206">add used entry</text>
+<path class="sv-line2" d="M430,202 L396,202"/><polygon class="sv-head" points="390,202 402,196 402,208"/>
+<path class="sv-line" d="M220,226 L186,226"/><polygon class="sv-head" points="180,226 192,220 192,232"/>
+<text class="sv-ts" x="30" y="214">5 poll used idx,</text><text class="sv-ts" x="30" y="230">read reply</text>
+<text class="sv-ts" x="20" y="284">one request at a time in this lab; the tag would let many requests share the queue</text>
+</svg></div><figcaption><b>Figure 2.</b> One 9P request in the lab. The kernel is the 9P client; QEMU's built-in 9P server, reached through a legacy virtio-9p PCI device, serves the host directory <code>export</code>. Steps 3 and 4 appear in the lab output as QEMU's own <code>v9fs_*</code> trace lines between the kernel's "-&gt;" and "&lt;-" lines. <sup class="src"><a href="#F5-45-src-D7">D7</a></sup> <sup class="src"><a href="#F5-45-src-D8">D8</a></sup> <sup class="src"><a href="#F5-45-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F5-45-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Bao's library answers only a few kinds of letter. You write "please find <i>atlas</i> and call it bookmark 1"; the library answers "found, bookmark 1 is the atlas". Then "open bookmark 1 for reading", "read bookmark 1 from page 0, up to 512 words", "I am finished with bookmark 1". Every letter has a reference number, and the answer repeats it, so if you send several letters at once you know which answer is which. Mapping: library = file server; letter = 9P message; bookmark = fid; reference number = tag; "find" = walk; "finished" = clunk; the library's own shelf number = qid.</p></div>
+<p>Because every service in that town answers the same letters, you can borrow anything from anyone the same way: books from Bao, records from Dalia, even the printer from Chidi ("write these pages to the printer"). And every friend can arrange their own shelf from any libraries they like: Amara can put Dalia's records next to her own and see them as one shelf.</p>
+<p>Dalia's club does it the other way round. You do not ask by name; you show a card. The card says which item and what you may do, and it carries a seal only the club can make. You can give your card to a friend, but you cannot change "may read" into "may borrow", because the seal would no longer match.</p>
+
+<h2 id="F5-45-layer2">Layer 2 — the student explanation</h2>
+<p><b>Plan 9 in three ideas.</b> First, resources are files: the network, the window system, processes and devices appear as file trees that are read and written. Second, every file server speaks one protocol, 9P, whether it is a disk server across a network or a driver inside the kernel. Third, every process has its own name space, built by binding file trees from any servers into its own view of the path tree. <sup class="src"><a href="#F5-45-src-D1">D1</a></sup> <sup class="src"><a href="#F5-45-src-D2">D2</a></sup> Together they give a different kind of single-system image from <a href="#F5-44">F5-44</a>'s: not one global view for everyone, but a uniform way for each process to assemble the view it needs, from whatever machines provide it.</p>
+<p><b>The 9P session.</b> A client first sends Tversion to agree on a protocol version and the largest message size (<i>msize</i>). Then Tattach makes a fid stand for the root of a served tree. Twalk moves along path names from one fid to a new fid; Topen opens a fid; Tread and Twrite move bytes at an offset; Tclunk tells the server the fid is no longer needed. Each request carries a tag, and the reply carries the same tag. <sup class="src"><a href="#F5-45-src-D3">D3</a></sup> The lab's kernel does exactly this against QEMU's server (Listing 3), and QEMU's trace shows the server's side of each message (R2).</p>
+<p><b>Why the lab uses 9P2000.u.</b> The kernel first offers classic "9P2000"; QEMU's server answers "unknown" (R2). The second offer, "9P2000.u", is accepted. The .u (Unix) extension adds numeric user ids and error numbers to some messages, so the kernel's Tattach carries an extra n_uname field and Rerror carries an errno after the error string. QEMU's server is built for Linux guests, whose 9P client uses 9P2000.u or 9P2000.L. <sup class="src"><a href="#F5-45-src-D9">D9</a></sup> <sup class="src"><a href="#F5-45-src-R2">R2</a></sup></p>
+<p><b>Amoeba in three ideas.</b> First, a processor pool: users' workstations are terminals, and processes run on processors the system picks. Second, objects on servers: files, directories and processes are objects managed by server processes, used through RPC. Third, capabilities: every object is named and protected by a capability, which the holder presents with each request. <sup class="src"><a href="#F5-45-src-D4">D4</a></sup> <sup class="src"><a href="#F5-45-src-D5">D5</a></sup> Amoeba's single-system image is closer to F5-44's: the user sees one computer, and the system decides where things run.</p>
+<p><b>Capabilities without a protected kernel table.</b> In a single machine, capabilities can live in kernel memory where users cannot touch them. Across a network a capability is only bits in a message. Amoeba's answer was to make capabilities <i>sparse</i>: the check field is derived from a secret with a one-way function, so that a holder cannot compute the check for any other rights, and guessing a valid one is hopeless. <sup class="src"><a href="#F5-45-src-D5">D5</a></sup> The lab's model (Listing 4) shows the two properties by experiment: editing the rights bits makes the check fail, and none of a million random check fields is accepted (R5).</p>
+<p><b>What to keep for our cluster.</b> From Plan 9: one small, explicit file protocol with fids and tags (F5-46's DFS copies its shape), and the idea that a name space is a per-process choice, not a global fact. From Amoeba: the processor pool as a scheduling model (F5-47's scheduler places jobs on any node) and capabilities as a way to pass rights around without a central list.</p>
+
+<h2 id="F5-45-layer3">Layer 3 — the engineer's depth</h2>
+<p><b>The 9P message format.</b> Every 9P message begins size[4] type[1] tag[2]: size counts the whole message including itself, all integers are little-endian, and strings are a 2-byte length followed by UTF-8 bytes without a terminating zero. <sup class="src"><a href="#F5-45-src-D3">D3</a></sup> The lab's Twalk, from the hex dump in the forensic output, decodes field by field:</p>
+<div class="tw"><table>
+<thead><tr><th>Bytes</th><th>Field</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td><code>1c 00 00 00</code></td><td>size[4]</td><td>28 bytes in total</td></tr>
+<tr><td><code>6e</code></td><td>type[1]</td><td>110 = Twalk</td></tr>
+<tr><td><code>02 00</code></td><td>tag[2]</td><td>2</td></tr>
+<tr><td><code>00 00 00 00</code></td><td>fid[4]</td><td>0 (the root, from attach)</td></tr>
+<tr><td><code>01 00 00 00</code></td><td>newfid[4]</td><td>1</td></tr>
+<tr><td><code>01 00</code></td><td>nwname[2]</td><td>one path element</td></tr>
+<tr><td><code>09 00</code> then 9 bytes</td><td>wname[s]</td><td>"Hello.txt" (forensic run) or "hello.txt" (session)</td></tr>
+</tbody></table></div>
+<p>4 + 1 + 2 + 4 + 4 + 2 + 2 + 9 = 28: the size checks. Rwalk returns one 13-byte qid per element walked; walking zero names clones a fid, which the lab uses to make fid 2 a second handle on the root before Tcreate turns it into the new file (R2). <sup class="src"><a href="#F5-45-src-D3">D3</a></sup></p>
+<p><b>Fids make the server stateful.</b> After a walk the server remembers what fid 1 means for this client. That makes requests short and lets the server keep an open file's state, but it also means a server crash loses every client's fids, and a client crash leaves fids the server must eventually free. F5-46 returns to this choice; NFS's original design went the other way (stateless server, file handles that survive reboots). <sup class="src"><a href="#F5-45-src-D6">D6</a></sup></p>
+<p><b>Tags and flush.</b> Because each request carries a tag, a client may have many outstanding requests on one connection and match replies in any order. Tflush asks the server to abandon a request; the reply to Tflush means the old request will not be answered (or already was). <sup class="src"><a href="#F5-45-src-D3">D3</a></sup> The lab sends one request at a time, but <code>call()</code> still prints the tag of each reply so that you can see they match.</p>
+<p><b>Qid versions and caching.</b> A qid's version changes when the file changes. A client cache can therefore ask "is the version I cached still current?" with a cheap stat request instead of re-reading the data. The lab's qids carry versions such as 1791597927 for <code>hello.txt</code>; QEMU's local back end derives them from the host file's metadata, which is an implementation detail of QEMU, not of 9P (R2). F5-46 uses exactly this idea for its own cache and shows what happens without it.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Historical and design details of Plan 9 and Amoeba in this chapter come from memory of their papers, not from documents opened in this build: Plan 9's origin at Bell Labs and its terminal / CPU server / file server split; the bind and mount operations and union directories; the use of 9P inside the kernel for devices; Amoeba's origin at the Vrije Universiteit and CWI, its Bullet file server and directory server, its FLIP protocol and group communication; the layout of Amoeba capabilities (server port, object number, rights, check) and how restricted capabilities are made with a one-way function. The Source Researcher must check each against D1, D2, D4 and D5 before the chapter is published.</p></div>
+<p><b>Capabilities, more carefully.</b> The lab model gives each object a random 64-bit secret on the server. The owner capability carries all rights and the secret itself as check. A restricted capability with rights <i>r</i> carries check = <i>f</i>(secret XOR <i>r</i>), with <i>f</i> one-way. The server validates by recomputing; anyone holding a capability can ask the server for a weaker copy, never a stronger one. In the run the reader's capability (rights r--, check 3d0b935add44d570) passes for reading, is refused for writing, and its forged copy with rights rw- and the same check is refused because the check no longer matches (R5). The model's <i>f</i> is a mixing function, not a cryptographic one: it shows the shape of the scheme, not its strength. Three properties follow, and each is a design choice to weigh:</p>
+<ul>
+<li><b>Delegation is free.</b> Passing a capability needs no server call, so any process can share access without asking.</li>
+<li><b>Revocation is hard.</b> Once a capability is copied, the only way to cancel it is to change the object's secret, which cancels every capability for that object.</li>
+<li><b>Secrecy is the protection.</b> A capability seen on the wire can be replayed by anyone; the network must keep capabilities confidential, or they must be bound to their holder.</li>
+</ul>
+<p><b>Plan 9's name spaces, more carefully.</b> The lab's model (Listing 5) builds two processes' name spaces. Both bind a local root, union the file server's <code>/bin</code> after the local one, and bind the server's <code>/usr</code>. Process 2 then binds a gateway's <code>/net</code> over its own. The output shows the effect: <code>/net/tcp</code> names "this terminal's TCP stack" for process 1 and "the gateway's TCP stack" for process 2, while every other path agrees (R6). The cluster lesson: a single global name space is one option, not the only one. Names that differ per process are a feature when they are chosen on purpose, and a debugging trap when they are not (two processes "opening the same file" and getting different ones).</p>
+<p><b>Transport choices.</b> Plan 9 ran 9P over its own network protocols and over pipes; Linux runs it over TCP, over virtio, and over other transports. <sup class="src"><a href="#F5-45-src-D9">D9</a></sup> 9P itself assumes a reliable, ordered transport that delivers whole messages. The lab's virtio transport is exactly that (one request, one reply buffer). F5-46 puts a 9P-like protocol over the cluster's raw Ethernet, where frames can be lost, and has to add retries, and with them the question of what a retried request means.</p>
+
+<h2 id="F5-45-hardware">How the hardware actually does it</h2>
+<p>The lab uses no network card. QEMU's <code>virtio-9p-pci</code> device, with <code>disable-modern=on</code>, appears as a legacy ("transitional") virtio PCI device with vendor 0x1AF4 and device 0x1009, whose registers are I/O ports in BAR0. The kernel's driver (Listing 1) resets the device, acknowledges it, accepts only feature bit 0 (the device has a mount tag), reads the queue size (128 in the run), lays out a split virtqueue in a 4,096-byte-aligned buffer, tells the device the page frame number of that buffer, and sets DRIVER_OK. It then reads the mount tag "ds403share" from the device-specific configuration at offset 0x14 (R2). <sup class="src"><a href="#F5-45-src-D7">D7</a></sup> <sup class="src"><a href="#F5-45-src-D8">D8</a></sup></p>
+<p>For each 9P request the driver writes two descriptors: descriptor 0 points at the request and is chained (NEXT) to descriptor 1, which points at the reply buffer and is marked WRITE (the device writes it). It puts descriptor 0's index in the available ring, increments the available index, writes 0 (the queue number) to the notify register, and polls the used ring's index until it changes; the used entry gives the number of bytes the device wrote. There is no interrupt, no second request in flight, and no memory barrier stronger than a compiler barrier, which suffices on one emulated x86 CPU but would not be enough on every real system. <sup class="src"><a href="#F5-45-src-D7">D7</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The legacy virtio register offsets (host features 0x00, guest features 0x04, queue address 0x08, queue size 0x0C, queue select 0x0E, queue notify 0x10, device status 0x12, device configuration 0x14 without MSI-X), the split-ring layout (16-byte descriptors, available ring after the table, used ring on the next 4,096-byte boundary), the device id 0x1009 for 9P, the feature bit for the mount tag, and the configuration layout (tag length then tag) were written from memory of the OASIS VIRTIO specification's legacy interface and 9P transport sections. They were confirmed only by the driver working with QEMU 8.2.2 (R2). Check them in the specification, and prefer the modern (virtio 1.x) interface for new work.</p></div>
+<p>On the other side, QEMU's 9P server is part of QEMU itself: with <code>-fsdev local,path=export</code> it serves the host directory with the QEMU process's own permissions, and <code>security_model=none</code> passes ownership and mode bits through without mapping. The <code>-trace v9fs_*</code> option enables QEMU's trace events for its 9P server, which print each request and reply as the server sees them. <sup class="src"><a href="#F5-45-src-D8">D8</a></sup></p>
+<div class="co safety"><span class="lbl">Safety</span><p>A 9P export gives the guest read and write access to the exported host directory with the permissions of the user running QEMU. Export only a dedicated, empty directory, as the lab does; never export your home directory or a source tree you have not backed up.</p></div>
+
+<h2 id="F5-45-worked">Worked example</h2>
+<p><b>Question.</b> Using only the session output, account for every byte of the Rread reply and check its size against QEMU's trace.</p>
+<p><b>Step 1: find the request.</b> The kernel sent <code>Tread tag 4</code> with fid 1, offset 0 and count 512 (the trace line <code>v9fs_read tag 4 id 116 fid 1 off 0 max_count 512</code> confirms each field).</p>
+<p><b>Step 2: the reply format.</b> Rread is size[4] type[1] tag[2] count[4] data[count]. <sup class="src"><a href="#F5-45-src-D3">D3</a></sup> The file holds 31 bytes ("hello from the host side of 9P" plus a newline), less than 512, so count = 31.</p>
+<p><b>Step 3: add it up.</b> 4 + 1 + 2 + 4 + 31 = 42 bytes. The kernel printed <code>&lt;- Rread tag 4 (42 bytes)</code>, and QEMU's trace says <code>count 31 err 42</code>: in QEMU's trace the last number of a read return is the reply's total size, not an error (R2).</p>
+<p><b>Step 4: where the data is.</b> The data starts at offset 4 + 1 + 2 + 4 = 11, which is why Listing 3 prints <code>rep[11 + i]</code>.</p>
+<p><b>Step 5: the same for Rerror.</b> In the forensic run the reply is 38 bytes: 7 header bytes, a 2-byte string length 0x19 = 25, the 25 bytes "No such file or directory", and the 4-byte errno 2 of 9P2000.u: 7 + 2 + 25 + 4 = 38 (R4).</p>
+<p>The habit this example trains, adding up every field until the size matches, is the fastest way to find encoding bugs in any protocol you implement.</p>
+
+<h2 id="F5-45-code">Code walk-through</h2>
+<p>The lab folder <code>university/labs/F5-45/</code> reuses <code>boot.S</code>, <code>kernel.ld</code> and <code>k.cc</code> from F5-44 and adds a legacy virtio-9p driver, 9P encoding helpers, the session program and two host-side models. The kernel builds with the same flags as F5-44:</p>
+<pre class="output" data-run="F5-45/build"></pre>
+
+<p><b>Listing 1</b> — <code>virtio9p.cc</code>: the legacy virtio transport.</p>
+<pre class="listing" data-src="F5-45/virtio9p.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–20</td><td>register offsets, status bits</td><td>Names for the legacy I/O registers.</td><td>See the unverified box: checked only against QEMU.</td></tr>
+<tr><td>22–29</td><td><code>Desc</code>, ring pointers</td><td>Descriptor layout; one 4,096-aligned area for the whole queue.</td><td>The legacy interface takes one page frame number for all three parts.</td></tr>
+<tr><td>41–47</td><td>find the device</td><td>Scans bus 0 for 1AF4:1009, takes the I/O base, enables I/O and bus mastering.</td><td>Without bus mastering the device could not read the rings.</td></tr>
+<tr><td>49–53</td><td>status handshake</td><td>Reset, ACKNOWLEDGE, DRIVER, then accept only feature bit 0.</td><td>Accepting features you do not implement is a classic driver bug.</td></tr>
+<tr><td>54–61</td><td>queue setup</td><td>Selects queue 0, reads its size, places the available ring after the table and the used ring on the next page.</td><td>The device computes the same offsets from the size; both sides must agree.</td></tr>
+<tr><td>62</td><td>DRIVER_OK</td><td>The device may now be used.</td><td>The driver must not notify the device before this.</td></tr>
+<tr><td>64–69</td><td>mount tag</td><td>Reads the tag length and bytes from the configuration area.</td><td>The tag lets a guest tell several shares apart.</td></tr>
+<tr><td>76–82</td><td>queue a request</td><td>Two chained descriptors, index into the available ring, then notify.</td><td>The compiler barrier keeps the ring entry before the index update.</td></tr>
+<tr><td>83–92</td><td>wait</td><td>Polls the used index; returns the length the device wrote.</td><td>Polling with a bound: a broken device gives −1, not a hang.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>p9.h</code>: message types and the encoder/decoder interfaces (implementation in <code>p9.cc</code> in the lab folder).</p>
+<pre class="listing" data-src="F5-45/p9.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>6–10</td><td>type numbers</td><td>Tversion = 100 and the rest in order; each R is its T plus one.</td><td>QEMU's trace prints these ids ("id 110"), so you can match them by number.</td></tr>
+<tr><td>11–12</td><td><code>NOTAG</code>, <code>NOFID</code></td><td>The "no tag" and "no fid" values.</td><td>Tversion uses NOTAG; Tattach without authentication uses NOFID as afid.</td></tr>
+<tr><td>14–25</td><td><code>P9Out</code></td><td>Appends little-endian fields and strings; <code>finish</code> writes the size.</td><td>The size is known only at the end, so it is written last into the first four bytes.</td></tr>
+<tr><td>27–38</td><td><code>P9In</code></td><td>Reads fields in order; reading past the end returns zeros.</td><td>A short or hostile reply cannot make the reader run off the buffer.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>f545_main.cc</code>: a whole 9P session.</p>
+<pre class="listing" data-src="F5-45/f545_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–33</td><td><code>call</code></td><td>Sends, prints both directions with tags, decodes Rerror's string and errno.</td><td>Printing both sides is what makes the trace comparison possible.</td></tr>
+<tr><td>43–55</td><td><code>version</code></td><td>Offers a version with msize 32768; succeeds only if the server echoes it.</td><td>The server may answer with a different version or "unknown".</td></tr>
+<tr><td>69</td><td>two offers</td><td>"9P2000" first, then "9P2000.u".</td><td>The run shows QEMU refusing the first.</td></tr>
+<tr><td>73–77</td><td>Tattach</td><td>fid 0, no authentication fid, user "ds403", empty tree name, n_uname 1000.</td><td>The last field exists only in 9P2000.u.</td></tr>
+<tr><td>80–89</td><td>Twalk</td><td>fid 0 to new fid 1 through one name; the forensic run changes the name.</td><td>A failed walk leaves newfid unused.</td></tr>
+<tr><td>92–102</td><td>Topen, Tread</td><td>Opens fid 1 for reading, reads up to 512 bytes at offset 0.</td><td>Data starts at byte 11 of Rread (worked example).</td></tr>
+<tr><td>105–116</td><td>clone, Tcreate, Twrite</td><td>Walks zero names to clone the root as fid 2, creates <code>from-kernel.txt</code> mode 0644 for writing, writes 36 bytes.</td><td>Tcreate turns the directory fid into the new file's fid.</td></tr>
+<tr><td>119–123</td><td>Tclunk</td><td>Releases fids 2, 1, 0.</td><td>A client that never clunks leaks server state.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>capability.cpp</code>: Amoeba-style capabilities as a model.</p>
+<pre class="listing" data-src="F5-45/capability.cpp"></pre>
+<pre class="output" data-run="F5-45/capability"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–15</td><td><code>Cap</code>, rights</td><td>Object number, rights bits, 64-bit check.</td><td>Field sizes are the model's, not Amoeba's.</td></tr>
+<tr><td>17–23</td><td><code>f</code></td><td>A 64-bit mixing function.</td><td>Stands in for a one-way function; not secure.</td></tr>
+<tr><td>35–41</td><td><code>restrict</code></td><td>Only a valid capability can be weakened; new rights = old AND wanted.</td><td>The AND makes widening impossible (line 94 tests it).</td></tr>
+<tr><td>42–48</td><td><code>valid</code></td><td>Owner: check = secret; restricted: check = f(secret XOR rights).</td><td>Changing the rights changes the expected check.</td></tr>
+<tr><td>81–84</td><td>forgery</td><td>Edits the rights bits, keeps the check.</td><td>Refused in the run.</td></tr>
+<tr><td>85–92</td><td>guessing</td><td>One million random check fields.</td><td>0 accepted: sparse capabilities.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 5</b> — <code>namespace.cpp</code>: per-process name spaces as a model.</p>
+<pre class="listing" data-src="F5-45/namespace.cpp"></pre>
+<pre class="output" data-run="F5-45/namespace"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–32</td><td><code>bind</code></td><td>Replace, or union before or after what the path shows now.</td><td>A union starts from the current contents, so the local <code>/bin</code> stays visible.</td></tr>
+<tr><td>34–43</td><td><code>open</code></td><td>Longest mount point wins; union members are tried in order.</td><td>Order decides which <code>ls</code> you run when both exist.</td></tr>
+<tr><td>78–79</td><td>copy, then bind</td><td>Process 2 starts as a copy of process 1's name space, then changes <code>/net</code>.</td><td>As in Plan 9, a child inherits its parent's name space and may change its own.</td></tr>
+</tbody></table></div>
+
+<h2 id="F5-45-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A library remembers bookmarks forever; a 9P server forgets them when it restarts.</b> Fids are server state. After a server reboot every bookmark number is meaningless, and a client that keeps using them gets errors or, worse, another client's new file.</li>
+<li><b>A sealed card cannot be photocopied; a capability can.</b> Paper seals resist copying. A capability is bits: anyone who sees it on the network can use it. Sparse capabilities stop forging, not copying.</li>
+<li><b>Letters are read by people who ask when something is unclear.</b> A 9P server does exactly what the bytes say. A wrong size field or a name with a capital letter is not "nearly right" (the forensic lab).</li>
+</ul>
+
+<h2 id="F5-45-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>No reply at all.</b> Cause: DRIVER_OK not set, wrong queue address (not shifted by 12), or the used ring placed where the device does not expect it. Find it: QEMU's trace prints nothing for the request. Fix: check the layout against the queue size the device reported.</li>
+<li><b>Rversion says "unknown".</b> Not a bug in the encoding: the server does not speak the offered version (R2). Fix: offer one it does; record which one you got.</li>
+<li><b>Fields shifted by a few bytes in every later message.</b> Cause: a string written with a terminating zero, or a .u field missing (n_uname in Tattach, extension in Tcreate). Find it: add up the sizes (worked example) and compare with the trace's field values.</li>
+<li><b>"No such file or directory" for a file you can see.</b> Cause: a different name (case, a trailing newline from a command line, a path with a slash in one wname). Find it: the hex dump of the walk. This is the forensic lab.</li>
+<li><b>Files appear owned by the wrong user on the host.</b> Cause: the security model; with <code>security_model=none</code> the host file belongs to the QEMU user, and the guest's uid is not mapped. Fix: choose the model on purpose; read QEMU's fsdev documentation.</li>
+<li><b>Server state grows forever.</b> Cause: fids never clunked. Fix: clunk on every path, including errors; in a long-lived client keep a table of open fids.</li>
+</ul>
+
+<div class="co transition" id="F5-45-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F5-44">F5-44</a> built membership and two cluster services over raw Ethernet, and showed that a single-system image leaks under partial failure. <b>What carries over:</b> request ids that match replies (the <code>cps</code> round number is 9P's tag), bounded waits, polled devices with descriptor rings. <b>What changes:</b> most dangerous first: the server now keeps state for each client (fids), so a crash on either side leaves the other with stale state; the transport (virtio) is reliable here, which hides the retry problem F5-46 must face; and names may differ per process. <sup class="src"><a href="#F5-45-src-D3">D3</a></sup> <b>What comes next:</b> <a href="#F5-46">F5-46</a> boots the cluster from the network and puts a 9P-shaped file service on it, over frames that can be lost.</p></div>
+
+<h2 id="F5-45-check">Check yourself</h2>
+<ol>
+<li>State Plan 9's three central ideas and Amoeba's three central ideas in one sentence each.</li>
+<li>Explain in your own words why a 9P client chooses fids and tags, rather than the server.</li>
+<li>Decode by hand: <code>0b 00 00 00 78 08 00 02 00 00 00</code>. Which message is it, with which fields?</li>
+<li>An Rwalk for a walk of three names returns only two qids. What happened, and what is the state of newfid?</li>
+<li>Why can a holder of a restricted capability not create the owner capability, even with unlimited computing time, if <i>f</i> is truly one-way? Why does the lab's <i>f</i> not give that guarantee?</li>
+<li>Apply it to a new case: your cluster wants a file service where any node can give another node read-only access to one file for one job. Would you use Plan 9-style per-process name spaces, Amoeba-style capabilities, or both? Say what each would cost.</li>
+<li>Predict, then run: if you change <code>out.u32(0644)</code> to <code>out.u32(0600)</code> in Listing 3, what will the host's <code>ls -l</code> show for <code>from-kernel.txt</code>, and which trace line changes?</li>
+<li>The session's Rread is 42 bytes. How long would it be if the file held 600 bytes and the request still asked for 512?</li>
+<li>Name one property that QEMU's 9P transport gives the lab and that F5-46's raw Ethernet transport does not.</li>
+</ol>
+
+<h2 id="F5-45-lab">Lab</h2>
+<p><b>Goal.</b> Run a complete 9P session from your own kernel against QEMU's 9P server, prove it with host-side checks and QEMU's own trace, and run the two models.</p>
+<p><b>Curriculum section 7.1, row "9P and virtio-fs" (quoted).</b> "9P and virtio-fs | Sharing a host directory with your OS in QEMU | The 9P protocol documentation (Plan 9 manual section 5; the 9P2000.L variant documented by its implementers); VIRTIO Specification (file system device) with the FUSE protocol (Linux kernel FUSE documentation) | Linux 9p and virtiofs; QEMU's 9p server and the virtiofsd daemon | Host-side comparison of files | Very useful during U-track work: edit on the host, build inside your OS" <sup class="src"><a href="#F5-45-src-C1">C1</a></sup> This lab implements the 9P half with the curriculum's test method (host-side comparison of files); virtio-fs and FUSE are not covered.</p>
+<p><b>Course lab (card, quoted).</b> "Your kernel on three QEMU nodes sharing a 9P or custom remote file service." <sup class="src"><a href="#F5-45-src-C2">C2</a></sup> Here one node speaks real 9P to QEMU's server; F5-46 adds the three-node custom service.</p>
+<p><b>Hardware and software needed.</b> As F5-44: one Linux computer, QEMU 8.2.2 with the virtio-9p device compiled in, g++ 13.3.0, GNU ld. Untested on hardware.</p>
+<p><b>Safety.</b> Export only the lab's scratch directory (see the safety box above). <code>run.sh</code> creates <code>.build/export</code> and deletes it afterwards.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F5-45</code>. It compiles and runs the two models, then <code>run.sh</code> builds <code>f545.elf</code>, writes <code>hello.txt</code> into the export directory and boots the kernel with <code>-fsdev local</code>, <code>-device virtio-9p-pci,...,disable-modern=on</code> and <code>-trace v9fs_*</code>.</li>
+<li>Read the session: for each "-&gt;" line find the matching <code>v9fs_</code> trace line and the "&lt;-" line with the same tag.</li>
+<li>Read the host-side checks.</li>
+<li>Decode the Tversion hex dump by hand and check its size.</li>
+</ol>
+<p><b>Expected observations</b> (measured on the build machine: Linux x86_64 cloud container without KVM, QEMU 8.2.2 TCG, on 2026-10-10; tick values and times will differ on yours):</p>
+<pre class="output" data-run="F5-45/session"></pre>
+<p>QEMU refused "9P2000" with "unknown" and accepted "9P2000.u"; every request has a trace line with the same tag and message id; the kernel read 31 bytes and wrote 36. The pointer value printed in the <code>v9fs_walk_return</code> line is a QEMU host address and changes between runs.</p>
+<p><b>Verification.</b></p>
+<pre class="output" data-run="F5-45/check"></pre>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"no virtio-9p device" and exit code 35: QEMU was built without 9P support, or <code>disable-modern=on</code> is missing so the device id differs. Check <code>qemu-system-x86_64 -device help</code>.</li>
+<li>A warning about msize on QEMU's standard error: the kernel offered a small msize; the lab offers 32,768, which QEMU 8.2.2 accepted without a warning.</li>
+<li>The run hangs: the used ring is never updated; check the queue address and DRIVER_OK.</li>
+</ul>
+<p><b>Extension.</b> Add Tstat and print the file's length and modification time; then send two Treads with different tags before polling, and match the replies by tag.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The virtio-9p device exists only in virtual machines, so this lab has no physical counterpart. The run is QEMU 8.2.2 TCG emulation on one Linux host (R2). Other QEMU versions may accept different 9P versions and print different trace lines.</p></div>
+
+<h2 id="F5-45-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Ines reports: "The kernel can't read <code>Hello.txt</code> from the share, but I can see the file on the host. QEMU's 9P server is broken." She attached the run below and nothing else.</p>
+<p><b>Evidence pack</b> (the real forensic run: the same kernel booted with <code>walk=Hello.txt</code>; the export directory contained <code>hello.txt</code> as in the session):</p>
+<pre class="output" data-run="F5-45/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which request failed, and what exactly did the server answer (message, string, number)?</li>
+<li>Decode the Twalk's wname bytes. Which name did the kernel ask for?</li>
+<li>Give two hypotheses for the failure, and say which evidence decides between them.</li>
+<li>Was the server broken? Use the earlier messages of the same run as evidence.</li>
+<li>What is the root cause, and in which file of the lab would you find where it comes from?</li>
+<li>Propose a fix and a check that would have caught the problem before Ines filed her report.</li>
+</ol>
+<p><b>Method hints.</b> Compare the hex dump with the session's Twalk byte by byte. Remember which file system the server's answer comes from, and whether that file system treats upper and lower case as different.</p>
+
+<p><b>Grading rubric</b> (guide 11.2): observation 20 % (anomalies found and described with file, tick and value); hypotheses 20 % (at least two before concluding); evidence-based conclusion 30 % (root cause proven from the evidence, competing hypotheses ruled out with evidence); fix and verification 20 %; prevention and communication 10 % (a test, monitor or design change, and a short clear write-up).</p>
+
+<h2 id="F5-45-project">Mini-project</h2>
+<p><b>A 9P <code>ls</code> and <code>cat</code> for your kernel.</b> Extend Listing 3 into a small shell command set: <code>ls</code> (open a directory fid and read it; in 9P2000.u a directory read returns stat structures), <code>cat path</code> (walk several names, read until a short read), and <code>cp</code> from the share to a RAM file. Handle Rerror on every request, clunk every fid on every path, and print the qid of each file.</p>
+<p><b>Rubric.</b> <code>ls</code> decodes every stat field it prints, checked against the host's <code>ls -l</code> (3). Multi-element walks and partial walks handled correctly, shown by a test with a missing middle directory (2). No fid leak: a run that opens 1,000 files in a loop and shows QEMU's trace with as many clunks as walks (2). Reads of files larger than one msize (2). Code style and comments (1).</p>
+
+<h2 id="F5-45-summary">Summary</h2>
+<ul>
+<li>Plan 9: resources are files, one protocol (9P) reaches all of them, and each process builds its own name space from local and remote trees.</li>
+<li>Amoeba: a processor pool, objects on servers reached by RPC, and sparse capabilities for naming and protection.</li>
+<li>A 9P message is size[4] type[1] tag[2] plus fields, little-endian; fids are client-chosen handles to server state; tags match replies to requests; qids identify files and carry versions.</li>
+<li>QEMU 8.2.2's 9P server refused "9P2000" and accepted "9P2000.u", which adds numeric ids and errnos.</li>
+<li>Capabilities make delegation free, revocation hard, and secrecy of the bits essential.</li>
+<li>Per-process name spaces are a powerful alternative to one global name space, and a debugging trap when used by accident.</li>
+<li>Adding up a message's fields until the size matches is the quickest check of any protocol encoding.</li>
+</ul>
+
+<h2 id="F5-45-sources">Sources</h2>
+<ol>
+<li id="F5-45-src-D1">D1 — Rob Pike, Dave Presotto, Sean Dorward, Bob Flandrena, Ken Thompson, Howard Trickey, Phil Winterbottom, "Plan 9 from Bell Labs" (tier 2; journal and year to be recorded). <i>Title only — not opened during this build; the Source Researcher must confirm the publication and section (dossier gate G1 open).</i></li>
+<li id="F5-45-src-D2">D2 — Rob Pike and co-authors, "The Use of Name Spaces in Plan 9" (tier 2; venue and year to be recorded). <i>Title only — not opened during this build; the Source Researcher must confirm the publication and authors (dossier gate G1 open).</i></li>
+<li id="F5-45-src-D3">D3 — Plan 9 Programmer's Manual, section 5 (the 9P protocol: intro, version, attach, walk, open and create, read and write, clunk, flush, stat) (tier 1; edition to be recorded). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and pages (dossier gate G1 open).</i></li>
+<li id="F5-45-src-D4">D4 — Andrew S. Tanenbaum, Robbert van Renesse, Hans van Staveren, Gregory J. Sharp, Sape J. Mullender and co-authors, "Experiences with the Amoeba Distributed Operating System" (tier 2; journal and year to be recorded). <i>Title only — not opened during this build; the Source Researcher must confirm the publication and authors (dossier gate G1 open).</i></li>
+<li id="F5-45-src-D5">D5 — Andrew S. Tanenbaum, Sape J. Mullender, Robbert van Renesse, "Using Sparse Capabilities in a Distributed Operating System" (tier 2; venue and year to be recorded). <i>Title only — not opened during this build; the Source Researcher must confirm the publication (dossier gate G1 open).</i></li>
+<li id="F5-45-src-D6">D6 — Maarten van Steen, Andrew S. Tanenbaum, "Distributed Systems" (tier 3; edition to be recorded): naming, distributed file systems (stateful and stateless servers). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-45-src-D7">D7 — OASIS, "Virtual I/O Device (VIRTIO) Specification" (tier 1; version to be recorded): legacy interface over PCI, split virtqueues, the 9P transport device. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-45-src-D8">D8 — QEMU project documentation for QEMU 8.2 (tier 2): <code>-fsdev local</code> and security models, <code>virtio-9p-pci</code>, <code>-trace</code> events. <i>Title only — not opened during this build; the options used were accepted by the installed QEMU 8.2.2 (R2), which is the only evidence.</i></li>
+<li id="F5-45-src-D9">D9 — 9P2000.u and 9P2000.L protocol descriptions published by the Linux v9fs implementers (tier 2; document and version to be recorded). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-45-src-C1">C1 — Systems Curriculum (this project), section 7.1, row "9P and virtio-fs" (local file <code>SYSTEMS_CURRICULUM.html</code>): quoted verbatim. A map, not a source (AH-4).</li>
+<li id="F5-45-src-C2">C2 — University Authoring Guide (this project), section 5 course card DS403: lab text quoted. A map, not a source.</li>
+<li id="F5-45-src-R1">R1 — build of <code>f545.elf</code>: <code>build.log</code>; g++ 13.3.0, GNU ld; exit code 0.</li>
+<li id="F5-45-src-R2">R2 — 9P session: <code>session.log</code>, <code>session.out</code>; QEMU 8.2.2 TCG with <code>-trace v9fs_*</code>; exit code 33 (planned halt). Untested on hardware.</li>
+<li id="F5-45-src-R3">R3 — host-side checks: <code>check.log</code>, <code>check.out</code>.</li>
+<li id="F5-45-src-R4">R4 — forensic run with <code>walk=Hello.txt</code>: <code>forensic.log</code>, <code>forensic.out</code>.</li>
+<li id="F5-45-src-R5">R5 — <code>capability.cpp</code>: <code>capability.log</code>; g++ 13.3.0 with AddressSanitizer and UBSan; exit code 0.</li>
+<li id="F5-45-src-R6">R6 — <code>namespace.cpp</code>: <code>namespace.log</code>; g++ 13.3.0 with AddressSanitizer and UBSan; exit code 0.</li>
+</ol>
+
+<h2 id="F5-45-glossary">Glossary links</h2>
+<p><a href="#gl-plan-9-from-bell-labs">Plan 9</a> · <a href="#gl-9p">9P</a> · <a href="#gl-fid">Fid</a> · <a href="#gl-tag-9p">Tag (9P)</a> · <a href="#gl-qid">Qid</a> · <a href="#gl-per-process-name-space">Per-process name space</a> · <a href="#gl-amoeba">Amoeba</a> · <a href="#gl-capability-sparse">Capability (sparse)</a> · <a href="#gl-processor-pool">Processor pool</a> · <a href="#gl-virtqueue-split">Virtqueue (split)</a> · <a href="#gl-virtio">virtio</a></p>
+
+<h2 id="F5-45-next">Next chapter</h2>
+<p><a href="#F5-46">F5-46 Your OS on many machines: network boot and remote file systems</a>. Back to the course: <a href="#DS403">DS403</a>.</p>
+
+<h2 id="F5-45-answers">Answers to Check yourself</h2>
+<ol>
+<li>Plan 9: resources are files; one protocol, 9P, serves all files; each process has its own name space built by bind and mount. Amoeba: processes run on an ownerless processor pool; resources are objects on servers reached by RPC; objects are named and protected by sparse capabilities.</li>
+<li>Because the client knows which numbers it is already using: it can pick a fresh fid or tag without a round trip, and a reply can be matched without the server having to invent and return a number first. Good answers mention that the server must reject a fid already in use.</li>
+<li>size 11, type 0x78 = 120 = Tclunk, tag 8, fid 2: the lab's first clunk.</li>
+<li>The walk stopped at the third name (it does not exist or is not reachable); for a partial walk the server returns the qids of the names that succeeded and newfid is <i>not</i> created. Only a complete walk (or a walk of zero names) sets newfid.</li>
+<li>Making the owner capability needs the secret; going from <i>f</i>(secret XOR r) back to the secret means inverting <i>f</i>, which a one-way function makes infeasible. The lab's <i>f</i> is an invertible mixing function (each step can be undone), so a determined attacker could recover the secret; the model shows the shape only.</li>
+<li>Capabilities fit "give one node read access to one file for one job": the giver asks for a read-only copy and passes it; no server list changes. Cost: revocation means changing the secret, and the capability must not be seen on the network. Name spaces decide what a process sees, not what it may do, so they help with isolation but not with delegation; using both (a capability to mount, a name space to arrange) is a reasonable design.</li>
+<li><code>-rw-------</code> instead of <code>-rw-r--r--</code> (with <code>security_model=none</code> the mode passes through), and the trace line changes to <code>perm 384</code>. Run it to check.</li>
+<li>4 + 1 + 2 + 4 + 512 = 523 bytes: the server returns at most count bytes.</li>
+<li>Reliable delivery of whole messages in order (one request, one reply, nothing lost), so the client never retries and never sees a duplicate.</li>
+</ol>
+<h3 id="F5-45-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>The Twalk with tag 2 failed: Rerror tag 2, string "No such file or directory", errno 2 (QEMU's trace: <code>v9fs_rerror tag 2 id 110 err 2</code>).</li>
+<li>Length 9, bytes <code>48 65 6c 6c 6f 2e 74 78 74</code>: "Hello.txt", with a capital H (0x48; the session's walk has 0x68, "h").</li>
+<li>(a) The server is broken or cannot read the share; (b) the name does not exist in the exported directory as spelled. Evidence: Tversion and Tattach in the same run succeeded, and the trace shows the server looked up the name and returned errno 2 (ENOENT): it is answering, and answering "not found".</li>
+<li>No. It agreed a version, attached and answered the walk with a correct, well-formed error, exactly as it should for a missing name.</li>
+<li>The kernel asked for "Hello.txt"; the host directory contains "hello.txt"; the host's file system is case-sensitive and QEMU's local back end passes names through unchanged. The name comes from the command line <code>walk=Hello.txt</code> (see <code>forensic.log</code>) handled at line 81 of <code>f545_main.cc</code>.</li>
+<li>Fix: use the exact name (or list the directory and offer the closest match). Check: a test that walks a known name and a deliberately wrong-case name and asserts success and ENOENT respectively; and an error message that prints the requested name in quotes, so the capital letter is visible in the first report.</li>
+</ol>
+<p><b>Alternative wrong answers.</b> "The 9P version is wrong": the same run agreed 9P2000.u and attached. "Permissions": the error is ENOENT (2), not EACCES. "The kernel corrupted the message": the size and every field decode correctly. <b>How the evidence was produced:</b> the healthy kernel booted with <code>walk=Hello.txt</code> while the export directory held <code>hello.txt</code> (<code>run.sh</code>, the <code>forensic</code> session).</p>

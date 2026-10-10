@@ -1,0 +1,280 @@
+<!--meta
+id: F6-12
+title: Synchronization inside a block (barriers) and why there is no simple barrier across the whole grid
+course: CU301
+level: L3
+prereqs: F6-10; F6-11; SP203 (F2-35 data races, F2-39 the C++ memory model); BR-03
+time: 6–10 hours including the lab
+hardware: Lab extension: an NVIDIA GPU that reports cooperative-launch support. The interleaving explorer, the grid-barrier simulation, the compiler evidence and the forensic lab run on any computer with g++ and nvcc (this build: no GPU)
+maps: Curriculum Track E 13.2 topic 1 (synchronization within a block); bridge BR-03 (synchronization is cheap inside a block and expensive or unavailable across the grid); preparation for E3–E4
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-12-hook">Story hook</h2>
+<p>At Ravi's table the helpers work in rounds: each puts a bowl on the table, then takes the bowl of the helper to their left. The table has one rule, a bell. When you have put your bowl down, you wait at the bell; when the last helper of the table arrives, everyone continues. Without the bell, a quick helper sometimes grabs an empty spot, or yesterday's bowl.</p>
+<p>One day the head of the hall wants every table in the hall to finish round one before anyone starts round two. "Easy," says Ravi, "a bell for the whole hall." But the hall is full. Some tables are still waiting outside the door for a free place, and they will only get one when a table inside finishes. The tables inside wait at the hall bell for the tables outside; the tables outside wait for the tables inside to leave. Nobody moves again.</p>
+<p>The table bell is <code>__syncthreads()</code>. The hall bell that freezes everything is a home-made <b>grid-wide barrier</b>. This chapter shows why the first is cheap and safe, why the second is dangerous, and what CUDA offers instead.</p>
+
+<h2 id="F6-12-able">What you will be able to do</h2>
+<ul>
+<li><b>State</b> exactly what <code>__syncthreads()</code> guarantees: every thread of the block arrives, and shared-memory writes before it are visible after it.</li>
+<li><b>Place</b> barriers correctly in multi-phase kernels, including the second barrier before a shared buffer is reused.</li>
+<li><b>Explain</b> with a residency argument why a spinning barrier across all blocks can hang, and name the two safe alternatives.</li>
+<li><b>Use</b> a cooperative launch with <code>cooperative_groups::this_grid().sync()</code>, sized by the occupancy calculator.</li>
+<li><b>Diagnose</b> a kernel that hangs only when the grid is larger than the GPU can hold at once.</li>
+</ul>
+
+<div class="co jargon" id="F6-12-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Barrier (<code>__syncthreads</code>)</dt><dd><b>Simple words:</b> a "wait here until everyone in the block arrives" point. <b>Analogy:</b> the table's bell. <b>Precise:</b> a block-wide barrier: no thread of the block continues until all threads of the block have reached it, and global and shared memory accesses made by the block's threads before it are visible to all of the block's threads after it. It must be reached by every thread of the block. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup></dd>
+<dt>Race (data race, GPU)</dt><dd><b>Simple words:</b> two threads touch the same memory, at least one writes, and nothing fixes their order. <b>Analogy:</b> grabbing a neighbour's bowl without waiting for the bell. <b>Precise:</b> conflicting accesses not ordered by synchronization; the result depends on scheduling. The same idea as in SP203 (<a href="#F2-35">F2-35</a>), now between GPU threads. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> <sup class="src"><a href="#F6-12-src-D3">D3</a></sup></dd>
+<dt>Residency</dt><dd><b>Simple words:</b> a block is resident when it has a place on an SM and can run. <b>Analogy:</b> a table that is inside the hall, not waiting outside. <b>Precise:</b> a block occupies an SM's registers, shared memory and thread slots from its start until it finishes; blocks beyond what all SMs can hold wait until resident blocks finish, and the programming model does not let you assume any order or co-residency between blocks. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup></dd>
+<dt>Grid-wide barrier</dt><dd><b>Simple words:</b> a point that all threads of all blocks must reach before any continues. <b>Analogy:</b> a bell for the whole hall. <b>Precise:</b> safe only when every block of the grid is resident at the same time; CUDA provides it through cooperative groups (<code>this_grid().sync()</code>) for kernels started with a cooperative launch. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> <sup class="src"><a href="#F6-12-src-H1">H1</a></sup></dd>
+<dt>Cooperative launch</dt><dd><b>Simple words:</b> a special way to start a kernel that promises all its blocks run at once. <b>Analogy:</b> asking for the whole hall, and only being let in if every table fits. <b>Precise:</b> <code>cudaLaunchCooperativeKernel</code>; the device must report the cooperative-launch attribute, and the number of blocks may not exceed the occupancy calculator's blocks per SM times the number of SMs. <sup class="src"><a href="#F6-12-src-H1">H1</a></sup></dd>
+<dt>Memory fence (<code>__threadfence</code>)</dt><dd><b>Simple words:</b> an instruction that orders a thread's own memory writes as others see them, without waiting for anybody. <b>Analogy:</b> putting the bowl down firmly before raising your hand, so whoever sees the hand also sees the bowl. <b>Precise:</b> orders the calling thread's memory accesses before and after it as observed by other threads (block, device or system scope for the three variants); unlike a barrier it waits for no other thread. Compare the C++ fences of <a href="#F2-39">F2-39</a>. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> <sup class="src"><a href="#F6-12-src-H1">H1</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-12-pictures">The idea in pictures</h2>
+<figure id="F6-12-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-12-f1t F6-12-f1d">
+<title id="F6-12-f1t">Figure 1: a barrier inside a block, and a home-made barrier across a grid that is larger than the GPU</title>
+<desc id="F6-12-f1d">Left half: one block of four threads on a time axis going down. Each thread writes, then all four reach a horizontal line labelled __syncthreads, then each reads; arrows show that the reads happen only after all writes. Right half: a toy GPU with 8 slots, drawn as two SMs with four slots each, all filled with blocks 0 to 7, each labelled spinning at the grid barrier. Outside the GPU, a queue of blocks 8 to 15 labelled waiting for a free slot. Arrows show that the resident blocks wait for blocks 8 to 15 to arrive, and blocks 8 to 15 wait for a slot that only a finishing block can free: a cycle, so the kernel hangs.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="22">inside one block: safe</text>
+<text class="sv-ts" x="30" y="44">t0</text><text class="sv-ts" x="90" y="44">t1</text><text class="sv-ts" x="150" y="44">t2</text><text class="sv-ts" x="210" y="44">t3</text>
+<rect class="sv-b1" x="20" y="54" width="40" height="40"/><text class="sv-ts" x="26" y="78">write</text>
+<rect class="sv-b1" x="80" y="70" width="40" height="40"/><text class="sv-ts" x="86" y="94">write</text>
+<rect class="sv-b1" x="140" y="54" width="40" height="40"/><text class="sv-ts" x="146" y="78">write</text>
+<rect class="sv-b1" x="200" y="96" width="40" height="40"/><text class="sv-ts" x="206" y="120">write</text>
+<line class="sv-line2" x1="14" y1="154" x2="250" y2="154"/><text class="sv-ts" x="20" y="170">__syncthreads(): all 4 arrived</text>
+<rect class="sv-b5" x="20" y="184" width="40" height="40"/><text class="sv-ts" x="28" y="208">read</text>
+<rect class="sv-b5" x="80" y="184" width="40" height="40"/><text class="sv-ts" x="88" y="208">read</text>
+<rect class="sv-b5" x="140" y="184" width="40" height="40"/><text class="sv-ts" x="148" y="208">read</text>
+<rect class="sv-b5" x="200" y="184" width="40" height="40"/><text class="sv-ts" x="208" y="208">read</text>
+<line class="sv-dash" x1="20" y1="236" x2="240" y2="236"/><text class="sv-ts" x="20" y="252">time runs downward</text>
+<line class="sv-line" x1="280" y1="10" x2="280" y2="320"/>
+<text class="sv-tb" x="300" y="22">home-made grid barrier, 16 blocks, 8 slots: hangs</text>
+<rect class="sv-box" x="300" y="36" width="250" height="200"/><text class="sv-t" x="310" y="54">toy GPU (TG-1, invented)</text>
+<rect class="sv-box" x="310" y="62" width="110" height="164"/><text class="sv-ts" x="316" y="78">SM 0</text>
+<rect class="sv-box" x="430" y="62" width="110" height="164"/><text class="sv-ts" x="436" y="78">SM 1</text>
+<rect class="sv-b6" x="318" y="86" width="94" height="30"/><text class="sv-ts" x="324" y="106">0 spinning</text>
+<rect class="sv-b6" x="318" y="120" width="94" height="30"/><text class="sv-ts" x="324" y="140">1 spinning</text>
+<rect class="sv-b6" x="318" y="154" width="94" height="30"/><text class="sv-ts" x="324" y="174">2 spinning</text>
+<rect class="sv-b6" x="318" y="188" width="94" height="30"/><text class="sv-ts" x="324" y="208">3 spinning</text>
+<rect class="sv-b6" x="438" y="86" width="94" height="30"/><text class="sv-ts" x="444" y="106">4 spinning</text>
+<rect class="sv-b6" x="438" y="120" width="94" height="30"/><text class="sv-ts" x="444" y="140">5 spinning</text>
+<rect class="sv-b6" x="438" y="154" width="94" height="30"/><text class="sv-ts" x="444" y="174">6 spinning</text>
+<rect class="sv-b6" x="438" y="188" width="94" height="30"/><text class="sv-ts" x="444" y="208">7 spinning</text>
+<rect class="sv-b8" x="580" y="86" width="160" height="132"/><text class="sv-t" x="590" y="108">blocks 8 .. 15</text><text class="sv-ts" x="590" y="128">waiting for a</text><text class="sv-ts" x="590" y="144">free slot</text>
+<line class="sv-line" x1="580" y1="190" x2="556" y2="190"/><polygon class="sv-head" points="550,190 559,185 559,195"/>
+<text class="sv-ts" x="300" y="258">resident blocks wait for 8..15 to arrive at the barrier;</text>
+<text class="sv-ts" x="300" y="274">8..15 wait for a slot that only a finishing block frees: a cycle</text>
+<text class="sv-ts" x="300" y="306">Simulated by Listing 2; slot counts invented (TG-1).</text>
+</svg></div><figcaption><b>Figure 1.</b> Left: the guarantee of a block barrier. Right: why a spinning barrier across a grid larger than the device's resident capacity cannot complete; Listing 2 reproduces the hang for 9, 16 and 64 blocks on 8 invented slots (R2). Arrows show waiting, not data flow. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> <sup class="src"><a href="#F6-12-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F6-12-layer1">Layer 1 — the kid explanation</h2>
+<p>A bell works when everyone who must ring it is in the room. At one table, everyone is always in the room, so the table's bell is safe. The whole hall is different: if not all tables fit inside at once, a bell for the whole hall can trap everyone forever. So you either ask for a hall where every table fits, or you end the shift: when one job is completely finished, the next job starts, and that end is the hall-wide bell.</p>
+
+<h2 id="F6-12-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-12-l2-guarantee">What <code>__syncthreads()</code> guarantees</h3>
+<p>Two things. Execution: no thread of the block passes the barrier until every thread of the block has reached it. Memory: the global and shared memory accesses that the block's threads made before the barrier are visible to all threads of the block after it. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> Both matter. The first stops a fast warp from reading a tile that a slow warp has not filled; the second ensures that what was written is what is read. The compiler turns it into <code>bar.sync 0</code> in PTX and <code>BAR.SYNC 0x0</code> in SASS (R4, and the listings of <a href="#F6-10">F6-10</a>). <sup class="src"><a href="#F6-12-src-R4">R4</a></sup></p>
+<h3 id="F6-12-l2-where">Where barriers go: count the phases</h3>
+<p>Listing 1 is an exhaustive check on a tiny "block" of four threads. Each thread writes <code>s[t]</code> and reads its neighbour's <code>s[(t + 1) % 4]</code>; the explorer tries every possible interleaving of the steps and counts wrong answers. <sup class="src"><a href="#F6-12-src-R1">R1</a></sup></p>
+<ul>
+<li>No barrier (<code>WR</code>): 1,432 of 2,520 orders are wrong.</li>
+<li>Barrier between write and read (<code>WBR</code>): 0 of 576 wrong.</li>
+<li>Two rounds reusing <code>s</code>, a barrier only after each write (<code>WBRWBR</code>): 824,832 of 1,451,520 wrong, because a fast thread overwrites <code>s[t]</code> for round 2 while its neighbour still needs the round-1 value.</li>
+<li>Two rounds with a barrier after the write <em>and</em> after the read (<code>WBRBWBR</code>): 0 of 331,776 wrong.</li>
+</ul>
+<p>The rule that follows: a shared buffer that is written, read, and written again needs a barrier after each write (read-after-write) <em>and</em> one after the last read before the next write (write-after-read). Loops over tiles, as in GEMM (<a href="#F6-22">F6-22</a>), need both. <sup class="src"><a href="#F6-12-src-D3">D3</a></sup></p>
+<h3 id="F6-12-l2-all">Every thread must arrive</h3>
+<p>A barrier inside a branch that only some threads of the block take is not allowed: the programming guide requires <code>__syncthreads()</code> in conditional code only when the condition evaluates identically across the whole block. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> Otherwise the kernel may hang or behave unpredictably. The usual offender is an early <code>return</code> for threads past the end of the data, placed before a barrier (<a href="#F6-10">F6-10</a>'s mistakes). Compute Sanitizer has a tool that checks barrier use (synccheck) and one that finds shared-memory races (racecheck) (<a href="#F6-05">F6-05</a>). <sup class="src"><a href="#F6-12-src-D4">D4</a></sup></p>
+<h3 id="F6-12-l2-variants">Barrier variants</h3>
+<p>The CUDA 12.0 headers read in this build declare <code>__syncthreads_count(int)</code>, <code>__syncthreads_and(int)</code> and <code>__syncthreads_or(int)</code>, which are barriers that also combine one predicate per thread over the block (count, all, any), and <code>__syncwarp(unsigned mask=0xFFFFFFFF)</code>, a barrier for the lanes of one warp named in the mask. <sup class="src"><a href="#F6-12-src-H1">H1</a></sup> <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> <a href="#F6-18">F6-18</a> uses <code>__syncthreads_count</code> to count the keys of a block in one step.</p>
+
+<h2 id="F6-12-layer3">Layer 3 — the engineer's depth</h2>
+<p>In one line of analogy: the table bell is free because the table is in the room by construction; the hall bell is only safe if you are guaranteed that all tables are in the room together.</p>
+<h3 id="F6-12-l3-why">Why there is no simple grid barrier</h3>
+<p>Blocks of one grid are independent by design: the hardware may run them in any order, concurrently or one after another, which is what lets the same kernel run on GPUs of any size. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> A barrier across blocks breaks that assumption. If the grid has more blocks than the device can hold at once, resident blocks that spin at the barrier keep their slots, and the waiting blocks can never start. Listing 2 simulates it on TG-1 (invented: 2 SMs × 4 resident blocks = 8 slots): grids of 4 and 8 blocks finish; grids of 9, 16 and 64 blocks hang with 8 blocks spinning and 1, 8 and 56 blocks never resident. <sup class="src"><a href="#F6-12-src-R2">R2</a></sup> Even a grid that fits is not safe with a home-made barrier unless all of its blocks are guaranteed to be resident together (another kernel or process may hold slots), and the barrier also needs correct memory ordering (fences). <sup class="src"><a href="#F6-12-src-D1">D1</a></sup></p>
+<h3 id="F6-12-l3-safe">The two safe answers</h3>
+<p><b>1. End the kernel.</b> Kernels launched into the same stream run in order, so the end of one kernel is a barrier for the whole grid, with all its memory writes visible to the next kernel. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> Listing 3, variant A, splits a sum into <code>phase1</code> (per-block partial sums) and <code>phase2</code>. It costs a launch, and shared memory and registers do not survive the boundary. Most multi-pass algorithms in this course (reduce-then-scan in <a href="#F6-16">F6-16</a>, radix sort in <a href="#F6-18">F6-18</a>) use this answer.</p>
+<p><b>2. A cooperative launch with a grid group.</b> The CUDA 12.0 header comment of <code>cudaLaunchCooperativeKernel</code>, read in this build, describes it as a launch "where thread blocks can cooperate and synchronize as they execute"; the device must have a non-zero <code>cudaDevAttrCooperativeLaunch</code>, and "the total number of blocks launched cannot exceed the maximum number of blocks per multiprocessor as returned by <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> … times the number of multiprocessors"; a launch that is too large returns <code>cudaErrorCooperativeLaunchTooLarge</code>. <sup class="src"><a href="#F6-12-src-H1">H1</a></sup> Inside, <code>cooperative_groups::this_grid().sync()</code> is the grid barrier. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> Listing 3, variant B, sizes the grid exactly by that rule and uses a grid-stride loop (<a href="#F6-14">F6-14</a>) so that a grid of any size covers the input. This is the residency argument of Figure 1, turned into an API contract.</p>
+<h3 id="F6-12-l3-cost">What a grid barrier costs</h3>
+<p>The SASS of <code>bothPhases</code> (Evidence R3) shows what <code>this_grid().sync()</code> compiles to in CUDA 12.0 for <code>sm_80</code>: a block barrier (<code>BAR.SYNC</code>), a device-scope fence (<code>MEMBAR.ALL.GPU</code>), one atomic add per block on a counter (<code>ATOM.E.ADD.STRONG.GPU</code>, issued by one lane), a polling loop of strong loads (<code>LD.E.STRONG.GPU</code>) with <code>YIELD</code> and a branch back, and a final block barrier. Before it there is a <code>BPT.TRAP</code> on a path guarded by a check of a launch parameter. <sup class="src"><a href="#F6-12-src-R3">R3</a></sup> In other words, it is the "counter and spin" barrier of the story, made safe by the launch-size rule, plus fences.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That the <code>BPT.TRAP</code> path fires when the kernel was not launched cooperatively is an interpretation of the SASS, not a documented fact checked in this build. Also not checked: the exact memory-ordering guarantees of <code>grid.sync()</code>, and whether a separate compiler option is needed for grid groups in other toolkit versions (CUDA 12.0 compiled Listing 3 without one, R5). Check: the CUDA C++ Programming Guide, "Cooperative Groups" (grid synchronization and its requirements), for your toolkit version.</p></div>
+<h3 id="F6-12-l3-fence">Fences are not barriers</h3>
+<p><code>__threadfence_block()</code>, <code>__threadfence()</code> and <code>__threadfence_system()</code> order the calling thread's own writes as seen by others at block, device and system scope; they do not wait for any other thread. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> <sup class="src"><a href="#F6-12-src-H1">H1</a></sup> They are the building block for "publish, then flag" protocols between blocks, such as the last-block-done reduction and the decoupled look-back of <a href="#F6-16">F6-16</a>, where one block waits only for blocks that are guaranteed to have started before it.</p>
+
+<h2 id="F6-12-hardware">How the hardware actually does it</h2>
+<p>A block lives on one SM for its whole life, so a block barrier is a local affair: the SM counts the warps of the block that have arrived at barrier 0 and releases them when all have; waiting warps simply are not scheduled, which costs no other warp anything (<a href="#F1-60">F1-60</a>). <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> <sup class="src"><a href="#F6-12-src-D3">D3</a></sup> There is no such counter across SMs; a grid barrier must be built from memory operations on the device's L2 or memory: atomics, fences and polling (R3). <sup class="src"><a href="#F6-12-src-R3">R3</a></sup> That is the hardware reason for the asymmetry BR-03 announced: synchronization is cheap inside a block and expensive across the grid.</p>
+
+<h2 id="F6-12-worked">Worked example</h2>
+<p><b>Task.</b> A kernel tiles a long array into chunks of 256 elements and loops over them with one shared buffer: for each chunk, load into <code>s</code>, then each thread reads <code>s[(t + 1) % 256]</code>. Where do barriers go, and how many per chunk?</p>
+<ol>
+<li>Write <code>s[t]</code>; then other threads read it: a read-after-write dependency between threads → barrier B1 after the load.</li>
+<li>Read <code>s[(t + 1) % 256]</code>; then, in the next chunk, thread <i>t</i>+1 overwrites <code>s[t+1]</code>: a write-after-read dependency → barrier B2 after the read, before the next load.</li>
+<li>Two barriers per chunk. Listing 1's <code>WBRBWBR</code> row is this pattern on four threads: 0 wrong of 331,776 orders; without B2 (<code>WBRWBR</code>), 824,832 of 1,451,520 are wrong. <sup class="src"><a href="#F6-12-src-R1">R1</a></sup></li>
+<li>Alternative: two buffers used alternately (double buffering, <a href="#F6-24">F6-24</a>) remove B2 at the cost of twice the shared memory.</li>
+</ol>
+
+<h2 id="F6-12-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>interleave.cpp</code>: an exhaustive interleaving explorer.</p>
+<pre class="listing" data-src="F6-12/interleave.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined interleave.cpp -o interleave</code>, then <code>./interleave</code>.</p>
+<pre class="output" data-run="F6-12/interleave"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>27–36</td><td>end of a schedule</td><td>When every thread finished, counts the schedule and whether it was wrong.</td><td>Exhaustive: every order, not a sample.</td></tr>
+<tr><td>37–46</td><td>barrier</td><td>If all threads wait at the same barrier, all pass together.</td><td>The execution guarantee of <code>__syncthreads()</code>.</td></tr>
+<tr><td>47–48</td><td>choices</td><td>Any thread not finished and not waiting may take the next step.</td><td>Models "no order between threads".</td></tr>
+<tr><td>50–57</td><td>W and R</td><td>Write own slot; read the neighbour's and check the round's value.</td><td>The bug is reading a value from the wrong round.</td></tr>
+<tr><td>65–70</td><td>programs</td><td>The four barrier placements.</td><td>Each answers one question of Layer 2.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>grid_barrier_sim.cpp</code>: a home-made grid barrier on a toy GPU.</p>
+<pre class="listing" data-src="F6-12/grid_barrier_sim.cpp"></pre>
+<p><b>Build command</b>: the same g++ command; <code>./grid_barrier_sim</code>.</p>
+<pre class="output" data-run="F6-12/grid_barrier_sim"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8</td><td><code>Phase</code></td><td>Waiting (no slot), working, spinning at the barrier, done.</td><td>The four states of Figure 1.</td></tr>
+<tr><td>16–19</td><td>block scheduler</td><td>Fills free slots in blockIdx order.</td><td>A block keeps its slot until it finishes.</td></tr>
+<tr><td>21–31</td><td>one step</td><td>Working blocks progress; spinning blocks leave only when all arrived.</td><td>The barrier's rule.</td></tr>
+<tr><td>37–44</td><td>hang detection</td><td>No progress in a step means no progress ever.</td><td>Prints who waits for whom.</td></tr>
+<tr><td>51–56</td><td>main</td><td>Grids of 4 to 64 blocks on 8 slots.</td><td>Hangs exactly when the grid exceeds the slots.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>grid_sync.cu</code>: the two safe grid-wide orderings (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-12/grid_sync.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings grid_sync.cu -o grid_sync</code>.</p>
+<pre class="output" data-run="F6-12/grid_sync"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The build is real (R5); the run stopped at <code>cudaGetDevice</code> because the container has no GPU. On a GPU, both variants should print the expected sum; that has not been verified. What would be needed: an NVIDIA GPU reporting cooperative-launch support, and a rerun.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–30</td><td><code>blockPartial</code></td><td>Grid-stride sum per thread, then a shared-memory tree with a barrier per step.</td><td>Each step's reads need the previous step's writes.</td></tr>
+<tr><td>32–44</td><td><code>phase1</code>, <code>phase2</code></td><td>Variant A: two kernels.</td><td>The kernel boundary is the grid barrier.</td></tr>
+<tr><td>46–55</td><td><code>bothPhases</code></td><td>Variant B: one kernel, <code>cg::this_grid().sync()</code> between the phases.</td><td>Valid only under a cooperative launch.</td></tr>
+<tr><td>69–73</td><td>attributes, occupancy</td><td>Asks the device for cooperative support, SM count and resident blocks per SM.</td><td>The grid size rule from the header comment.</td></tr>
+<tr><td>89–94</td><td>variant A</td><td>Two launches in the default stream, then the copy.</td><td>Stream order guarantees phase 1 finished.</td></tr>
+<tr><td>96–103</td><td>variant B</td><td><code>cudaLaunchCooperativeKernel</code> with an argument array.</td><td>Checked like every other call.</td></tr>
+</tbody></table></div>
+<p><b>Compiler evidence.</b> The PTX barriers of <code>phase1</code>, and the SASS of the grid synchronization in <code>bothPhases</code> (<code>sm_80</code>, from the trap to the end of the sync):</p>
+<pre class="output" data-run="F6-12/ptx_bar"></pre>
+<pre class="output" data-run="F6-12/sass_gridsync"></pre>
+
+<h2 id="F6-12-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The bell also delivers the bowls.</b> A real bell only says "everyone is here"; <code>__syncthreads()</code> also makes memory writes visible. A barrier that only waited would not be enough. <sup class="src"><a href="#F6-12-src-D1">D1</a></sup></li>
+<li><b>Tables outside the hall are not "slow"; they do not exist yet.</b> A non-resident block has not started at all; it has no registers, no shared memory and no program counter. The story's "waiting outside the door" suggests they are ready to go.</li>
+<li><b>The hall's size is not visible from inside.</b> A helper cannot look around and count tables; a kernel has no reliable way to know how many blocks are resident. That is why the launch, not the kernel, has to guarantee co-residency.</li>
+</ul>
+
+<h2 id="F6-12-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> results correct most of the time, wrong sometimes, different on another GPU. <b>Cause:</b> a missing barrier (read-after-write or write-after-read). <b>How to find it:</b> Compute Sanitizer racecheck; count phases as in the worked example. <b>Fix:</b> add the missing barrier, or double-buffer.</li>
+<li><b>Symptom:</b> the kernel hangs or gives garbage when <i>n</i> is not a multiple of the block size. <b>Cause:</b> a barrier inside a branch or after an early <code>return</code>. <b>How to find it:</b> Compute Sanitizer synccheck. <b>Fix:</b> hoist the barrier out of the branch; let inactive threads do neutral work.</li>
+<li><b>Symptom:</b> a kernel with a counter-and-spin barrier works on a big GPU and hangs on a small one (the forensic lab). <b>Cause:</b> grid larger than resident capacity. <b>Fix:</b> split into kernels, or use a cooperative launch sized by the occupancy calculator.</li>
+<li><b>Symptom:</b> <code>cudaLaunchCooperativeKernel</code> returns <code>cudaErrorCooperativeLaunchTooLarge</code>. <b>Cause:</b> the grid exceeds blocks per SM × SMs. <sup class="src"><a href="#F6-12-src-H1">H1</a></sup> <b>Fix:</b> compute the grid as Listing 3 does and use a grid-stride loop.</li>
+</ul>
+
+<div class="co transition" id="F6-12-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> SP203 (<a href="#F2-35">F2-35</a> to <a href="#F2-40">F2-40</a>): CPU threads, data races, mutexes, condition variables, the C++ memory model; and <a href="#BR-03">BR-03</a>. <b>What carries over:</b> a race is conflicting accesses without ordering; synchronization both orders execution and makes memory visible; deadlock is a cycle of waiting (<a href="#F2-40">F2-40</a>). <sup class="src"><a href="#F6-12-src-D1">D1</a></sup> <b>What changes:</b> there are no mutexes or condition variables to reach for; the block barrier is cheap and the default tool, but only inside a block; a barrier across blocks deadlocks unless co-residency is guaranteed, and the guarantee comes from the launch (<code>cudaLaunchCooperativeKernel</code>), not from your code. <sup class="src"><a href="#F6-12-src-H1">H1</a></sup> <b>What comes next:</b> <a href="#F6-13">F6-13</a> lets threads of different blocks update the same memory safely without any barrier: atomics.</p></div>
+
+<h2 id="F6-12-check">Check yourself</h2>
+<ol>
+<li>Name the two guarantees of <code>__syncthreads()</code>.</li>
+<li>A kernel loads a tile, computes, and loops to the next tile with the same shared array. How many barriers per iteration, and why?</li>
+<li>Which is safe? (a) <code>if (threadIdx.x &lt; 32) __syncthreads();</code> (b) <code>if (blockIdx.x == 0) __syncthreads();</code> in a kernel where all threads of a block share blockIdx (c) <code>if (i &gt;= n) return;</code> before a barrier (d) a spin-wait on a global counter across all blocks of a large grid.</li>
+<li>Explain in your own words why a cooperative launch limits the number of blocks.</li>
+<li>Apply: on TG-1 (2 SMs × 4 resident blocks of this kernel), what is the largest cooperative grid, and how would Listing 3 cover 10 million elements with it?</li>
+<li>Predict, then run: add the program <code>WBWR</code> to Listing 1 (write, barrier, write again, read). How many wrong orders do you expect?</li>
+<li>What is the difference between <code>__threadfence()</code> and <code>__syncthreads()</code>?</li>
+</ol>
+
+<h2 id="F6-12-lab">Lab</h2>
+<p><b>Goal.</b> Place barriers by reasoning, confirm with an exhaustive explorer, and see what a grid barrier costs in machine code.</p>
+<p><b>Hardware and software needed.</b> Steps 1–4: no GPU (g++ 13.3, CUDA 12.0). Steps 5–6: an NVIDIA GPU that reports cooperative-launch support, with Compute Sanitizer. Folder <code>university/labs/F6-12</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use. A hung GPU kernel can make a desktop unresponsive on a GPU that also drives the display; run the hang experiment of step 6 on a compute-only GPU or with a time limit.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-12</code>; read the four outputs.</li>
+<li>Add the programs <code>WBWR</code> and <code>WWBR</code> to Listing 1; predict, then run.</li>
+<li>In Listing 2, change TG-1 to 4 SMs × 2 blocks; predict which grids hang.</li>
+<li>In <code>sass_gridsync.out</code>, mark the fence, the atomic, the polling loop and the two block barriers.</li>
+<li>On a GPU: run Listing 3; then remove the <code>__syncthreads()</code> inside the tree loop of <code>blockPartial</code> (line 27) and run Compute Sanitizer's racecheck.</li>
+<li>On a GPU: launch <code>bothPhases</code> with an ordinary <code>&lt;&lt;&lt;grid * 4, BLOCK&gt;&gt;&gt;</code> launch under <code>timeout</code>, and record what happens (error, trap or hang) without assuming it.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: <code>WBWR</code> has wrong orders (the second write may land before a neighbour's read), <code>WWBR</code> has none. Step 3: grids larger than 8 hang. Steps 5–6: your own observations; nothing was run on a GPU in this build.</p>
+<p><b>Verification.</b> Steps 2–3: your predictions match. Step 5: racecheck reports a hazard with the barrier removed and none with it.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Listing 1 takes very long → longer programs explode combinatorially; keep at most 7 steps per thread with 4 threads.</li>
+<li><code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> returns 0 → the block size or shared memory is too large for the kernel; check the block size and the launch-bounds of the kernel.</li>
+<li>The cooperative launch fails with an invalid-value error → the argument array must hold pointers to each argument, in order (<code>args[]</code> in Listing 3).</li>
+</ul>
+<p><b>Extension.</b> Implement the "last block done" reduction: each block writes its partial, executes <code>__threadfence()</code>, increments a counter with an atomic, and the block that sees the last count adds all partials. Explain why it needs no grid barrier.</p>
+
+<h2 id="F6-12-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A team wrote a two-phase kernel with a home-made grid barrier: every block increments a global counter and spins until it equals <code>gridDim.x</code>. It passed on the developer's GPU with their test size. On a smaller GPU in CI, with the production input size, the job times out and is killed. No error message is printed.</p>
+<p><b>Evidence pack.</b> The simulation of the same barrier on a toy GPU (Listing 2 and its output above, R2), and the SASS of CUDA's own grid barrier (R3) for comparison.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: for which grid sizes does the simulation hang, and what is true of every hanging case?</li>
+<li>Hypotheses: an infinite loop in the work phase; a lost counter update; insufficient resident capacity. Which evidence supports or rules out each?</li>
+<li>Root cause: explain the cycle of waiting.</li>
+<li>Fix: give two fixes, and the API check that makes the second one safe.</li>
+<li>Prevention: what test configuration would have caught this on the developer's machine?</li>
+</ol>
+<p><b>Method hints.</b> Compare "arrived" with "slots" in every hanging line. Then ask what the developer's GPU and test size had in common.</p>
+
+<h2 id="F6-12-project">Mini-project</h2>
+<p><b>Grid-wide sum two ways, for the primitives library.</b> Implement a device-wide sum as (a) two kernels and (b) a single kernel using the "last block done" pattern with a fence and an atomic counter. Test both on the E4 sizes with your harness from <a href="#F6-10">F6-10</a>. Write half a page comparing them: launches, memory traffic, and what each assumes about residency.</p>
+<p><b>Rubric.</b> Both correct on all sizes (3). The fence placed and justified (2). No residency assumption in (b), argued in writing (3). Clear comparison (2).</p>
+
+<h2 id="F6-12-summary">Summary</h2>
+<ul>
+<li><code>__syncthreads()</code>: all threads of the block arrive, and their earlier memory accesses become visible to the block.</li>
+<li>Barriers are needed for read-after-write and for write-after-read on reused shared buffers.</li>
+<li>Every thread of the block must reach every barrier.</li>
+<li>A home-made grid barrier hangs when the grid exceeds what can be resident at once.</li>
+<li>Safe grid-wide ordering: end the kernel, or use a cooperative launch with <code>this_grid().sync()</code>, sized by occupancy.</li>
+<li>Fences order one thread's writes; they wait for nobody.</li>
+</ul>
+
+<h2 id="F6-12-sources">Sources</h2>
+<ol>
+<li id="F6-12-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): synchronization functions, memory fence functions, the thread hierarchy (independence of blocks), cooperative groups (grid synchronization). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-12-src-D3">D3 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): barrier synchronization and transparent scalability. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-12-src-D4">D4 — NVIDIA, Compute Sanitizer documentation (tier 1): racecheck and synccheck tools. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-12-src-H1">H1 — CUDA 12.0 headers as installed (nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>cuda_runtime_api.h</code> (comment of <code>cudaLaunchCooperativeKernel</code>, quoted), <code>sm_20_intrinsics.h</code> (<code>__syncthreads_count/and/or</code>), <code>sm_30_intrinsics.h</code> (<code>__syncwarp</code>), <code>crt/device_functions.h</code> (<code>__syncthreads</code>, <code>__threadfence</code>, <code>__threadfence_block</code>). Tier 1.</li>
+<li id="F6-12-src-R1">R1 — run of Listing 1 (<code>university/labs/F6-12/interleave.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-12-src-R2">R2 — run of Listing 2 (<code>grid_barrier_sim.log</code>), g++ 13.3.0, exit code 0; TG-1 invented.</li>
+<li id="F6-12-src-R3">R3 — SASS of <code>bothPhases</code>, <code>sm_80</code> (<code>sass_gridsync.log</code>), compiled only.</li>
+<li id="F6-12-src-R4">R4 — PTX of <code>phase1</code>, <code>sm_80</code> (<code>ptx_bar.log</code>), compiled only.</li>
+<li id="F6-12-src-R5">R5 — build and run of Listing 3 (<code>grid_sync.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+</ol>
+
+<h2 id="F6-12-glossary">Glossary links</h2>
+<p><a href="#gl-barrier-syncthreads">Barrier (__syncthreads)</a> · <a href="#gl-data-race">Data race</a> · <a href="#gl-residency">Residency (GPU block)</a> · <a href="#gl-grid-wide-barrier">Grid-wide barrier</a> · <a href="#gl-cooperative-launch">Cooperative launch</a> · <a href="#gl-memory-fence-threadfence">Memory fence (GPU, __threadfence)</a></p>
+
+<h2 id="F6-12-next">Next chapter</h2>
+<p>Next: <a href="#F6-13">F6-13 Atomics: one tally counter, many hands</a>. Previous: <a href="#F6-11">F6-11 Bank conflicts</a>. Back to the course: <a href="#CU301">CU301</a>.</p>
+
+<h2 id="F6-12-answers">Answers to Check yourself</h2>
+<ol>
+<li>No thread passes until all threads of the block arrive; memory accesses before the barrier are visible to all the block's threads after it.</li>
+<li>Two: one after the load (others read what was written) and one after the compute's reads (the next load overwrites what others may still read). Or one with double buffering.</li>
+<li>(b) only: the condition is identical for every thread of a block. (a) splits the block. (c) removes threads before the barrier. (d) can hang when the grid exceeds resident capacity.</li>
+<li>A grid barrier can only complete if every block is running at the same time; the launch refuses grids larger than blocks per SM × SMs so that co-residency is guaranteed, as the header comment states.</li>
+<li>8 blocks. A grid-stride loop: each of the 8 × 256 threads sums elements <i>i</i>, <i>i</i> + 2,048, <i>i</i> + 4,096, … (Listing 3, lines 18–21).</li>
+<li>Some orders are wrong: a thread's second write can overwrite <code>s[t]</code> before its neighbour reads the first value, and the reader also may see the first or second value depending on order. Run it to get the count; this key does not quote one.</li>
+<li><code>__threadfence()</code> orders one thread's own writes as seen by others, waiting for nobody; <code>__syncthreads()</code> waits for all threads of the block and makes their accesses visible within the block.</li>
+</ol>
+<h3 id="F6-12-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Grids of 4 and 8 blocks finish; 9, 16 and 64 hang, always with 8 blocks spinning (= the number of slots) and the rest never resident; arrived = 8 in every hanging case.</p>
+<p><b>Hypotheses.</b> An infinite work loop would leave blocks "working", not "spinning"; the evidence shows all resident blocks reached the barrier. A lost counter update would show arrived &lt; resident; it equals the resident count. Insufficient capacity fits every line: hangs exactly when grid &gt; slots.</p>
+<p><b>Root cause.</b> Resident blocks wait for non-resident blocks to arrive; non-resident blocks wait for a slot, which only a finishing block frees; no block can finish: a cycle (deadlock). The developer's larger GPU held the whole test grid at once; CI's smaller GPU with the production size did not.</p>
+<p><b>Fix.</b> (1) Split the kernel at the barrier into two launches. (2) A cooperative launch with <code>this_grid().sync()</code>, grid = <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> × SM count, a grid-stride loop for the data, and the <code>cudaDevAttrCooperativeLaunch</code> check. <b>Prevention:</b> test with a grid larger than the device can hold (or on the smallest supported GPU), always under a timeout; ban hand-written grid barriers in code review.</p>
+<p><b>How the evidence was produced:</b> <code>grid_barrier_sim.cpp</code> (simulation, TG-1 invented) and <code>run.sh</code> (SASS). No GPU was used; the CI story is the scenario.</p>

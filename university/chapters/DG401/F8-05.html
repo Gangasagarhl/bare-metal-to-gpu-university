@@ -1,0 +1,276 @@
+<!--meta
+id: F8-05
+title: Your own ring all-reduce
+course: DG401
+level: L4
+prereqs: F8-02; F8-03; F8-04; CU302 (streams, events, reduction kernels); DS201 (threads and races)
+time: 15–25 hours including the lab
+hardware: Lab: any computer with g++ for the threaded ring and the race forensic (this build: 4 logical CPUs on a shared container; threads stand in for GPUs). GPU part: two or more GPUs in one machine (NVIDIA with CUDA, or AMD with ROCm), or a cloud multi-GPU instance; the CUDA and HIP listings were compiled for real and are untested on hardware
+maps: Curriculum Track F 14.1 (row "Ring all-reduce"); milestone F2; MP5 single-node part
+analogy: F8 — the great kitchen hall (passing bowls around a round table, one ladle at a time)
+-->
+
+<h2 id="F8-05-hook">Story hook</h2>
+<p>Bilal has explained the ring three times now: everyone adds what comes from the left and passes the result to the right. Tonight the team must actually do it, with real bowls, real cooks and no Bilal at the table. The first try goes wrong at once. Ayasha passes a whole pot of soup to the right before she has finished adding; Ravi waits for a pot that is still being carried; Joon's helper passes a bowl and then pours the soup into it afterwards, so for a moment his neighbour picks up an empty bowl and adds nothing.</p>
+<p>The fix is a few simple rules. Pass small bowls, one ladle each, so the next cook can start adding while you fill the next bowl. Never take more than two bowls on your side of the table. Never hand over a bowl before the soup is in it. This chapter turns those rules into code: first with threads on a CPU, where every mistake can be caught by a tool, then with GPUs, streams and events.</p>
+
+<h2 id="F8-05-able">What you will be able to do</h2>
+<ul>
+<li><b>Implement</b> a ring all-reduce as reduce-scatter followed by all-gather, for any number of ranks and any message size, including sizes that do not divide evenly.</li>
+<li><b>Chunk and pipeline</b> the transfers so that receiving, reducing and sending overlap, with bounded buffering (flow control).</li>
+<li><b>Verify</b> it against a reference sum for FP32 and integer data, and explain why the floating-point result differs from a sequential sum but is the same on every rank.</li>
+<li><b>Order</b> GPU copies and reduction kernels across devices with streams and events, without blocking the host.</li>
+<li><b>Find</b> a synchronisation bug in a "faster" handoff with ThreadSanitizer.</li>
+</ul>
+
+<div class="co jargon" id="F8-05-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Chunk</dt><dd><b>Simple words:</b> a small piece of a segment, sent on its own. <b>Analogy:</b> one ladle of soup in its own bowl. <b>Precise:</b> a contiguous sub-range of a ring segment; transfers and reductions are done per chunk so they can overlap (<a href="#F8-02">F8-02</a>). <sup class="src"><a href="#F8-05-src-R1">R1</a></sup></dd>
+<dt>Pipelining (communication)</dt><dd><b>Simple words:</b> starting the next piece before the previous one is completely done everywhere. <b>Analogy:</b> while your neighbour adds the first bowl, you already fill the second. <b>Precise:</b> overlapping the transfer of chunk <i>k</i>+1 with the reduction of chunk <i>k</i> (and with transfers on other hops), so the per-step time approaches the larger of transfer and reduce time instead of their sum. <sup class="src"><a href="#F8-05-src-D4">D4</a></sup> <sup class="src"><a href="#F8-05-src-R1">R1</a></sup></dd>
+<dt>Flow control</dt><dd><b>Simple words:</b> the sender waits when the receiver has no room. <b>Analogy:</b> never more than two bowls waiting on your side of the table. <b>Precise:</b> a bound on the data in flight between two ranks, enforced by the receiver's free buffer slots; Listing 1 uses a mailbox of capacity 2, Listing 2 two receive slots per GPU. <sup class="src"><a href="#F8-05-src-R1">R1</a></sup></dd>
+<dt>Data race</dt><dd><b>Simple words:</b> two threads touch the same memory at the same time, at least one writes, and nothing orders them. <b>Analogy:</b> picking up a bowl while someone is still pouring into it. <b>Precise:</b> in C++, two conflicting accesses from different threads, not both atomic, with no happens-before relation between them; the behaviour of the program is then undefined (<a href="#DS201">DS201</a>). <sup class="src"><a href="#F8-05-src-D12">D12</a></sup></dd>
+<dt>Event (GPU)</dt><dd><b>Simple words:</b> a marker in a GPU's work queue that other queues can wait for. <b>Analogy:</b> a bell rung when a bowl has been delivered. <b>Precise:</b> a CUDA or HIP event recorded on a stream completes when all work before it on that stream has completed; <code>cudaStreamWaitEvent</code> makes another stream, possibly on another device, wait for it without blocking the host (installed header). <sup class="src"><a href="#F8-05-src-H1">H1</a></sup></dd>
+</dl></div>
+
+<h2 id="F8-05-pictures">The idea in pictures</h2>
+<p>Figure 1 shows why chunks help. Without chunks, a step is "send the whole segment, then reduce it": the link and the adder take turns. With chunks, the link sends chunk 2 while the adder works on chunk 1, and only the first and last pieces are not overlapped.</p>
+<figure id="F8-05-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F8-05-f1t F8-05-f1d">
+<title id="F8-05-f1t">Figure 1: one ring step without and with chunking</title>
+<desc id="F8-05-f1d">Two timelines for one ring step, time running to the right. Top, without chunks: a row "link" with one long box "send segment" followed by an empty gap, and a row "adder" with an empty gap followed by one long box "reduce segment"; the step ends after both, marked by a dashed line far to the right. Bottom, with four chunks: the link row has boxes send c1, send c2, send c3, send c4 back to back; the adder row has boxes add c1, add c2, add c3, add c4 each starting when its chunk has arrived, so add c1 runs under send c2, and so on; the step ends after add c4, marked by a dashed line well before the end of the top timeline. A note says the gain is the overlap, and each chunk adds its own start-up cost alpha.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="28">Without chunks</text>
+<text class="sv-t" x="20" y="62">link</text><text class="sv-t" x="20" y="102">adder</text>
+<rect class="sv-b1" x="90" y="44" width="280" height="28"/><text class="sv-t" x="180" y="63">send segment</text>
+<rect class="sv-b4" x="370" y="84" width="280" height="28"/><text class="sv-t" x="450" y="103">reduce segment</text>
+<line class="sv-dash" x1="650" y1="36" x2="650" y2="124"/><text class="sv-ts" x="656" y="128">step ends</text>
+<text class="sv-tb" x="20" y="168">With 4 chunks</text>
+<text class="sv-t" x="20" y="202">link</text><text class="sv-t" x="20" y="242">adder</text>
+<rect class="sv-b1" x="90" y="184" width="70" height="28"/><text class="sv-ts" x="98" y="203">send c1</text>
+<rect class="sv-b1" x="160" y="184" width="70" height="28"/><text class="sv-ts" x="168" y="203">send c2</text>
+<rect class="sv-b1" x="230" y="184" width="70" height="28"/><text class="sv-ts" x="238" y="203">send c3</text>
+<rect class="sv-b1" x="300" y="184" width="70" height="28"/><text class="sv-ts" x="308" y="203">send c4</text>
+<rect class="sv-b4" x="160" y="224" width="70" height="28"/><text class="sv-ts" x="170" y="243">add c1</text>
+<rect class="sv-b4" x="230" y="224" width="70" height="28"/><text class="sv-ts" x="240" y="243">add c2</text>
+<rect class="sv-b4" x="300" y="224" width="70" height="28"/><text class="sv-ts" x="310" y="243">add c3</text>
+<rect class="sv-b4" x="370" y="224" width="70" height="28"/><text class="sv-ts" x="380" y="243">add c4</text>
+<line class="sv-line" x1="160" y1="212" x2="168" y2="224"/><polygon class="sv-head" points="168,224 162,218 170,217"/>
+<line class="sv-dash" x1="440" y1="176" x2="440" y2="264"/><text class="sv-ts" x="446" y="268">step ends</text>
+<line class="sv-line2" x1="440" y1="286" x2="650" y2="286"/><polygon class="sv-head" points="440,286 450,281 450,291"/><polygon class="sv-head" points="650,286 640,281 640,291"/>
+<text class="sv-ts" x="470" y="280">time saved by overlap</text>
+<text class="sv-ts" x="20" y="312">Schematic, not to scale and not measured. Each chunk also pays its own start-up cost α (F8-03), so chunks cannot be made arbitrarily small.</text>
+</svg></div><figcaption><b>Figure 1.</b> One reduce-scatter step on one rank, without and with chunking. Schematic; the ordering is that of Listing 1 (R1), the idea is that of the pipelined ring in Patarasuk and Yuan (title only). <sup class="src"><a href="#F8-05-src-R1">R1</a></sup> <sup class="src"><a href="#F8-05-src-D4">D4</a></sup></figcaption></figure>
+
+<h2 id="F8-05-layer1">Layer 1 — the kid explanation</h2>
+<p>You already know the ring: everyone adds what comes from the left and passes it to the right, and after two laps everyone has the whole sum. Doing it for real needs three rules. Use small bowls, so the next person can start while you fill the next one. Do not let bowls pile up: if your neighbour already has two waiting, you wait. And only say "here you go" after the soup is in the bowl. If you break the last rule, the answer is sometimes right and sometimes wrong, which is the worst kind of wrong.</p>
+
+<h2 id="F8-05-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F8-05-l2-index">Which segment, when</h3>
+<p>With <i>N</i> ranks the buffer is cut into <i>N</i> segments. In reduce-scatter step <i>s</i> (0 ≤ <i>s</i> &lt; <i>N</i>−1), rank <i>r</i> sends segment (<i>r</i> − <i>s</i>) mod <i>N</i> and receives and adds segment (<i>r</i> − <i>s</i> − 1) mod <i>N</i>. After <i>N</i>−1 steps rank <i>r</i> holds the finished segment (<i>r</i> + 1) mod <i>N</i>. The all-gather is the same pattern shifted by one, with "add" replaced by "copy" (<a href="#F8-02">F8-02</a>). Listing 1 writes both phases as one loop: send segment (<i>r</i> − <i>s</i> + phase) mod <i>N</i>, receive segment (<i>r</i> − <i>s</i> − 1 + phase) mod <i>N</i> (lines 80–81). <sup class="src"><a href="#F8-05-src-R1">R1</a></sup></p>
+<h3 id="F8-05-l2-uneven">Sizes that do not divide</h3>
+<p>The milestone requires message sizes from 4 bytes up. With 4 bytes (one float) and 4 ranks, three segments are empty. Listing 1 gives segment <i>g</i> the elements from ⌊<i>g</i>·count/<i>N</i>⌋ to ⌊(<i>g</i>+1)·count/<i>N</i>⌋, and cuts every segment into the <i>same number</i> of chunks, some possibly empty (lines 55–60). Every rank then goes through the same number of sends and receives, whatever the size, and no rank waits for a message that never comes. For 4 bytes on 8 ranks the busiest rank sent 2 elements, not the 1.75 of the formula 2(<i>N</i>−1)/<i>N</i>·count, because the one element is not shared out evenly. <sup class="src"><a href="#F8-05-src-R1">R1</a></sup></p>
+<h3 id="F8-05-l2-pipeline">Chunks, mailboxes and flow control</h3>
+<p>In Listing 1 each rank has a mailbox that only its left neighbour puts into. <code>put</code> waits while the mailbox already holds 2 chunks; <code>take</code> waits while it is empty (lines 22–37). Each rank, for every chunk, puts its next chunk to the right and then takes one from the left and adds it. Because the left neighbour can be one chunk ahead, receiving and adding chunk <i>k</i> overlaps with the neighbour sending chunk <i>k</i>+1. The capacity of 2 is the flow control: a fast rank can never run more than two chunks ahead of a slow neighbour, so memory use is bounded. <sup class="src"><a href="#F8-05-src-R1">R1</a></sup></p>
+<h3 id="F8-05-l2-verify">Verifying the sum</h3>
+<p>The tests fill rank <i>r</i>'s element <i>i</i> with (<i>r</i>+1)·(<i>i</i> mod 251). Every partial sum is a small integer, exactly representable in int32 and float, so every rank's result must equal <i>N</i>(<i>N</i>+1)/2 · (<i>i</i> mod 251) bit for bit. With random floats the ring adds in a different order than a sequential loop, and the results differ by rounding: 23,196 of 100,000 elements differed from the sequential sum, by at most 4.77·10<sup>−7</sup>, yet all four ranks had bit-identical results. <sup class="src"><a href="#F8-05-src-R1">R1</a></sup> All ranks agree because, in the all-gather, every rank copies the same finished bits instead of computing them again. That matters for data-parallel training (<a href="#F8-06">F8-06</a>): replicas stay identical.</p>
+
+<h2 id="F8-05-layer3">Layer 3 — the engineer's depth</h2>
+<p>In one line of analogy: the round table becomes four kitchens with their own clocks, carts and bells; nobody waits by the door, everyone leaves a note saying "start when that bell rings".</p>
+<h3 id="F8-05-l3-gpu">From threads to GPUs</h3>
+<p>On GPUs, Listing 2 drives all GPUs from one host thread and never blocks it inside the ring. Each GPU has a copy stream and a compute stream, and two receive slots of one chunk each. A <i>tick</i> is one chunk of one step. In every tick, each GPU copies a chunk to its right neighbour's slot with <code>cudaMemcpyPeerAsync</code> on its copy stream, then each GPU adds (or copies) the chunk in its own slot into its buffer with a kernel on its compute stream. Four waits keep it correct (lines 82–101):</p>
+<ul>
+<li>A copy waits until the chunk it sends is final: <code>consumed[r][t−chunks]</code>, the add that finished it in the previous step.</li>
+<li>A copy waits until the neighbour's slot it overwrites is free: <code>consumed[next][t−2]</code>, the add that last used that slot.</li>
+<li>An add waits until its chunk has arrived: <code>copied[prev][t]</code>.</li>
+<li>An add waits until this GPU's own send of the tick has finished reading the buffer: <code>copied[r][t]</code>.</li>
+</ul>
+<p>The installed CUDA 12.0 header documents that <code>cudaStreamWaitEvent</code> "Makes all future work submitted to stream wait for all work captured in event", and that the event "may be from a different device than stream". <sup class="src"><a href="#F8-05-src-H1">H1</a></sup> That cross-device wait is what lets one host thread pipeline the whole ring.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listings 2 and 3 were compiled for real (CUDA 12.0; HIP 5.7 for gfx90a) and stopped at their first runtime call because the build container has no GPU (exit code 1). Their correctness on 2, 4 and all GPUs, their bandwidth, whether the copies use direct peer links or are staged by the driver when peer access is not enabled (Listing 2 does not call <code>cudaDeviceEnablePeerAccess</code>; add it from <a href="#F8-04">F8-04</a>), and the cost of creating two events per tick have not been seen. Needed: a machine with two or more GPUs and a rerun of <code>run_lab.sh</code>.</p></div>
+<h3 id="F8-05-l3-limits">What a library does that Listing 2 does not</h3>
+<p>Listing 2 is a teaching ring. Its copies and its adds are separate operations, each with its own launch and event; the chunk size is a constant; it uses one ring in one direction; and its reduction kernel is a plain loop, not your tuned E3 kernel from <a href="#CU302">CU302</a>. Production libraries are generally described as fusing receive, reduce and send into one long-running kernel that moves data through GPU memory or across links directly, using several rings ("channels") at once and tuning the chunk size per message size. How NCCL and RCCL do it is not verified here; the curriculum's milestone F2 asks you to compare against them, not to copy them. <sup class="src"><a href="#F8-05-src-C1">C1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That NCCL and RCCL implement collectives as single fused kernels per operation, use several channels, choose chunk sizes and protocols per message size and topology, and that <code>all_reduce_perf</code> in nccl-tests (rccl-tests) reports busbw with the factor 2(<i>N</i>−1)/<i>N</i> used here: none of this was read or run in this build. Check the NCCL and RCCL documentation and the nccl-tests performance notes.</p></div>
+<h3 id="F8-05-l3-chunk">Choosing the chunk size</h3>
+<p>From <a href="#F8-03">F8-03</a>: each chunk pays a start-up cost α; the per-step time with <i>c</i> chunks of a segment of <i>m</i> bytes is roughly <i>c</i>·α + <i>m</i>/β plus the part of the reduction that is not hidden. Small chunks hide more of the reduction and make the pipeline fill faster; large chunks pay fewer start-ups. A good chunk is large enough that α is a small fraction of its transfer time, yet small enough that a segment has several. Listing 1 uses 64 KiB chunks for the tests and 1 MiB for the large run; measuring the best chunk on your GPUs is a lab step. <sup class="src"><a href="#F8-05-src-R1">R1</a></sup></p>
+<h3 id="F8-05-l3-cpu">What the CPU timings mean</h3>
+<p>The large run (<code>ring_O2</code>) passed the 1 GiB tests on 2 and 4 ranks. Its busbw was between about 0.7 and 2.7 GB/s on this container, varying between runs (two runs during this build gave different numbers for the same sizes). <sup class="src"><a href="#F8-05-src-R2">R2</a></sup> These are numbers for threads copying vectors through a mutex-protected queue on four shared CPU cores; they say nothing about GPU links. They are shown so you see what a measurement record looks like, and why the milestone asks for curves rather than single numbers.</p>
+
+<h2 id="F8-05-hardware">How the hardware actually does it</h2>
+<p>A <code>cudaMemcpyPeerAsync</code> between two GPUs is carried out by a copy engine of one GPU and travels over the path between them: a direct link, or the PCIe tree (<a href="#F8-04">F8-04</a>). <sup class="src"><a href="#F8-05-src-D7">D7</a></sup> The header itself only promises that the copy "is asynchronous with respect to the host" and is ordered on its stream; it describes no path. <sup class="src"><a href="#F8-05-src-H1">H1</a></sup> Because copy engines and compute units are separate, a copy into the neighbour and a reduction kernel can run at the same time on one GPU, which is the overlap of Figure 1. The reduction itself is memory-bound: it reads two arrays and writes one, so its speed is set by GPU memory bandwidth (<a href="#CU302">CU302</a>), which on most GPUs is far higher than the link's, so it is easy to hide. On CPUs (Listing 1), all of this is threads sharing the same memory and cores, and the "link" is a memory copy.</p>
+
+<h2 id="F8-05-worked">Worked example</h2>
+<p><b>Task.</b> <i>N</i> = 4 ranks, count = 10 floats, chunks of at most 2 elements. (a) Give each segment's range. (b) How many chunks per segment? (c) Which segments does rank 1 send in reduce-scatter steps 0, 1, 2 and all-gather steps 0, 1, 2? (d) Which segment is final on rank 1 after the reduce-scatter?</p>
+<ol>
+<li>(a) Segment <i>g</i> = [⌊10<i>g</i>/4⌋, ⌊10(<i>g</i>+1)/4⌋): [0,2), [2,5), [5,7), [7,10).</li>
+<li>(b) Largest segment 3 elements, maxSeg = ⌈10/4⌉ = 3, chunks = ⌈3/2⌉ = 2 for every segment; segment 1 becomes [2,3) and [3,5), segment 0 becomes [0,1) and [1,2).</li>
+<li>(c) Reduce-scatter: (1−<i>s</i>) mod 4 = 1, 0, 3. All-gather: (2−<i>s</i>) mod 4 = 2, 1, 0.</li>
+<li>(d) Segment (1+1) mod 4 = 2, which rank 1 sends first in the all-gather.</li>
+</ol>
+<p>Each rank sends 6 steps × 2 chunks = 12 chunks, some of them of 1 element. Check by printing <code>s.begin</code> and <code>s.end</code> in a copy of Listing 1.</p>
+
+<h2 id="F8-05-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>ring_allreduce.cpp</code>: the chunked, pipelined ring with one thread per rank, and the acceptance tests.</p>
+<pre class="listing" data-src="F8-05/ring_allreduce.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined ring_allreduce.cpp -o ring_allreduce</code>, then <code>./ring_allreduce</code> (time limit 60 s because of the sanitizers).</p>
+<pre class="output" data-run="F8-05/ring_allreduce"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–44</td><td><code>Mailbox</code></td><td>A queue of chunks with a mutex and two condition variables; <code>put</code> waits while 2 chunks are queued.</td><td>The link, the receive buffer and flow control in one class.</td></tr>
+<tr><td>55–60</td><td><code>chunkRange</code></td><td>Element range of chunk <i>k</i> of segment <i>g</i>; same chunk count for every segment.</td><td>Handles any size, including fewer elements than ranks.</td></tr>
+<tr><td>70–71</td><td>chunk count</td><td>From the largest segment and the chunk size.</td><td>All ranks agree on the number of messages.</td></tr>
+<tr><td>78–98</td><td>rank loop</td><td>Two phases × (<i>N</i>−1) steps × chunks: put own chunk to the right, take one from the left, add or copy it.</td><td>The whole algorithm; 20 lines.</td></tr>
+<tr><td>86</td><td><code>sentElems</code></td><td>Counts elements each rank sends.</td><td>Checks the 2(<i>N</i>−1)/<i>N</i> traffic claim of <a href="#F8-02">F8-02</a>.</td></tr>
+<tr><td>100–106</td><td>threads</td><td>One thread per rank, joined at the end.</td><td>Threads stand in for GPUs.</td></tr>
+<tr><td>115–149</td><td><code>testOnce</code></td><td>Exact-integer inputs, reference comparison on every rank, optional busbw.</td><td>The milestone's correctness test.</td></tr>
+<tr><td>152–183</td><td><code>roundingDemo</code></td><td>Random floats: differences from the sequential sum; bit-identity across ranks.</td><td>Why "the same result" means "the same on every rank", not "the same as a loop".</td></tr>
+<tr><td>190–208</td><td>test plan</td><td>Sizes 4 B to 16 MiB on 2, 4, 8 ranks; with <code>big</code>: 1 GiB on 2 and 4 ranks, then 1–256 MiB.</td><td>The acceptance range of milestone F2, on CPU threads.</td></tr>
+</tbody></table></div>
+<p><b>The large run</b> — the same file built with <code>-O2</code> and without sanitizers, run with <code>big</code> (<code>run.sh</code> step <code>ring_O2</code>):</p>
+<pre class="output" data-run="F8-05/ring_O2"></pre>
+
+<p><b>Listing 2</b> — <code>ring_gpu.cu</code>: the same ring on GPUs, one host thread, streams and events (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F8-05/ring_gpu.cu"></pre>
+<p><b>Build command</b>: <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings ring_gpu.cu -o ring_gpu</code>, then <code>./ring_gpu</code>.</p>
+<pre class="output" data-run="F8-05/ring_gpu"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>22–36</td><td><code>addInto</code>, <code>copyInto</code></td><td>Grid-stride loops: add or copy a chunk from the slot into the buffer.</td><td>Replace <code>addInto</code> with your E3 reduction kernel (milestone F2).</td></tr>
+<tr><td>44–49</td><td><code>chunkRange</code></td><td>As in Listing 1.</td><td>Same index arithmetic on host and in the thread version.</td></tr>
+<tr><td>55–72</td><td>setup</td><td>Two slots, two streams and two events per tick per GPU.</td><td>Simple, not cheap: a library reuses a few events.</td></tr>
+<tr><td>73–77</td><td>tick</td><td>Phase, step, chunk and slot from the tick number.</td><td>One loop for both phases.</td></tr>
+<tr><td>78–94</td><td>sends</td><td>Wait for the chunk to be final and the neighbour's slot to be free, then <code>cudaMemcpyPeerAsync</code>, then record <code>copied</code>.</td><td>The first two waits.</td></tr>
+<tr><td>95–113</td><td>adds</td><td>Wait for the chunk to arrive and own send to finish, launch the kernel, record <code>consumed</code>.</td><td>The last two waits; the kernel runs on the compute stream, overlapping the next copies.</td></tr>
+<tr><td>115–126</td><td>finish</td><td>Synchronise every device, destroy events and streams.</td><td>The only place the host waits.</td></tr>
+<tr><td>129–166</td><td><code>main</code></td><td><i>N</i> = 2, 4, … up to the GPU count; 4 B, 1028 B, 1 MiB, 256 MiB; exact-integer check.</td><td>Extend to 1 GiB and to all GPUs for the milestone.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>ring_gpu_amd.hip</code>: Listing 2 for AMD GPUs, made by renaming every <code>cuda</code> name to <code>hip</code> (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F8-05/ring_gpu_amd.hip"></pre>
+<p><b>Build command</b>: <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a ring_gpu_amd.hip -o ring_gpu_amd</code>, then <code>./ring_gpu_amd</code>.</p>
+<pre class="output" data-run="F8-05/ring_gpu_amd"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> That the renamed HIP calls (<code>hipMemcpyPeerAsync</code>, <code>hipStreamWaitEvent</code> with an event from another device) behave on AMD GPUs as the CUDA ones are documented to on NVIDIA GPUs was not checked; the HIP 5.7 header declares them, but the cross-device event wait semantics were not found stated there. Run on an AMD multi-GPU machine and check the HIP documentation.</p></div>
+
+<h2 id="F8-05-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Cooks see each other; GPUs do not.</b> At the table, you see that the bowl is full. A GPU sees only memory; "the data is there" must be made true by an event or an atomic flag with the right ordering, never by looking.</li>
+<li><b>Bowls do not get rounded.</b> Soup added in a different order is the same soup; floats added in a different order are not the same number (R1).</li>
+<li><b>The table has no host.</b> In Listing 2 one host thread arranges all the work in advance and then waits; no one at the story's table plans everyone's moves before the meal.</li>
+</ul>
+
+<h2 id="F8-05-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> the program hangs for some sizes. <b>Cause:</b> ranks disagree on the number of chunks (each computed its own from its own segment). <b>Fix:</b> derive the chunk count from the largest segment, the same on all ranks (Listing 1, lines 70–71).</li>
+<li><b>Symptom:</b> wrong results, but only sometimes. <b>Cause:</b> a handoff without proper synchronisation (forensic lab). <b>How to find it:</b> ThreadSanitizer on the CPU version of the same protocol. Whether a GPU race checker covers ordering between devices and streams was not checked in this build, so build and test the CPU model first.</li>
+<li><b>Symptom:</b> GPU results correct for small sizes, wrong for large. <b>Cause:</b> a missing wait: a slot is overwritten before it was consumed, which only happens when the pipeline has more than two chunks in flight. <b>Fix:</b> list every buffer each operation reads and writes, and the event that protects it (Listing 2's four waits).</li>
+<li><b>Symptom:</b> float results differ from a CPU sum. <b>Cause:</b> different addition order. <b>Fix:</b> test with exact integer-valued data; for random data compare with a tolerance and check that all ranks are bit-identical.</li>
+<li><b>Symptom:</b> busbw lower with more chunks. <b>Cause:</b> start-up cost per chunk dominates. <b>Fix:</b> measure the chunk size sweep (lab step 4).</li>
+</ul>
+
+<div class="co transition" id="F8-05-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F8-02">F8-02</a> designed the ring on paper; <a href="#F8-03">F8-03</a> predicted its time; <a href="#F8-04">F8-04</a> chose its order from the topology. <b>What carries over:</b> the segment indices, the 2(<i>N</i>−1)/<i>N</i> traffic (checked here by counting), busbw, and the ring order. <sup class="src"><a href="#F8-05-src-R1">R1</a></sup> <b>What changes:</b> real code must handle uneven sizes, bound its buffers, overlap transfer with reduction, and make every handoff a proper synchronisation; floating-point results depend on the order of additions. <b>What comes next:</b> <a href="#F8-06">F8-06</a> puts an all-reduce inside a data-parallel training step, and introduces the libraries that do this job in production.</p></div>
+
+<h2 id="F8-05-check">Check yourself</h2>
+<ol>
+<li>Write the segment that rank <i>r</i> sends in reduce-scatter step <i>s</i> and in all-gather step <i>s</i>.</li>
+<li>Why does Listing 1 give every segment the same number of chunks, even empty ones?</li>
+<li>Which is true? (a) With capacity 2, a rank can be at most two chunks ahead of its left neighbour's consumption. (b) The ring's float result equals the sequential sum. (c) <code>cudaStreamWaitEvent</code> blocks the host thread. (d) A bool flag set after copying is a correct handoff in C++.</li>
+<li>Explain in your own words why the ring's float result is the same on all ranks.</li>
+<li>Apply: <i>N</i> = 3, count = 7. Give the segment ranges and how many elements the busiest rank sends.</li>
+<li>Predict, then run: set the mailbox capacity to 1 in a copy of Listing 1. Does it still work? Is it slower?</li>
+<li>In Listing 2, which wait protects the receive slot, and why <i>t</i>−2?</li>
+<li>Why do the CPU busbw figures in <code>ring_O2.out</code> say nothing about a GPU ring?</li>
+</ol>
+
+<h2 id="F8-05-lab">Lab</h2>
+<p><b>Goal.</b> Milestone F2: your own ring all-reduce, correct for all sizes and compared with the library.</p>
+<p><b>Hardware and software needed.</b> Steps 1–4: any computer with g++ (this build: g++ 13.3.0, 4 logical CPUs). Steps 5–8: two or more GPUs in one machine (NVIDIA with CUDA, or AMD with ROCm), or a cloud multi-GPU instance, with nccl-tests (or rccl-tests) built for your library version. Folder <code>university/labs/F8-05</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use. The 1 GiB tests need about <i>N</i> + 1 GiB of host memory on CPU, and 1 GiB plus slots per GPU; check free memory first on shared machines.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F8-05</code>; read every <code>.out</code> and <code>.log</code>.</li>
+<li>Do the worked example in a copy of Listing 1 with printing added.</li>
+<li>Do the forensic lab.</li>
+<li>Sweep the chunk size from 4 KiB to 16 MiB for a 256 MiB message in the <code>-O2</code> build; record the curve. Repeat each point and take the median.</li>
+<li>On GPUs: enable peer access in Listing 2 (from <a href="#F8-04">F8-04</a>'s Listing 2), set the ring order from your topology, and run the tests on 2, 4 and all GPUs.</li>
+<li>On GPUs: extend the tests to 1 GiB and to integer data (an integer copy of <code>addInto</code>).</li>
+<li>On GPUs: replace <code>addInto</code> by your E3 reduction kernel from <a href="#CU302">CU302</a>; measure busbw from 8 B to 1 GiB.</li>
+<li>On GPUs: run <code>all_reduce_perf</code> from nccl-tests (rccl-tests) on the same GPUs and plot both curves.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: every test PASS, the busiest rank's traffic matching 2(<i>N</i>−1)/<i>N</i>·count for large sizes; the rounding demo showing differences from the sequential sum but identical ranks. On GPUs: your own numbers; expect your ring below the library at large sizes and much worse at small sizes, but only your measurement says by how much (AH-23).</p>
+<p><b>Verification.</b> Milestone F2's acceptance tests verbatim: "Result equals a reference sum for FP32 and integer data on 2, 4 and all GPUs, for message sizes from 4 bytes to 1 GiB." "Bus bandwidth curve plotted against all_reduce_perf from nccl-tests (or rccl-tests) on the same GPUs; your large-message bus bandwidth reaches X % of NCCL/RCCL." <sup class="src"><a href="#F8-05-src-C1">C1</a></sup> X is set in your plan. In this build only the first test was done, and only on CPU threads (2, 4 and 8 ranks up to 16 MiB; 2 and 4 ranks at 1 GiB).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Hang at a size with fewer elements than ranks → chunk counts differ between ranks.</li>
+<li>Out of memory at 1 GiB → <i>N</i> buffers of 1 GiB plus copies; run fewer ranks or use a larger machine.</li>
+<li>GPU results wrong only in the all-gather → the copy's wait on <code>consumed[r][t−chunks]</code> crosses the phase boundary; print the tick, phase and segment for <i>N</i> = 2.</li>
+<li>GPU ring slower than a host-staged copy → peer access not enabled; check with <code>cudaDeviceCanAccessPeer</code>.</li>
+</ul>
+<p><b>Extension.</b> Two rings in opposite directions, each carrying half the data; compare busbw on a topology with bidirectional links.</p>
+
+<h2 id="F8-05-forensic">Forensic lab</h2>
+<p><b>Scenario: "Right on Monday, wrong on Tuesday".</b> A colleague made Listing 1 "faster" by replacing the mailbox with a one-slot handoff: a buffer and a <code>bool ready</code> flag, no mutex. The unit test passed on their laptop. In the nightly run, training loss jumps to nonsense on some nights only.</p>
+<p><b>Evidence.</b> The changed code (<code>ring_race.cc</code>), and the ThreadSanitizer report from <code>run.sh</code> step <code>race</code>, trimmed to frames in that file (R3):</p>
+<pre class="listing" data-src="F8-05/ring_race.cc"></pre>
+<pre class="output" data-run="F8-05/race"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which lines does each warning name, and which variables are they?</li>
+<li>Hypotheses: (a) the ring's index arithmetic is wrong; (b) the flag is not a synchronisation; (c) the order of "announce" and "copy" is wrong; (d) integer overflow. What supports or rules out each?</li>
+<li>Root cause: describe two different interleavings that give a wrong sum.</li>
+<li>Fix: two ways, one minimal and one structural.</li>
+<li>Verification and prevention.</li>
+</ol>
+<p><b>Method hints.</b> Compare lines 50–55 with Listing 1's lines 80–95. Read <code>send</code> line by line, imagining the receiver running between any two lines.</p>
+
+<h2 id="F8-05-project">Mini-project</h2>
+<p><b>MP5, single-node part.</b> The guide's MP5 "A multi-node all-reduce" starts with the milestone "Single-node ring all-reduce (F2) correct for all sizes". <sup class="src"><a href="#F8-05-src-C2">C2</a></sup> Build it as a small library: <code>allreduce(buffers, count, type, op, stream)</code> for float and int32 sum on 2 to <i>N</i> GPUs of one node, with the ring order taken from your <a href="#F8-04">F8-04</a> topology tool, chunk size as a parameter, and a benchmark printing algbw and busbw in the nccl-tests style. Include the CPU thread version as a reference model and its ThreadSanitizer run in CI. The multi-node part follows in DG402.</p>
+<p><b>Rubric</b> (MP5's weights applied to this part). Correctness (30 %): all sizes 4 B–1 GiB, float and int32, 2, 4 and all GPUs, against a reference. Performance (25 %): busbw curve against all_reduce_perf, reaching your pre-set target. Model accuracy and explanation (25 %): an alpha-beta prediction from <a href="#F8-03">F8-03</a> with your measured α and β, plotted with the measurement and the gap explained. Robustness (20 %): no races under the CPU model's sanitizers, errors checked on every call, clean failure on a missing GPU. <sup class="src"><a href="#F8-05-src-C2">C2</a></sup></p>
+
+<h2 id="F8-05-summary">Summary</h2>
+<ul>
+<li>A ring all-reduce is two loops of <i>N</i>−1 steps: send segment (<i>r</i>−<i>s</i>+phase) mod <i>N</i>, receive (<i>r</i>−<i>s</i>−1+phase) mod <i>N</i>, add or copy.</li>
+<li>Same chunk count on every rank handles every size; bounded mailboxes give flow control.</li>
+<li>Chunking overlaps transfer and reduction; each chunk costs a start-up α.</li>
+<li>Test with exact integer-valued data; float results differ from a loop but are identical across ranks.</li>
+<li>On GPUs, events and cross-device stream waits order copies and kernels without blocking the host; each buffer needs a named protecting event.</li>
+<li>A plain flag is not a handoff: ThreadSanitizer finds it on the CPU model.</li>
+</ul>
+
+<h2 id="F8-05-sources">Sources</h2>
+<ol>
+<li id="F8-05-src-D4">D4 — Pitch Patarasuk and Xin Yuan, "Bandwidth Optimal All-reduce Algorithms for Clusters of Workstations" (tier 5): the pipelined ring. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-05-src-D1">D1 — NVIDIA, NCCL documentation; and NVIDIA nccl-tests performance notes (tier 1 / tier 4). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-05-src-D2">D2 — AMD, RCCL documentation and rccl-tests (tier 1 / tier 4). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-05-src-D7">D7 — NVIDIA, "CUDA C++ Programming Guide", peer-to-peer memory access and streams/events sections (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-05-src-D12">D12 — ISO/IEC 14882, the C++ standard: data races and the memory model; and the ThreadSanitizer documentation of the compiler (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-05-src-C1">C1 — Systems Curriculum, section 14.1 (row "Ring all-reduce") and milestone F2, whose acceptance tests are quoted verbatim; a map, not a source (AH-4).</li>
+<li id="F8-05-src-C2">C2 — University authoring guide, MP5 "A multi-node all-reduce": milestones and rubric weights, quoted; a map, not a source.</li>
+<li id="F8-05-src-H1">H1 — CUDA 12.0 headers as installed (nvidia-cuda-dev 12.0.146~12.0.1-4build4), <code>cuda_runtime_api.h</code>: descriptions of <code>cudaStreamWaitEvent</code> and <code>cudaMemcpyPeerAsync</code>, read in this build. Tier 1.</li>
+<li id="F8-05-src-R1">R1 — run of Listing 1 under AddressSanitizer and UBSan (<code>university/labs/F8-05/ring_allreduce.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F8-05-src-R2">R2 — <code>run.sh</code> step <code>ring_O2</code>: Listing 1 with <code>-O2</code> and <code>big</code> (<code>ring_O2.log</code>), exit code 0; measured on the shared build container.</li>
+<li id="F8-05-src-R3">R3 — <code>run.sh</code> step <code>race</code>: <code>ring_race.cc</code> with ThreadSanitizer (<code>race.log</code>), exit code 66, expected.</li>
+<li id="F8-05-src-R4">R4 — build and run of Listings 2 and 3 (<code>ring_gpu.log</code>, <code>ring_gpu_amd.log</code>), CUDA 12.0 and HIP 5.7; untested on hardware, exit code 1.</li>
+</ol>
+
+<h2 id="F8-05-glossary">Glossary links</h2>
+<p><a href="#gl-ring-all-reduce">Ring all-reduce</a> · <a href="#gl-segment-and-chunk-collectives">Segment and chunk (collectives)</a> · <a href="#gl-pipelining-communication">Pipelining (communication)</a> · <a href="#gl-flow-control">Flow control</a> · <a href="#gl-data-race">Data race</a> · <a href="#gl-event-gpu">Event (GPU)</a> · <a href="#gl-bus-bandwidth-busbw">Bus bandwidth (busbw)</a></p>
+
+<h2 id="F8-05-next">Next chapter</h2>
+<p>Next: <a href="#F8-06">F8-06 NCCL and RCCL in a data-parallel training step</a>. Previous: <a href="#F8-04">F8-04</a>. Back to the course: <a href="#DG401">DG401</a>.</p>
+
+<h2 id="F8-05-answers">Answers to Check yourself</h2>
+<ol>
+<li>Reduce-scatter: (<i>r</i> − <i>s</i>) mod <i>N</i>; all-gather: (<i>r</i> − <i>s</i> + 1) mod <i>N</i>.</li>
+<li>So that every rank makes the same number of <code>put</code> and <code>take</code> calls; otherwise a rank waits for a chunk its neighbour never sends (hang), or a chunk is taken as the wrong one.</li>
+<li>(a). (b) is false: 23,196 of 100,000 elements differed (R1). (c) is false: it makes a stream wait, not the host. (d) is false: a plain bool gives no happens-before; the flag must be atomic with release/acquire ordering (and set after the copy).</li>
+<li>Each segment is fully reduced on exactly one rank, in one order; the all-gather then copies those bits to everyone. Nobody re-adds.</li>
+<li>[0,2), [2,4), [4,7) (sizes 2, 2, 3). Rank 2 sends segments 2 and 1 in the reduce-scatter (3 + 2) and segments 0 and 2 in the all-gather (2 + 3): 10 elements, the busiest; ranks 0 and 1 send 9. The formula 2·2/3·7 gives 9.3. A Lab Engineer's check run of a modified copy of Listing 1 (N = 3, 28 bytes) printed "busiest rank sent 10 elements".</li>
+<li>It still works (each put waits for the previous chunk to be taken, the receiver takes before its next put), but less overlap is possible; whether it is measurably slower on this container is a measurement to make, not to predict.</li>
+<li><code>consumed[next][t−2]</code>: the slot index is <i>t</i> mod 2, so the same slot of the neighbour was last written at tick <i>t</i>−2 and must have been consumed by the neighbour's add of that tick.</li>
+<li>They measure threads copying vectors through a mutex queue on shared CPU cores; there is no GPU, no link and no copy engine involved.</li>
+</ol>
+<h3 id="F8-05-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Warnings name lines 21 and 27 (writes and reads of <code>ready</code>), 22 and 30 (the vector <code>data</code>: written by <code>assign</code>, read by the copy), and 31 (<code>ready = false</code>) against 21; the callers are lines 52 and 53. The program reports that most of 20 runs gave a wrong result, and the run exits 66. (R3)</p>
+<p><b>Ruling out.</b> (a) The same indices as Listing 1 (lines 50–51 vs 80–81), which passes every test (R1). (d) Values are at most 10·99. (b) and (c) are both real.</p>
+<p><b>Root cause.</b> Bug 1: <code>ready</code> is a plain <code>bool</code> written and read by two threads: a data race, undefined behaviour, and no guarantee that the data written before the flag is visible after it. Bug 2: even with an atomic flag, <code>send</code> sets <code>ready = true</code> on line 21 <i>before</i> copying on line 22. Interleaving 1: the receiver sees the flag between lines 21 and 22 and copies the old or half-assigned vector. Interleaving 2: the receiver resets the flag (line 31) while the sender is still inside <code>assign</code> on line 22; the sender's next <code>send</code> then overwrites the slot before the first data was consumed.</p>
+<p><b>Fix.</b> Minimal: copy first, then <code>ready.store(true, std::memory_order_release)</code> with <code>std::atomic&lt;bool&gt;</code>; receiver loads with <code>memory_order_acquire</code>, copies, then stores false with release; sender waits for false with acquire. Structural: go back to Listing 1's mailbox (mutex and condition variables), which is also flow control. <b>Verification:</b> ThreadSanitizer reports nothing and 20 of 20 runs are right; run many times, since a race can hide. <b>Prevention:</b> keep a CPU thread model of every GPU protocol and run it under ThreadSanitizer in CI. <b>How the evidence was produced:</b> <code>run.sh</code> step <code>race</code>, which trims the full report to frames in <code>ring_race.cc</code>.</p>

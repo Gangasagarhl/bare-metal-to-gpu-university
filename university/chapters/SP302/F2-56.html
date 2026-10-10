@@ -1,0 +1,316 @@
+<!--meta
+id: F2-56
+title: The roofline model on a CPU
+course: SP302
+level: L3
+prereqs: F2-51; F2-52; F2-53; F2-55; HW301 (alpha–beta model, peak figures); MA202
+time: 8–12 hours including the SGEMM lab and the project
+hardware: a computer running Linux with g++ and an x86-64 CPU with AVX2 and FMA (the build used g++ 13.3 on a shared 4-CPU cloud virtual machine that also reports AVX-512); the programs check the CPU features at run time
+maps: Roofline paper (curriculum item 75; Williams, Waterman, Patterson; pending verification); Gregg "Systems Performance" (pending verification); prepares CU302 (the same SGEMM and roofline on a GPU)
+analogy: F1/F2 — the restaurant building and its kitchen (registered: head chef = CPU core); new proposal: roofline = the stove's limit versus the pantry delivery limit
+-->
+
+<h2 id="F2-56-hook">Story hook</h2>
+<p>Kofi runs a kitchen with a fast stove and a slow pantry door: ingredients arrive through the door at a fixed number of crates per hour, and the stove can perform a fixed number of cooking steps per hour. He serves two dishes. The salad needs one crate of vegetables per plate and almost no cooking: however fast his cooks chop, the kitchen never makes more salads per hour than the door delivers crates. The slow-braised stew needs many hours of stove work for each crate: there, the door is idle most of the time and only the stove matters.</p>
+<p>A consultant arrives and buys a second stove "to make everything faster". Stew output rises. Salad output does not move at all. Kofi could have predicted both without spending anything, if he had known two numbers about his kitchen and one number about each dish: how much cooking each crate of ingredients receives.</p>
+<p>That is the roofline model. This chapter measures the two machine numbers for the build machine (peak floating-point rate and memory bandwidth), computes the third for each kernel (arithmetic intensity), draws the roofline, and uses it to judge the course's matrix multiply as we optimise it step by step, from about 2 GFLOP/s to about 49 GFLOP/s in the recorded run.</p>
+
+<h2 id="F2-56-able">What you will be able to do</h2>
+<ul>
+<li><b>Measure</b> a compute roof (peak FLOP/s) and a memory roof (bandwidth) on your own machine with microbenchmarks.</li>
+<li><b>Compute</b> the arithmetic intensity of a kernel from its operation and byte counts, and state the assumptions behind the byte count.</li>
+<li><b>Draw</b> a roofline and place kernels on it; decide whether each is memory-bound or compute-bound and how far it is from its roof.</li>
+<li><b>Optimise</b> a CPU matrix multiply step by step (loop order, cache blocking, register tiling, threads), verifying correctness at every step and recording a speed table.</li>
+<li><b>Predict</b> which optimisations can help a kernel and which cannot, before trying them.</li>
+</ul>
+
+<div class="co jargon" id="F2-56-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Arithmetic intensity</dt><dd><b>Simple words:</b> how much calculation a program does for each byte it moves to or from memory. <b>Analogy:</b> how many cooking steps each crate of ingredients receives. <b>Precise:</b> the ratio of floating-point operations to bytes of memory traffic, in FLOP/byte; which traffic is counted (DRAM, a cache level; compulsory only or measured) must be stated. <sup class="src"><a href="#F2-56-src-D1">D1</a></sup></dd>
+<dt>Roofline model</dt><dd><b>Simple words:</b> a chart that shows the fastest a kernel can possibly run on a machine, given how much calculation it does per byte. <b>Analogy:</b> the kitchen's limit: the stove's or the pantry door's, whichever is lower for that dish. <b>Precise:</b> attainable performance = min(peak FLOP/s, arithmetic intensity × peak bandwidth), drawn on log–log axes as a slanted line (memory roof) meeting a flat line (compute roof). <sup class="src"><a href="#F2-56-src-D1">D1</a></sup></dd>
+<dt>Ridge point</dt><dd><b>Simple words:</b> the intensity where the two limits meet. <b>Analogy:</b> the dish for which the stove and the door are equally busy. <b>Precise:</b> peak FLOP/s divided by peak bandwidth (FLOP/byte); kernels to its left are memory-bound, to its right compute-bound. <sup class="src"><a href="#F2-56-src-D1">D1</a></sup></dd>
+<dt>Memory-bound and compute-bound</dt><dd><b>Simple words:</b> limited by moving data, or limited by calculating. <b>Analogy:</b> the salad (door-limited) and the stew (stove-limited). <b>Precise:</b> a kernel is memory-bound if intensity × bandwidth is below peak FLOP/s, compute-bound otherwise; the label describes the roof above it, not how close it runs to that roof. <sup class="src"><a href="#F2-56-src-D1">D1</a></sup></dd>
+<dt>Attainable performance</dt><dd><b>Simple words:</b> the roof's height above a kernel: the best it could do. <b>Analogy:</b> the most plates per hour this dish could reach in this kitchen. <b>Precise:</b> min(peak, AI × bandwidth) for that kernel's intensity; "percent of roof" = measured / attainable. <sup class="src"><a href="#F2-56-src-D1">D1</a></sup></dd>
+<dt>SGEMM</dt><dd><b>Simple words:</b> multiplying two matrices of single-precision numbers. <b>Analogy:</b> the stew: lots of cooking per ingredient. <b>Precise:</b> single-precision general matrix multiply, C = αAB + βC in the BLAS interface; here α = 1, β = 0, row-major, M × K times K × N, 2MNK floating-point operations. <sup class="src"><a href="#F2-56-src-D4">D4</a></sup></dd>
+<dt>Register tiling (micro-kernel)</dt><dd><b>Simple words:</b> computing a small block of the answer entirely in registers, reusing every loaded number many times. <b>Analogy:</b> keeping a few pans on the stove and adding to all of them from each crate before fetching the next. <b>Precise:</b> an innermost kernel that keeps an MR × NR block of C in vector registers and, for each k, loads NR values of B and MR values of A to perform MR × NR fused multiply-adds; here MR = 6, NR = 16 with AVX2. <sup class="src"><a href="#F2-56-src-D4">D4</a></sup></dd>
+</dl></div>
+
+<h2 id="F2-56-pictures">The idea in pictures</h2>
+<p>Figure 1 is the roofline of the build machine, drawn from our measured roofs, with the kernels of this chapter as points. Figure 2 shows how the SGEMM steps reuse data at different levels.</p>
+<figure id="F2-56-fig1"><div class="svgbox">
+<svg viewBox="0 0 780 360" role="img" aria-labelledby="F2-56-f1t F2-56-f1d">
+<title id="F2-56-f1t">Figure 1: the measured single-core roofline of the build machine</title>
+<desc id="F2-56-f1d">Log-log chart. Horizontal axis: arithmetic intensity from 1/8 to 256 FLOP per byte. Vertical axis: GFLOP/s from 1 to 256. A slanted memory roof rises from the left with slope one, at 12.4 GB/s, and meets a flat compute roof at 100.5 GFLOP/s at the ridge point, 8.1 FLOP per byte. A dashed higher flat line at 220.7 GFLOP/s marks the AVX-512 peak, not used as the roof because the SGEMM code uses AVX2. Points: triad at intensity 0.17, about 2 GFLOP/s, on the memory roof. SGEMM 512 steps at intensity 85.3, drawn as a column of points with an upward arrow: naive 2.0, loop order 19.3, blocked 20.3, register tiled 38.9, threads 49.0 (judged against the 4-core roof of 168.8, not drawn). The SGEMM points are far below the flat roof, the triad points touch the slanted roof.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="360"/>
+<line class="sv-line" x1="80" y1="310" x2="740" y2="310"/><line class="sv-line" x1="80" y1="310" x2="80" y2="20"/>
+<text class="sv-ts" x="72" y="328">1/8</text><text class="sv-ts" x="256" y="328">1</text><text class="sv-ts" x="436" y="328">8</text><text class="sv-ts" x="612" y="328">64</text><text class="sv-ts" x="728" y="328">256</text>
+<text class="sv-ts" x="250" y="350">arithmetic intensity (FLOP/byte, log scale)</text>
+<text class="sv-ts" x="58" y="314">1</text><text class="sv-ts" x="58" y="243">4</text><text class="sv-ts" x="50" y="172">16</text><text class="sv-ts" x="50" y="101">64</text><text class="sv-ts" x="42" y="30">256</text>
+<text class="sv-ts" x="4" y="140">GFLOP/s</text>
+<line class="sv-line2" x1="80" y1="288" x2="441" y2="74"/>
+<line class="sv-line2" x1="441" y1="74" x2="740" y2="74"/>
+<line class="sv-dash" x1="441" y1="34" x2="740" y2="34"/><text class="sv-ts" x="470" y="28">AVX-512 peak 220.7 (not the roof here)</text>
+<text class="sv-t" x="470" y="68">compute roof 100.5 GFLOP/s</text>
+<text class="sv-t" x="190" y="196">memory roof 12.4 GB/s</text>
+<line class="sv-dash" x1="441" y1="74" x2="441" y2="310"/><text class="sv-ts" x="447" y="300">ridge 8.1</text>
+<circle class="sv-dot2" cx="105" cy="273" r="6"/><text class="sv-ts" x="92" y="262">triad</text>
+<circle class="sv-dot1" cx="645" cy="274" r="6"/><text class="sv-ts" x="560" y="278">1 naive 2.0</text>
+<circle class="sv-dot1" cx="645" cy="157" r="6"/><text class="sv-ts" x="470" y="161">2 ikj 19.3 / 3 blk 20.3</text>
+<circle class="sv-dot1" cx="645" cy="123" r="6"/><text class="sv-ts" x="490" y="130">4 register tiled 38.9</text>
+<circle class="sv-dot3" cx="645" cy="111" r="5"/><text class="sv-ts" x="470" y="106">5 threads 49.0 (4 cores)</text>
+<line class="sv-line" x1="660" y1="270" x2="660" y2="122"/><polygon class="sv-head" points="655,122 660,114 665,122"/>
+</svg></div><figcaption><b>Figure 1.</b> Single-core roofline from the measured roofs (AVX2 FMA peak, single-core triad bandwidth) with this chapter's kernels; SGEMM at M = N = K = 512 with compulsory-traffic intensity N/6 ≈ 85.3 <sup class="src"><a href="#F2-56-src-R2">R2</a></sup> <sup class="src"><a href="#F2-56-src-R3">R3</a></sup> <sup class="src"><a href="#F2-56-src-R4">R4</a></sup>. Positions approximate; <code>roofline.out</code> has the exact table. Model after D1, pending verification <sup class="src"><a href="#F2-56-src-D1">D1</a></sup>.</figcaption></figure>
+
+<figure id="F2-56-fig2"><div class="svgbox">
+<svg viewBox="0 0 780 240" role="img" aria-labelledby="F2-56-f2t F2-56-f2d">
+<title id="F2-56-f2t">Figure 2: where each SGEMM step finds its reuse</title>
+<desc id="F2-56-f2d">Four panels left to right. Step 1 naive: inner loop walks down a column of B, one cache line per element, little reuse. Step 2 ikj: inner loop walks along rows of B and C with unit stride, vectorised, but a row of C is loaded and stored for every k. Step 3 blocked: a 256 by 512 panel of B stays in cache while all rows of A use it. Step 4 register tiled: a 6 by 16 block of C stays in 12 vector registers; each k loads 16 floats of B and 6 floats of A and performs 96 multiply-adds. Arrows from left to right labelled with the measured GFLOP/s at 512: 2.0, 19.3, 20.3, 38.9.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="240"/>
+<rect class="sv-b8" x="15" y="20" width="170" height="160" rx="8"/><text class="sv-tb" x="28" y="42">1 naive ijk</text>
+<text class="sv-ts" x="28" y="66">inner loop: down a</text><text class="sv-ts" x="28" y="82">column of B (stride N)</text><text class="sv-ts" x="28" y="98">one line per element;</text><text class="sv-ts" x="28" y="114">one sum chain</text>
+<rect class="sv-b6" x="205" y="20" width="170" height="160" rx="8"/><text class="sv-tb" x="218" y="42">2 loop order ikj</text>
+<text class="sv-ts" x="218" y="66">inner loop: along rows</text><text class="sv-ts" x="218" y="82">of B and C (stride 1),</text><text class="sv-ts" x="218" y="98">vectorised; C row</text><text class="sv-ts" x="218" y="114">reloaded for every k</text>
+<rect class="sv-b3" x="395" y="20" width="170" height="160" rx="8"/><text class="sv-tb" x="408" y="42">3 cache blocked</text>
+<text class="sv-ts" x="408" y="66">a 256 × 512 panel of B</text><text class="sv-ts" x="408" y="82">(512 KiB) stays in L2</text><text class="sv-ts" x="408" y="98">while every row of A</text><text class="sv-ts" x="408" y="114">uses it</text>
+<rect class="sv-b5" x="585" y="20" width="180" height="160" rx="8"/><text class="sv-tb" x="598" y="42">4 register tiled</text>
+<text class="sv-ts" x="598" y="66">6 × 16 block of C in</text><text class="sv-ts" x="598" y="82">12 ymm registers; per k:</text><text class="sv-ts" x="598" y="98">load 16 B + 6 A floats,</text><text class="sv-ts" x="598" y="114">96 multiply-adds</text>
+<line class="sv-line" x1="185" y1="200" x2="198" y2="200"/><polygon class="sv-head" points="198,195 205,200 198,205"/>
+<line class="sv-line" x1="375" y1="200" x2="388" y2="200"/><polygon class="sv-head" points="388,195 395,200 388,205"/>
+<line class="sv-line" x1="565" y1="200" x2="578" y2="200"/><polygon class="sv-head" points="578,195 585,200 578,205"/>
+<text class="sv-tm" x="70" y="206">2.0</text><text class="sv-tm" x="262" y="206">19.3</text><text class="sv-tm" x="452" y="206">20.3</text><text class="sv-tm" x="648" y="206">38.9</text>
+<text class="sv-ts" x="15" y="230">GFLOP/s at M = N = K = 512, one core, recorded run (sgemm.out); step 5 runs step 4 on 4 threads: 49.0</text>
+</svg></div><figcaption><b>Figure 2.</b> The reuse each SGEMM step adds, with the recorded single-core GFLOP/s <sup class="src"><a href="#F2-56-src-R4">R4</a></sup>. Blocking scheme after D4, pending verification <sup class="src"><a href="#F2-56-src-D4">D4</a></sup>; the L2 placement of the panel is our design intent, not a measurement.</figcaption></figure>
+
+<h2 id="F2-56-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>A kitchen has two speed limits: how fast the stove can cook and how fast the pantry door can deliver. A dish that needs little cooking per crate (a salad) is limited by the door; a dish that needs a lot of cooking per crate (a stew) is limited by the stove. Mapping: stove = the core's floating-point units (peak FLOP/s); pantry door = memory bandwidth (bytes per second); cooking per crate = arithmetic intensity (FLOP per byte).</p></div>
+<p>If you know which limit your dish hits, you know what to buy and what to change. A faster stove does nothing for salads. A wider door does nothing for stews. And if your dish runs far below both limits, the problem is neither the stove nor the door: it is how the cooks work, which is what the matrix-multiply lab improves.</p>
+
+<h2 id="F2-56-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F2-56-l2-roofs">Measuring the two roofs</h3>
+<p><b>Compute roof.</b> Listing 1 (<code>peak.cc</code>) runs 12 independent chains of fused multiply-adds (each FMA counts as two floating-point operations) that never touch memory. Independent chains are needed because one chain must wait for its previous result (the FMA's latency); with enough chains in flight, the units are kept busy every cycle (Little's law, <a href="#gl-little-s-law">HW301</a>). In the recorded run one core reached 100.5 GFLOP/s with 8-lane AVX2 and 220.7 GFLOP/s with 16-lane AVX-512; four threads reached 168.8 with AVX2 <sup class="src"><a href="#F2-56-src-R2">R2</a></sup>.</p>
+<p><b>Memory roof.</b> Listing 2 (<code>stream.cc</code>) runs the triad <code>a[i] = b[i] + s·c[i]</code>, counting 12 bytes per element (two 4-byte loads and one 4-byte store) <sup class="src"><a href="#F2-56-src-D3">D3</a></sup>. With 128 MiB arrays (far larger than any cache), one core moved 12.4 GB/s with AVX2 and four threads 12.6 GB/s <sup class="src"><a href="#F2-56-src-R3">R3</a></sup>. With 16 KiB arrays that stay in cache, the same AVX2 code moved 168.7 GB/s: the memory roof depends on where the data lives, and the DRAM roof is the one that matters for large data.</p>
+<p><b>Ridge point.</b> 100.5 / 12.4 ≈ 8.1 FLOP/byte for one core; 168.8 / 12.6 ≈ 13.4 for four cores <sup class="src"><a href="#F2-56-src-R5">R5</a></sup>. A kernel must do at least about 8 floating-point operations per byte from DRAM before the stove, rather than the door, can limit it on one core.</p>
+<h3 id="F2-56-l2-ai">Arithmetic intensity of two kernels</h3>
+<p><b>Triad:</b> 2 FLOP (one multiply, one add) per 12 bytes: 0.17 FLOP/byte. Far left of the ridge: memory-bound. Its attainable rate is 0.17 × 12.4 ≈ 2.1 GFLOP/s, and the recorded AVX2 run reached 100 % of it <sup class="src"><a href="#F2-56-src-R5">R5</a></sup> (by construction: this run also defined the roof).</p>
+<p><b>SGEMM, n × n:</b> 2n³ FLOP. Compulsory traffic, if each matrix crosses the memory bus exactly once: three matrices of n² floats, 12n² bytes. Intensity 2n³ / 12n² = n/6: 85.3 at n = 512, 170.7 at n = 1024. Far right of the ridge: compute-bound, attainable 100.5 GFLOP/s on one core <sup class="src"><a href="#F2-56-src-R5">R5</a></sup>. That intensity assumes perfect reuse; the naive loop moves far more bytes than that (it rereads B for every row of A), so its real intensity is much lower. Layer 3 returns to this.</p>
+<h3 id="F2-56-l2-gemm">The SGEMM speed table</h3>
+<p>Listing 3 (<code>sgemm.cc</code>) implements five steps, checks each one against a double-precision reference on seven shapes (including 1 × 1 × 1 and shapes that are not multiples of the tile), and times each with the F2-51 protocol <sup class="src"><a href="#F2-56-src-R4">R4</a></sup>. Recorded at n = 512 on one core unless stated:</p>
+<div class="tw"><table>
+<thead><tr><th>Step</th><th>Change</th><th>GFLOP/s</th><th>Of the roof</th><th>Why it helped (evidence)</th></tr></thead>
+<tbody>
+<tr><td>1 naive ijk</td><td>textbook loop</td><td>2.02</td><td>2 %</td><td>Baseline: inner loop strides down B's column (F2-52).</td></tr>
+<tr><td>2 loop order ikj</td><td>swap two loops</td><td>19.27</td><td>19 %</td><td>Unit stride; vectorisable inner loop (F2-53).</td></tr>
+<tr><td>3 cache blocked</td><td>panel of B reused</td><td>20.30</td><td>20 %</td><td>Small gain at 512 (B is 1 MiB and fits in L2 anyway); 1.4× at 1024.</td></tr>
+<tr><td>4 register tiled</td><td>6 × 16 AVX2 micro-kernel</td><td>38.91</td><td>39 %</td><td>C stays in registers; 96 FMAs per 22 loaded floats.</td></tr>
+<tr><td>5 threads</td><td>step 4 on 4 threads</td><td>48.98</td><td>29 % (of 168.8)</td><td>More cores; scaling limited (see unverified box).</td></tr>
+</tbody></table></div>
+<p>From step 1 to step 5 is a factor of about 24 at n = 512 in this run. At n = 1024 (step 1 skipped for time), steps 2 to 5 gave 11.1, 15.7, 33.0 and 39.0 GFLOP/s: loop order alone degrades at the larger size because B (4 MiB) no longer fits in the per-core L2, and blocking recovers part of it <sup class="src"><a href="#F2-56-src-R4">R4</a></sup>.</p>
+
+<h2 id="F2-56-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F2-56-l3-honest">What the roofline does and does not say</h3>
+<p>The roofline gives an upper bound from two machine numbers and one kernel number. It says nothing about why a kernel runs below its roof. Step 1's point sits at 2 % of the compute roof, but it is not compute-bound in any useful sense: its real traffic is much larger than the compulsory 12n² bytes, so its real intensity is far to the left, and on a roofline drawn with <i>measured</i> traffic it would sit near the slanted memory roof of whichever cache level feeds it. The model's original paper discusses both kinds of intensity and adds lower "ceilings" (no SIMD, no FMA, poor locality) below the roofs to explain such gaps (D1, pending verification <sup class="src"><a href="#F2-56-src-D1">D1</a></sup>). Our chart uses compulsory traffic only, which places every SGEMM step at the same intensity: honest as an upper bound, misleading as a diagnosis. On real hardware, counting DRAM bytes with hardware counters (F2-55, untested here) would give measured intensity.</p>
+<h3 id="F2-56-l3-roofs">Which roof is "the" roof</h3>
+<ul>
+<li><b>SIMD width.</b> The AVX-512 peak (220.7) is about twice the AVX2 peak (100.5) in our run <sup class="src"><a href="#F2-56-src-R2">R2</a></sup>. Our SGEMM uses AVX2, so we drew the AVX2 roof; an AVX-512 kernel would have a higher roof. State which instructions the roof assumes.</li>
+<li><b>Cache levels.</b> Each memory level has its own bandwidth roof: 168.7 GB/s for the in-cache triad versus 12.4 GB/s from DRAM <sup class="src"><a href="#F2-56-src-R3">R3</a></sup>. A kernel whose working set fits in cache should be judged against the cache's roof.</li>
+<li><b>Write-allocate.</b> A store to a line that is not in cache usually first reads that line (F2-52). Counting it, the triad moves 16 bytes per element, not 12, and the measured bandwidth would be reported a third higher. We counted 12 and say so in the output's header <sup class="src"><a href="#F2-56-src-R3">R3</a></sup>; vendor and benchmark conventions differ.</li>
+<li><b>Threads.</b> Single-core and all-core roofs differ; compare a threaded kernel with the all-core roof (the tool does: step 5 is judged against 168.8).</li>
+</ul>
+<h3 id="F2-56-l3-microkernel">Why the micro-kernel works</h3>
+<p>For each k, the 6 × 16 micro-kernel loads 16 floats of B (two AVX2 registers) and broadcasts 6 floats of A, then performs 6 × 2 = 12 vector FMAs, that is 96 lane FMAs or 192 FLOP, while the 12 accumulators of C stay in registers for the whole k-panel. That is 192 FLOP per 88 bytes loaded from cache, an intensity of about 2.2 FLOP/byte against the L1 cache, high enough that the L1 roof does not limit it. Twelve independent accumulators also cover the FMA latency, as in <code>peak.cc</code> <sup class="src"><a href="#F2-56-src-D4">D4</a></sup>. The remaining gap to the roof (39 % of it) comes from what we left out, compared with production libraries: packing A and B into contiguous buffers, prefetching, tuning MR, NR and the block sizes to this cache hierarchy, and using AVX-512 <sup class="src"><a href="#F2-56-src-D4">D4</a></sup>. Those are good next steps for the project, each one measured.</p>
+<h3 id="F2-56-l3-scaling">Multi-core roofs on a shared machine</h3>
+<p>Four threads of the FMA microbenchmark reached 1.68 times one thread, not 4 <sup class="src"><a href="#F2-56-src-R2">R2</a></sup>; the DRAM triad hardly scaled (12.4 to 12.6 GB/s) <sup class="src"><a href="#F2-56-src-R3">R3</a></sup>. Possible causes include virtual CPUs that share physical cores (hyper-threads), other tenants on the host, and a per-VM bandwidth limit; we did not establish which. The lesson for method: measure the roofs on the machine you report, with the same thread count, and say how they were measured.</p>
+
+<h2 id="F2-56-hardware">How the hardware actually does it</h2>
+<p>The compute roof is set by the number of floating-point units that can start an FMA each cycle, the vector width, and the clock frequency: peak = cores × FMA units × lanes × 2 × frequency <sup class="src"><a href="#F2-56-src-D5">D5</a></sup>. The memory roof is set by the memory channels, their transfer rate and how many outstanding misses a core can keep in flight (Little's law again: bandwidth ≈ bytes in flight / latency, <a href="#F1-39">F1-39</a>, <a href="#gl-little-s-law">Little's law</a>) <sup class="src"><a href="#F2-56-src-D5">D5</a></sup>. Our numbers are measurements, not this formula: we could not observe the frequency (<a href="#F2-51">F2-51</a>) or the core's unit count.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The number of FMA units per core, the clock frequency during the runs, whether AVX-512 lowers the frequency on this processor, the memory configuration and whether the 4 virtual CPUs are separate physical cores are not known from any document in this build; the CPU model string ("Intel(R) Xeon(R) Processor @ 2.10GHz") does not identify a product. Therefore the theoretical peak cannot be computed and compared with the measured 100.5 GFLOP/s, and the poor 4-thread scaling (1.68× for FMA, 1.01× for DRAM bandwidth) is unexplained. The roofs in this chapter are measurements on a shared cloud virtual machine in one session (AH-23), not properties of a processor. The arithmetic intensities assume compulsory traffic (each matrix moved once; triad with no write-allocate). To check on a real machine: the vendor's optimization reference manual (execution units, AVX frequency behaviour), the platform's memory specification, and measured DRAM traffic from hardware counters.</p></div>
+
+<h2 id="F2-56-worked">Worked example</h2>
+<p><b>Place the threaded SGEMM at n = 1024 on the roofline and say how much better it could get.</b> Numbers from <code>roofline.out</code> and <code>sgemm.out</code> <sup class="src"><a href="#F2-56-src-R4">R4</a></sup> <sup class="src"><a href="#F2-56-src-R5">R5</a></sup>:</p>
+<ol>
+<li>FLOP: 2 × 1024³ = 2,147,483,648.</li>
+<li>Compulsory bytes: 3 matrices × 1024² floats × 4 bytes = 12,582,912.</li>
+<li>Intensity: 2,147,483,648 / 12,582,912 ≈ 170.7 FLOP/byte (= 1024 / 6).</li>
+<li>All-core roofs: 168.8 GFLOP/s and 12.6 GB/s; ridge 168.8 / 12.6 ≈ 13.4. 170.7 &gt; 13.4: compute-bound.</li>
+<li>Attainable: min(168.8, 170.7 × 12.6 ≈ 2,150) = 168.8 GFLOP/s.</li>
+<li>Measured: 39.0 GFLOP/s, so 39.0 / 168.8 ≈ 23 % of the roof.</li>
+<li>Interpretation: memory bandwidth is not the limit even if real traffic were ten times the compulsory amount (intensity 17, still right of the ridge). The gap is inside the core: how well the micro-kernel feeds the FMA units, and how well the threads scale. The next optimisations to try are those of Layer 3 (packing, block sizes, AVX-512), not anything about DRAM.</li>
+</ol>
+<p><b>Contrast, the triad at 128 MiB:</b> intensity 0.17, attainable 0.17 × 12.4 ≈ 2.1 GFLOP/s, measured 2.07: at the roof. No compute optimisation can help it; only moving fewer bytes can (fusing it with the next loop that reads <code>a</code>, or using smaller data types).</p>
+
+<h2 id="F2-56-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>peak.cc</code>: the compute roof (built with <code>-O2 -pthread</code>; AVX2 and AVX-512 functions selected per function with <code>gnu::target</code> and used only if the CPU reports them).</p>
+<pre class="listing" data-src="F2-56/peak.cc"></pre>
+<pre class="output" data-run="F2-56/peak"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9</td><td><code>kChains = 12</code></td><td>Twelve independent accumulators.</td><td>Covers FMA latency × issue rate (Little's law).</td></tr>
+<tr><td>31–52</td><td><code>avx2Fma</code></td><td>12 × 8-lane <code>_mm256_fmadd_ps</code> per step.</td><td>Measures the AVX2 roof the SGEMM kernel can reach.</td></tr>
+<tr><td>40</td><td><code>#pragma GCC unroll 12</code></td><td>Unrolls the chain loop fully.</td><td>Without it, GCC kept the accumulators in memory and the run measured about 31 GFLOP/s (found while building this lab).</td></tr>
+<tr><td>77–90</td><td><code>gflops</code></td><td>Runs the function on <i>threads</i> threads, median of 11.</td><td>Single-core and all-core roofs.</td></tr>
+<tr><td>116</td><td><code>ROOF</code> lines</td><td>Machine-readable output.</td><td>Feeds <code>roofline.cc</code>; the chart cannot drift from the measurement.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>stream.cc</code>: the memory roof (triad, scalar and AVX2, in cache and in DRAM).</p>
+<pre class="listing" data-src="F2-56/stream.cc"></pre>
+<pre class="output" data-run="F2-56/stream"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–17</td><td><code>triadScalar</code></td><td>Plain loop with <code>no-tree-vectorize</code>.</td><td>A genuinely scalar version, for the forensic comparison.</td></tr>
+<tr><td>19–30</td><td><code>triadAvx2</code></td><td>8 floats per FMA, scalar tail.</td><td>The fastest simple version.</td></tr>
+<tr><td>43–45</td><td>inner repeat</td><td>Each thread repeats its own slice <code>inner</code> times.</td><td>Small arrays need many passes to time; threads are created once per measurement.</td></tr>
+<tr><td>53</td><td>12 bytes per element</td><td>The byte count convention.</td><td>No write-allocate counted; stated in the output header.</td></tr>
+<tr><td>65</td><td><code>inner</code></td><td>20,000 passes for 16 KiB, 1 for 128 MiB.</td><td>Similar total work for both sizes.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>sgemm.cc</code>: five steps, a correctness check, and the speed table (built with <code>-O3 -march=native -pthread</code>).</p>
+<pre class="listing" data-src="F2-56/sgemm.cc"></pre>
+<pre class="output" data-run="F2-56/sgemm"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–28</td><td><code>naiveIJK</code></td><td>Dot product of a row of A and a column of B.</td><td>Column walk of B: one cache line per element.</td></tr>
+<tr><td>32–43</td><td><code>loopIKJ</code></td><td>Adds <code>a × row of B</code> to a row of C.</td><td>Unit stride, vectorised by the compiler.</td></tr>
+<tr><td>47–69</td><td><code>blocked</code></td><td>KC × NC panels of B (256 × 512).</td><td>Panel reused by every row of A while in cache.</td></tr>
+<tr><td>71–97</td><td><code>microKernel</code></td><td>6 × 16 tile of C in 12 <code>__m256</code> registers; broadcast A, FMA with B.</td><td>Register-level reuse; <code>#pragma GCC unroll 6</code> keeps the accumulators in registers.</td></tr>
+<tr><td>99–123</td><td><code>registerTiledRows</code></td><td>Tiles the full blocks; a simple loop for edge rows and columns.</td><td>Correct for any shape, including 1 × 1 × 1.</td></tr>
+<tr><td>131–143</td><td><code>threaded</code></td><td>Each thread owns a band of rows of C (multiples of 6).</td><td>No two threads write the same element; no locks needed.</td></tr>
+<tr><td>145–166</td><td><code>check</code></td><td>Error ≤ 2·K·2<sup>−24</sup>·Σ|a||b| against a double reference.</td><td>A tolerance that grows with K, as float rounding does (<a href="#F2-53">F2-53</a>).</td></tr>
+<tr><td>190–209</td><td>shapes</td><td>Seven awkward shapes, every step.</td><td>A fast wrong kernel fails here before any timing.</td></tr>
+<tr><td>228–233</td><td><code>KERNEL</code> lines</td><td>FLOP, compulsory bytes, GFLOP/s.</td><td>Input to the roofline tool.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>roofline.cc</code>: reads <code>roofline.in</code> (generated by <code>run.sh</code> with <code>grep</code> from the three outputs above) and prints the table and an ASCII chart.</p>
+<pre class="listing" data-src="F2-56/roofline.cc"></pre>
+<pre class="output" data-run="F2-56/roofline"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>24–42</td><td>input</td><td>Reads <code>ROOF</code> and <code>KERNEL</code> lines.</td><td>The chart uses only measured numbers.</td></tr>
+<tr><td>43–45</td><td>roofs</td><td>Prints both roofs and ridge points.</td><td>The three numbers of the model.</td></tr>
+<tr><td>48–57</td><td>table</td><td>AI, attainable, measured, percent, bound.</td><td>The authoritative result; the chart is a sketch.</td></tr>
+<tr><td>59–92</td><td>chart</td><td>Log–log ASCII plot.</td><td>Letters at the same spot overwrite each other; the legend says so.</td></tr>
+</tbody></table></div>
+
+<h2 id="F2-56-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A kitchen's door and stove work in parallel only if someone organises it. A CPU overlaps memory transfers and arithmetic automatically to a large degree, which is why min(), not a sum, is a reasonable model.</li>
+<li>The kitchen has one door. A CPU has a hierarchy of "doors" (registers, L1, L2, L3, DRAM), each with its own bandwidth: there are several slanted roofs.</li>
+<li>The amount of cooking per crate is fixed by the recipe. A kernel's real intensity depends on how the code is written: blocking raises reuse and so raises the intensity measured at DRAM, without changing the mathematics.</li>
+<li>Kofi's stove has one speed. A CPU's peak changes with the instructions (scalar, AVX2, AVX-512), the number of cores and the frequency.</li>
+</ul>
+
+<h2 id="F2-56-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Measured FLOP/s above the "peak".</td><td>Peak measured with fewer lanes or threads than the kernel uses; or FLOP miscounted.</td><td>Compare instruction set and thread count of roof and kernel.</td><td>Matching roofs; count 2 FLOP per FMA consistently.</td></tr>
+<tr><td>Peak microbenchmark far below expectations.</td><td>Too few independent chains, or accumulators spilled to memory.</td><td>Disassembly: loads and stores in the FMA loop.</td><td>More chains; unroll; check registers (Listing 1, line 40).</td></tr>
+<tr><td>Vectorising a kernel gave no gain.</td><td>It is memory-bound.</td><td>Place it on the roofline.</td><td>Reduce bytes: fuse loops, smaller types, blocking.</td></tr>
+<tr><td>Blocked kernel slower than unblocked.</td><td>Block too large for the cache, or too small to amortise loop overhead.</td><td>Sweep block sizes; cache simulation (F2-52).</td><td>Choose blocks from the measured cache sizes; measure.</td></tr>
+<tr><td>Fast SGEMM, wrong answers on some shapes.</td><td>Edge handling when sizes are not multiples of the tile.</td><td>Test awkward shapes (1, 7, 513, primes).</td><td>Edge loops; correctness gate before timing.</td></tr>
+<tr><td>Threaded version slower than expected.</td><td>Shared cores, bandwidth, or false sharing of C rows at band edges.</td><td>Scale 1, 2, 4 threads; check band boundaries.</td><td>Bands aligned to cache lines and tiles; measure roofs per thread count.</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F2-56-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> this course measured single effects (timing <a href="#F2-51">F2-51</a>, caches <a href="#F2-52">F2-52</a>, SIMD <a href="#F2-53">F2-53</a>, branches <a href="#F2-54">F2-54</a>) and located hot code with profilers (<a href="#F2-55">F2-55</a>); HW301 gave peak figures and the alpha–beta model. <b>What carries over:</b> every SGEMM step uses one of those chapters, and the roofline combines their results into one picture. <b>What changes:</b> you now judge a kernel against what the machine can do, not against its previous version. <b>What comes next:</b> <a href="#CU302">CU302</a> takes the same SGEMM to a GPU, where the same steps (coalescing, shared-memory tiling, register tiling) and the same roofline apply with very different roofs.</p></div>
+
+<h2 id="F2-56-check">Check yourself</h2>
+<ol>
+<li>State the roofline formula and name its three inputs.</li>
+<li>A kernel performs 1 FLOP per 8 bytes. On the build machine's single-core roofs, what is its attainable rate, and is it memory- or compute-bound?</li>
+<li>Why does the peak benchmark use 12 independent chains instead of one?</li>
+<li>Explain in your own words why all SGEMM steps appear at the same intensity on our chart, and why that is misleading for step 1.</li>
+<li>Apply to a new case: a 3 × 3 image blur on single-precision pixels does 9 multiplies and 8 adds per output pixel and, with good caching, reads one input pixel and writes one output pixel. Compute its compulsory intensity and classify it on the single-core roofs.</li>
+<li>Step 3 (blocking) gained little at n = 512 but more at n = 1024. Explain with cache sizes.</li>
+<li>A manager suggests buying a CPU with twice the cores to speed up a triad-like job. What do you advise, with evidence from this chapter?</li>
+<li>Why should the roof used for the AVX2 SGEMM not be the AVX-512 peak?</li>
+</ol>
+
+<h2 id="F2-56-lab">Lab</h2>
+<p><b>Goal (course lab).</b> Optimise a CPU matrix multiply step by step, record a speed table, and place every step on a roofline measured on your own machine. This lab prepares CU302.</p>
+<p><b>Hardware and software.</b> Linux, g++ with C++20, an x86-64 CPU with AVX2 and FMA (the build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>). Programs check CPU features before using AVX2 or AVX-512. <b>Safety:</b> the benchmarks keep all cores busy for about a minute; on a laptop, keep it on a hard surface with ventilation.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F2-56</code>. Exit status 0 expected; all correctness rows must say PASS.</li>
+<li>Record your roofs (<code>peak.out</code>, <code>stream.out</code>) and compute both ridge points by hand; compare with <code>roofline.out</code>.</li>
+<li>For each SGEMM step, write one sentence of why it is faster, citing a chapter of this course and, where possible, a measurement (for example a Cachegrind miss count for steps 1 and 2 at a small size, F2-52).</li>
+<li>Sweep KC and NC (for example 64, 128, 256, 512) for step 3 and MR × NR (4 × 16, 6 × 16, 8 × 8) for step 4; predict, then measure. Keep the correctness gate.</li>
+<li>Add one more step of your own (packing B into a contiguous panel is a good choice) and add it to the table and the chart.</li>
+</ol>
+<p><b>Expected observations</b> (build container, one session; yours will differ): step 1 about 2 GFLOP/s; loop order about ten times faster; register tiling about twice the blocked step; threads helping less than four times; the DRAM triad at its own roof <sup class="src"><a href="#F2-56-src-R4">R4</a></sup> <sup class="src"><a href="#F2-56-src-R5">R5</a></sup>.</p>
+<p><b>Verification.</b> "all shapes, all steps: PASS" in <code>sgemm.out</code>; your hand-computed ridge points equal the tool's to two digits.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"AVX2" rows missing → the CPU lacks AVX2/FMA → the scalar steps still run; draw the scalar roof.</li>
+<li>A step FAILs correctness → usually edge handling → test the smallest failing shape by hand.</li>
+<li>Numbers jump between runs → noisy machine → F2-51: quiet machine, more runs, report spread.</li>
+</ul>
+<p><b>Extension.</b> Write an AVX-512 micro-kernel (for example 6 × 32 or 12 × 16) and compare with the AVX-512 roof; report whether the frequency appears to change (F2-51 warns you cannot see it directly).</p>
+
+<h2 id="F2-56-forensic">Forensic lab</h2>
+<p><b>Scenario — "the optimisation that did nothing".</b> A team spent a week hand-vectorising the hot loop of a data pipeline with AVX2 intrinsics. Their microbenchmark showed more than five times the speed. In production, on large arrays, the job became about 15 % faster. The team suspects the production build lost the AVX2 code. Another engineer suspects the benchmark was wrong.</p>
+<p><b>Evidence pack.</b> The loop is a triad. The team's benchmark and the production-size run, both in <code>stream.out</code> (Listing 2):</p>
+<pre class="output" data-run="F2-56/stream"></pre>
+<p>And the roofs and table from <code>roofline.out</code> (above), rows a and b.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Compute the speed-up of AVX2 over scalar at 16 KiB and at 128 MiB.</li>
+<li>Was the benchmark wrong? Was the AVX2 code lost in production? Use the evidence.</li>
+<li>Place both versions of the production-size kernel on the roofline and explain the result.</li>
+<li>What would have warned the team before they started?</li>
+<li>What could actually make the production job faster?</li>
+</ol>
+<p><b>Method hints.</b> Compute the intensity first; then compare the measured rate with the attainable rate at both sizes.</p>
+
+<h2 id="F2-56-project">Mini-project</h2>
+<p><b>Course project — a CPU SGEMM report with a roofline chart.</b> Write a report (about four pages) on your own SGEMM: the machine and toolchain (with versions), measured roofs and how they were measured, the speed table for at least five steps at two sizes, a roofline chart with every step placed on it, a paragraph per step explaining the gain with evidence (a profile, a cache-miss count, a disassembly excerpt or a parameter sweep, F2-55), the correctness method, and an honest list of what you could not measure. <b>Rubric:</b> correctness gate and records 20 %, roofs measured and justified 20 %, speed table and chart 20 %, evidence for each gain 25 %, limitations and next steps 15 %. Keep the report: CU302 asks you to repeat it on a GPU and compare.</p>
+
+<h2 id="F2-56-summary">Summary</h2>
+<ul>
+<li>Attainable performance = min(peak FLOP/s, arithmetic intensity × bandwidth); the ridge point separates memory-bound from compute-bound kernels.</li>
+<li>Measure the roofs: here one core gave 100.5 GFLOP/s (AVX2 FMA) and 12.4 GB/s (DRAM triad) in the recorded run, ridge about 8 FLOP/byte.</li>
+<li>Low-intensity kernels (the triad) are capped by bandwidth: vectorising them helps in cache, barely at all from DRAM.</li>
+<li>SGEMM has high intensity; its steps (loop order, blocking, register tiling, threads) raised it from about 2 to about 49 GFLOP/s, still below its roof.</li>
+<li>State the assumptions: which instructions, which memory level, compulsory or measured traffic, how many threads.</li>
+<li>Correctness first: every step passed a tolerance check on awkward shapes before being timed.</li>
+</ul>
+
+<h2 id="F2-56-sources">Sources</h2>
+<ol>
+<li id="F2-56-src-D1">D1 — Samuel Williams, Andrew Waterman, David Patterson, "Roofline: An Insightful Visual Performance Model for Multicore Architectures", Communications of the ACM (curriculum item 75; tier 1): the model, ridge point, ceilings, operational intensity. <i>Title only — not opened during this build; the Source Researcher must confirm the publication details and section (dossier gate G1 open).</i></li>
+<li id="F2-56-src-D2">D2 — Brendan Gregg, "Systems Performance: Enterprise and the Cloud" (tier 3; edition to be recorded): CPU and memory chapters. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F2-56-src-D3">D3 — John McCalpin, the STREAM benchmark (tier 2): the triad kernel and its byte-counting convention. <i>Title only — not opened during this build; our triad is our own code following the same formula (dossier gate G1 open).</i></li>
+<li id="F2-56-src-D4">D4 — Kazushige Goto, Robert van de Geijn, "Anatomy of High-Performance Matrix Multiplication", ACM Transactions on Mathematical Software (tier 1): blocking for caches, packing, the register micro-kernel; and the BLAS SGEMM interface. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F2-56-src-D5">D5 — John Hennessy, David Patterson, "Computer Architecture: A Quantitative Approach" (tier 3; edition to be recorded): peak performance, memory bandwidth, the roofline section. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F2-56-src-R1">R1 — <code>university/labs/F2-56/</code> run records, toolchain <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, machine "Linux x86_64 (cloud build container, 4 CPUs)".</li>
+<li id="F2-56-src-R2">R2 — <code>peak.log</code>: Listing 1, exit code 0; measurement of a shared cloud virtual machine (AH-23).</li>
+<li id="F2-56-src-R3">R3 — <code>stream.log</code>: Listing 2, exit code 0; measurement (AH-23).</li>
+<li id="F2-56-src-R4">R4 — <code>sgemm.log</code>: Listing 3, exit code 0, all correctness checks PASS; measurement (AH-23).</li>
+<li id="F2-56-src-R5">R5 — <code>roofline.log</code>: Listing 4 on <code>roofline.in</code> generated from R2–R4, exit code 0.</li>
+</ol>
+
+<h2 id="F2-56-glossary">Glossary links</h2>
+<p><a href="#gl-arithmetic-intensity">Arithmetic intensity</a> · <a href="#gl-roofline-model">Roofline model</a> · <a href="#gl-ridge-point">Ridge point</a> · <a href="#gl-memory-bound-and-compute-bound">Memory-bound and compute-bound</a> · <a href="#gl-attainable-performance">Attainable performance</a> · <a href="#gl-sgemm">SGEMM</a> · <a href="#gl-register-tiling-micro-kernel">Register tiling (micro-kernel)</a> · <a href="#gl-loop-tiling-cache-blocking">Loop tiling (cache blocking)</a> · <a href="#gl-little-s-law">Little's law</a> · <a href="#gl-peak-bandwidth">Peak bandwidth</a> · <a href="#gl-fma-fused-multiply-add">FMA (fused multiply-add)</a></p>
+
+<h2 id="F2-56-next">Next chapter</h2>
+<p>This is the last chapter of SP302. Previous: <a href="#F2-55">F2-55 Profilers</a>. Continue with <a href="#CU302">CU302</a>, which takes this SGEMM to the GPU. Back to the course: <a href="#SP302">SP302</a>.</p>
+
+<h2 id="F2-56-answers">Answers to Check yourself</h2>
+<ol>
+<li>Attainable = min(peak FLOP/s, AI × peak bandwidth). Inputs: the machine's peak FLOP/s, its peak bandwidth (for the memory level in question), and the kernel's arithmetic intensity.</li>
+<li>AI = 1/8 = 0.125 FLOP/byte; 0.125 × 12.4 ≈ 1.55 GFLOP/s, far below 100.5: memory-bound.</li>
+<li>One chain must wait for each FMA's result before starting the next (latency); with many independent chains the units can start a new FMA every cycle. The number needed is about latency × FMAs per cycle (Little's law).</li>
+<li>Good answers say: our tool uses compulsory traffic (each matrix once), which depends only on n, so all steps share one intensity. Step 1 really moves far more bytes (B's column walk rereads lines), so its true intensity is much lower and it is limited by memory traffic, not by the compute roof the chart shows above it.</li>
+<li>17 FLOP per output pixel; compulsory traffic 4 bytes read + 4 bytes written = 8 bytes: AI ≈ 2.1 FLOP/byte, left of the single-core ridge (8.1): memory-bound; attainable ≈ 2.1 × 12.4 ≈ 26 GFLOP/s.</li>
+<li>At n = 512, B is 512 × 512 × 4 bytes = 1 MiB, which fits in the 2 MiB L2 reported by <code>lscpu</code> (F2-52), so the unblocked loop already reuses it from L2. At 1024, B is 4 MiB, larger than L2; blocking keeps a 512 KiB panel in L2 and recovers reuse.</li>
+<li>Advise against it without evidence of a compute limit: the triad is memory-bound, and on the build machine four threads moved 12.6 GB/s versus 12.4 on one (R3). More cores would not help; more memory bandwidth, or moving fewer bytes, would. Measure the target machine's bandwidth roof first.</li>
+<li>The roof must match what the kernel can use. An AVX2 kernel can at most reach the AVX2 peak; comparing it with the AVX-512 peak would understate how close it is to its real limit and point at the wrong fix (it would need AVX-512 code, a different kernel).</li>
+</ol>
+<h3 id="F2-56-forensic-key">Forensic lab answer key</h3>
+<p><b>Speed-ups.</b> 16 KiB: 168.7 / 31.1 ≈ 5.4×. 128 MiB: 12.4 / 10.7 ≈ 1.16×, the "about 15 %" seen in production.</p>
+<p><b>Benchmark and build.</b> Neither was wrong. The benchmark used a 16 KiB array, which stays in cache, where the scalar loop is limited by instruction throughput and AVX2 removes that limit. Production arrays come from DRAM. The 128 MiB AVX2 row shows the AVX2 code running and reaching the DRAM roof.</p>
+<p><b>On the roofline.</b> Intensity 2 FLOP / 12 bytes ≈ 0.17. Attainable from DRAM: 0.17 × 12.4 ≈ 2.1 GFLOP/s. Scalar measured 1.8 (86 % of the roof), AVX2 2.07 (100 %; rows a and b of <code>roofline.out</code>). The scalar version was already close to the memory roof, so at most about 15 % was available to any compute optimisation.</p>
+<p><b>The warning sign.</b> Computing the intensity (0.17, far left of the ridge at about 8) and benchmarking at production size. A five-minute roofline estimate would have predicted at most about 15 %.</p>
+<p><b>What would help.</b> Moving fewer bytes: fuse the triad with the loop that consumes <code>a</code> so <code>a</code> is not written to and reread from DRAM; use 16-bit data where precision allows; or restructure so the data is processed in cache-sized chunks through several steps. Then measure. <b>How the evidence was produced:</b> <code>stream.cc</code> built with <code>-O2 -pthread</code>, scalar version compiled with <code>no-tree-vectorize</code>, median of 21 runs, 12 bytes counted per element; output unedited.</p>

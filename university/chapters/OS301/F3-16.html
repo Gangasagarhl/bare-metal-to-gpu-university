@@ -1,0 +1,303 @@
+<!--meta
+id: F3-16
+title: Secure Boot and measured boot
+course: OS301
+level: L3
+prereqs: F3-10 (UEFI applications, PE32+), F3-15 (the loader); SP-level C++; basic idea of a hash (MA or SP courses)
+time: 6–8 hours including the lab
+hardware: a Linux computer with clang 18 and lld (UEFI target), Python 3 with python3-cryptography, QEMU 8.2 with the distribution's OVMF builds (plain, Secure Boot, and the variable stores with keys); no real PC; no TPM
+maps: Curriculum section 2.5 "Security and hidden components" (Secure Boot, shim, measured boot, roots of trust); the exercise "enroll your own PK/KEK/db in OVMF and sign your loader"
+analogy: F3 — the school (registered mappings used: firmware = the caretaker; bootloader = the person who unlocks the classroom); proposals in NOTES.md: "Secure Boot = the caretaker checks a signed permission slip against the list on the staff-room wall"; "measured boot = the visitors' book, where each visitor's name is added and nobody can tear out a page"
+-->
+
+<h2 id="F3-16-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>The caretaker will not let anyone into the building whose permission slip is not signed by someone on the list pinned in the staff room. The list itself can only be changed by the head of the school board, whose signature is also on file. A second, quieter rule: at the entrance lies a visitors' book in which every person who enters is written down, in order, in ink, on numbered pages. Nobody can stop a visitor with that book, but afterwards anyone can read it and see exactly who came in.</p>
+</div>
+<p>These are the two security mechanisms of the PC boot chain. <b>Secure Boot</b> stops: the firmware refuses to start a UEFI program whose signature does not match a certificate or hash in its database. <b>Measured boot</b> records: each stage hashes the next into a TPM register before running it, so that a remote party can later check what ran. In this chapter you read the Secure Boot state from the firmware, watch it refuse your unsigned program, sign the program yourself, byte by byte, with a test key the firmware trusts, and watch it run. Then you compute the measured-boot arithmetic for real files. The forensic lab: one character changed in a signed file.</p>
+
+<h2 id="F3-16-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the Secure Boot key hierarchy (PK, KEK, db, dbx), setup mode and user mode, and where shim fits.</li>
+<li><b>Read</b> the Secure Boot state from a UEFI program, and predict what the firmware does with signed, unsigned and modified images.</li>
+<li><b>Sign</b> a PE32+ image with an Authenticode signature you construct yourself, and explain which bytes the signature covers.</li>
+<li><b>Compute</b> SHA-256 digests and PCR extends, and explain why the order of measurements matters.</li>
+<li><b>Distinguish</b> enforcement (Secure Boot) from attestation (measured boot), and explain what each one does not protect against.</li>
+</ul>
+
+<div class="co jargon" id="F3-16-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Secure Boot (PK, KEK, db, dbx)</dt><dd><b>Simple words:</b> the firmware feature that only starts programs signed by someone it trusts. <b>Analogy:</b> the caretaker who checks permission slips against the list in the staff room. <b>Precise:</b> UEFI image verification: before starting a UEFI image, the firmware checks its Authenticode signature (or its hash) against the allowed database db and the forbidden database dbx; db and dbx may be changed only with a signature from a Key Exchange Key (KEK), and the KEKs only with the Platform Key (PK). <sup class="src"><a href="#F3-16-src-D1">D1</a></sup> <sup class="src"><a href="#F3-16-src-S1">S1</a></sup></dd>
+<dt>Setup mode and user mode</dt><dd><b>Simple words:</b> whether the platform has an owner key yet. <b>Analogy:</b> a school without a head of the board accepts any new list; once one is appointed, only signed changes count. <b>Precise:</b> with no PK enrolled the platform is in setup mode (variable <code>SetupMode</code> = 1), the key variables can be written without authentication and images are not verified; enrolling a PK switches to user mode, where <code>SecureBoot</code> = 1 if verification is enabled. <sup class="src"><a href="#F3-16-src-D1">D1</a></sup></dd>
+<dt>Authenticode</dt><dd><b>Simple words:</b> the signature format for Windows and UEFI program files. <b>Analogy:</b> the signed permission slip stapled to the back of the visitor's papers. <b>Precise:</b> a PKCS#7 SignedData structure, stored in the PE file's certificate table, whose signed content holds a hash of the image computed over the headers (excluding the checksum and the certificate-table entry) and the sections, but not over the certificate table itself. <sup class="src"><a href="#F3-16-src-D2">D2</a></sup> <sup class="src"><a href="#F3-16-src-D3">D3</a></sup></dd>
+<dt>Measured boot</dt><dd><b>Simple words:</b> each step of the boot writes a fingerprint of the next step into a tamper-proof log before running it. <b>Analogy:</b> the visitors' book in ink. <b>Precise:</b> each boot component measures (hashes) the next one and extends a TPM Platform Configuration Register with that digest, and appends an event to the event log; the PCR values can be reported, signed by the TPM, to a remote verifier (attestation). <sup class="src"><a href="#F3-16-src-D4">D4</a></sup> <sup class="src"><a href="#F3-16-src-S1">S1</a></sup></dd>
+<dt>PCR extend</dt><dd><b>Simple words:</b> the only way to change a TPM register: mix in a new value, never set it. <b>Analogy:</b> adding a line to the book; there is no eraser. <b>Precise:</b> PCR<sub>new</sub> = H(PCR<sub>old</sub> ‖ digest) for the PCR bank's hash H (SHA-256 here); the final value depends on every digest and their order, and the register can only return to its initial value by a platform reset. <sup class="src"><a href="#F3-16-src-D5">D5</a></sup></dd>
+<dt>shim</dt><dd><b>Simple words:</b> a small first loader that Linux distributions use to boot with Secure Boot on. <b>Analogy:</b> a visitor with a permission slip from the board who vouches for his own colleagues. <b>Precise:</b> a UEFI loader signed by Microsoft's UEFI CA, which is in db on most PCs; it carries the distribution's own certificate and supports Machine Owner Keys (MOK), and verifies the next stage (for example GRUB) itself. <sup class="src"><a href="#F3-16-src-S1">S1</a></sup></dd>
+</dl></div>
+
+<h2 id="F3-16-pictures">The idea in pictures</h2>
+<p>Figure 1 shows who may change what, and where the check happens. Figure 2 is the measured-boot arithmetic with the values our program computed.</p>
+<figure id="F3-16-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F3-16-f1t F3-16-f1d">
+<title id="F3-16-f1t">The Secure Boot key hierarchy and the image check</title>
+<desc id="F3-16-f1d">Top row of three boxes: PK, the Platform Key, one certificate, the platform owner; an arrow labelled "signs updates to" leads to KEK, Key Exchange Keys; another arrow from KEK labelled "signs updates to" leads to two boxes, db (allowed certificates and hashes) and dbx (forbidden ones). Bottom: a UEFI image (PE32+ with a certificate table) goes into the firmware's check at LoadImage: compute the Authenticode hash; if the hash or a signer is in dbx, refuse; if a signature chains to a certificate in db or the hash is in db, start; otherwise refuse with Access Denied. In our lab the snakeoil store has the test certificate enrolled; the signed program ran and the unsigned and tampered ones were refused.</desc>
+<rect class="sv-b6" x="20" y="20" width="150" height="60"/><text class="sv-tb" x="30" y="44">PK</text><text class="sv-ts" x="30" y="64">platform owner (1 cert)</text>
+<rect class="sv-b4" x="230" y="20" width="150" height="60"/><text class="sv-tb" x="240" y="44">KEK</text><text class="sv-ts" x="240" y="64">key exchange keys</text>
+<rect class="sv-b3" x="440" y="20" width="140" height="60"/><text class="sv-tb" x="450" y="44">db</text><text class="sv-ts" x="450" y="64">allowed certs, hashes</text>
+<rect class="sv-b8" x="600" y="20" width="140" height="60"/><text class="sv-tb" x="610" y="44">dbx</text><text class="sv-ts" x="610" y="64">forbidden ones</text>
+<line class="sv-line" x1="170" y1="50" x2="222" y2="50"/><polygon class="sv-head" points="229,50 217,45 217,55"/>
+<line class="sv-line" x1="380" y1="50" x2="432" y2="50"/><polygon class="sv-head" points="439,50 427,45 427,55"/>
+<text class="sv-ts" x="174" y="98">signs updates to</text><text class="sv-ts" x="384" y="98">signs updates to db, dbx</text>
+<rect class="sv-b1" x="20" y="150" width="170" height="80"/><text class="sv-tb" x="30" y="172">UEFI image</text><text class="sv-ts" x="30" y="192">PE32+ headers, sections,</text><text class="sv-ts" x="30" y="210">certificate table (PKCS#7)</text>
+<line class="sv-line" x1="190" y1="190" x2="232" y2="190"/><polygon class="sv-head" points="239,190 227,185 227,195"/>
+<rect class="sv-b2" x="240" y="130" width="500" height="120"/><text class="sv-tb" x="250" y="152">firmware, at LoadImage (user mode, SecureBoot = 1)</text>
+<text class="sv-ts" x="250" y="174">1. compute the Authenticode hash of the image</text>
+<text class="sv-ts" x="250" y="194">2. hash or signer in dbx → refuse</text>
+<text class="sv-ts" x="250" y="214">3. signature chains to a db certificate, or hash in db → start</text>
+<text class="sv-ts" x="250" y="234">4. otherwise → "Access Denied" (seen in R3 and R6)</text>
+<line class="sv-dash" x1="510" y1="80" x2="510" y2="128"/>
+<text class="sv-ts" x="20" y="285">Lab: snakeoil store (PK, KEK, db with the test certificate) — signed program ran; unsigned and one-byte-modified copies refused.</text>
+</svg></div><figcaption><b>Figure 1.</b> The order of checks in step 2 and 3 is from memory of D1 (title only); the lab shows only the outcomes, not the order. Sources: <sup class="src"><a href="#F3-16-src-D1">D1</a></sup> <sup class="src"><a href="#F3-16-src-S1">S1</a></sup> <sup class="src"><a href="#F3-16-src-R6">R6</a></sup></figcaption></figure>
+<figure id="F3-16-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 260" role="img" aria-labelledby="F3-16-f2t F3-16-f2d">
+<title id="F3-16-f2t">Extending one register with three measurements</title>
+<desc id="F3-16-f2d">A chain of four boxes. Start: 32 zero bytes. Extend with SHA-256 of firmware.fd (ad23…b083): result 7bfc…ada6. Extend with SHA-256 of loader.efi (242f…9e67): result 8f00…790f. Extend with SHA-256 of kernel.elf (cd6d…d622): result 1af2…ac58. Below: the same three files extended in reverse order give ab82…9404, a different value. Each step computes SHA-256 of the old register value followed by the digest.</desc>
+<rect class="sv-box" x="20" y="40" width="130" height="60"/><text class="sv-ts" x="28" y="64">start</text><text class="sv-tm" x="28" y="86">00…00</text>
+<rect class="sv-b1" x="200" y="40" width="160" height="60"/><text class="sv-ts" x="208" y="64">+ firmware.fd</text><text class="sv-tm" x="208" y="86">7bfc…ada6</text>
+<rect class="sv-b2" x="400" y="40" width="160" height="60"/><text class="sv-ts" x="408" y="64">+ loader.efi</text><text class="sv-tm" x="408" y="86">8f00…790f</text>
+<rect class="sv-b3" x="600" y="40" width="150" height="60"/><text class="sv-ts" x="608" y="64">+ kernel.elf</text><text class="sv-tm" x="608" y="86">1af2…ac58</text>
+<line class="sv-line" x1="150" y1="70" x2="192" y2="70"/><polygon class="sv-head" points="199,70 187,65 187,75"/>
+<line class="sv-line" x1="360" y1="70" x2="392" y2="70"/><polygon class="sv-head" points="399,70 387,65 387,75"/>
+<line class="sv-line" x1="560" y1="70" x2="592" y2="70"/><polygon class="sv-head" points="599,70 587,65 587,75"/>
+<text class="sv-ts" x="20" y="130">each arrow: PCR ← SHA-256(PCR ‖ SHA-256(file))</text>
+<text class="sv-ts" x="20" y="150">digests: firmware.fd ad23…b083, loader.efi 242f…9e67, kernel.elf cd6d…d622</text>
+<rect class="sv-b8" x="20" y="180" width="440" height="50"/><text class="sv-ts" x="28" y="200">same three files, reverse order</text><text class="sv-tm" x="28" y="220">ab82…9404 (different)</text>
+<text class="sv-ts" x="480" y="210">no TPM used: arithmetic only</text>
+</svg></div><figcaption><b>Figure 2.</b> Values from <code>measure</code> (R7), each confirmed by sha256sum and Python's hashlib (R8). The extend formula is from memory of D5 (title only). Sources: <sup class="src"><a href="#F3-16-src-D5">D5</a></sup> <sup class="src"><a href="#F3-16-src-R7">R7</a></sup> <sup class="src"><a href="#F3-16-src-R8">R8</a></sup></figcaption></figure>
+
+<h2 id="F3-16-layer1">Layer 1 — the kid explanation</h2>
+<p>Before the firmware starts a program from the disk, it can check a seal on it. The seal can only be made by someone with a secret key, and the firmware has a list of whose seals it accepts. If one letter of the program is changed, the seal no longer fits, and the firmware says "access denied". Separately, a special chip can keep a fingerprint diary of everything that started, so someone can check later what really ran.</p>
+
+<h2 id="F3-16-layer2">Layer 2 — the student explanation</h2>
+<p><b>Secure Boot</b> is configured by four variables in the firmware's non-volatile store. The PK belongs to the platform owner (on a retail PC, the manufacturer); the KEKs belong to parties allowed to update the databases (on most PCs, the manufacturer and Microsoft); db holds certificates and hashes of allowed images (on most PCs, Microsoft's Windows and third-party UEFI CAs); dbx holds revoked ones.<sup class="src"><a href="#F3-16-src-S1">S1</a></sup> <sup class="src"><a href="#F3-16-src-D1">D1</a></sup> Two read-only variables report the state: <code>SetupMode</code> (1 when no PK is enrolled) and <code>SecureBoot</code> (1 when verification is enforced).</p>
+<p>A UEFI program is a PE32+ file (F3-10). Its signature lives in the <b>certificate table</b>, which is found through entry 4 of the optional header's data directories. The signature covers an <b>Authenticode hash</b>: a SHA-256 over the file with three pieces left out: the checksum field, the certificate-table directory entry, and the certificate table itself. That is why a signature can be added to a file without changing the hash it signs.<sup class="src"><a href="#F3-16-src-D2">D2</a></sup> <sup class="src"><a href="#F3-16-src-D3">D3</a></sup></p>
+<p>Linux distributions boot under Secure Boot through <b>shim</b>, signed by Microsoft's UEFI CA, which carries the distribution's key. For your own loader the curriculum's advice is to leave Secure Boot off in QEMU, and later "enroll your own PK/KEK/db in OVMF and sign your loader (the sbsigntools package is the usual tool) as an exercise".<sup class="src"><a href="#F3-16-src-S1">S1</a></sup> sbsigntools is not installed in this build, and neither are the usual tools for writing OVMF's variable store; the lab therefore uses the variable store the distribution ships with a test key already enrolled, and writes the signing program itself.</p>
+<p><b>Measured boot</b> does not stop anything. Each stage computes a digest of the next stage and <b>extends</b> a PCR in the TPM with it. Because extend is a hash of the old value and the new digest, the final PCR value is a commitment to the exact sequence of digests; a verifier who knows the expected components can recompute it from the event log and compare.<sup class="src"><a href="#F3-16-src-D4">D4</a></sup> <sup class="src"><a href="#F3-16-src-D5">D5</a></sup> No TPM is available in this build (no software TPM is installed), so the lab computes the arithmetic on real files and leaves the TPM itself untested.</p>
+
+<h2 id="F3-16-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-16-l3-state">Three firmware set-ups, one program</h3>
+<p><code>sbstate.efi</code> (Listing 1) reads <code>SecureBoot</code>, <code>SetupMode</code> and <code>PK</code> with the runtime service GetVariable and prints them. Booted on four set-ups, it gave four different answers (R1–R3, R6):</p>
+<div class="tw"><table>
+<thead><tr><th>Firmware code</th><th>Variable store</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>OVMF_CODE_4M.fd</td><td>OVMF_VARS_4M.fd</td><td>ran; SecureBoot, SetupMode and PK "not present"</td></tr>
+<tr><td>OVMF_CODE_4M.secboot.fd</td><td>OVMF_VARS_4M.fd</td><td>ran; SecureBoot = 0, SetupMode = 1, no PK</td></tr>
+<tr><td>OVMF_CODE_4M.secboot.fd</td><td>OVMF_VARS_4M.ms.fd</td><td>refused: "Access Denied"</td></tr>
+<tr><td>OVMF_CODE_4M.secboot.fd</td><td>OVMF_VARS_4M.snakeoil.fd</td><td>unsigned: "Access Denied"; signed by us: ran, SecureBoot = 1, SetupMode = 0, PK present (1,031 bytes)</td></tr>
+</tbody></table></div>
+<p>Read the rows against the model. The plain build has no Secure Boot support, so the variables do not exist. The Secure Boot build with an empty store is in setup mode: no PK, nothing enforced. The <code>.ms</code> store has keys enrolled (by its name, Microsoft's; we could not print them because our unsigned program was refused, which is itself the evidence that enforcement is on). The <code>.snakeoil</code> store has the distribution's test certificate enrolled; a program signed with the matching private key runs and reports user mode with enforcement on.<sup class="src"><a href="#F3-16-src-R1">R1</a></sup> <sup class="src"><a href="#F3-16-src-R2">R2</a></sup> <sup class="src"><a href="#F3-16-src-R3">R3</a></sup> <sup class="src"><a href="#F3-16-src-R6">R6</a></sup> The Secure Boot code build needs QEMU's <code>smm=on</code> and a secure flash device (<code>-global driver=cfi.pflash01,property=secure,value=on</code>): the variable store must be writable only from System Management Mode, or any program could rewrite db.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory of D1, not opened: the variable names, the EFI global variable GUID used in <code>efi.hpp</code>, the attribute bits (0x02 boot-service access, 0x04 runtime access; our values printed 0x06), and the meaning of SetupMode and SecureBoot. That the <code>.ms</code> store holds Microsoft's keys is inferred from its name and from the refusal; its contents were not listed. Which keys are in the <code>.snakeoil</code> store (PK only, or PK, KEK and db) was not listed either; the signed program's success shows that the test certificate is trusted for image verification. The private key's passphrase "snakeoil" was tried and accepted; it is not documented in any file we found in this build.</p></div>
+<h3 id="F3-16-l3-sign">Signing by hand</h3>
+<p><code>sign.py</code> (Listing 2) produces an Authenticode signature without a signing tool, so every byte is visible. It works in four steps:</p>
+<ol>
+<li><b>Authenticode hash</b> (lines 76–90): SHA-256 over the headers up to the checksum field, then from after the checksum to the certificate-table entry, then from after that entry to the end of the headers; then each section's raw data in file order; then any bytes after the last section that are not the certificate table.</li>
+<li><b>SpcIndirectDataContent</b> (lines 95–98): a DER structure saying "this is a PE image" (an object identifier and an empty <code>SpcPeImageData</code>) followed by a DigestInfo: the SHA-256 algorithm identifier and the hash from step 1.</li>
+<li><b>PKCS#7 SignedData</b> (lines 99–119): two signed attributes, the content type and the SHA-256 of the content from step 2 (its value bytes, without the outer tag and length); the RSA signature (PKCS#1 v1.5, SHA-256) over the DER-encoded set of those attributes; the signer's certificate; issuer and serial number to identify it.</li>
+<li><b>WIN_CERTIFICATE</b> (lines 129–137): length, revision 0x0200, type 0x0002 (PKCS signed data), the PKCS#7 bytes, padded to 8 bytes, appended at an 8-byte-aligned end of the file; directory entry 4 set to its file offset and size.</li>
+</ol>
+<p>The run (R5): the image hash, the certificate table at file offset 0x1000 with 1,664 bytes, and <code>llvm-readobj</code> now reporting <code>CertificateTableSize: 0x680</code> (1,664). The proof that the format is right is the firmware's decision: the signed file ran under the snakeoil store, the same file without the signature was refused (R6).<sup class="src"><a href="#F3-16-src-R5">R5</a></sup> <sup class="src"><a href="#F3-16-src-R6">R6</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Every structure in <code>sign.py</code> was written from memory of D2, D3 and D6: the offsets of the checksum (optional header + 64) and the data directories (optional header + 112), the object identifiers, the layout of SpcPeImageData, and the rule that the message digest covers the content's value bytes. The firmware's acceptance shows that OVMF's verifier agrees with this encoding; it does not show that every detail matches the specifications, nor that other verifiers (Windows, shim, older firmware) accept it. Use sbsigntools for anything beyond this lab.</p></div>
+<h3 id="F3-16-l3-measure">Measurement arithmetic and reproducible builds</h3>
+<p><code>measure</code> (Listing 3) contains its own SHA-256 and computes, for three files (the OVMF code image, our UEFI program, the F3-14 kernel), each digest and the register after each extend, plus the register for the same files in reverse order (R7). <code>run.sh</code> checks every digest against <code>sha256sum</code> and the final register against a three-line Python loop; they agree (R8).<sup class="src"><a href="#F3-16-src-R7">R7</a></sup> <sup class="src"><a href="#F3-16-src-R8">R8</a></sup> The reverse order gives a different final value: a PCR records the sequence, not the set.</p>
+<p>The lab also found something a measured-boot designer must know. An earlier version of <code>run.sh</code> gave <code>loader.efi</code> (the same source, compiler and flags) a different digest on every run. Step 5 isolates the cause: linking the same object file twice, 1.1 s apart, gives two files that differ in exactly one byte, at offset 129 (decimal, counted from 1, as <code>cmp</code> prints it), inside the PE header's <code>TimeDateStamp</code>; with lld-link's <code>/Brepro</code> option the two links are identical (R10). The main build now links with <code>/Brepro</code>, which is why the digests in this chapter are the same on every run.<sup class="src"><a href="#F3-16-src-R10">R10</a></sup> A verifier that expects a PCR value computed from "the loader we built" must expect the exact bytes, so boot components should be built reproducibly.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Untested on hardware and untested with any TPM, real or emulated. From memory of D4 and D5, not opened: which PCR the firmware uses for which component (for example, UEFI applications measured into PCR 4 and Secure Boot policy into PCR 7), that UEFI applications are measured by their Authenticode hash rather than the plain file hash used in <code>measure</code>, and the event-log format. <code>measure</code> models only the extend operation with one SHA-256 bank.</p></div>
+
+<h2 id="F3-16-hardware">How the hardware actually does it</h2>
+<p>Neither mechanism is enforced by the processor. Secure Boot is firmware code: the DXE image loader (F3-11) calls a verification library before starting an image. Its strength depends on the firmware being unmodified and on the variable store being writable only through authenticated paths: on PCs, SMM-protected flash, which is why QEMU needs <code>smm=on</code> and a secure flash device for the Secure Boot build. What protects the firmware itself is a separate, earlier root of trust, such as Intel Boot Guard or AMD Platform Secure Boot, which the curriculum names as topics.<sup class="src"><a href="#F3-16-src-S1">S1</a></sup> The TPM is a separate chip (or a firmware TPM running in a protected processor) whose PCRs can only be extended, and reset only by a platform reset; it can sign a report of its PCRs ("quote") with a key that never leaves it.<sup class="src"><a href="#F3-16-src-D5">D5</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Untested on hardware: all runs used QEMU 8.2.2 with the distribution's OVMF 2024.02 builds and no TPM. The descriptions of Boot Guard, Platform Secure Boot, firmware TPMs and quotes are from the curriculum's summary (S1) and memory of D5; none was observed here. Real PCs differ in which keys are in db by default and in how the firmware setup screen lets the owner change them.</p></div>
+
+<h2 id="F3-16-worked">Worked example</h2>
+<p><b>Problem.</b> (a) Under the snakeoil store, <code>sbstate</code> reported the PK as 1,031 bytes. The PK is stored as one EFI_SIGNATURE_LIST holding one X.509 certificate. Our test certificate is 987 bytes in DER. Account for the remaining bytes. (b) The signed file is 1,664 bytes longer than the unsigned one (the certificate table's size), yet both have the same Authenticode hash (R9). Explain both facts. (c) The tampered file differs from the signed file in one byte. Which hashes change?</p>
+<p><b>Solution.</b> (a) 1,031 − 987 = 44 bytes. An EFI_SIGNATURE_LIST starts with a 28-byte header: the signature type GUID (16 bytes, here "X.509 certificate"), the list size, the header size and the signature size (4 bytes each). Each signature in the list then starts with a 16-byte owner GUID. 28 + 16 = 44.<sup class="src"><a href="#F3-16-src-R6">R6</a></sup> (b) The unsigned file ended at 0x1000 (4,096 bytes), already 8-byte aligned, so no padding was added; the certificate table of 0x680 = 1,664 bytes was appended at 0x1000 (R5). The Authenticode hash leaves out the certificate-table directory entry (changed by signing) and the table itself (added by signing), so it is the same for both files: 3e39…46f9. The plain file hashes differ: 242f…9e67 and 040a…d308. (c) The changed byte is in a section, so the Authenticode hash changes (e018…a47d) and so does the plain hash (cf4e…ebab); the signature, which was over the old Authenticode hash, no longer matches.<sup class="src"><a href="#F3-16-src-R9">R9</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The EFI_SIGNATURE_LIST layout (28-byte header, 16-byte owner GUID) is from memory of D1. The arithmetic matches the observed size exactly, which is consistent with that layout but does not prove it (a different 44-byte layout would also match).</p></div>
+
+<h2 id="F3-16-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>sbstate.cc</code>: reads the Secure Boot variables (a UEFI application; F3-10's headers).</p>
+<pre class="listing" data-src="F3-16/sbstate.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">12–15</td><td><code>get_variable(name, &amp;kGlobalVariableGuid, …)</code></td><td>Reads a variable into an 8-byte buffer.</td><td>A variable is named by a string and a vendor GUID together.</td></tr>
+<tr><td class="n">25–28</td><td><code>kBufferTooSmall</code></td><td>Reports "present" and the size the firmware says it needs.</td><td>How the PK's 1,031 bytes were learned without reading it.</td></tr>
+<tr><td class="n">29–30</td><td><code>kNotFound</code></td><td>Reports "not present".</td><td>On the plain build, the variables do not exist at all.</td></tr>
+<tr><td class="n">48</td><td><code>qemu_exit(0x10)</code></td><td>Writes to QEMU's isa-debug-exit port: exit status 33.</td><td>Status 33 proves the program ran; 124 means the harness stopped a firmware that never started it.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-16/sb_plain"></pre>
+<pre class="output" data-run="F3-16/sb_nokeys"></pre>
+<pre class="output" data-run="F3-16/sb_enrolled"></pre>
+<pre class="output" data-run="F3-16/signature"></pre>
+<p><b>Listing 2</b> — <code>sign.py</code>: an Authenticode signer written out by hand.</p>
+<pre class="listing" data-src="F3-16/sign.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">25–49</td><td><code>der</code>, <code>seq</code>, <code>oid</code></td><td>DER encoding: tag, length (short or long form), body; object identifiers in base 128.</td><td>Every structure below is built from these three.</td></tr>
+<tr><td class="n">57–73</td><td><code>pe_layout</code></td><td>Finds the checksum, directory entry 4, the header size and the sections.</td><td>The pieces the hash skips or includes.</td></tr>
+<tr><td class="n">76–90</td><td><code>authenticode_hash</code></td><td>The hash with the three exclusions.</td><td>The same function checks signed and unsigned files (<code>--hash</code>).</td></tr>
+<tr><td class="n">95–99</td><td><code>content</code>, <code>content_value</code></td><td>SpcIndirectDataContent; its value without tag and length.</td><td>The message digest is over the value only.</td></tr>
+<tr><td class="n">100–104</td><td>signed attributes, <code>key.sign</code></td><td>Content type and message digest, sorted; RSA over their DER SET.</td><td>The only library call: the RSA operation.</td></tr>
+<tr><td class="n">108–113</td><td><code>signer</code></td><td>The attributes again, re-tagged [0] IMPLICIT.</td><td>Signed as a SET, stored with a context tag.</td></tr>
+<tr><td class="n">131–137</td><td>WIN_CERTIFICATE</td><td>Pads the file, appends the certificate, sets directory entry 4.</td><td>Where the firmware looks for the signature.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-16/sign"></pre>
+<pre class="output" data-run="F3-16/sb_snakeoil_unsigned"></pre>
+<pre class="output" data-run="F3-16/sb_snakeoil_signed"></pre>
+<p><b>Listing 3</b> — <code>measure.cc</code>: SHA-256 and PCR extends on the host.</p>
+<pre class="listing" data-src="F3-16/measure.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">23–33</td><td><code>k[64]</code>, <code>h[8]</code></td><td>SHA-256's round constants and initial value.</td><td>Typed from memory of D6; the cross-check catches any wrong digit.</td></tr>
+<tr><td class="n">34–42</td><td>padding</td><td>0x80, zeros to 56 mod 64, then the bit length as 8 big-endian bytes.</td><td>Makes the message a whole number of 64-byte blocks.</td></tr>
+<tr><td class="n">43–68</td><td>compression</td><td>Message schedule of 64 words, 64 rounds, add to the state.</td><td>The core of the algorithm.</td></tr>
+<tr><td class="n">89–94</td><td><code>extend</code></td><td>SHA-256 of the old value followed by the digest.</td><td>The only operation a PCR allows.</td></tr>
+<tr><td class="n">121–125</td><td>reverse order</td><td>The same digests extended last to first.</td><td>Shows that order is recorded.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-16/measure"></pre>
+<pre class="output" data-run="F3-16/crosscheck"></pre>
+<pre class="output" data-run="F3-16/repro"></pre>
+
+<h2 id="F3-16-breaks">Where the analogy breaks</h2>
+<ol>
+<li><b>The caretaker cannot recognise faces.</b> A permission slip in the school is checked by a person who might notice something odd; the firmware checks only mathematics. A signed program with a bug (or signed by a careless key holder) runs.</li>
+<li><b>The visitors' book in a school can be read by anyone at the door.</b> PCRs are only useful if someone checks them against expected values; on most machines nobody does, except for features such as disk encryption keys sealed to PCR values.</li>
+<li><b>The board's list is not in the staff room.</b> db and dbx live in the firmware's flash and are protected by firmware code; a firmware compromise bypasses them, which is why roots of trust below the firmware exist.</li>
+</ol>
+
+<h2 id="F3-16-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Expecting the plain OVMF build to enforce anything.</b> It has no Secure Boot support; use the <code>secboot</code> build with <code>smm=on</code> and secure flash.</li>
+<li><b>Thinking "Secure Boot is enabled" because keys exist.</b> Check <code>SecureBoot</code> and <code>SetupMode</code>: in setup mode nothing is verified.</li>
+<li><b>Changing a signed file after signing</b> (patching a string, stripping symbols, adding a section). The Authenticode hash changes; sign as the last step.</li>
+<li><b>Hashing the whole file to compare with a signature.</b> The signature is over the Authenticode hash, which skips the checksum, the directory entry and the certificates.</li>
+<li><b>Expecting identical builds to measure identically.</b> Time stamps in PE headers (and other build metadata) change the digest; build reproducibly.</li>
+<li><b>Treating measured boot as protection.</b> It records; something has to check the record.</li>
+</ul>
+
+<div class="co transition" id="F3-16-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F3-10 (PE32+ programs), F3-11 (the DXE image loader), F3-15 (your loader). <b>What carries over:</b> the format knowledge (PE headers, data directories), the habit of checking every claim against a run, and the CRC and checksum ideas of F3-13, now with cryptographic hashes and signatures that an attacker cannot recompute without the key. <b>What changes:</b> the question is no longer "does it boot?" but "who decided that it may boot, and how would anyone know what booted?". <b>What comes next:</b> F3-17 (optional) looks at the firmware itself: the OVMF builds you have been using, what differs between them, and what building EDK II and coreboot from source would involve.</p></div>
+
+<h2 id="F3-16-check">Check yourself</h2>
+<ol>
+<li>Name the four Secure Boot key stores and who may change each.</li>
+<li>What do <code>SetupMode</code> = 1 and <code>SecureBoot</code> = 0 together mean?</li>
+<li>Why can a signature be added to a PE file without changing the hash it signs?</li>
+<li>Why does the Secure Boot build of OVMF need SMM and secure flash in QEMU?</li>
+<li>Explain the difference between Secure Boot and measured boot in one sentence each, and name one attack each one does not stop.</li>
+<li>Which of these change the Authenticode hash? (a) adding a signature (b) changing one byte of code (c) changing the PE checksum field (d) relinking without <code>/Brepro</code></li>
+<li>Apply to a new case: a distribution wants to boot its own kernel under Secure Boot on retail PCs whose db holds only Microsoft's certificates. Describe the chain.</li>
+<li>Predict: the firmware measures loader.efi and kernel.elf into a PCR, but the build forgets <code>/Brepro</code>. What does a verifier with an expected PCR value see after a rebuild?</li>
+</ol>
+
+<h2 id="F3-16-lab">Lab</h2>
+<h3 id="F3-16-lab-goal">Goal</h3>
+<p>The curriculum's exercise: "enroll your own PK/KEK/db in OVMF and sign your loader … as an exercise".<sup class="src"><a href="#F3-16-src-S1">S1</a></sup> In this build: observe the Secure Boot states, sign a program with a key the firmware trusts, and compute measured-boot values.</p>
+<h3 id="F3-16-lab-hw">Hardware and software needed</h3>
+<p>clang 18.1.3 and lld-link, Python 3.13 with python3-cryptography (50.0.1 in this build, R5), llvm-readobj 18.1.3, QEMU 8.2.2, the ovmf package 2024.02 with its <code>secboot</code> code and <code>ms</code> and <code>snakeoil</code> variable stores, and its test key files <code>PkKek-1-snakeoil.pem</code> and <code>.key</code>.</p>
+<h3 id="F3-16-lab-safety">Safety</h3>
+<p>Never change Secure Boot keys on a real PC as part of this lab: a mistake can leave a machine that refuses its own operating system, and on some laptops the firmware's own option ROMs (graphics) are verified against db too, so removing Microsoft's certificate can leave no display. The snakeoil key is public test material: never trust it on a real machine.</p>
+<h3 id="F3-16-lab-steps">Steps</h3>
+<ol>
+<li>Build <code>sbstate.efi</code> and boot it on the three set-ups of <code>run.sh</code> step 1. Write down what each line means.</li>
+<li>Run <code>sign.py</code>; boot the signed and unsigned files under the snakeoil store.</li>
+<li>Change one byte in the signed file (any byte inside a section) and boot it; then change one byte inside the certificate table and boot it. Predict both results first.</li>
+<li>Run <code>measure</code> on three files; reorder them; change one file; record which values change.</li>
+<li>Link the same object twice with and without <code>/Brepro</code> and compare digests.</li>
+</ol>
+<h3 id="F3-16-lab-expect">Expected observations</h3>
+<p>The four rows of the table in Layer 3 (R1–R3, R6); the signed program prints SecureBoot = 1; every digest equals <code>sha256sum</code>'s; the reverse order gives a different register; links differ only at offset 129 without <code>/Brepro</code> (R10).</p>
+<h3 id="F3-16-lab-verify">Verification</h3>
+<p><code>run.sh</code> exits 0 only if: the plain build's program printed the variables, the <code>ms</code> store refused it, the snakeoil store refused the unsigned and tampered files and ran the signed one with SecureBoot = 1, every digest matched <code>sha256sum</code>, the final register matched Python's, and the <code>/Brepro</code> links were identical.</p>
+<h3 id="F3-16-lab-trouble">Troubleshooting</h3>
+<ul>
+<li>The Secure Boot build does not start at all → missing <code>smm=on</code> or the secure flash option.</li>
+<li>The signed file is refused → check that the certificate table entry points at the WIN_CERTIFICATE and that the file was not modified after signing (compare <code>sign.py --hash</code> before and after).</li>
+<li><code>sign.py</code> says "already signed" → start from the unsigned file.</li>
+</ul>
+<h3 id="F3-16-lab-ext">Extension</h3>
+<p>Generate your own key pair and certificate with <code>openssl req -x509</code>, sign with it, and observe the refusal under the snakeoil store (the certificate is not in db). Enrolling it requires writing OVMF's variable store, either from the firmware setup screen (with a display) or with a variable-store tool not installed here: record which you used, and that this step was untested in this build.</p>
+
+<h2 id="F3-16-forensic">Forensic lab</h2>
+<p><b>Scenario: "One character".</b> A team boots its signed tool on test machines with Secure Boot on. Before a demonstration, Ana corrects a typo in the tool's start message, a one-character change, directly in the <code>.efi</code> file with a hex editor, "to avoid a rebuild". The machines now refuse to start it. Her colleague suspects the test key has expired; another suspects the hex editor corrupted the file.</p>
+<p><b>Evidence pack.</b> (1) The original signed file booting. (2) The edited file booting. (3) The Authenticode hashes and plain hashes of the unsigned, signed and edited files, and the bytes that differ between signed and edited.</p>
+<pre class="output" data-run="F3-16/sb_snakeoil_tampered"></pre>
+<pre class="output" data-run="F3-16/forensic_hashes"></pre>
+<p>Compare with the original signed file's boot in the code walk-through (<code>sb_snakeoil_signed</code>).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>How many bytes changed, and what was the change?</li>
+<li>Which hash did the signature cover, and did it change?</li>
+<li>Evaluate the two hypotheses (expired key; corrupted file).</li>
+<li>Why are the unsigned and signed files' Authenticode hashes equal while their plain hashes differ?</li>
+<li>What should Ana have done, and what process rule follows?</li>
+</ol>
+<p><b>Method hints.</b> <code>cmp -l</code> prints a 1-based decimal offset and the two byte values in octal. Convert both. Then decide which of the three hashes in the pack the firmware compares with the signature.</p>
+
+<h2 id="F3-16-project">Mini-project</h2>
+<p>Write <code>verify.py</code>, the other half of <code>sign.py</code>: parse the WIN_CERTIFICATE and the PKCS#7 structure of a signed file, recompute the Authenticode hash, compare it with the one inside SpcIndirectDataContent, check the message-digest attribute, and verify the RSA signature with the certificate inside. Rubric: reports OK for <code>signed.efi</code> (1); reports which check fails for <code>tampered.efi</code> (hash mismatch) and for a file with one byte changed inside the signature (signature check) (2); never crashes on a truncated certificate table (fuzz it with 1,000 random truncations) (1); a paragraph on what this verifier does not check that the firmware does (db, dbx, certificate chains) (1).</p>
+
+<h2 id="F3-16-summary">Summary</h2>
+<ul>
+<li>Secure Boot: PK controls KEK, KEK controls db and dbx; images are verified against db and dbx at load time; SetupMode and SecureBoot report the state.</li>
+<li>Authenticode: PKCS#7 SignedData in the PE certificate table, over a hash that skips the checksum, the certificate directory entry and the certificate table.</li>
+<li>Observed: plain OVMF has no Secure Boot; the secboot build with an empty store is in setup mode; with keys enrolled, unsigned and modified programs get "Access Denied"; our hand-made signature with the enrolled test key ran.</li>
+<li>Measured boot: PCR ← H(PCR ‖ digest); the final value commits to every component and their order; it records, it does not stop.</li>
+<li>Reproducible builds matter for measurement: a linker time stamp alone changed our program's digest.</li>
+</ul>
+
+<h2 id="F3-16-sources">Sources</h2>
+<ol>
+<li id="F3-16-src-D1">D1 — UEFI Forum, "UEFI Specification" (curriculum item 12): "Secure Boot and Driver Signing", "Globally Defined Variables", EFI_SIGNATURE_LIST, GetVariable, LoadImage. Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</li>
+<li id="F3-16-src-D2">D2 — Microsoft, "PE Format" (Microsoft Portable Executable and Common Object File Format Specification): optional header, data directories, the attribute certificate table. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-16-src-D3">D3 — Microsoft, "Windows Authenticode Portable Executable Signature Format": the Authenticode hash, SpcIndirectDataContent. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-16-src-D4">D4 — Trusted Computing Group, "TCG PC Client Platform Firmware Profile Specification": what is measured into which PCR, the event log. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-16-src-D5">D5 — Trusted Computing Group, "TPM 2.0 Library Specification" (Part 1, Architecture): PCRs, extend, quotes. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-16-src-D6">D6 — NIST, "FIPS 180-4: Secure Hash Standard"; IETF, "RFC 2315: PKCS #7: Cryptographic Message Syntax Version 1.5"; ITU-T, "X.690" (DER encoding rules). Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-16-src-S1">S1 — Systems Curriculum (this project), section 2.5 "Security and hidden components" (Secure Boot, shim, MOK, measured boot, roots of trust; the exercise quoted verbatim). Opened in this build (local file); a map, not a source (AH-4).</li>
+<li id="F3-16-src-R1">R1 — Lab run <code>F3-16/sb_plain.log</code>: plain OVMF; exit code 33; QEMU 8.2.2, OVMF 2024.02-2ubuntu0.10; 2026-10-09; untested on hardware.</li>
+<li id="F3-16-src-R2">R2 — Lab run <code>F3-16/sb_nokeys.log</code>: secboot code, empty store; exit code 33.</li>
+<li id="F3-16-src-R3">R3 — Lab run <code>F3-16/sb_enrolled.log</code>: secboot code, <code>.ms</code> store; exit code 124 (refused).</li>
+<li id="F3-16-src-R4">R4 — Lab run <code>F3-16/signature.log</code>: llvm-readobj 18.1.3 on the unsigned program; exit code 0.</li>
+<li id="F3-16-src-R5">R5 — Lab run <code>F3-16/sign.log</code>: sign.py with the snakeoil test key; exit code 0.</li>
+<li id="F3-16-src-R6">R6 — Lab runs <code>F3-16/sb_snakeoil_unsigned.log</code> (exit code 124, refused), <code>sb_snakeoil_signed.log</code> (exit code 33, ran), <code>sb_snakeoil_tampered.log</code> (exit code 124, refused).</li>
+<li id="F3-16-src-R7">R7 — Lab run <code>F3-16/measure.log</code>: g++ 13.3.0 with AddressSanitizer and UBSan; exit code 0.</li>
+<li id="F3-16-src-R8">R8 — Lab run <code>F3-16/crosscheck.log</code>: GNU coreutils sha256sum 9.4 and Python hashlib; exit code 0.</li>
+<li id="F3-16-src-R9">R9 — Lab run <code>F3-16/forensic_hashes.log</code>; exit code 0.</li>
+<li id="F3-16-src-R10">R10 — Lab run <code>F3-16/repro.log</code>: lld-link 18.1.3 with and without <code>/Brepro</code>; exit code 0.</li>
+</ol>
+
+<h2 id="F3-16-glossary">Glossary links</h2>
+<p><a href="#gl-secure-boot-pk-kek-db-dbx">Secure Boot (PK, KEK, db, dbx)</a> · <a href="#gl-setup-mode-and-user-mode">Setup mode and user mode</a> · <a href="#gl-authenticode">Authenticode</a> · <a href="#gl-measured-boot">Measured boot</a> · <a href="#gl-pcr-extend">PCR extend</a> · <a href="#gl-shim">shim</a> · <a href="#gl-tpm">TPM</a> · <a href="#gl-pcr">PCR</a> · <a href="#gl-reproducible-build">Reproducible build</a></p>
+
+<h2 id="F3-16-next">Next chapter</h2>
+<p>Next (optional): <a href="#F3-17">F3-17 Building OVMF and coreboot</a>. Previous: <a href="#F3-15">F3-15</a>. Back to the course: <a href="#OS301">OS301</a>.</p>
+
+<h2 id="F3-16-answers">Answers to Check yourself</h2>
+<ol>
+<li>PK: changed by the PK holder (the platform owner). KEK: changed with the PK. db and dbx: changed with a KEK (or the PK). In setup mode (no PK), they can be written without authentication.</li>
+<li>No Platform Key is enrolled, so images are not verified: Secure Boot is not in force, whatever else is stored.</li>
+<li>The Authenticode hash excludes the certificate-table directory entry and the certificate table, the two things that signing changes (and the checksum, which tools may recompute).</li>
+<li>The variable store holds the keys; if the operating system or any program could write the flash directly, it could put its own certificate in db. SMM-only write access (secure flash) lets the firmware enforce the authenticated-update rules.</li>
+<li>Secure Boot refuses to start images not allowed by db and dbx; it does not stop a signed but vulnerable program, or an attacker who has modified the firmware. Measured boot records digests of what ran in PCRs; it does not stop anything, and is useless if nobody checks the values.</li>
+<li>(b) and (d). (a) and (c) touch only the excluded fields; (d) changes TimeDateStamp in the COFF header, which is hashed.</li>
+<li>Firmware (db: Microsoft UEFI CA) → shim, signed by Microsoft, carrying the distribution's certificate → the distribution's boot loader and kernel, signed with the distribution's key and verified by shim (and by the next stage for the kernel). The owner can add keys through MOK.</li>
+<li>A different PCR value: the rebuilt loader has a different time stamp, so a different digest, so every extend after it differs. The verifier reports an unknown boot even though the source did not change.</li>
+</ol>
+<h3 id="F3-16-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>One byte, at 1-based offset 3753 (byte 3752 = 0xEA8): octal 66 → 67, the character "6" → "7", turning "F3-16" into "F3-17" in the message text.</li>
+<li>The Authenticode hash. It changed from 3e39…46f9 to e018…a47d, so the signature (over 3e39…) no longer matches the file, and the firmware refused it: "Access Denied".</li>
+<li>Expired key: rejected; the original signed file with the same key ran under the same firmware, and the certificate's validity runs to 2053 (<code>notAfter</code> in R5). Whether OVMF checks validity periods at all was not tested. Corrupted file: partly right but misleading; the editor did exactly what was asked, one byte, and that is enough.</li>
+<li>Signing changed only the certificate-table directory entry and appended the table; both are excluded from the Authenticode hash, both are included in a plain hash.</li>
+<li>Change the source, rebuild, and sign again as the last step. Rule: signed artefacts are never edited; signing is the final build step, and the signing key is used by the build, not by hand on edited binaries.</li>
+</ol>
+<p><b>How the evidence was produced:</b> <code>run.sh</code> step 4 changed the byte with a one-line Python command (the "hex editor") and booted the result under the snakeoil store.</p>

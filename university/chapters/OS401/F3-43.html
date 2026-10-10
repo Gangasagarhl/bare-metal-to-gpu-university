@@ -1,0 +1,331 @@
+<!--meta
+id: F3-43
+title: Crash consistency: the discipline
+course: OS401
+level: L4
+prereqs: OS304 (F3-31 VFS and block cache, F3-32 FAT32, F3-33 ext2); DR301 (milestone C4, virtio-blk)
+time: 12–16 hours including the lab and the forensic lab
+hardware: none required (g++ 13.3.0 and strace 6.8 in the build container); a disk you may erase is optional and untested in this build
+maps: Curriculum section 7.2 (crash consistency) as preparation for FS1 and FS2; course forensic theme "Lost after power cut"
+analogy: F3 — the school; registered: file system = library catalogue and shelves (must survive a power cut in the middle of shelving); proposed: journal = the librarian's day book, flush = the porter's signed delivery note (see NOTES.md)
+-->
+
+<h2 id="F3-43-hook">Story hook</h2>
+<p>In the school library, Ms Okafor is moving a new atlas onto shelf 12. Three things must change: the atlas must stand on the shelf, the catalogue card must say "shelf 12", and the shelf chart at the desk must mark one more place on shelf 12 as taken. She writes the card first, because the card box is next to her. Then the lights go out. The power cut lasts all night.</p>
+<p>In the morning a pupil looks up the atlas. The card says "shelf 12". On shelf 12, in the place the card names, stands an old dictionary that was thrown out last year and never removed. The shelf chart says the place is free, so the next librarian will put another book there. Nothing is broken in a way anyone can see, and yet the catalogue now lies twice.</p>
+<p>Ms Okafor's mistake was not slowness. It was the <b>order</b> of her three steps, and the fact that she could not know which of her steps were really finished when the lights went out. A computer's file system has exactly her problem, made worse: the disk has its own helpers who carry the writes to the shelves in whatever order suits them. This chapter is about the rules that keep the catalogue truthful whenever the power goes.</p>
+
+<h2 id="F3-43-able">What you will be able to do</h2>
+<ul>
+<li><b>Enumerate</b> every disk state a power cut can leave behind for a given sequence of writes and flushes on a device with a volatile write cache, and <b>classify</b> each state as consistent, repairable, or damaged.</li>
+<li><b>Explain</b> the five strategies of curriculum section 7.2 (checker after the crash, careful ordering and soft updates, journaling, copy-on-write, log-structured) and where each puts its single atomic step.</li>
+<li><b>Name</b> the device commands that give ordering and durability (cache flush, Force Unit Access) for NVMe, ATA, SCSI and virtio-blk, and <b>state</b> what the file system can and cannot assume about atomic writes.</li>
+<li><b>Write</b> an application update that survives a crash (write a temporary file, <code>fsync</code>, <code>rename</code>, <code>fsync</code> the directory), and <b>verify</b> its system calls with <code>strace</code>.</li>
+<li><b>Design</b> a crash test: record a write stream, cut it at every point or at random points, let the cache drop unflushed writes, then check the image and the files whose <code>fsync</code> had returned.</li>
+</ul>
+
+<div class="co jargon" id="F3-43-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Crash consistency</dt><dd><b>Simple words:</b> the file system is still correct, or can be made correct, whenever the power is cut. <b>Analogy:</b> the catalogue never sends a pupil to the wrong book, even after a power cut in the middle of shelving. <b>Precise:</b> the property that every on-disk state reachable by a crash at any point (with any subset of unflushed writes lost) satisfies the file system's invariants after the defined recovery step, and that every operation acknowledged as durable is preserved. <sup class="src"><a href="#F3-43-src-D1">D1</a></sup></dd>
+<dt>Volatile write cache</dt><dd><b>Simple words:</b> memory inside the disk that holds writes for a while before they reach the medium; it forgets everything when the power goes. <b>Analogy:</b> the porter's trolley in the corridor: books on it are not yet on any shelf. <b>Precise:</b> a device-side buffer that may acknowledge a write before the data is on non-volatile media and may write cached blocks to the media in any order. <sup class="src"><a href="#F3-43-src-D7">D7</a></sup></dd>
+<dt>Cache flush</dt><dd><b>Simple words:</b> a command that tells the disk "put everything you are holding onto the medium, and tell me when it is done". <b>Analogy:</b> the porter's signed delivery note: everything on the trolley is now on a shelf. <b>Precise:</b> a device command (NVMe Flush, ATA FLUSH CACHE EXT, SCSI SYNCHRONIZE CACHE, virtio-blk flush request) that completes only after all previously completed writes are on non-volatile media. <sup class="src"><a href="#F3-43-src-D7">D7</a></sup> <sup class="src"><a href="#F3-43-src-D8">D8</a></sup> <sup class="src"><a href="#F3-43-src-D9">D9</a></sup></dd>
+<dt>Force Unit Access (FUA)</dt><dd><b>Simple words:</b> a flag on one write that says "do not finish this until it is on the medium". <b>Analogy:</b> carrying one book to the shelf yourself instead of putting it on the trolley. <b>Precise:</b> a per-command attribute of a write that makes its completion imply that this command's data is on non-volatile media; it says nothing about other writes still in the cache. <sup class="src"><a href="#F3-43-src-D7">D7</a></sup> <sup class="src"><a href="#F3-43-src-D8">D8</a></sup></dd>
+<dt>Crash state</dt><dd><b>Simple words:</b> one possible picture of the disk after a power cut. <b>Analogy:</b> which books happened to reach their shelves when the lights went out. <b>Precise:</b> the media contents given a cut after operation <i>k</i>: every write before the last completed flush is present, and any subset of the writes issued after it may be present. <sup class="src"><a href="#F3-43-src-R1">R1</a></sup></dd>
+<dt>File system checker (fsck)</dt><dd><b>Simple words:</b> a program that reads the whole file system after a crash and repairs what it can. <b>Analogy:</b> a librarian who walks every shelf with the catalogue and fixes the cards. <b>Precise:</b> an offline tool that verifies cross-structure invariants (bitmaps against pointers, link counts against directory entries) and repairs violations; its run time grows with the size of the file system, and it cannot know which of two contradicting versions the user meant. <sup class="src"><a href="#F3-43-src-D1">D1</a></sup></dd>
+<dt>Journaling (write-ahead logging)</dt><dd><b>Simple words:</b> first write down what you are about to change in a separate log, mark it complete, and only then change the real places. <b>Analogy:</b> the librarian's day book: "atlas to shelf 12, card updated, chart updated", ticked off before she starts. <b>Precise:</b> recording a transaction's new block images (physical journaling) or operations (logical journaling) in a log, followed by a commit record; after a crash, committed transactions are replayed and uncommitted ones ignored. <sup class="src"><a href="#F3-43-src-D1">D1</a></sup> <sup class="src"><a href="#F3-43-src-D2">D2</a></sup></dd>
+<dt>Ordered mode</dt><dd><b>Simple words:</b> only metadata goes into the journal, but file data is written to its final place before the metadata that points to it is committed. <b>Analogy:</b> the atlas is on the shelf before the day book's entry about its card is ticked. <b>Precise:</b> the ext3/ext4 default journaling mode: data blocks of a transaction are forced to disk before its commit record, so committed metadata never points to unwritten data. <sup class="src"><a href="#F3-43-src-D11">D11</a></sup></dd>
+<dt>Soft updates</dt><dd><b>Simple words:</b> keep the disk consistent by tracking which writes depend on which, and writing them in a safe order. <b>Analogy:</b> the atlas first, then the chart, then the card, every time. <b>Precise:</b> a technique that records dependencies between cached metadata blocks and orders (and if needed rolls back) updates so that the on-disk image only ever contains leaks, never dangling pointers. <sup class="src"><a href="#F3-43-src-D3">D3</a></sup></dd>
+<dt>Copy-on-write (COW)</dt><dd><b>Simple words:</b> never change a block in place; write a new copy and switch one pointer at the end. <b>Analogy:</b> write a whole new catalogue drawer, then swap the label on the cabinet. <b>Precise:</b> an update discipline in which modified blocks are written to free space and the tree of pointers above them is rewritten up to a root, which is updated with a single atomic write after a flush. <sup class="src"><a href="#F3-43-src-D1">D1</a></sup></dd>
+<dt>fsync</dt><dd><b>Simple words:</b> the system call a program uses to ask "make this file safe on disk now". <b>Analogy:</b> asking the librarian to confirm that this one book, card and chart are done. <b>Precise:</b> a POSIX call that returns after the file's data and the metadata needed to retrieve it have been transferred to the storage device; whether the directory entry naming the file is included is not guaranteed by POSIX, hence the separate directory <code>fsync</code>. <sup class="src"><a href="#F3-43-src-D10">D10</a></sup></dd>
+<dt>Torn write</dt><dd><b>Simple words:</b> a write that was cut in half by a power failure, leaving part old and part new. <b>Analogy:</b> half of a catalogue card rewritten. <b>Precise:</b> a multi-sector write of which only some sectors reached the media; devices guarantee atomicity only up to a documented unit, often one logical block. <sup class="src"><a href="#F3-43-src-D7">D7</a></sup></dd>
+</dl></div>
+
+<h2 id="F3-43-pictures">The idea in pictures</h2>
+<p>Figure 1 shows where the uncertainty comes from. The file system sends writes to the device; the device may keep them in a volatile cache and move them to the medium in any order. Only a completed flush draws a line: everything before it is on the medium. Between two flushes, any subset of the writes may have landed when the power goes.</p>
+<figure id="F3-43-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F3-43-f1t F3-43-f1d">
+<title id="F3-43-f1t">Figure 1: writes, a volatile write cache, and a flush</title>
+<desc id="F3-43-f1d">Left: the file system issues three writes, W(D) for a data block, W(B) for the bitmap block, W(I) for the inode block, then FLUSH. Middle: the device's volatile write cache holds W(D), W(B) and W(I) and may move them to the medium in any order, shown by three crossing arrows. Right: the medium with blocks D, I and B. A note below says: before the flush completes, any subset of the three writes may be on the medium after a power cut: 2 to the power 3 = 8 possible states. After the flush completes, all three are.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<rect class="sv-b1" x="20" y="40" width="190" height="170" rx="6"/>
+<text class="sv-tb" x="34" y="66">File system</text>
+<text class="sv-tm" x="34" y="96">1  W(D) data</text>
+<text class="sv-tm" x="34" y="122">2  W(B) bitmap</text>
+<text class="sv-tm" x="34" y="148">3  W(I) inode</text>
+<text class="sv-tm" x="34" y="174">4  FLUSH</text>
+<line class="sv-line" x1="210" y1="120" x2="268" y2="120"/><polygon class="sv-head" points="262,114 262,126 272,120"/>
+<rect class="sv-b3" x="272" y="40" width="210" height="170" rx="6"/>
+<text class="sv-tb" x="286" y="66">Volatile write cache</text>
+<rect class="sv-box" x="292" y="84" width="54" height="30"/><text class="sv-t" x="302" y="104">D</text>
+<rect class="sv-box" x="352" y="84" width="54" height="30"/><text class="sv-t" x="362" y="104">B</text>
+<rect class="sv-box" x="412" y="84" width="54" height="30"/><text class="sv-t" x="422" y="104">I</text>
+<text class="sv-ts" x="286" y="146">lost if the power goes</text>
+<text class="sv-ts" x="286" y="166">before a flush completes</text>
+<text class="sv-ts" x="286" y="190">may drain in any order</text>
+<line class="sv-line" x1="482" y1="100" x2="568" y2="160"/><polygon class="sv-head" points="560,160 568,152 572,163"/>
+<line class="sv-line" x1="482" y1="130" x2="568" y2="90"/><polygon class="sv-head" points="560,88 570,86 566,96"/>
+<line class="sv-line" x1="482" y1="160" x2="568" y2="125"/><polygon class="sv-head" points="560,122 570,122 564,131"/>
+<rect class="sv-b2" x="572" y="40" width="170" height="170" rx="6"/>
+<text class="sv-tb" x="586" y="66">Medium</text>
+<rect class="sv-box" x="592" y="78" width="130" height="28"/><text class="sv-t" x="602" y="97">I (inode table)</text>
+<rect class="sv-box" x="592" y="112" width="130" height="28"/><text class="sv-t" x="602" y="131">B (bitmap)</text>
+<rect class="sv-box" x="592" y="146" width="130" height="28"/><text class="sv-t" x="602" y="165">D (data block)</text>
+<text class="sv-t" x="20" y="250">Cut before step 4 completes: any subset of {D, B, I} is on the medium, 2 × 2 × 2 = 8 states.</text>
+<text class="sv-t" x="20" y="276">Cut after step 4 completes: all three are. A flush is the only line you can count on.</text>
+</svg></div><figcaption><b>Figure 1.</b> Why order matters: between flushes, the device decides what reaches the medium. <sup class="src"><a href="#F3-43-src-D7">D7</a></sup> <sup class="src"><a href="#F3-43-src-R1">R1</a></sup></figcaption></figure>
+<p>Figure 2 shows the same append done with a journal in ordered mode, with its two flushes as solid bars. A crash anywhere left of the first bar finds no commit block: recovery ignores the log and the old file is intact. A crash after the second bar finds a complete committed transaction: recovery replays it and the new file is intact. There is no third outcome, and the lab counts all 26 crash states to prove it.</p>
+<figure id="F3-43-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F3-43-f2t F3-43-f2d">
+<title id="F3-43-f2t">Figure 2: ordered-mode journaling of one append, with its flushes</title>
+<desc id="F3-43-f2d">A timeline from left to right: W(D) data in place, W(J1) log copy of the inode, W(J2) log copy of the bitmap, FLUSH, W(JC) commit block, FLUSH, W(I) and W(B) in place (checkpoint), FLUSH. Brackets below: before the first flush, recovery finds no valid commit and the result is the old file. Between the first and second flush, the commit block may or may not have landed; if it has, everything it describes is already durable, so replay gives the new file; if not, the old file. After the second flush, replay always gives the new file. The checkpoint writes can be lost, because replay redoes them.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<line class="sv-line2" x1="20" y1="80" x2="740" y2="80"/>
+<rect class="sv-b2" x="24" y="56" width="62" height="48" rx="4"/><text class="sv-t" x="32" y="85">W(D)</text>
+<rect class="sv-b1" x="94" y="56" width="62" height="48" rx="4"/><text class="sv-t" x="100" y="85">W(J1)</text>
+<rect class="sv-b1" x="164" y="56" width="62" height="48" rx="4"/><text class="sv-t" x="170" y="85">W(J2)</text>
+<rect class="sv-b8" x="236" y="40" width="12" height="80"/><text class="sv-ts" x="214" y="34">FLUSH</text>
+<rect class="sv-b4" x="258" y="56" width="62" height="48" rx="4"/><text class="sv-t" x="264" y="85">W(JC)</text>
+<rect class="sv-b8" x="330" y="40" width="12" height="80"/><text class="sv-ts" x="308" y="34">FLUSH</text>
+<rect class="sv-b3" x="352" y="56" width="62" height="48" rx="4"/><text class="sv-t" x="362" y="85">W(I)</text>
+<rect class="sv-b3" x="422" y="56" width="62" height="48" rx="4"/><text class="sv-t" x="432" y="85">W(B)</text>
+<rect class="sv-b8" x="494" y="40" width="12" height="80"/><text class="sv-ts" x="472" y="34">FLUSH</text>
+<text class="sv-ts" x="520" y="76">checkpoint done;</text>
+<text class="sv-ts" x="520" y="94">log space can be reused</text>
+<line class="sv-dash" x1="24" y1="140" x2="236" y2="140"/>
+<text class="sv-t" x="24" y="162">no commit on the medium:</text>
+<text class="sv-t" x="24" y="182">ignore the log → old file</text>
+<line class="sv-dash" x1="248" y1="140" x2="330" y2="140"/>
+<text class="sv-t" x="250" y="162">commit there</text>
+<text class="sv-t" x="250" y="182">or not: new</text>
+<text class="sv-t" x="250" y="202">or old file</text>
+<line class="sv-dash" x1="342" y1="140" x2="740" y2="140"/>
+<text class="sv-t" x="352" y="162">commit durable: replay J1, J2 over I, B → new file,</text>
+<text class="sv-t" x="352" y="182">even if the checkpoint writes are lost</text>
+<text class="sv-ts" x="24" y="236">Result of the lab's enumeration: 26 crash states, 9 new file, 17 old file, 0 damaged.</text>
+</svg></div><figcaption><b>Figure 2.</b> Ordered-mode journaling of one append: two flushes make every crash state either "old" or "new". <sup class="src"><a href="#F3-43-src-D1">D1</a></sup> <sup class="src"><a href="#F3-43-src-R1">R1</a></sup></figcaption></figure>
+
+<h2 id="F3-43-layer1">Layer 1 — the kid explanation</h2>
+<p>A library is only useful if the cards tell the truth. When a librarian moves a book, three things change: the shelf, the card and the chart of free places. If the lights go out halfway, some of those changes are done and some are not.</p>
+<p>The trick is to choose an order where a half-finished job is harmless. Put the book on the shelf before you write the card. Then a power cut can only leave a book with no card (annoying, but nobody is misled), never a card that points to the wrong book.</p>
+<p>A second trick is a notebook. Before touching anything, write in the notebook what you are going to do, and put a big tick under it when the note is complete. After a power cut, read the notebook: a ticked note is done again from the start; an unticked note is crossed out. Either way, the library is right.</p>
+
+<h2 id="F3-43-layer2">Layer 2 — the student explanation</h2>
+<p>A file system keeps several structures that must agree with each other: the data blocks, the inodes that point to them, the bitmaps that say which blocks and inodes are in use, and the directory entries that give names to inodes. One user operation, such as appending a block to a file, changes several of them: a data block D, the file's inode I (new size, new block pointer) and a bitmap block B (one more block in use). <sup class="src"><a href="#F3-43-src-D1">D1</a></sup></p>
+<p>The disk writes one block at a time, so between the first and the last of those writes there is a window in which a power cut leaves only some of them on the medium. There are two kinds of damage. A <b>leak</b> (B updated, I not) wastes a block but misleads nobody. A <b>dangling pointer</b> (I updated, D or B not) is worse: the file shows another file's old bytes, or the block is marked free and will later be given to a second file, so two files share it. <sup class="src"><a href="#F3-43-src-D1">D1</a></sup></p>
+<p>Disks make it harder because of their write cache. A write that the device has acknowledged may still be in volatile memory, and the device may write cached blocks to the medium in a different order than they arrived. The only tool the file system has is the <b>cache flush</b>: when a flush completes, every write that completed before it is on the medium. Order therefore exists only across flushes. <sup class="src"><a href="#F3-43-src-D7">D7</a></sup> <sup class="src"><a href="#F3-43-src-D9">D9</a></sup></p>
+<p>Curriculum section 7.2 names five answers. <b>Check after the crash</b> (FAT, ext2): let anything happen, then run fsck, which reads every structure and repairs; it is slow on large disks and has to guess. <b>Careful ordering</b> (soft updates in FreeBSD's UFS): order writes so that only leaks are possible. <b>Journaling</b> (ext3, ext4, NTFS, XFS): write the changes to a log first, with a commit record, then in place. <b>Copy-on-write</b> (ZFS, btrfs, APFS): never overwrite live blocks; build the new version elsewhere and switch one root pointer. <b>Log-structured</b> (Sprite LFS, F2FS): the whole disk is a log. <sup class="src"><a href="#F3-43-src-C1">C1</a></sup> <sup class="src"><a href="#F3-43-src-D3">D3</a></sup> <sup class="src"><a href="#F3-43-src-D4">D4</a></sup></p>
+<p>Applications have their own share of the job. A program that wants its file to survive must call <code>fsync</code>, and a program that wants to replace a file atomically writes a new file, syncs it, renames it over the old one and syncs the directory. Many real programs get this wrong; one study traced popular applications and found such bugs widely. <sup class="src"><a href="#F3-43-src-D5">D5</a></sup> <sup class="src"><a href="#F3-43-src-D10">D10</a></sup></p>
+
+<h2 id="F3-43-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-43-l3-model">A model you can count</h3>
+<p>Treat the device as follows. Each write, once issued, may land on the medium at any time until the next flush completes; a flush completes only when all writes issued before it have landed; a crash at any moment loses every write that has not landed. A crash after the <i>k</i>-th operation therefore leaves all writes before the last flush, plus any subset of the <i>m</i> writes issued since: 2<sup><i>m</i></sup> states for that cut. Summing over every cut point gives the full state space of a write sequence, small enough to enumerate for one operation and the basis of every crash-testing tool. <sup class="src"><a href="#F3-43-src-D6">D6</a></sup> <sup class="src"><a href="#F3-43-src-R1">R1</a></sup></p>
+<p>Two refinements matter in practice. First, this model assumes each block write is atomic. Devices document an atomic write unit (for NVMe, in the namespace's atomic-write fields), and it may be a single logical block; a 4 KiB file-system block on a device with 512-byte sectors could tear. Second, the model ignores reads: recovery code sees the crash state and must not trust anything it has not validated. File systems defend against torn and stale blocks with checksums (ext4 metadata checksums, the JBD2 commit checksum, NTFS's update sequence arrays in F3-49). <sup class="src"><a href="#F3-43-src-C1">C1</a></sup> <sup class="src"><a href="#F3-43-src-D7">D7</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The device semantics in this section (that a completed flush covers all previously <i>completed</i> writes, that FUA covers only its own command, that atomicity is guaranteed only up to a reported unit, and that write caches may reorder) are the author's summary from memory of the NVMe Base Specification (Flush command; Force Unit Access; Atomic Write Unit Normal and Power Fail fields), the ATA/ATAPI Command Set (FLUSH CACHE EXT; WRITE DMA FUA EXT), SCSI Block Commands (SYNCHRONIZE CACHE) and the VIRTIO specification (block device, flush request and the VIRTIO_BLK_F_FLUSH feature). None was opened in this build. The lab's model is deliberately the most pessimistic reading; check each specification for the device you use, including whether its write cache is enabled at all.</p></div>
+
+<h3 id="F3-43-l3-fsck">Strategy 1: let it happen, then check</h3>
+<p>ext2 and FAT write in whatever order the block cache flushes, and recovery is a full check: <code>e2fsck</code> reads every inode, follows every block pointer, rebuilds the bitmaps it expects and compares; walks every directory and counts links. This catches everything that breaks a cross-structure invariant, so it is the ground truth the FS1 harness uses. Its two weaknesses are cost (work proportional to the size of the file system, not to the size of the last change) and ambiguity: if the inode points to block 700 and the bitmap says 700 is free, the checker can mark it used, but it cannot know whether block 700 holds the new data or another file's old bytes. It repairs the structure, not the contents. <sup class="src"><a href="#F3-43-src-D1">D1</a></sup></p>
+
+<h3 id="F3-43-l3-order">Strategy 2: careful ordering and soft updates</h3>
+<p>The ordering rules of soft updates can be stated as three rules about pointers: never point to a structure before it has been initialised (write D and B before I); never reuse a resource before every pointer to it has been removed (clear the inode's pointer before freeing the block in the bitmap); and never reset the last pointer to a live resource before the new pointer has been set (for a rename, write the new name before removing the old one). Followed strictly, a crash can only leave leaks: blocks or inodes marked used that nothing references, and link counts that are too high. Those are harmless and can be reclaimed lazily in the background. <sup class="src"><a href="#F3-43-src-D3">D3</a></sup></p>
+<p>The naive way to follow the rules is to flush between the steps, which makes every metadata update synchronous. Soft updates instead keep per-block dependency records in the cache and write blocks in dependency order, rolling back not-yet-safe changes in a block's image when it must be written early. That machinery is notoriously intricate; F3-44 follows the rules with plain flushes, which is slow but easy to verify. <sup class="src"><a href="#F3-43-src-D3">D3</a></sup></p>
+
+<h3 id="F3-43-l3-journal">Strategy 3: journaling</h3>
+<p>A journal turns many writes into one atomic step: the commit record. A transaction writes the new images of every metadata block it changes into a log area, then a commit block; once the commit block is durable, the transaction is durable, and the in-place writes (the <b>checkpoint</b>) can happen lazily. Recovery scans the log, replays every transaction that has a valid commit block, and ignores the rest. Log space is reused only after the checkpoint is durable, which is recorded by advancing the start of the log in the journal superblock. <sup class="src"><a href="#F3-43-src-D2">D2</a></sup></p>
+<p>What goes into the log decides the mode. In <b>data journaling</b>, data blocks are logged too (everything is written twice). In <b>ordered</b> mode, only metadata is logged, and the data blocks a transaction makes reachable are written in place before the commit block, so committed metadata never points at garbage. In <b>writeback</b> mode, data and metadata are not ordered against each other: the file system stays consistent, but a file can show stale bytes after a crash. ext3 and ext4 default to ordered mode. <sup class="src"><a href="#F3-43-src-D11">D11</a></sup></p>
+<p>The flushes are the whole point. The commit block must not reach the medium before the log blocks it describes (and, in ordered mode, before the data blocks): otherwise the device may land the commit block first, the power goes, and recovery replays log slots that still hold an older transaction's contents onto live metadata. Hence the classic sequence: write data and log blocks, flush, write commit, flush, checkpoint. JBD2 adds an option to put a checksum of the transaction into the commit block so that a commit without its log blocks is detected and ignored, which allows dropping the first flush; the lab shows exactly what that does and does not protect. <sup class="src"><a href="#F3-43-src-D2">D2</a></sup> <sup class="src"><a href="#F3-43-src-D11">D11</a></sup> <sup class="src"><a href="#F3-43-src-R1">R1</a></sup></p>
+<p>The output of Listing 1 for strategies 3 to 5 is the most useful table in this course. With both flushes (strategy 3), all 26 crash states are "old" or "new". Without the first flush (strategy 4), 6 of 39 states replay stale journal slots over metadata ("CORRUPT") and 1 state shows a deleted file's bytes in the new file ("BAD"). The commit checksum (strategy 5) removes the 6 corrupt states, because recovery now refuses a commit whose log blocks are not the ones it describes, but the stale-data state remains: the checksum covers the log, not the data block D that ordered mode promised to write first. <sup class="src"><a href="#F3-43-src-R1">R1</a></sup></p>
+<div class="co warning"><span class="lbl">Watch out</span><p>A checksum in the commit block is not a replacement for the data flush in ordered mode. It protects the log against itself. If you drop the flush before the commit, you must find another way to make sure the transaction's data blocks are durable before the commit can be, or accept writeback-mode semantics and say so.</p></div>
+
+<h3 id="F3-43-l3-cow">Strategies 4 and 5: copy-on-write and log-structured</h3>
+<p>Copy-on-write file systems never overwrite a live block. An update writes new copies of the changed blocks, then new copies of every block on the path up to the root of the tree, flushes, and finally writes a new root (an "uberblock" or superblock with a higher generation number), flushes again. A crash before the root write leaves the old tree intact; after it, the new tree. There is no replay, and the price moves to allocation (free space fragments) and to write amplification on the path to the root. Checksums stored in parent pointers, as ZFS and btrfs do, make every read verifiable. <sup class="src"><a href="#F3-43-src-D1">D1</a></sup></p>
+<p>A log-structured file system takes the idea to its end: the whole disk is an append-only log of segments, inodes included, located through an inode map that is itself written to the log, with periodic checkpoints of where the map is. Recovery reads the last checkpoint and rolls forward through the log written after it. The cost is the cleaner that compacts partially dead segments; the benefit is large sequential writes, which is why the idea returned for flash in F2FS. <sup class="src"><a href="#F3-43-src-D4">D4</a></sup></p>
+
+<h3 id="F3-43-l3-apps">What applications are promised</h3>
+<p>None of this helps a program that does not ask. POSIX <code>write</code> returns when the data is in the page cache; only <code>fsync</code> (or <code>fdatasync</code>, which may skip metadata not needed to read the data back) asks for durability. <code>rename</code> is atomic with respect to other processes (an observer sees the old file or the new one), and on Linux file systems with journaling it is also atomic across a crash as a metadata operation. But the rename's durability needs an <code>fsync</code> of the directory, and a rename of a file whose data was never synced can leave a correctly named empty file after a crash, because the metadata transaction committed before the data was written. <sup class="src"><a href="#F3-43-src-D5">D5</a></sup> <sup class="src"><a href="#F3-43-src-D10">D10</a></sup></p>
+<p>The robust pattern, Listing 2's <code>replaceSafely</code>, is therefore: create a temporary file in the same directory, write, <code>fsync</code> it, <code>rename</code> it over the target, open the directory and <code>fsync</code> it. Each step closes a specific window: the first <code>fsync</code> guarantees the new bytes exist before any name points to them (the soft-updates "initialise before pointing" rule, applied by the application); <code>rename</code> switches the name in one step; the directory <code>fsync</code> makes the switch durable before the program reports success. <sup class="src"><a href="#F3-43-src-R3">R3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The statements about <code>fsync</code>, <code>fdatasync</code> and <code>rename</code> follow the author's memory of the POSIX specification and of Pillai et al.; the strace runs in this build only show which calls the program makes, not what the host file system did with them, and no crash was injected into the host. Read the POSIX pages for <code>fsync</code>, <code>fdatasync</code> and <code>rename</code>, and the paper's description of the persistence properties it measured for ext3, ext4, btrfs and others, before relying on a specific file system's behaviour.</p></div>
+
+<h3 id="F3-43-l3-test">Testing crash consistency</h3>
+<p>The tests in this course follow one recipe, used by research tools such as CrashMonkey and by Linux's <code>dm-log-writes</code> target: record every write and flush the file system sends to the device (a <b>write stream</b>); pick a cut point; build the image the device could hold at that point (everything before the last flush, plus a chosen subset of later writes); run recovery and a checker on it; and check every file whose <code>fsync</code> had returned. Choosing subsets randomly gives a fast random test (F3-44, F3-45); choosing them all gives an exhaustive test for small workloads (Listing 1). A real emulator power cut (killing QEMU with a cache mode that drops unflushed writes) tests the same thing less reproducibly. <sup class="src"><a href="#F3-43-src-D6">D6</a></sup> <sup class="src"><a href="#F3-43-src-D11">D11</a></sup> <sup class="src"><a href="#F3-43-src-D12">D12</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>QEMU's block cache modes (for example <code>cache=unsafe</code>, which ignores guest flushes, and <code>cache=writeback</code>, which honours them) and the exact behaviour of a killed QEMU process with each were not tested in this build: the harnesses of F3-44 and F3-45 replay recorded write streams instead. Check the QEMU documentation on block device cache modes before building a kill-based harness, and note that a host page cache sits between QEMU and the image file.</p></div>
+
+<h2 id="F3-43-hardware">How the hardware actually does it</h2>
+<p>A drive's write cache is DRAM (or SRAM) on the controller board; hard disks use it to reorder writes by head position, and flash devices use it to gather writes into full flash pages. When the cache is enabled, the drive acknowledges a write as soon as the data is in that memory. The device interfaces give the host three tools: a <b>flush</b> command per device class (NVMe Flush; ATA FLUSH CACHE EXT; SCSI SYNCHRONIZE CACHE; a virtio-blk request of type flush if the device offers the flush feature); a <b>FUA</b> bit on individual writes; and a way to <b>disable</b> the write cache altogether. Enterprise flash devices commonly carry capacitors that let them write their cache out after the power fails ("power-loss protection"); when the device reports a non-volatile cache, flushes become cheap or unnecessary. <sup class="src"><a href="#F3-43-src-D7">D7</a></sup> <sup class="src"><a href="#F3-43-src-D8">D8</a></sup> <sup class="src"><a href="#F3-43-src-D9">D9</a></sup></p>
+<p>Your DR301 virtio-blk driver (milestone C4) already speaks the flush request if you implemented it; FS1 asks for "a flush call down to the block driver", which means your block cache must be able to say "flush now and wait", and your driver must turn that into the device command and wait for its completion before reporting success. A driver that completes flushes immediately without sending them makes every file system above it unsafe, silently. <sup class="src"><a href="#F3-43-src-C1">C1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> No device with a real write cache was used in this build, and no power was cut. Whether a particular drive honours flushes, reports a volatile write cache, or has power-loss protection is a fact about that product: take it from the product's datasheet and from the identify data it returns (NVMe Identify Controller, the Volatile Write Cache field; ATA IDENTIFY DEVICE, write-cache support and enable bits), never from this chapter.</p></div>
+<div class="co safety"><span class="lbl">Safety</span><p>Crash tests belong in an emulator first. On real hardware, use only a disk whose contents you may lose, disconnect disks you care about, and never "test" by pulling the power of a machine whose file systems you need: a cut during a firmware update or on a device without power-loss protection can do more than lose the last write.</p></div>
+
+<h2 id="F3-43-worked">Worked example</h2>
+<p>Count the crash states of strategy 2 by hand: <code>W(D) W(B) FLUSH W(I) FLUSH</code>, starting from a disk where D holds a deleted file's old bytes and I, B are the old inode and bitmap.</p>
+<div class="tw"><table>
+<thead><tr><th>Cut after</th><th>Durable</th><th>Unflushed (any subset)</th><th>States</th><th>Classification</th></tr></thead>
+<tbody>
+<tr><td>0 operations</td><td>—</td><td>—</td><td>1</td><td>old file</td></tr>
+<tr><td>W(D)</td><td>—</td><td>D</td><td>2</td><td>old file (D new or not; nothing points to it)</td></tr>
+<tr><td>W(B)</td><td>—</td><td>D, B</td><td>4</td><td>2 old file; 2 with B new: leak</td></tr>
+<tr><td>FLUSH</td><td>D, B</td><td>—</td><td>1</td><td>leak (B says used, I does not point)</td></tr>
+<tr><td>W(I)</td><td>D, B</td><td>I</td><td>2</td><td>1 leak (I old); 1 new file</td></tr>
+<tr><td>FLUSH</td><td>D, B, I</td><td>—</td><td>1</td><td>new file</td></tr>
+<tr><td colspan="3"><b>Total</b></td><td><b>11</b></td><td>5 old, 4 leak, 2 new, 0 damaged</td></tr>
+</tbody></table></div>
+<p>The table matches the program's line for strategy 2 (11 states: 5 old, 4 leak, 2 new). Notice where the cost went: two flushes for one append, and a leak in four states that a checker must still reclaim. Now do strategy 1 (<code>W(I) W(B) W(D) FLUSH</code>): cuts after 0, 1, 2, 3 and 4 operations give 1 + 2 + 4 + 8 + 1 = 16 states, and every state with I new but D old shows a deleted file's bytes. Listing 1 finds 5 such states (in 3 of them the block is also still free in the bitmap) and 1 more where only the bitmap is wrong. <sup class="src"><a href="#F3-43-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F3-43/crashsim"></pre>
+
+<h2 id="F3-43-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>crashsim.cpp</code>: every crash state of one append, for five strategies.</p>
+<pre class="listing" data-src="F3-43/crashsim.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9</td><td><code>enum class V { Old, New, Stale }</code></td><td>Three possible contents of a block on the medium.</td><td>"Stale" marks journal slots that hold an older transaction: the danger of replay.</td></tr>
+<tr><td>11–22</td><td><code>Op</code>, <code>Strategy</code></td><td>A strategy is a list of writes and flushes plus two recovery switches.</td><td>Recovery is part of the strategy; the same writes mean different things with and without replay.</td></tr>
+<tr><td>26–31</td><td><code>initialDisk</code></td><td>D holds a deleted file's bytes; the log holds an old committed transaction.</td><td>A fresh, zeroed disk would hide both bugs: real disks are never fresh.</td></tr>
+<tr><td>33–43</td><td><code>recover</code></td><td>Replays the log only if the commit block is new, and with a checksum only if both log blocks are new.</td><td>Replay copies whatever is in the slots: it cannot tell stale from new without a checksum.</td></tr>
+<tr><td>45–64</td><td><code>classify</code></td><td>Turns a disk into one verdict: corrupt, bad, leak, new or old.</td><td>The categories are the "acceptable" list of FS1 written down before testing.</td></tr>
+<tr><td>70–80</td><td>first loop</td><td>For a cut after <i>k</i> operations, splits writes into durable (before the last flush) and open.</td><td>This is the device model of Layer 3 in nine lines.</td></tr>
+<tr><td>81–94</td><td><code>mask</code> loop</td><td>Tries every subset of the open writes.</td><td>2<sup><i>m</i></sup> states per cut: exhaustive, so a "0" in the output is a proof for this model.</td></tr>
+<tr><td>108–119</td><td><code>all</code></td><td>The five write orders.</td><td>Strategies 4 and 5 differ only in the recovery switch, isolating what the checksum buys.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>atomic_replace.cc</code>: the application's side, done right and done wrong.</p>
+<pre class="listing" data-src="F3-43/atomic_replace.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–21</td><td><code>class Fd</code></td><td>Closes a descriptor when it goes out of scope.</td><td>No leaked descriptors on the error paths.</td></tr>
+<tr><td>29–40</td><td><code>writeAll</code></td><td>Loops until every byte is written.</td><td><code>write</code> may write less than asked; a short write is not an error.</td></tr>
+<tr><td>44–51</td><td>temporary file, <code>fsync</code></td><td>Writes the new contents under a different name and makes them durable.</td><td>Initialise before pointing: no name refers to these bytes yet.</td></tr>
+<tr><td>52</td><td><code>rename</code></td><td>Atomically replaces the old name's target.</td><td>Observers see the old file or the new file, never a mixture.</td></tr>
+<tr><td>53–55</td><td>directory <code>fsync</code></td><td>Makes the changed directory entry durable.</td><td>Without it, the program may report success and the old name may come back after a crash.</td></tr>
+<tr><td>59–65</td><td><code>replaceUnsafely</code></td><td><code>O_TRUNC</code> then <code>write</code>, no <code>fsync</code>.</td><td>The old contents are gone at the <code>open</code>; the new ones are only in memory.</td></tr>
+</tbody></table></div>
+<p>The system calls each version really makes, recorded with <code>strace</code> (paths shortened; only calls on the work folder kept) <sup class="src"><a href="#F3-43-src-R3">R3</a></sup>:</p>
+<pre class="output" data-run="F3-43/strace_safe"></pre>
+<p>And the unsafe version <sup class="src"><a href="#F3-43-src-R4">R4</a></sup>:</p>
+<pre class="output" data-run="F3-43/strace_unsafe"></pre>
+
+<h2 id="F3-43-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A librarian remembers what she was doing; a computer after a power cut remembers nothing that was only in memory. Recovery code sees only the disk, and must decide from the disk alone.</li>
+<li>Books on the porter's trolley arrive in the order they were stacked, or at least one by one. A disk's cache may land the third write before the first, and may land half of a large write. The analogy hides reordering and tearing, which are the hard parts.</li>
+<li>The day book is read by a person who can spot a smudged entry. A journal is read by code that replays bytes; without a checksum it cannot tell an old entry from a new one (strategy 4's "CORRUPT" states).</li>
+<li>In a library, one card per book is natural. In a file system the same block can be pointed to by two inodes after a bad crash, and a checker must choose which one keeps it.</li>
+</ul>
+
+<h2 id="F3-43-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Treating "the write returned" as "the data is safe".</b> A completed write may be in the page cache or the device cache. Durability is a flush (device) or an <code>fsync</code> (application), and only after it returns.</li>
+<li><b>Forgetting the directory.</b> A new file's name lives in its directory. <code>fsync</code> on the file alone may not persist the name; sync the directory after <code>creat</code>, <code>rename</code>, <code>link</code> and <code>unlink</code> when it matters.</li>
+<li><b>Testing on a fresh, zeroed disk.</b> Stale bytes are what make dangling pointers visible. Listing 1 starts with a deleted file's data in D and an old transaction in the log for that reason; F3-44's harness reuses blocks.</li>
+<li><b>Flushes that do nothing.</b> A block driver that completes a flush without sending it, an emulator configured to ignore flushes, or a mount option that disables barriers all turn a correct file system into an unsafe one. Test the flush path itself: count flush commands in the write stream.</li>
+<li><b>Running the checker in repair mode first.</b> <code>e2fsck -y</code> changes the evidence. Always copy the image, run the checker read-only (<code>-n</code>), keep its report, and only then repair a copy.</li>
+<li><b>Declaring acceptable damage after the test.</b> FS1 asks for the acceptable categories "in the plan". Write them before the first run, as Listing 1's <code>classify</code> does, or every new failure will look acceptable.</li>
+</ul>
+
+<div class="co transition" id="F3-43-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#OS304">OS304</a> gave you a VFS with a block cache (<a href="#F3-31">F3-31</a>), FAT32 with a careful update order (<a href="#F3-32">F3-32</a>) and ext2 read and write checked by <code>e2fsck</code> (<a href="#F3-33">F3-33</a>); DR301 gave you a virtio-blk driver (milestone C4). <b>What carries over:</b> the on-disk structures and the habit of letting an independent checker judge your images. <b>What changes:</b> correctness is no longer "the image is valid after a clean unmount" but "every image a power cut could leave is valid after recovery, and every <code>fsync</code> that returned is honoured". You reason about sets of possible disks, not one disk. <sup class="src"><a href="#F3-43-src-C1">C1</a></sup> <b>What comes next:</b> <a href="#F3-44">F3-44</a> finishes ext2 writing with ordered updates and runs 500 power cuts against it; <a href="#F3-45">F3-45</a> adds a journal that Linux's tools can replay.</p></div>
+
+<h2 id="F3-43-check">Check yourself</h2>
+<ol>
+<li>A file system issues <code>W(A) W(B) W(C) FLUSH W(D)</code>. How many crash states are possible for a cut after the fifth operation, and how many over all cut points (0 to 5 operations)?</li>
+<li>Explain in your own words why a leak is acceptable after a crash and a dangling pointer is not.</li>
+<li>Strategy 5 adds a checksum to the commit block. Which of strategy 4's bad outcomes does it remove, which remains, and why?</li>
+<li>Which soft-updates rule does each of these violate: (a) writing an inode that points to block 900 before block 900's bitmap bit is set; (b) marking block 900 free in the bitmap before the inode's pointer to it is cleared; (c) removing a file's only directory entry before writing its new name in another directory?</li>
+<li>Why does <code>replaceSafely</code> call <code>fsync</code> on the temporary file before <code>rename</code>? What could a crash leave behind without that call on a journaling file system in ordered mode with delayed allocation?</li>
+<li>FUA or flush: a file system wants the commit block to be durable before it reports a transaction as committed, and the log blocks were already flushed. Which tool is enough, and why is FUA alone not enough for the log blocks?</li>
+<li>Apply it to a new case: a copy-on-write file system writes new leaf blocks, new interior blocks, and then the new root, with one flush at the very end. What can go wrong, and where must a second flush go?</li>
+<li>A colleague's crash test runs on a QEMU disk configured to ignore guest flushes and reports "500 runs, all clean". What does that result prove?</li>
+<li>Why does a full <code>e2fsck</code> after a crash cost more on a 4 TB disk than on a 4 GB disk, while journal replay costs about the same on both?</li>
+</ol>
+
+<h2 id="F3-43-lab">Lab</h2>
+<p><b>Goal.</b> Count every crash state of small write sequences, and see the system calls of a safe file replacement. This lab prepares the acceptance test of FS1 ("After 500 random power cuts, e2fsck never reports damage beyond the categories you declared acceptable in the plan … and every file whose fsync had completed before the cut has exactly its fsynced contents"), which F3-44 runs for real. <sup class="src"><a href="#F3-43-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> No hardware. The build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> and <code>strace -- version 6.8</code>, as printed in the logs. Run <code>university/labs/run_lab.sh university/labs/F3-43</code> from the repository root; <code>run.sh</code> builds Listing 2 and traces it.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab and compare <code>crashsim.out</code> with the worked example. Then add a sixth strategy: ordered-mode journaling with the data block written <i>after</i> the commit (<code>W(J1) W(J2) FLUSH W(JC) FLUSH W(D) W(I) W(B) FLUSH</code>). Predict its classification before running.</li>
+<li>Model the safe replacement as blocks: new data N, new inode NI, directory block DIR (the rename), with flushes where the program calls <code>fsync</code>. Write the unsafe version too (truncate T, data N, no flush). Count the states in which the file is empty.</li>
+<li>Change <code>classify</code> so that it reports the exact set of blocks that were new in each "BAD" state, and check by hand that every one breaks a soft-updates rule.</li>
+<li>Run Listing 2 under <code>strace</code> yourself, then remove the directory <code>fsync</code> and confirm with the trace that it is gone.</li>
+</ol>
+<p><b>Expected results.</b> The five strategies print exactly the counts shown in the worked example; your sixth strategy shows "BAD: file shows stale data" states (ordered mode's promise broken), and the unsafe replacement has empty-file states that the safe one does not.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The crash model is a program, not a disk: it assumes whole-block atomic writes and a cache that may reorder anything between flushes. No physical power cut was made in this build. The real-disk part of FS1 (a harness that cuts QEMU or a spare machine) is described in F3-44 and was replaced there by write-stream replay.</p></div>
+
+<h2 id="F3-43-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A media player stores its settings in <code>settings.conf</code>. After a power cut, three users report that the player starts with factory settings; one sends the file: it exists, has the right name, and is 0 bytes long. The developer says: "We write the whole file every time, and the write call never fails." The support team captured the system calls of one settings save on a test machine.</p>
+<p><b>Evidence pack.</b> The trace of one save <sup class="src"><a href="#F3-43-src-R4">R4</a></sup>:</p>
+<pre class="output" data-run="F3-43/strace_unsafe"></pre>
+<p>For comparison, a colleague's prototype of a different save routine <sup class="src"><a href="#F3-43-src-R3">R3</a></sup>:</p>
+<pre class="output" data-run="F3-43/strace_safe"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: list, in order, what the first trace does to <code>settings.conf</code>. At which call do the old settings stop existing anywhere?</li>
+<li>Which on-disk changes does the save cause (metadata and data), and which of them can a journaling file system commit before the others?</li>
+<li>Give a sequence of events, including the power cut, that leaves a 0-byte <code>settings.conf</code>.</li>
+<li>Could the same trace ever leave the <i>old</i> settings after a power cut? Could it leave half of the new ones?</li>
+<li>Name the three changes the second trace makes, and for each say which crash outcome it rules out.</li>
+<li>Propose a test that would have caught the bug before release, using the method of Layer 3.</li>
+</ol>
+<p><b>Method hints.</b> Model the save as writes and flushes, as in the lab step 2. Remember that <code>O_TRUNC</code> is a metadata change (the size becomes 0, blocks are freed) and that file data may be allocated and written much later than the <code>write</code> call returns.</p>
+
+<h2 id="F3-43-project">Mini-project</h2>
+<p><b>A crash-state explorer for your own kernel.</b> Add to your kernel's block layer (from OS304 and DR301) a recording mode: every write (block number and contents) and every flush is appended to a log on a second virtual disk or sent over the serial port. Write a host program that reads such a log, applies a cut and a random subset of the unflushed writes to a copy of the starting image, and runs <code>e2fsck -fn</code> on the result. Use it on a short workload of your OS304 ext2 driver (create, append, unlink) and report the categories you find.</p>
+<p><b>Rubric.</b> Recording is complete (every write and flush, in order, with contents) and tested with a known workload (3). The replay tool builds images exactly per the model of Layer 3, with an exhaustive mode for short logs (3). A written plan lists the acceptable categories before the first run (1). Results for at least 100 cuts with the real <code>e2fsck</code> report counts per category (2). One state of each category is explained by naming the writes that were lost (1).</p>
+
+<h2 id="F3-43-summary">Summary</h2>
+<ul>
+<li>One file operation changes several blocks; a power cut can leave any prefix of the issued writes plus any subset of the writes since the last completed flush.</li>
+<li>A flush is the only ordering tool a device gives; FUA makes one write durable; atomicity is guaranteed only up to the device's documented unit.</li>
+<li>Leaks are acceptable damage; dangling pointers and stale data are not. Decide the acceptable list before testing.</li>
+<li>Careful ordering keeps damage to leaks; journaling makes the commit record the single atomic step; copy-on-write makes the root pointer that step; log-structured designs make the whole disk a log.</li>
+<li>Ordered-mode journaling needs data and log blocks durable before the commit block; a commit checksum protects the log but not the data.</li>
+<li>Applications must <code>fsync</code>, write new files under a temporary name, <code>rename</code>, and <code>fsync</code> the directory.</li>
+<li>Crash testing records the write stream, cuts it, drops unflushed writes, recovers, and checks with an independent checker and the fsynced files.</li>
+</ul>
+
+<h2 id="F3-43-sources">Sources</h2>
+<ol>
+<li id="F3-43-src-D1">Remzi H. Arpaci-Dusseau, Andrea C. Arpaci-Dusseau, "Operating Systems: Three Easy Pieces" (tier 3), chapters "Crash Consistency: FSCK and Journaling", "Log-structured File Systems", "Data Integrity and Protection" and "Flash-based SSDs". Used for: the append example, fsck, journaling modes, copy-on-write, checksums. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-43-src-D2">Stephen C. Tweedie, "Journaling the Linux ext2fs Filesystem" (tier 5). Used for: transactions, commit records, checkpointing and log reuse. <i>Title only — not opened during this build; the Source Researcher must confirm the publication and section (dossier gate G1 open).</i></li>
+<li id="F3-43-src-D3">Marshall Kirk McKusick, Gregory R. Ganger, "Soft Updates: A Technique for Eliminating Most Synchronous Writes in the Fast Filesystem" (USENIX 1999) (tier 5). Used for: the three ordering rules, dependency tracking and rollback, leaks as the only damage. <i>Title only — not opened during this build; the Source Researcher must confirm the publication and section (dossier gate G1 open).</i></li>
+<li id="F3-43-src-D4">Mendel Rosenblum, John K. Ousterhout, "The Design and Implementation of a Log-Structured File System" (tier 5). Used for: the log-structured design, checkpoints, roll-forward, the cleaner. <i>Title only — not opened during this build; the Source Researcher must confirm the publication and section (dossier gate G1 open).</i></li>
+<li id="F3-43-src-D5">Thanumalayan Sankaranarayana Pillai et al., "All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications" (OSDI 2014) (tier 5). Used for: application update protocols and their bugs, persistence properties of file systems. <i>Title only — not opened during this build; the Source Researcher must confirm the publication and section (dossier gate G1 open).</i> No number from the paper is quoted.</li>
+<li id="F3-43-src-D6">Jayashree Mohan et al., "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing" (CrashMonkey, OSDI 2018) (tier 5). Used for: the record-cut-replay-check method. <i>Title only — not opened during this build; the Source Researcher must confirm the publication and section (dossier gate G1 open).</i></li>
+<li id="F3-43-src-D7">NVM Express, "NVM Express Base Specification" (tier 1): Flush command, Force Unit Access, atomic write unit fields, Volatile Write Cache in Identify Controller. <i>Title only — not opened during this build; the Source Researcher must confirm the revision and sections (dossier gate G1 open).</i></li>
+<li id="F3-43-src-D8">INCITS T13, "ATA/ATAPI Command Set" (FLUSH CACHE EXT, write commands with FUA, IDENTIFY DEVICE cache bits), and INCITS T10, "SCSI Block Commands" (SYNCHRONIZE CACHE, FUA) (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the revisions and sections (dossier gate G1 open).</i></li>
+<li id="F3-43-src-D9">OASIS, "Virtual I/O Device (VIRTIO) Specification" (tier 1), Block Device: flush request type and the flush feature bit. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F3-43-src-D10">IEEE and The Open Group, "The Open Group Base Specifications" (POSIX.1) (tier 1): <code>fsync</code>, <code>fdatasync</code>, <code>rename</code>, <code>open</code> with <code>O_TRUNC</code>. <i>Title only — not opened during this build; the Source Researcher must confirm the issue and sections (dossier gate G1 open).</i></li>
+<li id="F3-43-src-D11">The Linux kernel documentation (tier 2): "ext4 Data Structures and Algorithms" (journal section, journaling modes, commit checksums) and the device-mapper "log-writes" target documentation. <i>Title only — not opened during this build; the Source Researcher must confirm the kernel version and sections (dossier gate G1 open).</i></li>
+<li id="F3-43-src-D12">QEMU documentation (tier 2), block device options and cache modes. <i>Title only — not opened during this build; the Source Researcher must confirm the version and section (dossier gate G1 open).</i></li>
+<li id="F3-43-src-C1">Systems Curriculum (this project), section 7.2 "Crash consistency: the discipline" and milestone FS1 (local file <code>SYSTEMS_CURRICULUM.html</code>): the five strategies, the device tools, the testing method, the reading list and the FS1 acceptance test quoted verbatim. A map, not a source (AH-4).</li>
+<li id="F3-43-src-R1">R1 — Listing 1 run: <code>crashsim.log</code>; g++ 13.3.0 with AddressSanitizer and UBSan; exit code 0.</li>
+<li id="F3-43-src-R2">R2 — Listing 2 build: <code>build.log</code>; g++ 13.3.0; exit code 0.</li>
+<li id="F3-43-src-R3">R3 — safe replacement under strace: <code>strace_safe.log</code>; strace 6.8; exit code 0.</li>
+<li id="F3-43-src-R4">R4 — unsafe replacement under strace: <code>strace_unsafe.log</code>; strace 6.8; exit code 0.</li>
+</ol>
+
+<h2 id="F3-43-glossary">Glossary links</h2>
+<p><a href="#gl-crash-consistency">Crash consistency</a> · <a href="#gl-volatile-write-cache">Volatile write cache</a> · <a href="#gl-cache-flush">Cache flush</a> · <a href="#gl-force-unit-access-fua">Force Unit Access (FUA)</a> · <a href="#gl-crash-state">Crash state</a> · <a href="#gl-file-system-checker-fsck">File system checker (fsck)</a> · <a href="#gl-journaling-write-ahead-logging">Journaling (write-ahead logging)</a> · <a href="#gl-ordered-mode">Ordered mode</a> · <a href="#gl-soft-updates">Soft updates</a> · <a href="#gl-copy-on-write-cow">Copy-on-write (COW)</a> · <a href="#gl-fsync">fsync</a> · <a href="#gl-torn-write">Torn write</a></p>
+
+<h2 id="F3-43-next">Next chapter</h2>
+<p><a href="#F3-44">F3-44 Complete ext2 writing and a crash harness</a> puts these rules into a real ext2 writer and runs 500 power cuts against it with <code>e2fsck</code> as the judge. Back to the course: <a href="#OS401">OS401</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#fs">section 7, file systems in breadth</a>.</p>
+
+<h2 id="F3-43-answers">Answers to Check yourself</h2>
+<ol>
+<li>After the fifth operation: A, B, C are durable and D is open: 2 states. Over all cuts: 1 (none) + 2 (A) + 4 (A, B) + 8 (A, B, C) + 1 (flush) + 2 (D) = 18.</li>
+<li>Good answers say: a leak is space marked used that nobody points to; every pointer still leads to the right thing, so no reader is misled and the space can be reclaimed later. A dangling pointer leads a reader to something that is not what it claims (stale bytes, a block about to be given to another file), so data is wrong or two files end up sharing a block.</li>
+<li>It removes the 6 "CORRUPT" states: a commit block whose log blocks are not the ones it describes fails the checksum and is ignored. The 1 "BAD: stale data" state remains: the commit and the log landed, the data block D did not, and the checksum does not cover D. Ordered mode needs D durable before the commit; only a flush (or FUA writes of D completed before the commit is issued) gives that.</li>
+<li>(a) Initialise (here: allocate) before pointing: the bitmap must say "used" before an inode points at the block. (b) Never reuse before nullifying: clear the pointer first, then free. (c) Never reset the last pointer before the new one is set: write the new name first.</li>
+<li>Without it, the rename (a metadata change) can be committed and become durable before the new file's data is written, because data writes may be delayed and allocated late. After a crash, <code>settings.conf</code> names the new inode, which has no data yet: an empty or zero-filled file, and the old contents are gone. The <code>fsync</code> forces the data out before the name points at it.</li>
+<li>For the commit block alone, a FUA write (or a write followed by a flush) is enough, since the log blocks are already durable. FUA alone is not enough for the log blocks before the commit, because FUA on the commit says nothing about other writes still in the cache: the commit could be durable while log blocks are still cached. The log blocks need a flush (or each its own FUA write, completed) before the commit is issued.</li>
+<li>With one flush at the end, the device may land the new root before the new leaves and interior blocks; a crash then leaves a root pointing at blocks that hold old or random contents. A flush must separate "all new blocks of the tree" from "the new root", and a second flush after the root makes the update durable.</li>
+<li>Nothing about crash consistency on a real device: with flushes ignored, the test cannot distinguish a correct flush order from no flushes at all. (It may even be that every write landed in order.) The test must use a device model that drops unflushed writes.</li>
+<li>fsck reads every inode and follows every pointer and directory, so its work grows with the number of files and blocks. Replay reads only the part of the log written since the last checkpoint, which depends on recent activity and the journal size, not on the disk size.</li>
+</ol>
+<h3 id="F3-43-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li><code>openat</code> with <code>O_TRUNC</code> (size becomes 0: the old settings are gone from the file at this call), <code>write</code> of 21 bytes (into the page cache), <code>close</code>. There is no <code>fsync</code>.</li>
+<li>Metadata: the inode's size set to 0 and its blocks freed (truncate), later the size set to 21 and a block allocated; data: the 21 bytes. The truncate is a metadata change that a journal can commit on its own, early; the data and the allocation can follow much later (delayed allocation), in another transaction.</li>
+<li>The truncate is committed (the periodic journal commit, or another program's <code>fsync</code> pulling it in), the new data is still in memory, the power goes. Recovery restores a consistent file system in which <code>settings.conf</code> has size 0.</li>
+<li>Old settings: yes, if the power goes before the truncate is committed. Half of the new ones: not for a 21-byte file in one block, but a larger file written in several blocks could be found partly written.</li>
+<li>A different name for the new bytes (the old file is untouched while the new one is written: rules out "empty or half file" under the real name); <code>fsync</code> of the new file before <code>rename</code> (rules out a name pointing to unwritten data); <code>rename</code> plus <code>fsync</code> of the directory (rules out success being reported while the old name could come back).</li>
+<li>Record the write stream of a save on a test disk, cut it at every point (or randomly, many times) with unflushed writes dropped, mount or check each image and assert that <code>settings.conf</code> holds either the complete old or the complete new contents. The unsafe version fails on the states where the truncate landed and the data did not.</li>
+</ol>

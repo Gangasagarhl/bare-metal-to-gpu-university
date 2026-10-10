@@ -1,0 +1,210 @@
+<!--meta
+id: F11-10
+title: 'Hardening: stack protectors, NX, ASLR, SMEP and SMAP'
+course: SS302
+level: L3
+prereqs: F11-07; SP301 (F2-44, F2-50); OS302 (F3-21); OS303 (F3-29)
+time: 6–9 hours including the lab
+hardware: none (host C++: g++ 13.3.0, GNU Binutils readelf 2.42; SMEP/SMAP demonstrated in OS303 F3-29 under QEMU, cross-referenced here)
+maps: SS302 goal "harden binaries and kernels"; curriculum B12 (SMEP/SMAP, user-pointer validation); Intel SDM paging and SMEP/SMAP sections
+analogy: F11 — a castle with gates and guards
+-->
+
+<h2 id="F11-10-hook">Story hook</h2>
+<p>Even a castle with a careless clerk can be made hard to rob. Put a thin wax seal between each order and the one below it, so a clerk who scribbles too far breaks the seal and the guard refuses the order (a stack canary). Forbid the guards from ever acting on instructions written in the visitors' own notebooks (no-execute pages). Move the rooms around every night so a thief who learned yesterday's map arrives at the wrong door (address randomisation). And post an inner rule that the castle staff never follow orders found in a visitor's bag, nor rummage in it, unless a specific procedure says to (SMEP and SMAP in the kernel). None of these fixes the clerk; each makes a surviving mistake far harder to turn into a robbery.</p>
+<p>This chapter is about defence in depth for compiled programs and kernels: the mitigations that sit under your code so that a bug which slipped past <a href="#F11-08">F11-08</a> and <a href="#F11-09">F11-09</a> is more likely to become a clean crash than a working exploit. You will set each one, watch it fire, and read it out of a real binary.</p>
+
+<h2 id="F11-10-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what a stack canary, non-executable memory (NX/W^X), ASLR, SMEP and SMAP each defend against, and which exploit link each one breaks.</li>
+<li><b>Trigger</b> a stack-protector abort and an NX fault on your own machine and read them.</li>
+<li><b>Observe</b> ASLR by seeing addresses change between runs of the same binary.</li>
+<li><b>Read</b> a binary's hardening flags (PIE, non-executable stack, RELRO) from its ELF program headers.</li>
+<li><b>Describe</b> how SMEP and SMAP protect a kernel from user memory, and why user pointers must still be validated (B12).</li>
+</ul>
+
+<div class="co jargon" id="F11-10-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Stack canary</dt><dd><b>Simple words:</b> a secret value placed between a buffer and the saved return address, checked before returning. <b>Analogy:</b> a wax seal that breaks if the clerk writes too far. <b>Precise:</b> a random value (<code>__stack_chk_guard</code>) the compiler stores on the stack with <code>-fstack-protector</code>; the function checks it before returning and calls <code>__stack_chk_fail</code> (aborting) if it changed. <sup class="src"><a href="#F11-10-src-D1">D1</a></sup></dd>
+<dt>NX / W^X</dt><dd><b>Simple words:</b> memory is either writable or executable, never both; data pages cannot run as code. <b>Analogy:</b> guards never act on notes in visitors' notebooks. <b>Precise:</b> the no-execute page bit (x86-64 XD bit 63 of a page-table entry, honoured when EFER.NXE is set); an instruction fetch from a non-executable page faults. W^X is the policy of never mapping a page writable and executable at once. <sup class="src"><a href="#F11-10-src-D2">D2</a></sup></dd>
+<dt>ASLR</dt><dd><b>Simple words:</b> the program's stack, heap and code sit at different addresses each run. <b>Analogy:</b> the rooms are rearranged every night. <b>Precise:</b> Address Space Layout Randomisation — the kernel loads the stack, the heap, shared libraries and (for a position-independent executable) the program itself at randomised base addresses, so an attacker cannot know a target address in advance. <sup class="src"><a href="#F11-10-src-D3">D3</a></sup></dd>
+<dt>PIE</dt><dd><b>Simple words:</b> a program built so it can be loaded at any address. <b>Analogy:</b> a building with no fixed street number. <b>Precise:</b> a Position-Independent Executable (ELF type <code>ET_DYN</code>) whose code uses relative addressing, letting the loader place it at a random base — the prerequisite for ASLR of the main program. <sup class="src"><a href="#F11-10-src-D4">D4</a></sup></dd>
+<dt>SMEP</dt><dd><b>Simple words:</b> the CPU refuses to run user-page code while in kernel mode. <b>Analogy:</b> staff never follow instructions written in a visitor's notebook. <b>Precise:</b> Supervisor Mode Execution Prevention (CR4 bit 20): an instruction fetch at privilege level 0 from a user page faults. <sup class="src"><a href="#F11-10-src-D2">D2</a></sup></dd>
+<dt>SMAP</dt><dd><b>Simple words:</b> the CPU refuses kernel reads and writes of user pages, except in an explicitly opened window. <b>Analogy:</b> staff do not rummage in a visitor's bag unless the copy procedure is open. <b>Precise:</b> Supervisor Mode Access Prevention (CR4 bit 21): data accesses at privilege level 0 to user pages fault unless RFLAGS.AC is set, which <code>stac</code> sets and <code>clac</code> clears. <sup class="src"><a href="#F11-10-src-D2">D2</a></sup></dd>
+</dl></div>
+
+<h2 id="F11-10-pictures">The idea in pictures</h2>
+<p>Figure 1 shows a stack frame with a canary between the buffer and the saved return address: an overflow that reaches the return address must first pass through, and change, the canary.</p>
+<figure id="F11-10-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 280" role="img" aria-labelledby="F11-10-f1t F11-10-f1d">
+<title id="F11-10-f1t">Figure 1: the stack canary sits between the buffer and the return address</title>
+<desc id="F11-10-f1d">A vertical stack frame, higher addresses at the bottom. From top to bottom: local buffer buf[16]; then the stack canary (a random secret); then the saved frame pointer; then the saved return address at the bottom. An arrow on the left labelled "overflow grows this way" points downward from buf through the canary toward the return address. A note says: to overwrite the return address, the overflow must pass through the canary and change it; the function checks the canary before ret and aborts if it changed.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="280"/>
+<text class="sv-tb" x="30" y="28">one stack frame (higher addresses downward)</text>
+<rect class="sv-b1" x="220" y="44" width="320" height="44"/><text class="sv-tm" x="240" y="71">char buf[16]  (the overflowed buffer)</text>
+<rect class="sv-b6" x="220" y="92" width="320" height="40"/><text class="sv-tm" x="240" y="117">stack canary (random secret)</text>
+<rect class="sv-box" x="220" y="136" width="320" height="40"/><text class="sv-tm" x="240" y="161">saved frame pointer</text>
+<rect class="sv-b8" x="220" y="180" width="320" height="44"/><text class="sv-tm" x="240" y="207">saved return address</text>
+<text class="sv-ts" x="30" y="120">overflow</text><text class="sv-ts" x="30" y="138">grows</text><text class="sv-ts" x="30" y="156">downward</text>
+<line class="sv-line2" x1="150" y1="66" x2="150" y2="200"/><polygon class="sv-head" points="150,200 144,188 156,188"/>
+<text class="sv-ts" x="560" y="112">to reach the return</text>
+<text class="sv-ts" x="560" y="130">address, the overflow</text>
+<text class="sv-ts" x="560" y="148">must change the canary</text>
+<text class="sv-ts" x="560" y="200">checked before ret;</text>
+<text class="sv-ts" x="560" y="218">abort if changed (R1)</text>
+<text class="sv-ts" x="30" y="260">Not to scale. Frame layout is the common case on x86-64; the compiler chooses exact placement.</text>
+</svg></div><figcaption><b>Figure 1.</b> A stack canary between the buffer and the saved return address; an overflow reaching the return address changes the canary, which is checked before <code>ret</code>. Data flow downward. <sup class="src"><a href="#F11-10-src-D1">D1</a></sup> <sup class="src"><a href="#F11-10-src-R1">R1</a></sup></figcaption></figure>
+
+<h2 id="F11-10-layer1">Layer 1 — the kid explanation</h2>
+<p>You cannot promise a big program has no bugs. So you add layers that make a bug hard to use. A <b>canary</b> is a secret number tucked in just before the return address; if an overflow stomps toward the return address, it changes the secret, and the program notices and stops. <b>No-execute</b> says data can be written or run, never both, so an attacker who drops code into a buffer cannot run it. <b>Address randomisation</b> moves everything around each run, so an attacker who needs to know where something is must guess, and usually guesses wrong. Inside the operating system, two more rules (SMEP and SMAP) stop the kernel from being tricked into running or reading a program's own memory. Each layer is cheap and each breaks a different step of an attack.</p>
+
+<h2 id="F11-10-layer2">Layer 2 — the student explanation</h2>
+<p>Recall the stack exploit chain from <a href="#F11-07">F11-07</a>: overflow a buffer, overwrite the saved return address, jump to attacker code. Each mitigation breaks one link.</p>
+<ul>
+<li><b>Stack canary</b> (<code>-fstack-protector</code>): detects the overwrite. The compiler stores a secret below the buffer and checks it before <code>ret</code>; a contiguous overflow that reaches the return address must change the canary, so the check fails and the program aborts with "stack smashing detected". The lab shows this abort (R1). <sup class="src"><a href="#F11-10-src-D1">D1</a></sup> <sup class="src"><a href="#F11-10-src-R1">R1</a></sup></li>
+<li><b>NX / W^X</b>: blocks jumping to injected code. Data pages are non-executable, so even if the attacker places code in a buffer, fetching an instruction from it faults. The lab calls a byte of data as a function and gets a segmentation fault (R3). <sup class="src"><a href="#F11-10-src-D2">D2</a></sup> <sup class="src"><a href="#F11-10-src-R3">R3</a></sup></li>
+<li><b>ASLR</b> (with <b>PIE</b>): hides the address the attacker needs. Stack, heap, libraries and the PIE program itself load at random bases each run, so a hard-coded address is wrong. The lab prints stack, heap and code addresses across three runs and they differ (R4). <sup class="src"><a href="#F11-10-src-D3">D3</a></sup> <sup class="src"><a href="#F11-10-src-R4">R4</a></sup></li>
+</ul>
+<p>Because NX blocks running injected code, real attacks turned to <b>return-oriented programming</b> — stitching together existing code fragments — which in turn needs to know addresses, which ASLR denies. The defences interlock. For kernels, <b>SMEP</b> and <b>SMAP</b> add two more: the processor refuses to execute user-page code in kernel mode (SMEP) and refuses to read or write user pages except in an explicitly opened window (SMAP), so a kernel bug cannot be steered into running or trusting user memory. You built these in <a href="#F3-29">OS303 (F3-29)</a>. <sup class="src"><a href="#F11-10-src-D2">D2</a></sup></p>
+
+<h2 id="F11-10-layer3">Layer 3 — the engineer's depth</h2>
+<p>Mitigations are probabilistic and composable, not proofs. A stack canary defends the return address but not a function pointer overwritten before the canary, and not a non-contiguous write that skips it; <code>-fstack-protector-strong</code> protects more functions than the default heuristic, at a small cost. NX forces attackers to reuse existing executable code (return-oriented programming), which is why control-flow integrity and shadow stacks exist as the next layer. ASLR's strength is its entropy: too few random bits and an attacker brute-forces the base; a non-PIE executable leaves the main program at a fixed address even when libraries move, which is why PIE matters. None of these removes the bug; they raise the cost and, crucially, convert many silent corruptions into loud crashes you can detect and alert on. <sup class="src"><a href="#F11-10-src-D1">D1</a></sup> <sup class="src"><a href="#F11-10-src-D3">D3</a></sup></p>
+<p>You can read most of a binary's posture straight from its ELF program headers, which is what tools like <code>checksec</code> do. A <code>PT_GNU_STACK</code> segment with the <code>X</code> flag means an executable stack (bad); without it the stack is non-executable. <code>PT_GNU_RELRO</code> marks the region made read-only after relocation, which protects the Global Offset Table; combined with "bind now" it closes a classic GOT-overwrite path. ELF type <code>ET_DYN</code> (rather than <code>ET_EXEC</code>) marks a PIE. The lab's own reader and <code>readelf</code> agree: the weakly built binary has an executable stack and is not a PIE; the hardened one has a non-executable stack, is a PIE, and carries RELRO (R5). <sup class="src"><a href="#F11-10-src-D4">D4</a></sup> <sup class="src"><a href="#F11-10-src-R5">R5</a></sup></p>
+<p>SMEP and SMAP are architectural, enforced by the processor given the right CR4 bits (B12). SMEP (CR4.20) faults on a supervisor instruction fetch from a user page; SMAP (CR4.21) faults on a supervisor data access to a user page unless RFLAGS.AC is set, which the kernel sets briefly with <code>stac</code> around a deliberate user copy and clears with <code>clac</code>. They do not remove the need to <b>validate user pointers</b>: SMAP stops an <i>accidental</i> access, but a system call that takes a pointer and length from a user program must still check that the range is a user range and copy it through a fault-tolerant routine — otherwise a malicious program can hand the kernel a kernel address or an unmapped one. The OS303 lab shows exactly this: with SMAP on, a bug that trusts a user pointer faults in the kernel; the correct kernel validates the range and returns an error instead. SMEP, SMAP and user-pointer validation are three layers for the same goal. <sup class="src"><a href="#F11-10-src-D2">D2</a></sup> <sup class="src"><a href="#F11-10-src-D5">D5</a></sup></p>
+
+<h2 id="F11-10-hardware">How the hardware actually does it</h2>
+<p>These are hardware features the processor enforces on every access, which is why they are cheap. The no-execute bit is bit 63 of each page-table entry; when <code>EFER.NXE</code> is set, an instruction fetch from a page with that bit raises a page fault with the instruction-fetch error bit, so the data page in the lab's NX demo cannot be run (R3). <sup class="src"><a href="#F11-10-src-D2">D2</a></sup> <sup class="src"><a href="#F11-10-src-R3">R3</a></sup> SMEP and SMAP are CR4 bits the kernel sets once at boot; thereafter the page-walk hardware checks the user/supervisor bit of every page against the current privilege level and the AC flag, and faults without the kernel executing a single extra instruction per access. The stack canary is not hardware — it is compiler-emitted loads, a compare and a conditional call to <code>__stack_chk_fail</code> — which is why it costs a few instructions per protected function. ASLR is the kernel choosing random load bases using the per-page translation the MMU already does; the running code is identical, only its base differs, which is why a PIE can run anywhere. <sup class="src"><a href="#F11-10-src-D3">D3</a></sup></p>
+
+<h2 id="F11-10-worked">Worked example</h2>
+<p>Run the lab's <code>canary.cc</code>: a function copies an unbounded string into <code>char buf[16]</code>. Give it a forty-byte string. Built with <code>-fstack-protector-all</code>, the copy overruns the buffer, overwrites the canary and the saved return address, and on return the function's epilogue reloads the canary, finds it changed, and calls <code>__stack_chk_fail</code>: the program prints "*** stack smashing detected ***" and aborts with SIGABRT (exit 134) before any attacker-chosen address can be used (R1). Built with <code>-fno-stack-protector</code>, there is no check; the corrupted return address is loaded on <code>ret</code> and the program jumps to a bad address, giving a segmentation fault (exit 139) — or, with a cleverly chosen string, silent corruption (R2). The difference is the whole value of the mitigation: with it, the overflow is a clean, detectable abort; without it, it is an uncontrolled jump the attacker might steer. <sup class="src"><a href="#F11-10-src-R1">R1</a></sup> <sup class="src"><a href="#F11-10-src-R2">R2</a></sup></p>
+
+<h2 id="F11-10-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>canary.cc</code> (full file in the lab folder).</p>
+<pre class="listing" data-src="F11-10/canary.cc"></pre>
+<p>With the stack protector, the forty-byte input aborts; a safe name returns normally:</p>
+<pre class="output" data-run="F11-10/canary_on"></pre>
+<p>Without the stack protector, the same input corrupts the return address and segfaults:</p>
+<pre class="output" data-run="F11-10/canary_off"></pre>
+<table class="tw"><thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–19</td><td><code>char buf[16]; std::strcpy(buf, name);</code></td><td>Copies an unbounded string into a 16-byte stack buffer.</td><td>The overflow the canary is there to detect.</td></tr>
+<tr><td>—</td><td><code>-fstack-protector-all</code> (build flag)</td><td>Adds the canary and the check.</td><td>Turns a return-address overwrite into a clean abort.</td></tr>
+<tr><td>24</td><td><code>greet(argv[1]); "greet returned normally"</code></td><td>Reached only if no overflow (or no detection).</td><td>Shows the control-flow difference between the two builds.</td></tr>
+</tbody></table>
+<p><b>NX / W^X.</b> Calling a data byte as a function faults because the page is non-executable:</p>
+<pre class="output" data-run="F11-10/nx"></pre>
+<p><b>ASLR.</b> Three runs of the same PIE binary print different stack, heap and code addresses:</p>
+<pre class="output" data-run="F11-10/aslr"></pre>
+<p><b>Reading hardening from the binary.</b> The lab's own ELF reader (and <code>readelf</code>, which agrees) shows a weak binary versus a hardened one:</p>
+<pre class="output" data-run="F11-10/checksec"></pre>
+
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Whether ASLR actually randomises on a given machine depends on the kernel's settings (for example the system-wide <code>randomize_va_space</code> control). The lab's three runs showed differing addresses in this build container, but a hardened or a locked-down host may differ; confirm your kernel's ASLR setting before relying on it, and never treat any printed address as a fixed number. The exact CR4 bit numbers for SMEP (20) and SMAP (21) and the XD bit position (63) are cited from the Intel SDM by title; confirm them in the current manual (dossier gate G1 open).</p></div>
+
+<h2 id="F11-10-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A wax seal stops one path; a canary guards one slot.</b> The canary protects the saved return address, not a function pointer overwritten before it or a write that skips over it. The seal image suggests a wall; it is one checkpoint. <sup class="src"><a href="#F11-10-src-D1">D1</a></sup></li>
+<li><b>Rearranging rooms nightly still leaves the same building.</b> ASLR moves bases, not contents; a leak of one address can de-randomise the rest, and too little entropy can be brute-forced. The analogy hides that the map is still internally fixed. <sup class="src"><a href="#F11-10-src-D3">D3</a></sup></li>
+<li><b>"Guards ignore the visitor's notebook" is not "the bag is safe".</b> SMAP stops accidental kernel access to user memory, but the kernel still must validate any user pointer it is asked to use; the analogy makes the rule sound total when deliberate, checked access is still needed. <sup class="src"><a href="#F11-10-src-D5">D5</a></sup></li>
+</ul>
+
+<h2 id="F11-10-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> an overflow that should abort just runs. <b>Cause:</b> the stack protector was off (<code>-fno-stack-protector</code>) or the function was not covered by the default heuristic. <b>How to find it:</b> check the build flags; disassemble and look for <code>__stack_chk_fail</code>. <b>Fix:</b> use <code>-fstack-protector-strong</code> (or <code>-all</code> for sensitive code).</li>
+<li><b>Symptom:</b> a binary you shipped reports an executable stack in a scan. <b>Cause:</b> a <code>-z execstack</code> flag or an assembly file without a <code>.note.GNU-stack</code> marker. <b>How to find it:</b> <code>readelf -lW</code> and look at <code>GNU_STACK</code> flags (RWE vs RW). <b>Fix:</b> remove <code>-z execstack</code>; add the non-exec stack note to assembly.</li>
+<li><b>Symptom:</b> the kernel crashes when a system call is given a crafted pointer. <b>Cause:</b> a user pointer trusted without validation (SMAP stops accidental access, not this). <b>How to find it:</b> the fault's address is a user or kernel address from the call; see <a href="#F3-29">F3-29</a>. <b>Fix:</b> validate the range and copy through a fault-tolerant routine.</li>
+</ul>
+
+<div class="co transition" id="F11-10-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F11-07">F11-07</a> showed the stack exploit chain, <a href="#F2-44">SP301</a> and <a href="#F3-21">OS302</a> introduced ELF program headers and the no-execute page bit, and <a href="#F3-29">OS303</a> built SMEP, SMAP and user-pointer validation in a teaching kernel. <b>What carries over:</b> the exploit chain, ELF segments and permissions, and paging. <sup class="src"><a href="#F11-10-src-D2">D2</a></sup> <b>What changes:</b> you now see each mitigation as breaking one specific link, read a binary's posture from its headers, and treat these as layers under — never instead of — the prevention of <a href="#F11-08">F11-08</a>. <b>What comes next:</b> <a href="#F11-11">F11-11</a> makes hardening flags and sanitizer builds part of the coding standard and CI; <a href="#F11-12">F11-12</a> applies the whole stack to untrusted device input.</p></div>
+
+<h2 id="F11-10-check">Check yourself</h2>
+<ol>
+<li>For each of stack canary, NX, ASLR: which link of the "overflow → overwrite return address → jump to attacker code" chain does it break?</li>
+<li>Why did widespread NX push attackers toward return-oriented programming, and what later defence targets that?</li>
+<li>Explain in your own words why a PIE is needed for the main program to benefit from ASLR.</li>
+<li>Which is true? (a) A stack canary prevents all overflows. (b) SMAP removes the need to validate user pointers. (c) An executable stack shows as the X flag on PT_GNU_STACK. (d) ASLR changes the program's code, not just its base.</li>
+<li>What exactly does SMAP fault on, and how does the kernel do a legitimate user copy anyway?</li>
+<li>Apply it: a scan says your service has RELRO but no PIE and a non-executable stack. Which one mitigation is missing, what does it cost to add, and what does it defend?</li>
+<li>Predict, then run: build <code>canary.cc</code> with <code>-fstack-protector-all</code> and then with <code>-fno-stack-protector</code>, feeding 40 bytes each time. Predict the exit outcome of each, then check against <code>canary_on.out</code> and <code>canary_off.out</code>.</li>
+</ol>
+
+<h2 id="F11-10-lab">Lab</h2>
+<p><b>Goal.</b> Trigger a stack-protector abort and an NX fault, observe ASLR, and read hardening flags from real binaries.</p>
+<p><b>Hardware and software needed.</b> No hardware. Logged toolchain: <code>g++ 13.3.0</code>, GNU Binutils <code>readelf</code> 2.42. SMEP/SMAP are demonstrated in the OS303 kernel lab (<a href="#F3-29">F3-29</a>) under QEMU, not re-run here. Run <code>university/labs/run_lab.sh university/labs/F11-10</code> from the repository root.</p>
+<p><b>Safety.</b> None beyond normal computer use. The demos crash on purpose (SIGABRT, SIGSEGV); that is the expected result.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In <code>canary_on.out</code>, confirm the safe name returns and the 40-byte name aborts with "stack smashing detected" (exit 134).</li>
+<li>In <code>canary_off.out</code>, confirm the same input segfaults (exit 139) — no detection.</li>
+<li>In <code>nx.out</code>, confirm calling a data byte faults (exit 139): NX refused to execute a data page.</li>
+<li>In <code>aslr.out</code>, confirm the stack, heap and code addresses differ across the three runs.</li>
+<li>In <code>checksec.out</code>, compare the weak and hardened binaries (PIE, exec-stack, RELRO), and confirm the lab's reader agrees with <code>readelf</code>.</li>
+</ol>
+<p><b>Expected observations.</b> Canary build aborts (134); no-canary build segfaults (139); NX demo segfaults (139); ASLR addresses differ; the hardened binary is a PIE with a non-executable stack. <sup class="src"><a href="#F11-10-src-R1">R1</a></sup> <sup class="src"><a href="#F11-10-src-R2">R2</a></sup> <sup class="src"><a href="#F11-10-src-R3">R3</a></sup> <sup class="src"><a href="#F11-10-src-R4">R4</a></sup> <sup class="src"><a href="#F11-10-src-R5">R5</a></sup></p>
+<p><b>Verification.</b> <code>run_lab.sh</code> exits 0; the canary build aborts via <code>__stack_chk_fail</code>; the lab's ELF reader and <code>readelf</code> report the same GNU_STACK flags.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The canary build does not abort → <code>_FORTIFY_SOURCE</code> caught the <code>strcpy</code> first, or optimisation removed the buffer → build at <code>-O0</code> (as the lab does) so the overflow reaches the canary.</li>
+<li>ASLR addresses are identical across runs → your kernel's ASLR is disabled → check the system setting; this is a host policy, not a program bug (see the unverified box).</li>
+<li>The NX demo prints "returned from data" → the page was executable → ensure you did not pass <code>-z execstack</code>; data should be non-executable by default.</li>
+</ul>
+<p><b>Extension.</b> Rebuild the weak binary with full hardening (<code>-fstack-protector-strong -fPIE -pie -Wl,-z,relro,-z,now</code>) and confirm with the lab reader that exec-stack becomes no and PIE becomes yes. Then revisit <a href="#F3-29">F3-29</a> and relate its SMAP-on versus SMAP-off kernel runs to this chapter.</p>
+
+<h2 id="F11-10-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A security review flags a shipped binary. The reviewer attached the output of a hardening scan of two builds of the same program.</p>
+<p><b>Evidence pack.</b> The real reader output (and <code>readelf</code> agreement):</p>
+<pre class="output" data-run="F11-10/checksec"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: for each binary, state PIE, executable-stack and RELRO from the evidence.</li>
+<li>Hypotheses: name two mitigations the weak binary is missing and the attack each would defend against.</li>
+<li>Root cause: which build flags most likely produced the weak binary's executable stack and lack of PIE?</li>
+<li>Fix: give the exact compiler and linker flags to harden it, and say what each adds.</li>
+<li>Prevention: what CI check would stop a binary with an executable stack from shipping? (Think of reading <code>PT_GNU_STACK</code>.)</li>
+</ol>
+<p><b>Method hints.</b> The <code>X</code> flag on <code>PT_GNU_STACK</code> (RWE vs RW) is the executable-stack signal; ELF type <code>ET_DYN</code> marks a PIE; <code>PT_GNU_RELRO</code> marks RELRO. The lab reader prints these directly.</p>
+
+<h2 id="F11-10-project">Mini-project</h2>
+<p><b>A hardening report for one program.</b> Take a program you built earlier. Read its ELF headers (with the lab reader and <code>readelf</code>) and record its posture: PIE, exec-stack, RELRO, and whether the stack protector is present (look for <code>__stack_chk_fail</code>). Rebuild with a full hardening flag set and show the before/after. Trigger a stack overflow in a copy and show the canary abort. Deliver a one-page report: each mitigation, whether it was present, what it defends, and the exact flags to turn it on — plus an honest note that mitigations do not replace fixing the bug.</p>
+<p><b>Rubric.</b> Posture read correctly from headers (3). Before/after hardening shown (2). Canary abort demonstrated (2). Report honest that mitigations are layers, not fixes (3).</p>
+
+<h2 id="F11-10-summary">Summary</h2>
+<ul>
+<li>Hardening is defence in depth: each mitigation breaks one link of an exploit chain, turning many silent corruptions into clean crashes.</li>
+<li>Stack canary detects a return-address overwrite; NX/W^X blocks running injected code; ASLR (with PIE) hides needed addresses.</li>
+<li>SMEP and SMAP stop a kernel from executing or reading user memory; user pointers must still be validated (B12).</li>
+<li>A binary's posture — PIE, executable stack, RELRO — is readable straight from its ELF program headers.</li>
+<li>Mitigations are probabilistic and composable; they raise cost and detectability but do not remove the bug.</li>
+<li>Use them under, never instead of, the prevention of F11-08 and the finding of F11-09.</li>
+</ul>
+
+<h2 id="F11-10-sources">Sources</h2>
+<ol>
+<li id="F11-10-src-D1">GCC documentation, the stack-protector options (<code>-fstack-protector</code>, <code>-strong</code>, <code>-all</code>) and <code>__stack_chk_fail</code> (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-10-src-D2">Intel Corporation, "Intel 64 and IA-32 Architectures Software Developer's Manual", Vol. 3: paging (the XD/no-execute bit), and the SMEP (CR4.20) and SMAP (CR4.21) sections, plus <code>stac</code>/<code>clac</code> (tier 1; curriculum item 10). <i>Title only — not opened during this build; confirm bit numbers (dossier gate G1 open).</i></li>
+<li id="F11-10-src-D3">Linux kernel documentation on address-space layout randomisation and the <code>randomize_va_space</code> control (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-10-src-D4">"System V Application Binary Interface" (generic and AMD64 supplement): ELF types <code>ET_EXEC</code>/<code>ET_DYN</code>, <code>PT_GNU_STACK</code> and <code>PT_GNU_RELRO</code> program headers (tier 1; curriculum items 5–6). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-10-src-D5">Intel SDM Vol. 3 "Fast System Calls" and the SMAP section, with the curriculum B12 milestone (user-pointer validation, fault-tolerant copy) (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-10-src-R1">R1 — lab run, step <code>canary_on</code> (<code>canary_on.log</code>): <code>-fstack-protector-all</code>; the 40-byte input prints "stack smashing detected" and aborts (exit 134).</li>
+<li id="F11-10-src-R2">R2 — lab run, step <code>canary_off</code> (<code>canary_off.log</code>): <code>-fno-stack-protector</code>; the same input segfaults (exit 139).</li>
+<li id="F11-10-src-R3">R3 — lab run, step <code>nx</code> (<code>nx.log</code>): calling a data byte as a function faults (exit 139): NX enforced.</li>
+<li id="F11-10-src-R4">R4 — lab run, step <code>aslr</code> (<code>aslr.log</code>): three runs of the same PIE print differing stack, heap and code addresses.</li>
+<li id="F11-10-src-R5">R5 — lab run, step <code>checksec</code> (<code>checksec.log</code>): the lab's ELF reader and <code>readelf</code> 2.42 agree on PIE, executable stack and RELRO for a weak and a hardened binary.</li>
+</ol>
+
+<h2 id="F11-10-glossary">Glossary links</h2>
+<p><a href="#gl-stack-canary">Stack canary</a> · <a href="#gl-nx-w-x">NX / W^X</a> · <a href="#gl-aslr">ASLR</a> · <a href="#gl-pie">PIE</a> · <a href="#gl-smep">SMEP</a> · <a href="#gl-smap">SMAP</a></p>
+
+<h2 id="F11-10-next">Next chapter</h2>
+<p>Next: <a href="#F11-11">F11-11 Coding standards</a>. Previous: <a href="#F11-09">F11-09 Sanitizers and fuzzing</a>. Course: <a href="#SS302">SS302</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (B12) and <a href="../SYSTEMS_CURRICULUM.html#found">Foundations</a>.</p>
+
+<h2 id="F11-10-answers">Answers to Check yourself</h2>
+<ol>
+<li>Stack canary breaks the "overwrite return address" link (it detects the overwrite before <code>ret</code>). NX breaks the "jump to attacker code" link (it refuses to execute injected data). ASLR breaks the attacker's need to know the target address (it randomises bases).</li>
+<li>NX made injected code non-runnable, so attackers reused existing executable code fragments (gadgets) ending in <code>ret</code> — return-oriented programming. Control-flow integrity and hardware shadow stacks target that by constraining where returns and indirect calls may go.</li>
+<li>ASLR randomises load bases, but a non-PIE main program is <code>ET_EXEC</code> and must load at its fixed link address. Only a position-independent executable (<code>ET_DYN</code>) can be placed at a random base, so without PIE the program's own code stays at a known address.</li>
+<li>(c). (a) a canary detects a contiguous overwrite of the return address, not all overflows; (b) SMAP stops accidental access but user pointers still need validation; (d) ASLR changes only the base, not the code.</li>
+<li>SMAP faults on a supervisor-mode data access to a user page when RFLAGS.AC is clear. The kernel does a legitimate user copy by briefly setting AC with <code>stac</code> around a fault-tolerant copy routine and clearing it with <code>clac</code>.</li>
+<li>PIE is missing. Adding it costs recompiling with <code>-fPIE -pie</code> (a small code-size/indirection cost); it lets ASLR randomise the main program's base, so its code and data addresses are no longer fixed and known to an attacker.</li>
+<li>With <code>-fstack-protector-all</code>: the canary changes, the check fails, and the program aborts with "stack smashing detected" (exit 134). With <code>-fno-stack-protector</code>: no check, the corrupted return address is used and the program segfaults (exit 139). The logs confirm both.</li>
+</ol>
+<footer>Corrections log: <a href="../_qa/F11-10.qa.html#corrections">F11-10 QA record</a>.</footer>

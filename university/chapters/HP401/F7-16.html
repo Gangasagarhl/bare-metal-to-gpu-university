@@ -1,0 +1,302 @@
+<!--meta
+id: F7-16
+title: GEMM on AMD: tiling for LDS
+course: HP401
+level: L4
+prereqs: F7-15; HP302 (F7-10 registers and occupancy, F7-11 LDS and its banks, F7-13 reading AMD ISA); CU302 (F6-21 naive GEMM and arithmetic intensity, F6-22 shared-memory tiling, F6-23 register tiling); MA201
+time: 12–20 hours including the lab
+hardware: Lab steps 1–5: any Linux computer with g++ and hipcc (this build: no GPU). Steps 6–8: an AMD GPU listed in the ROCm compatibility matrix with ROCm and rocBLAS, or a cloud instance
+maps: Curriculum E6 on AMD (part of E9); Track E 13.2 topic 6 (tiling and GEMM); item 73 (rocBLAS as the reference)
+analogy: F7 — the great kitchen hall
+-->
+
+<h2 id="F7-16-hook">Story hook</h2>
+<p>The great kitchen hall has an order for a mountain of small pastries. Each pastry needs one ingredient from a long shelf of fillings and one from a long shelf of doughs, and every filling goes with every dough. The first night, every helper walks to the far pantry for each filling and each dough they use. The path is jammed and most helpers stand in the queue.</p>
+<p>The second night, Chidi's table works differently. The table fetches one short stretch of fillings and one short stretch of doughs and lays them on the table in the middle. Every helper at the table then makes many pastries from what is already in front of them, holding a few of the pastries they are building in their own hands. Only when the table's stretch is used up does the table fetch the next stretch, and everyone waits until the new ingredients are all laid out, and also until everyone has finished with the old ones, before anything on the table is replaced.</p>
+<p>That second "wait" is easy to forget, and forgetting it ruins pastries only sometimes. This chapter is about the table (the <b>LDS</b>), the stretches (<b>tiles</b>), the hands (<b>registers</b>) and both waits, for a matrix multiply on an AMD GPU.</p>
+
+<h2 id="F7-16-able">What you will be able to do</h2>
+<ul>
+<li><b>Write</b> an SGEMM kernel in HIP with LDS block tiling and register tiling that is correct for any M, N and K.</li>
+<li><b>Compute</b> for a tile shape its LDS bytes, global arithmetic intensity, LDS reads per FMA and accumulator registers, and check them against the compiler's metadata.</li>
+<li><b>Read</b> the AMD ISA of the inner loop: LDS read widths, packed FMAs, barriers, VGPR count and spills.</li>
+<li><b>Explain</b> why both barriers of the tile loop are needed, and diagnose a kernel that lost one.</li>
+<li><b>Run</b> the E6 step table on an AMD GPU against rocBLAS (lab steps 6–8).</li>
+</ul>
+
+<div class="co jargon" id="F7-16-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>GEMM</dt><dd><b>Simple words:</b> multiplying two matrices and adding the result into a third. <b>Analogy:</b> every filling goes with every dough. <b>Precise:</b> general matrix-matrix multiply, C ← α·A·B + β·C, with A of size M × K, B of size K × N and C of size M × N; SGEMM is the FP32 version. It performs 2·M·N·K floating-point operations. <sup class="src"><a href="#F7-16-src-D5">D5</a></sup> <sup class="src"><a href="#F7-16-src-D6">D6</a></sup></dd>
+<dt>LDS (Local Data Share)</dt><dd><b>Simple words:</b> AMD's fast memory that the threads of one workgroup share. <b>Analogy:</b> the table in the middle of the row group. <b>Precise:</b> on-chip, banked memory allocated per workgroup, declared in HIP with <code>__shared__</code>; the AMD name for what CUDA calls shared memory (<a href="#F7-11">F7-11</a>). Not the same as shared memory between processes. <sup class="src"><a href="#F7-16-src-D1">D1</a></sup> <sup class="src"><a href="#F7-16-src-D2">D2</a></sup></dd>
+<dt>Block tile (LDS tiling)</dt><dd><b>Simple words:</b> the part of A and B that one workgroup copies to LDS before using it many times. <b>Analogy:</b> the stretch of fillings and doughs laid on the table. <b>Precise:</b> a BM × BK slice of A and a BK × BN slice of B staged in LDS so that each element loaded from global memory serves BN (for A) or BM (for B) multiply-adds. <sup class="src"><a href="#F7-16-src-D5">D5</a></sup></dd>
+<dt>Register tiling (thread tile)</dt><dd><b>Simple words:</b> each thread computes a small block of outputs, not one. <b>Analogy:</b> each helper holds several pastries in their hands at once. <b>Precise:</b> each thread keeps a TM × TN block of C in registers and, per k step, reads TM values of A and TN values of B from LDS for TM·TN FMAs. <sup class="src"><a href="#F7-16-src-D5">D5</a></sup></dd>
+<dt>Arithmetic intensity</dt><dd><b>Simple words:</b> how much arithmetic you do per byte you fetch. <b>Analogy:</b> pastries made per trip to the pantry. <b>Precise:</b> floating-point operations divided by bytes moved between two levels of memory (here global memory to LDS); the quantity on the x-axis of the roofline model. <sup class="src"><a href="#F7-16-src-D7">D7</a></sup></dd>
+<dt>Write-after-read hazard (on a tile)</dt><dd><b>Simple words:</b> overwriting a value that someone has not finished reading. <b>Analogy:</b> clearing the table while a helper is still reaching for a filling. <b>Precise:</b> in a tiled loop, a thread storing the next tile into LDS before all threads have finished reading the current one; the barrier at the end of each iteration prevents it. <sup class="src"><a href="#F7-16-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F7-16-pictures">The idea in pictures</h2>
+<p>Figure 1 is the tiling diagram of guide 9.2 for this kernel: tiles of A and B move from global memory into LDS once per k-step of the tile loop, and each thread moves values from LDS into registers and multiplies them into its 4 × 4 block of C.</p>
+<figure id="F7-16-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 380" role="img" aria-labelledby="F7-16-f1t F7-16-f1d">
+<title id="F7-16-f1t">Figure 1: GEMM tiles moving from global memory to LDS to registers</title>
+<desc id="F7-16-f1d">On the left, matrix A in global memory, M rows by K columns, with a horizontal strip of 64 rows highlighted and, inside it, a 64 by 16 block marked as the current k-tile. At the top, matrix B, K rows by N columns, with a vertical strip of 64 columns and a 16 by 64 block marked. Arrows go from both blocks into the middle, labelled LDS: As 16 by 68 (A stored transposed with 4 floats of padding) and Bs 16 by 64, 8,448 bytes. From LDS, arrows go to a small box labelled one thread's registers: 4 values of A, 4 values of B, a 4 by 4 accumulator. On the right, matrix C with a 64 by 64 block tile owned by one workgroup of 256 threads and, inside it, a 4 by 4 thread tile. A note says the k loop repeats: load, barrier, compute 16 k steps, barrier.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="380"/>
+<text class="sv-tb" x="20" y="100">A (M × K), global</text>
+<rect class="sv-box" x="20" y="110" width="170" height="220"/>
+<rect class="sv-b1" x="20" y="170" width="170" height="60"/>
+<rect class="sv-b6" x="70" y="170" width="40" height="60"/><text class="sv-ts" x="24" y="250">64-row strip; k-tile 64 × 16</text>
+<text class="sv-tb" x="230" y="20">B (K × N), global</text>
+<rect class="sv-box" x="230" y="28" width="250" height="70"/>
+<rect class="sv-b1" x="330" y="28" width="60" height="70"/>
+<rect class="sv-b6" x="330" y="45" width="60" height="22"/><text class="sv-ts" x="400" y="60">k-tile 16 × 64</text>
+<rect class="sv-b2" x="230" y="160" width="190" height="80"/>
+<text class="sv-tb" x="240" y="182">LDS (per workgroup)</text>
+<text class="sv-tm" x="240" y="204">As[16][64+4] (A transposed)</text>
+<text class="sv-tm" x="240" y="222">Bs[16][64]   8,448 bytes</text>
+<line class="sv-line" x1="110" y1="200" x2="222" y2="200"/><polygon class="sv-head" points="230,200 221,195 221,205"/>
+<line class="sv-line" x1="360" y1="67" x2="340" y2="152"/><polygon class="sv-head" points="338,160 335,150 345,152"/>
+<text class="sv-ts" x="120" y="192">global → LDS</text>
+<rect class="sv-b5" x="245" y="280" width="180" height="70"/>
+<text class="sv-tb" x="255" y="300">one thread's registers</text>
+<text class="sv-ts" x="255" y="318">a[4], b[4] per k step</text>
+<text class="sv-ts" x="255" y="336">acc[4][4]: 16 FMAs per k</text>
+<line class="sv-line" x1="325" y1="240" x2="325" y2="272"/><polygon class="sv-head" points="325,280 320,271 330,271"/>
+<text class="sv-ts" x="332" y="262">LDS → registers</text>
+<text class="sv-tb" x="520" y="100">C (M × N)</text>
+<rect class="sv-box" x="520" y="110" width="220" height="220"/>
+<rect class="sv-b1" x="600" y="170" width="70" height="60"/>
+<rect class="sv-b7" x="610" y="178" width="14" height="12"/>
+<text class="sv-ts" x="530" y="250">64 × 64 block tile: 256 threads</text>
+<text class="sv-ts" x="530" y="266">one thread: a 4 × 4 thread tile</text>
+<line class="sv-line" x1="425" y1="315" x2="600" y2="200"/><polygon class="sv-head" points="606,196 600,204 596,197"/>
+<text class="sv-ts" x="440" y="300">results stay in registers until the end</text>
+<text class="sv-ts" x="20" y="364">For each k-tile: load to LDS → barrier → 16 k steps from LDS → barrier. Not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> Tiling of <code>sgemmLdsReg</code> (Listing 1): global memory → LDS → registers. Arrows show data flow. The LDS size, 8,448 bytes, is the compiler's <code>group_segment_fixed_size</code> for this kernel (R3). The method is the one PMPP teaches (D5); the AMD names follow the HIP documentation (D1). <sup class="src"><a href="#F7-16-src-D5">D5</a></sup> <sup class="src"><a href="#F7-16-src-R3">R3</a></sup></figcaption></figure>
+
+<h2 id="F7-16-layer1">Layer 1 — the kid explanation</h2>
+<p>In a matrix multiply, every number of A is used many times and every number of B is used many times. If each helper fetches every number from the far pantry each time, the pantry path is full and the helpers wait. So a group fetches a piece of A and a piece of B once, puts them on its table, and everyone uses them many times. Each helper also builds several results at once in their hands, so every number they pick up from the table is used more than once.</p>
+<p>Two waits keep it safe: nobody starts using the table before it is fully set, and nobody clears the table before everyone has finished with it.</p>
+
+<h2 id="F7-16-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F7-16-l2-naive">Why naive GEMM is starved</h3>
+<p>In <code>sgemmNaive</code> each thread computes one element of C. Every k step loads one float of A and one of B (8 bytes) for one FMA (2 FLOP): 0.25 FLOP per byte from global memory, as Listing 2 prints (R4). <sup class="src"><a href="#F7-16-src-R4">R4</a></sup> Caches catch some reuse, but the kernel's design does not guarantee any. GEMM itself does 2·M·N·K operations on M·K + K·N inputs, so its potential reuse grows with the matrix size; tiling is how a kernel collects it. <sup class="src"><a href="#F7-16-src-D5">D5</a></sup></p>
+
+<h3 id="F7-16-l2-lds">LDS tiling</h3>
+<p><code>sgemmLds</code> is <a href="#F6-22">F6-22</a>'s kernel in HIP: a 16 × 16 workgroup loads a 16 × 16 tile of A and of B into LDS, synchronises, does 16 multiply-adds per thread from LDS, synchronises, and moves on. Each element loaded from global memory now serves 16 FMAs: per k-tile the workgroup loads (16 + 16) × 16 floats and does 16 × 16 × 16 FMAs, which is 4 FLOP per byte (Listing 2). <sup class="src"><a href="#F7-16-src-R4">R4</a></sup> In HIP the declaration is the same <code>__shared__</code> as in CUDA; AMD's documents call the memory LDS. <sup class="src"><a href="#F7-16-src-D1">D1</a></sup></p>
+<p>The cost moved: each FMA now needs two LDS reads (2.000 in Listing 2's "LDS rd/FMA" column). LDS is fast but not free; the next step attacks that ratio.</p>
+
+<h3 id="F7-16-l2-reg">Register tiling</h3>
+<p><code>sgemmLdsReg</code> has a 64 × 64 block tile, BK = 16, 256 threads, and each thread owns a 4 × 4 block of C in registers. Per k step a thread reads 4 values of A and 4 of B from LDS and does 16 FMAs: 0.5 LDS reads per FMA. The global intensity rises to 16 FLOP per byte, because each loaded element serves 64 FMAs. <sup class="src"><a href="#F7-16-src-R4">R4</a></sup> The A tile is stored transposed (<code>As[k][m]</code>), so the four A values a thread needs for one k are contiguous, and padded by four floats per row. The compiler turned these reads into <code>ds_read_b128</code> and <code>ds_read_b96</code> (several floats per instruction), and the 256 FMAs per k-tile into 98 packed <code>v_pk_fma_f32</code> (two FMAs each) plus 60 <code>v_fmac_f32</code>: 98 × 2 + 60 = 256 (R5). <sup class="src"><a href="#F7-16-src-R5">R5</a></sup></p>
+
+<h3 id="F7-16-l2-edges">Edges</h3>
+<p>The E6 acceptance test includes "sizes not multiples of the tile". Listing 1 guards every load (out-of-range elements become 0 in LDS, which adds nothing) and every store, so one kernel serves all shapes. Listing 3 replays the register-tiled kernel on the CPU, thread by thread and phase by phase, for square, tall-skinny, short-wide and odd shapes, and finds 0 wrong elements for all of them (R6). <sup class="src"><a href="#F7-16-src-R6">R6</a></sup> This proves the index logic, not the GPU run, which is untested here.</p>
+
+<h3 id="F7-16-l2-barriers">Both barriers</h3>
+<p>Every iteration of the k loop has two barriers. The first (after the loads) makes the tile complete before anyone reads it. The second (after the compute) makes sure nobody overwrites the tile with the next one while another wave is still reading it: a write-after-read hazard. In HIP, <code>__syncthreads()</code> waits for all threads of the workgroup and makes their LDS writes visible to each other. <sup class="src"><a href="#F7-16-src-D1">D1</a></sup> In the ISA of <code>sgemmLdsReg</code> they are the two <code>s_barrier</code> (R5). The forensic lab is about the second one.</p>
+
+<h2 id="F7-16-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F7-16-l3-budget">The tile budget</h3>
+<p>A tile shape trades four resources against each other. Listing 2 computes them for four shapes (R4): LDS bytes per workgroup (limits how many workgroups can share a compute unit), global FLOP per byte (how far the kernel is from being memory-bound), LDS reads per FMA (pressure on LDS bandwidth) and accumulator registers per thread (VGPR pressure, hence occupancy). Bigger tiles raise both intensities but need more registers and give fewer workgroups: 4,096 workgroups for a 4096 × 4096 C with 64 × 64 tiles, 1,024 with 128 × 128. A GPU with many compute units needs enough workgroups to fill them; the compute-unit count of your GPU comes from <code>rocminfo</code> or <code>hipDeviceProp_t::multiProcessorCount</code>, not from this chapter. <sup class="src"><a href="#F7-16-src-H1">H1</a></sup></p>
+
+<h3 id="F7-16-l3-meta">What the compiler reports</h3>
+<p>Without a GPU you can still read each kernel's resource use from the code object metadata (the LLVM AMDGPU back end emits it; D3). <sup class="src"><a href="#F7-16-src-D3">D3</a></sup> For gfx90a the <code>resources</code> run shows: <code>sgemmNaive</code> 11 VGPRs and no LDS; <code>sgemmLds</code> 34 VGPRs and 2,048 bytes of LDS; <code>sgemmLdsReg</code> 76 VGPRs and 8,448 bytes, and no spills (R3). <sup class="src"><a href="#F7-16-src-R3">R3</a></sup> The LDS figures match Listing 2's formula exactly. The 16 accumulators are only part of the 76 VGPRs: the A and B values for one k step, addresses and loop state take the rest.</p>
+<p>How many waves can be resident per SIMD with 76 VGPRs, and how many workgroups per CU with 8,448 bytes of LDS, depends on the register file and LDS sizes of your GPU (<a href="#F7-10">F7-10</a>, <a href="#F7-11">F7-11</a>).</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>This build did not open any AMD document, so it gives no register-file size, LDS size per compute unit, LDS bank count or VGPR allocation granularity for any GPU. The only LDS number here is the compiler's own: clang 17 refused 65,540 bytes for one gfx90a workgroup with "local memory (65540) exceeds limit (65536)" (R7). Whether a gfx90a compute unit has exactly 65,536 bytes for all its resident workgroups together is a hardware fact to check in the AMD Instinct MI200 (CDNA2) ISA reference guide, LDS chapter. The "WGs/limit" column of Listing 2 is only that ratio.</p></div>
+
+<h3 id="F7-16-l3-next">Beyond this kernel</h3>
+<p>The E6 step table continues: vectorised global loads (four floats per thread per instruction), double buffering (two LDS buffers so the next tile loads while the current one is used, which also changes the barrier pattern), tuned tile sizes per GPU, and finally the matrix cores (<a href="#F7-17">F7-17</a>), where FP32 SGEMM can use FP32 matrix instructions on CDNA if the ISA guide lists them for your GPU. Each step is a measured row in your table against rocBLAS (<a href="#F7-19">F7-19</a>); a step that does not help on your GPU is recorded too. <sup class="src"><a href="#F7-16-src-C1">C1</a></sup></p>
+
+<h2 id="F7-16-hardware">How the hardware actually does it</h2>
+<p>The inner loop of <code>sgemmLdsReg</code> as compiled for gfx90a (R5) is almost pure LDS reads and FMAs: <code>ds_read_b128</code> brings four floats per lane from LDS into four VGPRs, and <code>v_pk_fma_f32</code> performs two FP32 FMAs on pairs of registers. <sup class="src"><a href="#F7-16-src-R5">R5</a></sup> <sup class="src"><a href="#F7-16-src-D2">D2</a></sup> The loads of the tiles from global memory appear as <code>global_load_dword</code> inside small loops (the compiler did not unroll the strided load loops), and stores to LDS as <code>ds_write_b32</code>. The barrier is <code>s_barrier</code>, preceded by <code>s_waitcnt</code> so that outstanding LDS operations are complete (<a href="#F7-13">F7-13</a>). In <code>sgemmLds</code> the compiler chose <code>v_pk_mul_f32</code> and separate <code>v_add_f32</code> rather than fused multiply-adds (visible if you rebuild with <code>-S</code>): the rounding differs slightly from an FMA, one more reason to test with a tolerance.</p>
+
+<h2 id="F7-16-worked">Worked example</h2>
+<p><b>Sizing the 64 × 64 × 16, 4 × 4 tile.</b></p>
+<div class="tw"><table>
+<thead><tr><th>Quantity</th><th>Computation</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>Threads</td><td>(64 / 4) × (64 / 4)</td><td>256 = 4 waves of 64 (8 of 32)</td></tr>
+<tr><td>LDS bytes</td><td>(16 × (64 + 4) + 16 × 64) × 4</td><td>8,448 (matches R3)</td></tr>
+<tr><td>Global loads per k-tile</td><td>(64 + 64) × 16 floats</td><td>2,048 floats = 8,192 bytes</td></tr>
+<tr><td>FMAs per k-tile</td><td>64 × 64 × 16</td><td>65,536 = 131,072 FLOP</td></tr>
+<tr><td>Global intensity</td><td>131,072 / 8,192</td><td>16 FLOP/byte (R4)</td></tr>
+<tr><td>Loads per thread per k-tile</td><td>2,048 / 256</td><td>8 (4 of A, 4 of B)</td></tr>
+<tr><td>LDS reads per FMA</td><td>(4 + 4) / 16</td><td>0.5</td></tr>
+<tr><td>Workgroups for M = N = 4096</td><td>64 × 64</td><td>4,096</td></tr>
+</tbody></table></div>
+<p><b>Edge example.</b> For M = 77 the second row of workgroups covers rows 64–127; rows 77–127 load 0 into LDS and store nothing. Thread 255 (tRow 15) owns rows 64 + 60 … 64 + 63 = 124–127, all outside: it computes zeros and writes nothing. Its participation in both barriers is still required.</p>
+
+<h2 id="F7-16-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>sgemm_lds.hip</code>: three SGEMM kernels and a test over the E6 shape list (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-16/sgemm_lds.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a sgemm_lds.hip -o sgemm_lds</code>, then <code>./sgemm_lds</code>.</p>
+<pre class="output" data-run="F7-16/sgemm_lds"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 1 was built for gfx90a and stopped at the first allocation (no AMD GPU in the build container). On a GPU it should print 0 elements outside tolerance for all 15 lines; that has not been verified. The CPU replay (Listing 3) checks the index logic of <code>sgemmLdsReg</code>, not the GPU. What would be needed: an AMD GPU in the ROCm compatibility matrix and a rerun with <code>--offload-arch</code> set to its gfx target.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>20–31</td><td><code>sgemmNaive</code></td><td>One thread per C element, all reads from global memory.</td><td>Step 1 of the E6 table; 0.25 FLOP/byte by design.</td></tr>
+<tr><td>33–55</td><td><code>sgemmLds</code></td><td>16 × 16 LDS tiles, guarded loads, two barriers.</td><td>Step 2: F6-22's kernel in HIP.</td></tr>
+<tr><td>46, 50</td><td><code>__syncthreads()</code></td><td>"Tile complete" and "everyone finished".</td><td>Remove the second and you get the forensic lab.</td></tr>
+<tr><td>57–62</td><td>tile constants</td><td>64 × 64 × 16 block tile, 4 × 4 thread tile, padding 4.</td><td>Listing 2 computes what these cost.</td></tr>
+<tr><td>63</td><td><code>__launch_bounds__(256)</code></td><td>Promises at most 256 threads per workgroup.</td><td>Lets the compiler budget registers for 256 threads.</td></tr>
+<tr><td>66–67</td><td><code>As[BK][BM + PAD]</code>, <code>Bs</code></td><td>A tile stored transposed and padded; B tile as is.</td><td>Contiguous reads per thread → wide LDS reads (R5).</td></tr>
+<tr><td>75–88</td><td>load loops</td><td>Each thread stores 4 elements of A and 4 of B, zero outside the matrix.</td><td>Edge handling for all shapes.</td></tr>
+<tr><td>89, 105</td><td>barriers</td><td>The two barriers of the tile loop.</td><td>Two <code>s_barrier</code> in R5.</td></tr>
+<tr><td>90–104</td><td>k loop</td><td>Reads 4 + 4 values, 16 FMAs per k.</td><td>98 <code>v_pk_fma_f32</code> + 60 <code>v_fmac_f32</code> per k-tile.</td></tr>
+<tr><td>107–116</td><td>store</td><td>Writes the 4 × 4 thread tile with bounds checks.</td><td>Threads past the edge write nothing.</td></tr>
+<tr><td>157–172</td><td>tolerance</td><td>2·K·2<sup>−24</sup>·Σ|a||b| per element against a double reference.</td><td>FP32 rounding bound; no golden numbers.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>tile_math.cpp</code>: what a tile shape costs and buys.</p>
+<pre class="listing" data-src="F7-16/tile_math.cpp"></pre>
+<pre class="output" data-run="F7-16/tile_math"></pre>
+<p>Lines 22–27 are the four formulas of the worked example; line 15 is the compiler's per-workgroup LDS limit from R7, labelled as such.</p>
+
+<p><b>Listing 3</b> — <code>tiled_replay.cpp</code>: a CPU replay of <code>sgemmLdsReg</code>, phase by phase (mode 2 belongs to the forensic lab).</p>
+<pre class="listing" data-src="F7-16/tiled_replay.cpp"></pre>
+<pre class="output" data-run="F7-16/tiled_replay"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–24</td><td><code>loadTile</code></td><td>The load loops of Listing 1 for one thread.</td><td>Same index arithmetic, same guards.</td></tr>
+<tr><td>26–36</td><td><code>compute</code></td><td>The k loop for one thread.</td><td>Same LDS indices.</td></tr>
+<tr><td>49–54</td><td>phase 1</td><td>All threads load (except wave 0 if it already did).</td><td>The first barrier is the end of this loop.</td></tr>
+<tr><td>56–68</td><td>phase 2</td><td>Wave 0 computes, then waves 1–3.</td><td>Mode 2 lets wave 0 start the next tile in between.</td></tr>
+</tbody></table></div>
+
+<p><b>Compiler evidence</b> without a GPU: resource metadata of the three kernels and instruction counts of the register-tiled kernel (gfx90a).</p>
+<pre class="output" data-run="F7-16/resources"></pre>
+<pre class="output" data-run="F7-16/inner_loop"></pre>
+<p>And the compiler's LDS limit, from a kernel that asks for 4 bytes too many (expected to fail):</p>
+<pre class="listing" data-src="F7-16/lds_limit.hip.inc"></pre>
+<pre class="output" data-run="F7-16/lds_limit"></pre>
+
+<h2 id="F7-16-breaks">Where the analogy breaks</h2>
+<ul>
+<li>The table suggests a passive surface. LDS is banked (<a href="#F7-11">F7-11</a>): lanes of one wave reaching into the same bank at different addresses are served one after another, so the layout on the "table" matters, which the story does not show.</li>
+<li>"Holding pastries in their hands" suggests a helper can hold as many as they like. Every accumulator is a VGPR; more registers per thread means fewer waves resident (<a href="#F7-10">F7-10</a>), and too many means spills to slow memory.</li>
+<li>In the story, a helper who finishes early simply waits. On a GPU, a wave that does not wait at the second barrier really does overwrite LDS that other waves are still reading; the result is not "a bit late" but wrong.</li>
+<li>The pantry trip in the story has a fixed cost. Real global loads pass through caches and are combined per wave (coalescing), so the "one trip per element" picture of the naive kernel overstates its traffic; that is why intensity here is defined by the kernel's design, not by measured traffic.</li>
+</ul>
+
+<h2 id="F7-16-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> correct for 512 × 512 × 512, wrong for 1000. <b>Cause:</b> loads or stores not guarded. <b>How to find it:</b> run the E6 shape list; print wrong indices modulo the tile size. <b>Fix:</b> zero-fill out-of-range loads, guard stores.</li>
+<li><b>Symptom:</b> wrong only sometimes, at "random" places; correct when K ≤ BK. <b>Cause:</b> the second barrier is missing. <b>How to find it:</b> count <code>s_barrier</code> in the ISA (the forensic lab). <b>Fix:</b> restore it, or double-buffer.</li>
+<li><b>Symptom:</b> a compile error "local memory (…) exceeds limit (65536)". <b>Cause:</b> tile too large for one workgroup on this target (R7). <b>Fix:</b> smaller BK or BM/BN, or less padding.</li>
+<li><b>Symptom:</b> a bigger thread tile makes the kernel slower. <b>Cause:</b> VGPR use rose (check <code>vgpr_count</code>, <code>vgpr_spill_count</code>), occupancy fell or registers spilled. <b>Fix:</b> read the metadata after every change; record it in the E6 table.</li>
+<li><b>Symptom:</b> results differ from the CPU in the last bits. <b>Cause:</b> different rounding (FMA versus multiply then add) and order. <b>Fix:</b> a tolerance from the K·u·Σ|a||b| bound, as Listing 1 uses.</li>
+</ul>
+
+<div class="co transition" id="F7-16-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-22">F6-22</a> and <a href="#F6-23">F6-23</a> tiled GEMM for CUDA shared memory and registers; <a href="#F7-11">F7-11</a> introduced LDS. <b>What carries over:</b> the tiling method, both barriers, edge guards, the step-table discipline of E6. <sup class="src"><a href="#F7-16-src-D5">D5</a></sup> <b>What changes:</b> a workgroup of 256 threads is 4 waves on CDNA, not 8 warps, so per-wave work and LDS access patterns differ; resource numbers come from AMD code-object metadata instead of the ptxas report (R3); tuning parameters copied from NVIDIA are starting points only. <sup class="src"><a href="#F7-16-src-R3">R3</a></sup> <b>What comes next:</b> <a href="#F7-17">F7-17</a> replaces the inner FMAs with matrix-core instructions.</p></div>
+
+<h2 id="F7-16-check">Check yourself</h2>
+<ol>
+<li>What is the global arithmetic intensity of the 128 × 128 × 8 tile, and why does it not depend on BK?</li>
+<li>Why is the A tile stored transposed in <code>sgemmLdsReg</code>?</li>
+<li>Which statement is true? (a) The first barrier alone is enough if K is large. (b) Without the second barrier, results can be wrong only when there are at least two k-tiles. (c) The compiler inserts the second barrier automatically. (d) Removing barriers is safe when the workgroup is one wave.</li>
+<li>Explain in your own words what limits how large a thread tile should be.</li>
+<li>Apply: BM = 128, BN = 64, BK = 16, TM = 8, TN = 4, padding 4. Compute threads, LDS bytes, global FLOP per byte and LDS reads per FMA, then compare with Listing 2.</li>
+<li>Predict, then run: change <code>PAD</code> to 0 in Listing 1 and rerun the <code>resources</code> step. What LDS size do you expect, and do the <code>ds_read</code> widths in <code>inner_loop</code> change?</li>
+<li>In the <code>inner_loop</code> output, show that the FMA instructions perform exactly 256 FMAs per k-tile.</li>
+<li>Why is a test with K = 16 useless for catching a missing second barrier?</li>
+</ol>
+
+<h2 id="F7-16-lab">Lab</h2>
+<p><b>Goal.</b> Build the three kernels, read their resource use and inner loop, prove the edge logic on the CPU, and (on an AMD GPU) produce the first rows of the E6 step table against rocBLAS.</p>
+<p><b>Hardware and software needed.</b> Steps 1–5: no GPU; g++ 13.3 and hipcc (HIP 5.7, clang 17) as in the logs. Steps 6–8: an AMD GPU in the ROCm compatibility matrix, ROCm and rocBLAS (record their version lines), or a cloud instance. Folder <code>university/labs/F7-16</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F7-16</code> from the repository root; read <code>resources.out</code>, <code>inner_loop.out</code>, <code>tile_math.out</code>, <code>tiled_replay.out</code>.</li>
+<li>Rebuild Listing 1 with <code>--cuda-device-only -S</code> and find the k loop of <code>sgemmLdsReg</code>: mark the LDS reads, the FMAs and both barriers.</li>
+<li>Add the 128 × 64 × 16, 8 × 4 tile as a fourth kernel; predict its LDS bytes and check them in the metadata; record its VGPR count.</li>
+<li>Add M = 1, N = 1, K = 1 and M = 65, N = 63, K = 17 to Listing 3's shape list; all must pass.</li>
+<li>Compare <code>gfx90a</code> and <code>gfx1100</code> builds of <code>sgemmLdsReg</code>: VGPR count and LDS read instructions.</li>
+<li>On an AMD GPU: run Listing 1 (0 outside tolerance everywhere).</li>
+<li>On an AMD GPU: time each kernel at M = N = K = 4096 and two other sizes with the harness of <a href="#F7-19">F7-19</a>, and rocBLAS SGEMM with the same harness.</li>
+<li>On an AMD GPU: profile <code>sgemmLdsReg</code> with the ROCm Compute Profiler or rocprofv3 (<a href="#F7-14">F7-14</a>) and write one paragraph on the remaining gap.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: the outputs above. On a GPU: your own numbers; none are given because none were measured (AH-23).</p>
+<p><b>Verification</b> (E6 acceptance tests, verbatim, run on AMD): "Correct for all shapes in a test matrix (square, tall-skinny, short-wide, sizes not multiples of the tile) against the library result within tolerance." "At M=N=K=4096 (and two other sizes you choose), your kernel reaches X % of cuBLAS/rocBLAS SGEMM on your GPU." "Profiler report explains the remaining gap; register usage and occupancy are recorded per step." <sup class="src"><a href="#F7-16-src-C1">C1</a></sup></p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>No <code>.vgpr_count</code> lines → you compiled without <code>--cuda-device-only -S</code>, or for the host only.</li>
+<li>The awk range in <code>inner_loop</code> prints nothing → the kernel's mangled name changed; list with <code>grep -E '^_Z' .tmp.s</code>.</li>
+<li>On a GPU, the 1000 × 1000 test takes long → the CPU reference in double is O(MNK); keep it, it is the check.</li>
+</ul>
+<p><b>Extension.</b> Double buffering: two LDS tiles, load tile k+1 while computing tile k; count the barriers you need and justify each.</p>
+
+<h2 id="F7-16-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Kai "cleaned up" the register-tiled kernel before a demo. His unit test (100 × 100 × 16) still passes. In the full test suite on the lab's AMD GPU, most large shapes fail, but not on every run, and adding a <code>printf</code> inside the kernel made one failure disappear.</p>
+<p><b>Evidence pack.</b> (1) Kai's kernel as committed:</p>
+<pre class="listing" data-src="F7-16/kai_kernel.inc"></pre>
+<p>(2) Barrier counts and metadata from the compiler (gfx90a):</p>
+<pre class="output" data-run="F7-16/kai_isa"></pre>
+<p>(3) A deterministic replay of Kai's kernel on the CPU with one schedule the hardware may legally choose, in which wave 0 runs one phase ahead of waves 1–3: the second half of the <code>tiled_replay</code> output above (R6). On the GPU the schedule changes from run to run.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which rows of each 64-row block tile are wrong in the replay, and which shape passes?</li>
+<li>Hypotheses: list at least two causes (missing edge guard; missing barrier; wrong LDS size). Which evidence rules each in or out?</li>
+<li>Root cause: which line is missing, and exactly which LDS values does wave 0 overwrite too early?</li>
+<li>Why did the 100 × 100 × 16 test pass, and why did a <code>printf</code> change the behaviour?</li>
+<li>Fix and prevention.</li>
+</ol>
+<p><b>Method hints.</b> Diff Kai's kernel against Listing 1 line by line. For the replay: wave 0 is threads 0–63; work out which <code>As</code> and <code>Bs</code> cells those threads store in the load loops, and who reads them.</p>
+
+<h2 id="F7-16-project">Mini-project</h2>
+<p><b>The AMD SGEMM step table (MP4 preparation).</b> Turn Listing 1 into a small benchmark program that runs every kernel version over the E6 shape list, checks it within tolerance against a reference, and prints a table with columns: step, VGPRs, LDS bytes, spills (from the metadata) and, on a GPU, median time, TFLOP/s and % of rocBLAS. Without a GPU, the timing columns say "not measured".</p>
+<p><b>Rubric.</b> Correctness on all shapes for every step (4). Metadata columns filled automatically from the build (2). Clear "not measured" marking where no GPU was used (2). One sentence per step explaining what changed and why (2).</p>
+
+<h2 id="F7-16-summary">Summary</h2>
+<ul>
+<li>Naive GEMM does 0.25 FLOP per byte from global memory; LDS tiling raises it to BM·BN/(2(BM+BN)) FLOP per byte.</li>
+<li>Register tiling cuts LDS reads per FMA to (TM+TN)/(TM·TN) and turns into wide <code>ds_read</code> and packed FMAs on gfx90a.</li>
+<li>The code-object metadata gives LDS bytes, VGPRs and spills without a GPU; check every change against it.</li>
+<li>clang 17 limited one gfx90a workgroup to 65,536 bytes of LDS; hardware sizes come from the ISA guide (unverified here).</li>
+<li>Guard loads and stores for any M, N, K; test the E6 shape list.</li>
+<li>Both barriers of the tile loop are needed; a missing second one corrupts results only for K &gt; BK and only on some schedules.</li>
+</ul>
+
+<h2 id="F7-16-sources">Sources</h2>
+<ol>
+<li id="F7-16-src-D1">D1 — AMD, HIP documentation (HIP Programming Guide: memory model, <code>__shared__</code>/LDS, <code>__syncthreads</code>) (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F7-16-src-D2">D2 — AMD, "AMD Instinct MI200 (CDNA2) Instruction Set Architecture" reference guide (tier 1): LDS, data share instructions, packed FP32 instructions. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-16-src-D3">D3 — LLVM project, "User Guide for AMDGPU Backend" (tier 2): code object metadata (<code>.vgpr_count</code>, <code>.group_segment_fixed_size</code>). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-16-src-D5">D5 — Hwu, Kirk, El Hajj, "Programming Massively Parallel Processors" (tier 3): tiled matrix multiplication. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-16-src-D6">D6 — AMD, rocBLAS documentation (tier 2): GEMM definition and conventions. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-16-src-D7">D7 — Williams, Waterman, Patterson, "Roofline: An Insightful Visual Performance Model for Multicore Architectures" (tier 5). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-16-src-H1">H1 — HIP 5.7 header <code>hip/hip_runtime_api.h</code> as installed (libamdhip64-dev 5.7.1-3), read in this build: <code>hipDeviceProp_t</code> fields <code>multiProcessorCount</code> ("Number of multi-processors (compute units)") and <code>warpSize</code>. Tier 1.</li>
+<li id="F7-16-src-C1">C1 — Systems Curriculum, milestone E6 and section 13.4 (map only, AH-4): acceptance tests quoted verbatim.</li>
+<li id="F7-16-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F7-16/sgemm_lds.log</code>), HIP 5.7, gfx90a; untested on hardware, exit code 1.</li>
+<li id="F7-16-src-R3">R3 — code-object metadata of Listing 1 for gfx90a (<code>resources.log</code>), clang 17 via hipcc, compiled only.</li>
+<li id="F7-16-src-R4">R4 — run of Listing 2 (<code>tile_math.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F7-16-src-R5">R5 — instruction counts of <code>sgemmLdsReg</code> for gfx90a (<code>inner_loop.log</code>), compiled only.</li>
+<li id="F7-16-src-R6">R6 — run of Listing 3 (<code>tiled_replay.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F7-16-src-R7">R7 — compile of <code>lds_limit.hip.inc</code> for gfx90a (<code>lds_limit.log</code>), failed as expected.</li>
+<li id="F7-16-src-R8">R8 — barrier counts and metadata of Kai's kernel (<code>kai_isa.log</code>), compiled only.</li>
+</ol>
+
+<h2 id="F7-16-glossary">Glossary links</h2>
+<p><a href="#gl-gemm">GEMM</a> · <a href="#gl-lds-local-data-share">LDS (Local Data Share)</a> · <a href="#gl-block-tile-lds-tiling">Block tile (LDS tiling)</a> · <a href="#gl-register-tiling-thread-tile">Register tiling (thread tile)</a> · <a href="#gl-arithmetic-intensity">Arithmetic intensity</a> · <a href="#gl-write-after-read-hazard-on-a-tile">Write-after-read hazard (on a tile)</a></p>
+
+<h2 id="F7-16-next">Next chapter</h2>
+<p>Next: <a href="#F7-17">F7-17 Matrix cores: MFMA and rocWMMA</a>. Previous: <a href="#F7-15">F7-15</a>. Back to the course: <a href="#HP401">HP401</a>.</p>
+
+<h2 id="F7-16-answers">Answers to Check yourself</h2>
+<ol>
+<li>BM·BN/(2(BM+BN)) = 128·128/(2·256) = 32 FLOP/byte (Listing 2). Per k-tile, both the FLOPs (2·BM·BN·BK) and the loaded bytes (4·(BM+BN)·BK) are proportional to BK, so it cancels.</li>
+<li>So that the four A values one thread needs for one k (rows tRow·4 … tRow·4+3) are contiguous in LDS and can be read with one wide instruction (<code>ds_read_b128</code> in R5).</li>
+<li>(b). (a) is wrong: without the second barrier a fast wave can overwrite the tile others still read, however large K is. (c) is wrong: the compiler keeps exactly the barriers you write (one in Kai's kernel, R8). (d) is risky reasoning for this kernel, which has four waves; even for one wave the HIP documentation, not intuition, decides what is guaranteed.</li>
+<li>Each accumulator is a VGPR, plus the A and B values per k; more VGPRs per thread mean fewer resident waves and, past a point, spills. Bigger thread tiles also mean fewer threads per block tile, so fewer waves to hide latency, and coarser edge waste.</li>
+<li>Threads (128/8)·(64/4) = 256; LDS (16·(128+4) + 16·64)·4 = 12,544 bytes; global 128·64/(2·192) = 21.33 FLOP/byte; LDS reads (8+4)/32 = 0.375 per FMA. All match the third row of Listing 2.</li>
+<li>(16·64 + 16·64)·4 = 8,192 bytes. Whether the read widths change is what the run tells you: rows of <code>As</code> remain 16-byte aligned (64 floats), so wide reads stay possible; record what you see.</li>
+<li>98 <code>v_pk_fma_f32</code> × 2 + 60 <code>v_fmac_f32_e32</code> × 1 = 256 = 16 (k) × 16 (4 × 4).</li>
+<li>With K = 16 there is only one k-tile, so no next tile is ever loaded and nothing can be overwritten too early (the replay's last row).</li>
+</ol>
+<h3 id="F7-16-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> In the replay of Kai's kernel, every failing shape is wrong exactly in rows 16–63 of each 64-row block tile; rows 0–15 are correct; the shape with K = 16 passes. The compiler shows one <code>s_barrier</code> in <code>kaiGemm</code> against two in <code>sgemmLdsReg</code>; registers and LDS size are otherwise identical (R8).</p>
+<p><b>Root cause.</b> The second <code>__syncthreads()</code> at the end of the k loop is missing. Wave 0 (threads 0–63, tRow 0–3, which own rows 0–15) finishes its compute and starts loading the next k-tile while waves 1–3 still read the current one. In the load loops, threads 0–63 store <code>As</code> for m = 0–3, 16–19, 32–35, 48–51 and <code>Bs</code> rows k = 0, 4, 8, 12 (all 64 columns). Waves 1–3 read all <code>Bs</code> rows, so all their outputs (rows 16–63) are corrupted; wave 0 itself read the tile before overwriting it.</p>
+<p><b>Why the tests misled.</b> K = 16 has one k-tile, so there is no next tile. On a GPU the schedule varies; a <code>printf</code> changes timing and can hide the race. That is exactly why the replay chooses one legal schedule deliberately.</p>
+<p><b>Wrong answers and why.</b> "Missing edge guard": edge bugs depend on M and N, not on K, and would hit the last block tiles, not rows 16–63 of every tile. "LDS too small": the metadata shows the same 8,448 bytes as Listing 1.</p>
+<p><b>Fix.</b> Restore the barrier after the compute loop. <b>Prevention:</b> test shapes with several k-tiles; count barriers in the ISA in code review; for races, consider a race checker where the ROCm tools offer one, and a CPU replay with adversarial schedules like Listing 3. <b>How the evidence was produced:</b> <code>kai_kernel.inc</code> is Listing 1's kernel minus that line; the replay is <code>tiled_replay.cpp</code> mode 2.</p>

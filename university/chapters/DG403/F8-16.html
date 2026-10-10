@@ -1,0 +1,305 @@
+<!--meta
+id: F8-16
+title: Fault tolerance: detect, abort, restart
+course: DG403
+level: L4
+prereqs: F8-12 Data parallelism; F8-07 MPI basics; F8-15 Sharded optimizer states (checkpoint consequences); OS-level chapters on processes and signals and on files and fsync (DS-track or OS-track equivalents)
+time: 10–14 hours including the lab and the course project
+hardware: none for the listings: MPI processes on one Linux computer stand in for GPUs (this build: g++ 13.3.0, Open MPI 4.1.6, no GPU). The real-hardware extension needs two or more GPUs with NCCL or RCCL
+maps: Curriculum milestone F8 "Fault tolerance basics" (goal, build and acceptance test quoted verbatim in the Lab); Track F 14.1; course card DG403 (guide 5.13): forensic "The hung job", course project "a fault-tolerant training run that resumes from checkpoint"
+analogy: F8 — the great kitchen hall (registered: a chain of kitchen halls with a delivery service; ring all-reduce = passing bowls around a round table). Proposed in NOTES.md: "a hung rank = a cook at the round table who stopped passing bowls without saying anything"; "watchdog = the steward's kitchen timer"; "checkpoint = the evening's recipe card written in ink and filed in the safe"
+-->
+
+<h2 id="F8-16-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>Eight cooks sit around the round table, passing bowls to their right. On every turn, each cook must receive a bowl before passing one on. One evening, the cook in seat 3 stops. Not falls over, not walks out: stops, hands on the table, eyes open, saying nothing. Seat 4 waits for a bowl that never comes; seat 5 waits for seat 4; soon the whole table is waiting, each cook patiently holding out a hand. Nobody shouts. The kitchen is silent until morning, when the hall manager finds the dinner never served and the night's work lost.</p>
+<p>Ingrid, the steward, introduces three rules. First, every cook keeps a kitchen timer: anyone who waits more than two minutes for a bowl rings the alarm, and the whole table stops. Second, every ten turns, the head cook writes the state of the dinner on a card in ink and files it in the safe. Third, when the alarm rings, the hall manager calls a fresh table, and it starts from the last card in the safe.</p>
+</div>
+
+<h2 id="F8-16-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> why one failed rank stops the whole job in synchronous training, and why a frozen rank is worse than a dead one.</li>
+<li><b>Build</b> a watchdog that turns a silent hang into an abort within a set timeout.</li>
+<li><b>Write</b> checkpoints that survive a crash during writing (temporary file, flush to disk, atomic rename, checksum, an older fallback).</li>
+<li><b>Restart</b> a job automatically and show that the result equals an uninterrupted run (milestone F8).</li>
+<li><b>Reconstruct</b> a hung job from per-rank logs and traces: which rank stopped, where, and when.</li>
+</ul>
+
+<div class="co jargon" id="F8-16-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Hung job</dt><dd><b>Simple words:</b> a job that is still running but no longer makes progress, often without any error message. <b>Analogy:</b> the round table waiting for a bowl that never comes. <b>Precise:</b> a distributed job in which some processes block indefinitely, most often in a collective or receive whose matching operation on another rank will never be posted, because that rank is stopped, slow, deadlocked or on a different code path; no process exits, so exit-based failure detection does not trigger. <sup class="src"><a href="#F8-16-src-R4">R4</a></sup></dd>
+<dt>Watchdog (collective timeout)</dt><dd><b>Simple words:</b> a timer that stops the job when an operation takes much longer than it should. <b>Analogy:</b> each cook's kitchen timer. <b>Precise:</b> a mechanism that bounds how long a rank waits for a communication operation; after the timeout it reports the stuck operation and aborts the job (or the communicator), turning a hang into a failure that a restart mechanism can handle. In Listing 1, the gradient all-reduce is started with <code>MPI_Iallreduce</code> and polled with <code>MPI_Test</code>; after <code>watchdog</code> seconds the rank calls <code>MPI_Abort</code>. <sup class="src"><a href="#F8-16-src-L1">L1</a></sup> <sup class="src"><a href="#F8-16-src-R2">R2</a></sup></dd>
+<dt>Abort</dt><dd><b>Simple words:</b> stopping every process of the job at once, on purpose. <b>Analogy:</b> the alarm that stops the whole table. <b>Precise:</b> in MPI, <code>MPI_Abort(comm, errorcode)</code> makes a best attempt to terminate all tasks in the group of <code>comm</code>; Open MPI terminates all processes of the job and <code>mpirun</code> returns the error code. In NCCL, a communicator can be aborted so that pending operations stop and resources are released (unverified box). <sup class="src"><a href="#F8-16-src-D2">D2</a></sup> <sup class="src"><a href="#F8-16-src-R2">R2</a></sup></dd>
+<dt>Atomic checkpoint</dt><dd><b>Simple words:</b> a saved state that is either completely old or completely new, never half-written. <b>Analogy:</b> the card written in ink and only then put in the safe. <b>Precise:</b> a checkpoint written to a temporary file, flushed to stable storage (<code>fsync</code>), and moved into place with <code>rename</code>, which POSIX specifies to replace the target atomically; readers verify size, a magic number and a checksum, and fall back to the previous checkpoint if the newest fails. <sup class="src"><a href="#F8-16-src-D3">D3</a></sup> <sup class="src"><a href="#F8-16-src-R3">R3</a></sup></dd>
+<dt>Restart from checkpoint</dt><dd><b>Simple words:</b> starting the job again from the last saved state instead of the beginning. <b>Analogy:</b> a fresh table starting from the card in the safe. <b>Precise:</b> a new instance of the job (often on new processes or new machines) that loads the newest valid checkpoint and continues from its recorded step; with deterministic data order and computation, the result equals that of an uninterrupted run. <sup class="src"><a href="#F8-16-src-R2">R2</a></sup></dd>
+</dl></div>
+
+<h2 id="F8-16-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the three phases on four ranks, drawn from the run in R2 where rank 2 froze at step 37.</p>
+<figure id="F8-16-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 290" role="img" aria-labelledby="F8-16-f1t F8-16-f1d">
+<title id="F8-16-f1t">Figure 1: detect, abort, restart on four ranks</title>
+<desc id="F8-16-f1d">Four horizontal lanes, ranks 0 to 3. All ranks train steps 0 to 36, with checkpoint marks after steps 9, 19 and 29. At step 37, rank 2 freezes: its lane becomes a dashed empty box labelled frozen. Ranks 0, 1 and 3 enter the step 37 all-reduce and wait; a mark at 1 second says warning, a mark at 2 seconds says watchdog: MPI_Abort. A fifth lane below, attempt 2 started by restart.sh, loads the checkpoint of step 30 and runs steps 30 to 59. An arrow goes from the step-30 checkpoint mark to the start of attempt 2.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="290"/>
+<text class="sv-tb" x="20" y="24">attempt 1</text>
+<text class="sv-ts" x="20" y="57">rank 0</text><rect class="sv-b3" x="90" y="42" width="240" height="24"/><rect class="sv-b5" x="330" y="42" width="200" height="24"/>
+<text class="sv-ts" x="20" y="91">rank 1</text><rect class="sv-b3" x="90" y="76" width="240" height="24"/><rect class="sv-b5" x="330" y="76" width="200" height="24"/>
+<text class="sv-ts" x="20" y="125">rank 2</text><rect class="sv-b3" x="90" y="110" width="240" height="24"/><rect class="sv-dash" x="330" y="110" width="200" height="24"/>
+<text class="sv-ts" x="20" y="159">rank 3</text><rect class="sv-b3" x="90" y="144" width="240" height="24"/><rect class="sv-b5" x="330" y="144" width="200" height="24"/>
+<text class="sv-ts" x="160" y="58">steps 0–36</text>
+<text class="sv-ts" x="345" y="58">waiting in all-reduce</text>
+<text class="sv-ts" x="345" y="126">frozen at step 37</text>
+<line class="sv-dash" x1="150" y1="36" x2="150" y2="174"/><line class="sv-dash" x1="210" y1="36" x2="210" y2="174"/><line class="sv-dash" x1="270" y1="36" x2="270" y2="174"/>
+<text class="sv-ts" x="128" y="188">ckpt 10</text><text class="sv-ts" x="188" y="188">ckpt 20</text><text class="sv-ts" x="248" y="188">ckpt 30</text>
+<line class="sv-line2" x1="430" y1="36" x2="430" y2="174"/><text class="sv-ts" x="402" y="30">warn 1 s</text>
+<line class="sv-line2" x1="530" y1="36" x2="530" y2="174"/><text class="sv-tb" x="540" y="57">watchdog 2 s</text><text class="sv-ts" x="540" y="75">MPI_Abort(…, 42)</text><text class="sv-ts" x="540" y="93">all processes end;</text><text class="sv-ts" x="540" y="111">mpirun exits with 42</text>
+<text class="sv-tb" x="20" y="226">attempt 2</text>
+<rect class="sv-b3" x="560" y="210" width="180" height="24"/><text class="sv-ts" x="572" y="226">steps 30–59, all ranks</text>
+<line class="sv-line" x1="270" y1="196" x2="552" y2="220"/><polygon class="sv-head" points="560,222 549,215 548,226"/>
+<text class="sv-ts" x="300" y="246">restart.sh starts a new job; every rank loads ckpt.bin (next step 30)</text>
+<text class="sv-ts" x="20" y="276">final parameter checksum equals the uninterrupted run's (R2); steps 30–36 are computed twice</text>
+</svg>
+</div><figcaption><b>Figure 1.</b> A hang becomes an abort (watchdog), and an abort becomes a restart (restart script plus checkpoint). Schematic timeline of the run <code>ft_hang</code> (R2); widths are not to scale. <sup class="src"><a href="#F8-16-src-R2">R2</a></sup></figcaption></figure>
+<p>Figure 2 shows how Listing 1 writes a checkpoint so that a crash at any moment leaves a complete one on disk.</p>
+<figure id="F8-16-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 220" role="img" aria-labelledby="F8-16-f2t F8-16-f2d">
+<title id="F8-16-f2t">Figure 2: writing and reading a checkpoint safely</title>
+<desc id="F8-16-f2d">Writer, four boxes left to right: 1 write ckpt.tmp, 2 fflush and fsync, 3 rename ckpt.bin to ckpt.prev, 4 rename ckpt.tmp to ckpt.bin. Under each box, what survives a crash at that point: before 3, the old ckpt.bin; between 3 and 4, ckpt.prev only; after 4, the new ckpt.bin and the old ckpt.prev. Reader, below: open ckpt.bin, check size, magic number and checksum; if any check fails, try ckpt.prev; if that fails too, start at step 0.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="220"/>
+<text class="sv-tb" x="20" y="24">writer (rank 0, every 10 steps)</text>
+<rect class="sv-b1" x="20" y="36" width="160" height="40" rx="6"/><text class="sv-ts" x="32" y="60">1 write ckpt.tmp</text>
+<rect class="sv-b2" x="205" y="36" width="160" height="40" rx="6"/><text class="sv-ts" x="217" y="60">2 fflush + fsync</text>
+<rect class="sv-b4" x="390" y="36" width="160" height="40" rx="6"/><text class="sv-ts" x="400" y="60">3 bin → prev</text>
+<rect class="sv-b3" x="575" y="36" width="165" height="40" rx="6"/><text class="sv-ts" x="585" y="60">4 tmp → bin (atomic)</text>
+<line class="sv-line" x1="180" y1="56" x2="197" y2="56"/><polygon class="sv-head" points="205,56 196,51 196,61"/>
+<line class="sv-line" x1="365" y1="56" x2="382" y2="56"/><polygon class="sv-head" points="390,56 381,51 381,61"/>
+<line class="sv-line" x1="550" y1="56" x2="567" y2="56"/><polygon class="sv-head" points="575,56 566,51 566,61"/>
+<text class="sv-ts" x="20" y="98">crash before 3: old ckpt.bin intact</text>
+<text class="sv-ts" x="390" y="98">crash between 3 and 4: ckpt.prev</text>
+<text class="sv-ts" x="575" y="98">after 4: new bin, old prev</text>
+<text class="sv-tb" x="20" y="140">reader (every rank, at start)</text>
+<rect class="sv-box" x="20" y="152" width="230" height="40" rx="6"/><text class="sv-ts" x="32" y="176">ckpt.bin: size, magic, checksum</text>
+<rect class="sv-box" x="285" y="152" width="200" height="40" rx="6"/><text class="sv-ts" x="297" y="176">else ckpt.prev: same checks</text>
+<rect class="sv-box" x="520" y="152" width="220" height="40" rx="6"/><text class="sv-ts" x="532" y="176">else start at step 0 (and say so)</text>
+<line class="sv-line" x1="250" y1="172" x2="277" y2="172"/><polygon class="sv-head" points="285,172 276,167 276,177"/>
+<line class="sv-line" x1="485" y1="172" x2="512" y2="172"/><polygon class="sv-head" points="520,172 511,167 511,177"/>
+<text class="sv-ts" x="20" y="212">R3: a ckpt.bin cut to 100 of 272 bytes is rejected and the run resumes from ckpt.prev</text>
+</svg>
+</div><figcaption><b>Figure 2.</b> At every moment, at least one complete, checked checkpoint exists. Listing 1, lines 56–78; behaviour shown in R3. <sup class="src"><a href="#F8-16-src-R3">R3</a></sup> <sup class="src"><a href="#F8-16-src-D3">D3</a></sup></figcaption></figure>
+
+<h2 id="F8-16-layer1">Layer 1 — the kid explanation</h2>
+<p>When many computers train one model together, they wait for each other at every step to add up their results. If one computer breaks loudly, the others are told and everything stops. If one computer freezes instead, the others wait forever, politely, and nothing tells you. So you add three things. A timer: if waiting takes far too long, stop everything. A save point: every few steps, write down where you are, carefully, so a crash cannot leave a half-written page. And a restart: when the job stops, start it again from the last save point. Done well, the final model is exactly the same as if nothing had gone wrong.</p>
+
+<h2 id="F8-16-layer2">Layer 2 — the student explanation</h2>
+<h3>Why one rank stops everyone</h3>
+<p>The round table cannot pass bowls past an empty seat. In synchronous data parallelism (F8-12), every step ends with an all-reduce over all ranks; a collective completes only when every rank in the communicator has taken part. One missing rank therefore blocks every other rank in the same collective, and they cannot tell, from inside the call, whether the missing rank is slow, frozen, dead or doing something else. <sup class="src"><a href="#F8-16-src-D2">D2</a></sup></p>
+<h3>Dead and frozen are different failures</h3>
+<p>Listing 1 can inject two kinds of failure into one rank, both silent:</p>
+<ul>
+<li><b>Killed</b> (<code>SIGKILL</code>): the process is gone. The launcher, <code>mpirun</code>, sees one of its processes exit and ends the whole job. In R2's <code>ft_kill</code> run, Open MPI printed "mpirun noticed that process rank 1 … exited on signal 9 (Killed)" and returned 137 (128 + 9, the shell's way of reporting death by signal 9). <sup class="src"><a href="#F8-16-src-R2">R2</a></sup> <sup class="src"><a href="#F8-16-src-L2">L2</a></sup> Detection here costs nothing; the launcher does it.</li>
+<li><b>Frozen</b> (<code>SIGSTOP</code>): the process still exists but never runs again. No process exits, so the launcher notices nothing. The other ranks wait in the all-reduce forever. This is the hung job. Real causes include a GPU kernel that never finishes, a deadlock inside one rank, a network path that drops a connection without an error, or a rank that took a different branch of the code and calls a different collective. <sup class="src"><a href="#F8-16-src-R4">R4</a></sup></li>
+</ul>
+<h3>The watchdog: turn a hang into an abort</h3>
+<p>A blocking <code>MPI_Allreduce</code> gives the program no chance to look at the clock. Listing 1 instead starts the all-reduce with <code>MPI_Iallreduce</code> and polls it with <code>MPI_Test</code>, sleeping 1 ms between polls. While it waits, it prints a warning every <code>warn</code> seconds and writes "still waiting" to its trace; after <code>watchdog</code> seconds it calls <code>MPI_Abort(MPI_COMM_WORLD, 42)</code>. <sup class="src"><a href="#F8-16-src-L1">L1</a></sup> In R2's <code>ft_hang</code> run, rank 2 froze at step 37; ranks 0, 1 and 3 printed "allreduce not complete after 1 s", then "WATCHDOG: no progress for 2.0 s, calling MPI_Abort", and the job ended with exit code 42. <sup class="src"><a href="#F8-16-src-R2">R2</a></sup> The value 42 is this program's own choice; <code>restart.sh</code> only checks that the exit code is not 0.</p>
+<h3>Checkpoints: write so that a crash cannot destroy them</h3>
+<p>Every <code>ckpt</code> steps (10 by default), rank 0 writes the parameters and the next step number. Plain data parallelism keeps identical parameters on every rank (F8-12), so one rank's copy is the whole state; with sharded state this is wrong (F8-15's forensic lab). The write follows Figure 2: write <code>ckpt.tmp</code>, <code>fflush</code> and <code>fsync</code> it, rename the current <code>ckpt.bin</code> to <code>ckpt.prev</code>, rename <code>ckpt.tmp</code> to <code>ckpt.bin</code>. <sup class="src"><a href="#F8-16-src-L3">L3</a></sup> On start, every rank reads <code>ckpt.bin</code> and checks its size, a magic number and an FNV-1a checksum of its contents; if any check fails it tries <code>ckpt.prev</code>; if that fails too, it starts from step 0 and says so. In R3, <code>ckpt.bin</code> was cut to 100 bytes after a 45-step run, and the next run printed "ckpt.bin rejected (short file (100 of 272 bytes)); resuming from ckpt.prev at step 30". <sup class="src"><a href="#F8-16-src-R3">R3</a></sup></p>
+<h3>Restart, and the proof that it worked</h3>
+<p><code>restart.sh</code> runs the job under a time limit (<code>timeout -s KILL</code>) and starts it again when the exit code is not 0, up to a maximum number of attempts. The injected failure is passed to the first attempt only, because it stands for a transient fault. The proof that a restart is correct is that the final parameters equal those of an uninterrupted run: Listing 1 prints a checksum of the parameters, and all three faulty runs (hang, kill, damaged checkpoint) ended with e31e3fa0a92a7485, the same as the clean run. <sup class="src"><a href="#F8-16-src-R1">R1</a></sup> <sup class="src"><a href="#F8-16-src-R2">R2</a></sup> <sup class="src"><a href="#F8-16-src-R3">R3</a></sup> They are bitwise equal, not merely close, because the data of every step are a function of the step number only (a hash), the checkpoint stores the exact 32-bit floats, and the reduction runs the same way on the same number of ranks; the steps between the checkpoint and the failure are computed twice, with the same result.</p>
+
+<h2 id="F8-16-layer3">Layer 3 — the engineer's depth</h2>
+<h3>Choosing the timeout</h3>
+<p>A watchdog that fires too early kills healthy jobs that hit a slow step (a long checkpoint write, a slow first step while kernels are compiled or loaded, a busy network); one that fires too late wastes GPU hours every time a rank hangs. Measure the distribution of step times (and of the all-reduce wait in particular) on healthy runs, and set the timeout well above the largest healthy value, with a separate, longer timeout for known slow phases (start-up, checkpoints). Listing 1 uses 2 s because its steps take about 22 ms; R1 shows steps 10 apart about 0.21–0.23 s apart. <sup class="src"><a href="#F8-16-src-R1">R1</a></sup> The warnings before the abort matter as much as the abort: they put the time and step of the stall in the log.</p>
+<h3>Who should time out?</h3>
+<p>In Listing 1 every waiting rank has its own watchdog; the first to fire calls <code>MPI_Abort</code>, and R2 shows that several ranks reached the timeout within a millisecond and each called it. In some trial runs Open MPI also printed its own error messages ("ORTE_ERROR_LOG: …") while several aborts arrived at once; such lines differ between runs and are a side effect of the simultaneous aborts, not a second failure. <sup class="src"><a href="#F8-16-src-R2">R2</a></sup> The frozen rank never fires its own watchdog: it is not running. That asymmetry is evidence in the forensic lab.</p>
+<h3>MPI's model of failure</h3>
+<p>The MPI standard's default error handler for communicators, <code>MPI_ERRORS_ARE_FATAL</code>, aborts the job on an error; <code>MPI_ERRORS_RETURN</code> returns error codes instead, set with <code>MPI_Comm_set_errhandler</code>. <sup class="src"><a href="#F8-16-src-L1">L1</a></sup> <sup class="src"><a href="#F8-16-src-D2">D2</a></sup> Neither helps with a hang: there is no error, only waiting. And after a real process failure, MPI-3.1 does not define how to continue in the surviving processes; the practical recovery is the one in this chapter: abort everything, start a new job, load a checkpoint. <sup class="src"><a href="#F8-16-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not opened in this build: the MPI Forum's User-Level Failure Mitigation proposal (ULFM) adds calls to detect, revoke and shrink a communicator after a process failure, so that the survivors can continue, and Open MPI ships a ULFM implementation in later releases than the 4.1.6 used here. Confirm the status of ULFM in the current MPI standard and in your MPI library before planning on it.</p></div>
+<h3>The GPU version: NCCL and RCCL</h3>
+<p>On GPUs the all-reduce runs in a NCCL or RCCL kernel on a stream; the host thread that launched it is free, so the watchdog runs on the host and checks whether the collective's work on the stream has completed (for example with an event). If it has not, the communicator must be aborted so that the kernels stop and the GPU memory is released; then the process exits and the job restarts. <sup class="src"><a href="#F8-16-src-D1">D1</a></sup> Milestone F8 asks you to read "NCCL documentation on asynchronous error handling and communicator abort". <sup class="src"><a href="#F8-16-src-M1">M1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, not checked against the documentation or headers in this build (no NCCL headers were available): NCCL provides <code>ncclCommAbort</code> (frees a communicator's resources and aborts its outstanding operations) and <code>ncclCommGetAsyncError</code> (polls for asynchronous errors such as a failed network connection); recent NCCL versions can be told to return instead of blocking forever (a non-blocking communicator configuration); RCCL mirrors the NCCL API. PyTorch's process groups wrap NCCL with a collective timeout argument (<code>timeout</code> of <code>init_process_group</code>) and a watchdog thread controlled by environment variables whose names have changed across releases (from <code>NCCL_ASYNC_ERROR_HANDLING</code> to <code>TORCH_NCCL_ASYNC_ERROR_HANDLING</code>, among others). Read the NCCL "Fault tolerance" or error-handling section and your framework's documentation for the version you install; do not copy these names into a job script on the strength of this box.</p></div>
+<h3>Checkpoint frequency and cost</h3>
+<p>Each checkpoint costs time; each failure loses, on average, half a checkpoint interval of work plus the restart time. F8-17 derives the interval that balances the two (Young's approximation) and simulates it. Two engineering rules apply already here: a checkpoint must contain everything that the next step depends on (parameters, optimizer state, step number, data position, random-number state, learning-rate schedule position); and a restart should be tested, not assumed: run the clean and the faulty jobs and compare their results, as <code>run.sh</code> does.</p>
+<h3>What "atomic" covers, and what it does not</h3>
+<p>POSIX specifies that <code>rename</code> replaces the target name atomically: another process sees either the old file or the new one under that name. <sup class="src"><a href="#F8-16-src-D3">D3</a></sup> That is about names, not about the data reaching the disk; hence the <code>fsync</code> of the file before the rename. For a power failure, the directory entry itself must also reach the disk, which needs an <code>fsync</code> of the directory; Listing 1 does not do that, and on a shared cluster file system the guarantees depend on the file system. <sup class="src"><a href="#F8-16-src-D3">D3</a></sup> The checksum and the fallback to <code>ckpt.prev</code> are the second line of defence: they detect a damaged file whatever the cause, as R3 shows.</p>
+
+<h2 id="F8-16-hardware">How the hardware actually does it</h2>
+<p>On a GPU cluster the same three mechanisms exist at different layers. Detection: the launcher or the scheduler notices exited processes and lost nodes (through its own heartbeats with each node's agent), the communication library notices broken connections, and the training framework's watchdog notices collectives that do not finish. Abort: the framework aborts the NCCL/RCCL communicator and exits; the scheduler kills the remaining processes of the job on every node. Restart: the scheduler requeues the job (F8-17), often on different machines, so the checkpoint must be on storage that every node can read, and the job must not depend on the old node names or GPU numbers. Common hardware causes of hangs and failures include GPU errors reported by the driver, network link flaps and failing memory; the node health checks of F8-17 try to catch them before a job starts. <sup class="src"><a href="#F8-16-src-D1">D1</a></sup></p>
+<div class="co note"><span class="lbl">Note</span><p>Nothing in this chapter ran on a GPU or across machines. The listings show the mechanisms with MPI processes on one computer; the real-hardware extension of the lab is <span class="tag">untested in this build</span>.</p></div>
+
+<h2 id="F8-16-worked">Worked example</h2>
+<p>How much work did the <code>ft_hang</code> run of R2 lose, and how long did detection take?</p>
+<ol>
+<li>The last checkpoint before the failure: "checkpoint written: next step 30" at about t = 0.71 s. Rank 2 froze at step 37 (the fault injected).</li>
+<li>Work redone after the restart: steps 30 to 36, 7 steps. At about 22 ms per step (R1: steps 10 apart are about 0.21–0.23 s apart), about 0.15 s of work.</li>
+<li>Detection: the last progress of ranks 0, 1, 3 was the all-reduce of step 37 posted at about 0.9 s; the watchdog fired at about t = 2.9 s, 2 s after posting, as configured.</li>
+<li>Restart: attempt 2 printed "resuming from ckpt.bin at step 30" and finished in about 0.7 s of its own clock.</li>
+<li>Total cost of the failure: the 2 s detection timeout + about 0.15 s redone + the restart time (process start, 1 s pause in <code>restart.sh</code>).</li>
+</ol>
+<p>The numbers are read from R2 and R1. <sup class="src"><a href="#F8-16-src-R2">R2</a></sup> <sup class="src"><a href="#F8-16-src-R1">R1</a></sup> The lesson scales: at real sizes the timeout is minutes and the redone work is up to a checkpoint interval of a large job, so both the timeout and the interval are design decisions with a cost (F8-17).</p>
+
+<h2 id="F8-16-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>ft_train.cc</code>: data-parallel training with checkpoints, a watchdog, traces and fault injection.</p>
+<pre class="listing" data-src="F8-16/ft_train.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">40–46</td><td><code>fnv1a</code></td><td>A 64-bit checksum of a byte range.</td><td>Detects a damaged checkpoint; also gives the final parameter fingerprint.</td></tr>
+<tr><td class="n">48–54</td><td><code>struct Checkpoint</code></td><td>Magic number, next step, 64 parameters, checksum: 272 bytes.</td><td>Everything the next step depends on, for this model.</td></tr>
+<tr><td class="n">56–66</td><td><code>readCheckpoint</code></td><td>Rejects a missing, short, wrongly-marked or wrongly-summed file, with the reason.</td><td>The reason is printed: R3 shows "short file (100 of 272 bytes)".</td></tr>
+<tr><td class="n">68–78</td><td><code>writeCheckpoint</code></td><td>Write to <code>ckpt.tmp</code>, <code>fflush</code>, <code>fsync</code>, close; keep the old one as <code>ckpt.prev</code>; rename into place.</td><td>Figure 2: a complete checkpoint exists at every moment.</td></tr>
+<tr><td class="n">86–100</td><td>arguments</td><td><code>steps=</code>, <code>ckpt=</code>, <code>watchdog=</code>, <code>warn=</code>, <code>fail=rank:step:mode</code>.</td><td>The same program serves the clean run, the faults and the forensic evidence.</td></tr>
+<tr><td class="n">103–107</td><td><code>trace</code>, <code>note</code></td><td>Each rank appends time-stamped lines to <code>rank&lt;r&gt;.trace</code> and flushes each line.</td><td>Flushed lines survive a kill; the forensic lab reads them.</td></tr>
+<tr><td class="n">109–118</td><td>resume</td><td><code>ckpt.bin</code>, else <code>ckpt.prev</code>, else step 0.</td><td>Every rank loads the same state: the replicas stay identical.</td></tr>
+<tr><td class="n">124–127</td><td>fault injection</td><td><code>raise(SIGSTOP)</code> freezes, <code>raise(SIGKILL)</code> kills, without a message.</td><td>Real failures do not announce themselves either.</td></tr>
+<tr><td class="n">128–141</td><td>gradient</td><td>Linear regression on this rank's 8 samples; data from a hash of step and index; 20 ms sleep.</td><td>Deterministic: a restarted step gives exactly the same numbers.</td></tr>
+<tr><td class="n">143–145</td><td><code>MPI_Iallreduce</code></td><td>Starts the all-reduce without blocking.</td><td>The thread stays free to watch the clock.</td></tr>
+<tr><td class="n">149–167</td><td>watchdog loop</td><td><code>MPI_Test</code> every 1 ms; warn every <code>warn</code> s; abort after <code>watchdog</code> s with code 42.</td><td>A hang becomes an abort within a set time.</td></tr>
+<tr><td class="n">169</td><td>update</td><td>SGD with the averaged gradient.</td><td>The same on every rank.</td></tr>
+<tr><td class="n">173–178</td><td>checkpoint</td><td>Rank 0 stores the next step and the checksum, writes, reports.</td><td>"next step" is the step to resume at: no step is skipped or done twice by the state.</td></tr>
+<tr><td class="n">180–183</td><td>fingerprint</td><td>Prints the parameters' checksum.</td><td>The milestone's comparison with an uninterrupted run, in one line.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>restart.sh</code>: run, and on failure run again.</p>
+<pre class="listing" data-src="F8-16/restart.sh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">7–8</td><td><code>max</code>, <code>limit</code>, <code>np</code></td><td>Attempts, time limit per attempt, processes.</td><td>A restart loop without a limit can burn a cluster allocation on a permanent fault.</td></tr>
+<tr><td class="n">12</td><td><code>FAULT</code></td><td>Adds the fault to the first attempt only.</td><td>Models a transient fault; a permanent one would fail every attempt and end at line 22.</td></tr>
+<tr><td class="n">14</td><td><code>timeout -s KILL</code></td><td>Runs the job, killing it with SIGKILL after the limit.</td><td>A last line of defence if the watchdog itself fails; SIGKILL because a polite signal was forwarded by <code>mpirun</code> to the frozen rank and woke it up in trial runs (not kept as a lab record).</td></tr>
+<tr><td class="n">16–19</td><td>success</td><td>Exit 0 ends the loop.</td><td>The job itself decides when it is finished.</td></tr>
+<tr><td class="n">21–26</td><td>retry</td><td>Gives up after <code>max</code>; otherwise waits 1 s and starts again.</td><td>The job resumes from its own checkpoint; the script knows nothing about steps.</td></tr>
+</tbody></table></div>
+<p><b>Build and run</b> (by <code>run.sh</code>): <code>mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -DOMPI_SKIP_MPICXX ft_train.cc -o ft_train</code>; then <code>NP=4 ./restart.sh 3 60 ./ft_train watchdog=2</code>, with <code>FAULT=fail=2:37:hang</code> or <code>FAULT=fail=1:23:kill</code> for the faulty runs. Each run starts in an empty folder. Open MPI's host names and process ids are replaced by placeholders.</p>
+<pre class="output" data-run="F8-16/ft_clean"></pre>
+<pre class="output" data-run="F8-16/ft_hang"></pre>
+<pre class="output" data-run="F8-16/ft_kill"></pre>
+<pre class="output" data-run="F8-16/ft_corrupt"></pre>
+
+<h2 id="F8-16-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A frozen cook can be seen.</b> At the table, a neighbour would notice. A frozen process looks exactly like a slow one from the other ranks; only time tells them apart, which is why the watchdog is a timer and not a test.</li>
+<li><b>The alarm in the kitchen is heard by everyone.</b> <code>MPI_Abort</code> asks the runtime to end every process; a frozen or unreachable process may only be ended by the operating system or the scheduler on its node, and on a lost node not at all until the node returns.</li>
+<li><b>The card in the safe holds the dinner.</b> A checkpoint holds only what the program wrote into it; anything forgotten (optimizer state, data position, random state) is silently reset by a restart.</li>
+<li><b>The new table is not the same table.</b> A restarted job may get different machines, different GPU numbers, even a different number of ranks; the checkpoint format must not assume the old ones.</li>
+</ul>
+
+<h2 id="F8-16-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>No timeout at all.</b> Symptom: a job uses its whole time limit with no output after some point. Find it: per-rank traces (forensic lab). Fix: a watchdog on every collective.</li>
+<li><b>Timeout too short.</b> Symptom: aborts during checkpoints or the first step. Fix: measure healthy times; longer timeouts for known slow phases.</li>
+<li><b>Writing the checkpoint in place.</b> Symptom: after a crash during the write, the job cannot resume at all. Fix: Figure 2.</li>
+<li><b>No check on read.</b> Symptom: a job resumes from a damaged checkpoint and trains on garbage. Fix: size, magic, checksum, fallback.</li>
+<li><b>Restart loop on a permanent fault.</b> Symptom: the same failure on every attempt. Fix: a maximum number of attempts, and record the failing node so the next attempt avoids it.</li>
+<li><b>Restart result "close enough".</b> Symptom: a resumed run differs slightly from the uninterrupted one. Find it: compare checksums; look for state missing from the checkpoint (data order, random state). The milestone accepts a difference only if it is explained.</li>
+<li><b>Logs that do not survive.</b> Symptom: the last lines before a kill are missing. Fix: flush after each line (Listing 1, line 106).</li>
+</ul>
+
+<div class="co transition" id="F8-16-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F8-12 to F8-15 assumed every rank works until the end; F8-15 showed that the state of a job can be spread over all ranks. <b>What carries over:</b> collectives need every rank (F8-12); the result must equal the reference (now: the uninterrupted run); evidence beats belief: checksums, traces and exit codes. <sup class="src"><a href="#F8-16-src-R2">R2</a></sup> <b>What changes:</b> failures are expected, not exceptional; the job is a loop of attempts, and correctness includes "restarts give the same answer". <sup class="src"><a href="#F8-16-src-M1">M1</a></sup> <b>What comes next:</b> F8-17 puts the job on a shared cluster, where the scheduler decides where and when it runs, may stop it, and requeues it; the checkpoint interval becomes a calculation.</p></div>
+
+<h2 id="F8-16-check">Check yourself</h2>
+<ol>
+<li>Why does a killed rank stop the job without any watchdog, while a frozen rank does not?</li>
+<li>Why does Listing 1 use <code>MPI_Iallreduce</code> and <code>MPI_Test</code> instead of <code>MPI_Allreduce</code>?</li>
+<li>Put in order and justify: rename tmp → bin; fsync tmp; write tmp; rename bin → prev.</li>
+<li>Which statement is true: (a) <code>rename</code> guarantees the data is on disk; (b) a checksum can detect a truncated checkpoint; (c) <code>MPI_ERRORS_RETURN</code> lets ranks detect a hang; (d) restarting from a checkpoint always gives a slightly different result.</li>
+<li>Apply to a new case: steps take 3 s, a checkpoint takes 40 s every 500 steps, the all-reduce of a healthy step never takes more than 0.8 s. Propose a watchdog timeout for normal steps and for checkpoint steps, and justify it.</li>
+<li>In R2's <code>ft_kill</code> run, the exit code was 137. Where does that number come from?</li>
+<li>Predict, then run: what does Listing 1 print if both <code>ckpt.bin</code> and <code>ckpt.prev</code> are damaged? Try it by truncating both.</li>
+<li>List four things a real training checkpoint must contain that Listing 1's does not.</li>
+</ol>
+
+<h2 id="F8-16-lab">Lab</h2>
+<p><b>Goal.</b> Milestone F8, verbatim: "A training job that survives the loss of a process: detection, abort, restart from checkpoint." <sup class="src"><a href="#F8-16-src-M1">M1</a></sup></p>
+<p><b>Hardware and software.</b> Part A: any Linux computer with g++ and Open MPI (this build: g++ 13.3.0, Open MPI 4.1.6, 4 logical CPUs, no GPU). Part B: two or more GPUs with NCCL or RCCL, and a framework or your own NCCL program; <span class="tag">untested in this build</span>.</p>
+<p><b>Safety.</b> Fault injection sends signals to your own processes only. Never test by killing processes of other users' jobs on a shared cluster; on a cluster, inject faults only inside your own allocation.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F8-16</code>. Read R1–R3 and find, in each faulty run, the failure, the detection, the abort, the restart and the final comparison.</li>
+<li>Kill a rank yourself: start <code>NP=4 ./restart.sh 3 60 ./ft_train watchdog=2 steps=600</code> in an empty folder and, from another terminal, send <code>SIGKILL</code> to one <code>ft_train</code> process (find its process id with <code>pgrep -a ft_train</code>). Record how long the job takes to stop and from which step it resumes.</li>
+<li>Repeat with <code>SIGSTOP</code> instead, once with <code>watchdog=2</code> and once with <code>watchdog=0</code>. Explain the difference.</li>
+<li>Add the missing state: give the model a momentum term and store it in the checkpoint; show that the restart still gives the same checksum, then remove it from the checkpoint and show that the checksum changes.</li>
+<li>Part B: on GPUs, use your framework's collective timeout or your own watchdog with a communicator abort; kill a rank with <code>SIGKILL</code> and with <code>SIGSTOP</code>; restart from a checkpoint and compare the final model with an uninterrupted run.</li>
+</ol>
+<p><b>Expected observations.</b> Step 2: the job ends within about a second of the kill (the launcher notices the exit) and resumes from the last multiple of 10 steps. Step 3: with the watchdog, it aborts about 2 s after the stall; without it, it waits until <code>restart.sh</code>'s time limit kills it. Step 4: equal checksums with momentum in the checkpoint, different without.</p>
+<p><b>Verification.</b> Milestone F8 acceptance, verbatim: "Killing one rank in the middle of a run causes all ranks to stop within a set timeout and the job to resume from the last checkpoint; the final model equals that of an uninterrupted run with the same seeds (or the difference is explained)." <sup class="src"><a href="#F8-16-src-M1">M1</a></sup> R2 and R3 show it for the toy job; record the same evidence for yours.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>A stopped process remains after the job → <code>SIGSTOP</code>ped processes ignore everything except <code>SIGKILL</code> (and <code>SIGCONT</code>); kill it by its exact name, not by a pattern that also matches your shell.</li>
+<li>The restarted run starts at step 0 → it ran in a different folder, or the checkpoint was rejected; read the first printed line.</li>
+<li>Checksums differ after a restart → state missing from the checkpoint, or a different number of ranks (a different reduction order).</li>
+</ul>
+<p><b>Extension.</b> Make every rank write its own checkpoint slice (as F8-15 requires) and restart on a different number of ranks, redistributing the slices.</p>
+
+<h2 id="F8-16-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "The hung job" (the course forensic). An overnight job of Sakura's team used its whole time limit and was killed by the scheduler; its last printed loss was early in the run. No error message appears in the output. The scheduler record and the per-rank trace files were collected (in this reproduction, seconds stand in for hours).</p>
+<p><b>Evidence pack.</b> The job's output, the scheduler's record and the last lines of each rank's trace file <sup class="src"><a href="#F8-16-src-R4">R4</a></sup>:</p>
+<pre class="output" data-run="F8-16/hung"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Timeline: when did the job last make progress, and at which step? When was it killed? How much of the time limit was wasted?</li>
+<li>Which rank is different, and what exactly does its trace show compared with the others?</li>
+<li>Was the different rank dead (exited) or alive? Use the behaviour of R2's <code>ft_kill</code> run as a comparison.</li>
+<li>Why did that rank print no "allreduce not complete" warning?</li>
+<li>List at least three hypotheses for what happened inside that rank, and what further evidence (from the machine, the scheduler, a debugger) would decide between them.</li>
+<li>If the job had been restarted at once, from which step would it have resumed, and why?</li>
+<li>What change to the job would have turned this into a short failure followed by an automatic restart? Give the setting you would use and why.</li>
+</ol>
+<p><b>Method hints.</b> Align the four traces on time. A rank that is waiting writes "still waiting"; a rank that is not running writes nothing.</p>
+
+<h2 id="F8-16-project">Mini-project</h2>
+<p><b>Course project: a fault-tolerant training run that resumes from checkpoint.</b> Take a real training script you have written in this track (for example the data-parallel training of F8-12, on GPUs if you have them) and make it meet milestone F8: periodic atomic checkpoints of all state, a watchdog on every collective with a measured timeout, an automatic restart script (or scheduler requeue, F8-17), and a fault-injection switch. Demonstrate three failures (a killed rank, a frozen rank, a damaged newest checkpoint) and show, for each, the detection time, the step resumed from and the comparison with an uninterrupted run. Write a one-page report with the evidence (logs, checksums, traces) and every number labelled measured or invented.</p>
+<p><b>Rubric</b> (20 points): checkpoint contains all state, shown by a bitwise or explained comparison (5); watchdog timeout derived from measured healthy step times (3); all three failures demonstrated with logs (6); restart automatic, with a limit on attempts (2); report clear, evidence attached, unverified tool names marked (4).</p>
+
+<h2 id="F8-16-summary">Summary</h2>
+<ul>
+<li>In synchronous training one missing rank blocks every collective; a dead rank is noticed by the launcher, a frozen one is not.</li>
+<li>A watchdog (non-blocking collective, polled with a timeout, then abort) turns a hang into a failure within a set time.</li>
+<li>Checkpoints are written to a temporary file, flushed, and renamed into place; readers check size, magic and checksum and fall back to the previous one.</li>
+<li>A restart loop plus a deterministic job gives a final model bitwise equal to the uninterrupted run: R2 and R3 show the same checksum after a hang, a kill and a damaged checkpoint.</li>
+<li>Per-rank traces, flushed line by line, reconstruct which rank stopped and where.</li>
+</ul>
+
+<h2 id="F8-16-sources">Sources</h2>
+<ol>
+<li id="F8-16-src-D1">D1 — NVIDIA, NCCL documentation (error handling, communicator abort, asynchronous errors); AMD, RCCL documentation (tier 1; guide 4.6; read list of milestone F8). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-16-src-D2">D2 — MPI Forum, "MPI: A Message-Passing Interface Standard", version 3.1: sections on error handling and <code>MPI_Abort</code>, and on collective semantics (tier 1; curriculum item 77). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-16-src-D3">D3 — The Open Group, "The Open Group Base Specifications" (POSIX.1), entries <code>rename</code> and <code>fsync</code> (tier 1; not in the guide's registry by this title, proposed in NOTES.md). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-16-src-M1">M1 — Systems Curriculum (repository file <code>SYSTEMS_CURRICULUM.html</code>), milestone F8 "Fault tolerance basics" (goal, read list and acceptance quoted verbatim). A map, not a source for technical claims (AH-4).</li>
+<li id="F8-16-src-L1">L1 — Open MPI 4.1.6 header in the build container (tier 4, opened): <code>/usr/lib/x86_64-linux-gnu/openmpi/include/mpi.h</code> lines 1306–1307 (<code>MPI_ERRORS_ARE_FATAL</code>, <code>MPI_ERRORS_RETURN</code>), 1324 (<code>MPI_Abort</code>), 1347 (<code>MPI_Iallreduce</code>), 1449 (<code>MPI_Comm_set_errhandler</code>), 1835 (<code>MPI_Test</code>).</li>
+<li id="F8-16-src-L2">L2 — glibc headers in the build container (tier 4, opened): <code>/usr/include/x86_64-linux-gnu/bits/signum-generic.h</code> line 59 (<code>SIGKILL</code> 9), line 53 (<code>SIGTERM</code> 15); <code>bits/signum-arch.h</code> line 38 (<code>SIGSTOP</code> 19).</li>
+<li id="F8-16-src-L3">L3 — glibc headers in the build container (tier 4, opened): <code>/usr/include/stdio.h</code> line 160 (<code>rename</code>), <code>/usr/include/unistd.h</code> line 989 (<code>fsync</code>).</li>
+<li id="F8-16-src-R1">R1 — lab run <code>ft_clean</code>: Listings 1 and 2, 4 processes, no fault: <code>F8-16/ft_clean.out</code>, <code>ft_clean.log</code> (Open MPI 4.1.6, g++ 13.3.0, exit code 0).</li>
+<li id="F8-16-src-R2">R2 — lab runs <code>ft_hang</code> (rank 2 frozen at step 37) and <code>ft_kill</code> (rank 1 killed at step 23): <code>F8-16/ft_hang.out</code>, <code>ft_kill.out</code> with logs (exit code 0 after the restart).</li>
+<li id="F8-16-src-R3">R3 — lab run <code>ft_corrupt</code> (newest checkpoint cut to 100 bytes): <code>F8-16/ft_corrupt.out</code>, <code>ft_corrupt.log</code> (exit code 0).</li>
+<li id="F8-16-src-R4">R4 — lab run <code>hung</code> (forensic evidence; watchdog off, 6 s time limit): <code>F8-16/hung.out</code>, <code>hung.log</code> (exit code 137, expected).</li>
+</ol>
+
+<h2 id="F8-16-glossary">Glossary links</h2>
+<p><a href="#gl-hung-job">Hung job</a> · <a href="#gl-watchdog-collective-timeout">Watchdog (collective timeout)</a> · <a href="#gl-watchdog">Watchdog</a> · <a href="#gl-abort">Abort</a> · <a href="#gl-atomic-checkpoint">Atomic checkpoint</a> · <a href="#gl-restart-from-checkpoint">Restart from checkpoint</a> · <a href="#gl-checkpoint-job">Checkpoint (job)</a> · <a href="#gl-failure-detector">Failure detector</a> · <a href="#gl-heartbeat">Heartbeat</a> · <a href="#gl-collective">Collective</a> · <a href="#gl-nccl-rccl">NCCL / RCCL</a></p>
+
+<h2 id="F8-16-next">Next chapter</h2>
+<p>Next: <a href="#F8-17">F8-17 Scheduling GPU jobs on a cluster</a>. Previous: <a href="#F8-15">F8-15 Sharded optimizer states (reading)</a>. Back to the course: <a href="#DG403">DG403</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackF">Track F</a>.</p>
+
+<h2 id="F8-16-answers">Answers to Check yourself</h2>
+<ol>
+<li>A killed process exits; <code>mpirun</code> watches its processes and ends the job (R2, <code>ft_kill</code>). A frozen process does not exit, so nothing tells the launcher; the others keep waiting.</li>
+<li>A blocking call does not return until the collective completes, so the rank cannot look at the clock; the non-blocking call returns at once and <code>MPI_Test</code> can be polled with a timeout.</li>
+<li>Write tmp; fsync tmp (data on disk before the name points to it); rename bin → prev (keep the old one); rename tmp → bin (atomic replace). Any crash leaves a complete file under <code>ckpt.bin</code> or <code>ckpt.prev</code>.</li>
+<li>(b): R3. (a) rename is about names; (c) a hang produces no error to return; (d) with deterministic data and complete state, R2 and R3 show a bitwise-equal result.</li>
+<li>For example 10 s for normal steps (more than ten times the largest healthy all-reduce wait, small next to the step-time cost of an undetected hang) and 120 s for the step that writes a checkpoint (three times its 40 s); justify with your own measured distribution.</li>
+<li>The shell and <code>timeout</code> report death by signal n as 128 + n; SIGKILL is 9 (L2), so 137. Here <code>mpirun</code> passed on the failure of its process.</li>
+<li>"no usable checkpoint (ckpt.bin: short file (…))", starting at step 0: the program reports the reason for <code>ckpt.bin</code> only. Run it to confirm.</li>
+<li>Optimizer state (momentum, Adam moments), data-loader position or epoch and shuffle seed, random-number generator states, learning-rate scheduler position (also: the number of ranks and the format version).</li>
+</ol>
+<h3 id="F8-16-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Last progress: rank 0's "step 40 loss" line at about t = 0.97 s and the checkpoint "next step 40" at about 0.95 s. The traces show ranks 0–2 posting the step 41 all-reduce at about 0.99 s and waiting from then on. The scheduler killed the job at 6 s (exit code 137): about 5 s of the 6 s limit, over 80 %, was wasted.</li>
+<li>Rank 3. Its last trace line is "step 41 begin" at about 0.97 s: it never posted the all-reduce of step 41. Ranks 0–2 posted it at about 0.99 s and wrote "still waiting" once a second until the kill.</li>
+<li>Alive. A dead process ends an Open MPI job at once with "mpirun noticed that process rank … exited" (R2, <code>ft_kill</code>); there is no such message, and the job ran until the time limit. Rank 3 still existed but was not making progress.</li>
+<li>The warnings come from the waiting loop around <code>MPI_Test</code>. Rank 3 never reached it: it stopped between "step 41 begin" and posting the all-reduce, in the computation part of the step (or it was not running at all).</li>
+<li>(a) The process was stopped (by a signal, a debugger, or the system). (b) An endless loop or a deadlock in the computation of step 41 (for example, waiting for a lock or a device). (c) A device call that never returned (on GPUs: a kernel that never finishes, a driver fault). Evidence: process state on the node (<code>ps</code> shows "T" for stopped, "R" for running, "D" for waiting on I/O), CPU time growing or not, a stack trace with a debugger, the kernel and driver logs, the scheduler's node health record. Here: the evidence was produced by stopping rank 3 with <code>SIGSTOP</code> at step 41 (<code>fail=3:41:hang</code>), and the process state would have shown "T".</li>
+<li>Step 40: the last checkpoint said "next step 40", written after step 39 at about 0.95 s; only step 40 (and the started step 41) would be redone.</li>
+<li>Turn on the watchdog (the job ran with <code>watchdog=0</code>), with a timeout above the largest healthy wait (2 s for steps of about 22 ms), and run under <code>restart.sh</code> or a requeueing scheduler: the job would have aborted at about 3 s and resumed from step 40, as R2's <code>ft_hang</code> run shows for a similar fault.</li>
+</ol>
+<p>How the evidence was produced: <code>timeout -s KILL 6 mpirun -np 4 ./ft_train watchdog=0 warn=1 fail=3:41:hang</code> in an empty folder, followed by <code>tail -n 7</code> of each trace file; host names and process ids replaced by placeholders, otherwise unedited. The team is invented for the exercise.</p>

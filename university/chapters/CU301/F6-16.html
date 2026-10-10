@@ -1,0 +1,276 @@
+<!--meta
+id: F6-16
+title: Scans (prefix sums): block-level, device-wide, decoupled look-back (stretch)
+course: CU301
+level: L3
+prereqs: F6-12 (barriers, grid-wide ordering), F6-14 (reductions), F6-15 (warp shuffles); SP203 F2-39 (acquire and release)
+time: 10–14 hours including the lab
+hardware: Lab extension: an NVIDIA GPU. The block-scan simulator, the CPU device-wide scans (including a threaded decoupled look-back), the forensic replay and the CUB source evidence run on any computer with g++ and nvcc (this build: no GPU)
+maps: Curriculum Track E 13.2 topic 5 (scans: Blelloch, decoupled look-back as used in CUB); milestone E4 (block-level scan, device-wide scan multi-pass first, single-pass decoupled look-back as a stretch goal)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-16-hook">Story hook</h2>
+<p>The plates for tonight's banquet are numbered, and each table must know where its plates start in the long serving line. Table 0 has 3 plates, table 1 has 1, table 2 has 7, and so on. Table 5 starts after all the plates of tables 0 to 4. That number, "how many came before me", is a <b>prefix sum</b>, and every helper in the hall needs one.</p>
+<p>Inside one row it is easy: helpers pass running totals hand to hand. For the whole hall, Sofia first had every table count its plates, then the head of the hall added up the table counts, then every table placed its plates. Three trips. Then she tried something bolder: each table, as soon as it knows its own count, writes it on a board by the door, and looks at the board for the tables before it, walking back until it finds one whose full "start" number is already written. One trip. But it only works because every table that a helper waits for has already started work: otherwise they would wait forever, as in <a href="#F6-12">F6-12</a>.</p>
+<p>This chapter builds both: the block-level scan, the three-pass device-wide scan, and the single-pass <b>decoupled look-back</b> that CUB uses.</p>
+
+<h2 id="F6-16-able">What you will be able to do</h2>
+<ul>
+<li><b>Define</b> inclusive and exclusive scans and convert between them.</li>
+<li><b>Trace</b> the Hillis–Steele and Blelloch block scans by hand, and count their steps and additions.</li>
+<li><b>Build</b> a block scan from warp shuffles and a device-wide scan from three kernels (reduce-then-scan), and test it on E4's sizes and inputs.</li>
+<li><b>Explain</b> decoupled look-back: tile status words, the look-back loop, and why tile numbers must be assigned in start order.</li>
+<li><b>Diagnose</b> an in-place scan that is right for one warp and wrong for a block.</li>
+</ul>
+
+<div class="co jargon" id="F6-16-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Scan (prefix sum)</dt><dd><b>Simple words:</b> for every position, the total of everything up to it. <b>Analogy:</b> each table's starting plate number. <b>Precise:</b> for input <i>x</i> and associative ⊕, output <i>y</i><sub><i>i</i></sub> = <i>x</i><sub>0</sub> ⊕ … ⊕ <i>x</i><sub><i>i</i></sub> (inclusive). <sup class="src"><a href="#F6-16-src-D3">D3</a></sup></dd>
+<dt>Inclusive scan</dt><dd><b>Simple words:</b> each output includes its own element. <b>Analogy:</b> "plates up to and including mine". <b>Precise:</b> <i>y</i><sub><i>i</i></sub> = ⊕<sub><i>j</i> ≤ <i>i</i></sub> <i>x</i><sub><i>j</i></sub>; <code>std::inclusive_scan</code>. <sup class="src"><a href="#F6-16-src-D3">D3</a></sup></dd>
+<dt>Exclusive scan</dt><dd><b>Simple words:</b> each output is the total of the elements before it; the first is the identity. <b>Analogy:</b> "where my plates start". <b>Precise:</b> <i>y</i><sub>0</sub> = identity, <i>y</i><sub><i>i</i></sub> = ⊕<sub><i>j</i> &lt; <i>i</i></sub> <i>x</i><sub><i>j</i></sub>; exclusive = inclusive shifted right by one. <sup class="src"><a href="#F6-16-src-D3">D3</a></sup></dd>
+<dt>Hillis–Steele scan</dt><dd><b>Simple words:</b> in step <i>k</i>, every element adds the element 2<sup><i>k</i></sup> places before it. <b>Analogy:</b> everybody looks 1, then 2, then 4 places back and adds. <b>Precise:</b> log₂ <i>n</i> steps, about <i>n</i> log₂ <i>n</i> additions; not work-efficient but short; needs two buffers or a barrier between read and write. <sup class="src"><a href="#F6-16-src-D3">D3</a></sup> <sup class="src"><a href="#F6-16-src-R1">R1</a></sup></dd>
+<dt>Blelloch scan</dt><dd><b>Simple words:</b> a reduction tree up, then a tree down that hands each subtree its starting value. <b>Analogy:</b> collect counts up to the head of the hall, then hand starting numbers back down. <b>Precise:</b> up-sweep and down-sweep, 2 log₂ <i>n</i> steps, about 2<i>n</i> additions (work-efficient); exclusive result. <sup class="src"><a href="#F6-16-src-D3">D3</a></sup> <sup class="src"><a href="#F6-16-src-R1">R1</a></sup></dd>
+<dt>Reduce-then-scan</dt><dd><b>Simple words:</b> a device-wide scan in three passes: tile sums, a scan of those, then each tile with its offset. <b>Analogy:</b> count per table, the head adds the counts, tables number their plates. <b>Precise:</b> needs about 3<i>n</i> memory accesses (read, read, write) plus the small middle pass; the kernel boundaries are the grid-wide barriers (<a href="#F6-12">F6-12</a>). <sup class="src"><a href="#F6-16-src-D3">D3</a></sup></dd>
+<dt>Decoupled look-back</dt><dd><b>Simple words:</b> a one-pass device scan where each tile publishes its total and looks back at earlier tiles' published values. <b>Analogy:</b> the board by the door. <b>Precise:</b> Merrill and Garland's method: per-tile status words (not ready, aggregate available, inclusive prefix available); a tile sums predecessors' aggregates until it meets an inclusive prefix; about 2<i>n</i> memory accesses; implemented in CUB's <code>DeviceScan</code>. <sup class="src"><a href="#F6-16-src-S2">S2</a></sup> <sup class="src"><a href="#F6-16-src-H2">H2</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-16-pictures">The idea in pictures</h2>
+<figure id="F6-16-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 340" role="img" aria-labelledby="F6-16-f1t F6-16-f1d">
+<title id="F6-16-f1t">Figure 1: decoupled look-back over five tiles</title>
+<desc id="F6-16-f1d">Five boxes for tiles 0 to 4 in a row, each with a status letter and a value. Tile 0: status P, inclusive prefix 120. Tile 1: status A, aggregate 80. Tile 2: status A, aggregate 95. Tile 3: status X, not ready. Tile 4 is the tile doing the look-back, with its own aggregate 70 already published as A. Arrows go from tile 4 back to tile 3 (wait while X), then to tile 2 (add 95), tile 1 (add 80), tile 0 (add 120, status P, stop). Below: tile 4's exclusive prefix is the sum of what it collected, and it then publishes status P with exclusive plus its own aggregate. A note says the statuses X, A, P correspond to CUB's SCAN_TILE_INVALID, SCAN_TILE_PARTIAL and SCAN_TILE_INCLUSIVE in CUB 2.0.1.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="340"/>
+<text class="sv-tb" x="20" y="24">tile status words in global memory (one per tile)</text>
+<rect class="sv-b3" x="20" y="44" width="120" height="70"/><text class="sv-t" x="30" y="66">tile 0</text><text class="sv-ts" x="30" y="86">P: prefix 120</text><text class="sv-ts" x="30" y="104">(inclusive)</text>
+<rect class="sv-b2" x="160" y="44" width="120" height="70"/><text class="sv-t" x="170" y="66">tile 1</text><text class="sv-ts" x="170" y="86">A: aggregate 80</text>
+<rect class="sv-b2" x="300" y="44" width="120" height="70"/><text class="sv-t" x="310" y="66">tile 2</text><text class="sv-ts" x="310" y="86">A: aggregate 95</text>
+<rect class="sv-b8" x="440" y="44" width="120" height="70"/><text class="sv-t" x="450" y="66">tile 3</text><text class="sv-ts" x="450" y="86">X: not ready</text>
+<rect class="sv-b6" x="580" y="44" width="160" height="70"/><text class="sv-t" x="590" y="66">tile 4 (me)</text><text class="sv-ts" x="590" y="86">published A: 70</text><text class="sv-ts" x="590" y="104">now looking back</text>
+<path class="sv-line" d="M620,114 C620,150 520,150 500,118"/><polygon class="sv-head" points="500,116 497,127 507,123"/>
+<text class="sv-ts" x="520" y="164">1. wait while X</text>
+<path class="sv-line" d="M500,114 C500,190 380,190 360,118"/><polygon class="sv-head" points="360,116 357,127 367,123"/>
+<text class="sv-ts" x="380" y="204">2. A: add 95</text>
+<path class="sv-line" d="M360,114 C360,230 240,230 220,118"/><polygon class="sv-head" points="220,116 217,127 227,123"/>
+<text class="sv-ts" x="240" y="244">3. A: add 80</text>
+<path class="sv-line" d="M220,114 C220,270 100,270 80,118"/><polygon class="sv-head" points="80,116 77,127 87,123"/>
+<text class="sv-ts" x="40" y="284">4. P: add 120, stop</text>
+<rect class="sv-box" x="420" y="236" width="320" height="66"/>
+<text class="sv-ts" x="430" y="256">tile 4: exclusive prefix = 95 + 80 + 120 (+ tile 3's)</text>
+<text class="sv-ts" x="430" y="274">then publish P = exclusive + 70</text>
+<text class="sv-ts" x="430" y="292">X, A, P = CUB's INVALID, PARTIAL, INCLUSIVE</text>
+<text class="sv-ts" x="20" y="326">Values are an invented example; the algorithm is Listing 2's lookback(); status names from CUB 2.0.1 (R5).</text>
+</svg></div><figcaption><b>Figure 1.</b> A tile waits only for tiles that started before it, and stops looking back at the first tile that already knows its full prefix. Arrows show the order of the look-back, not data movement. <sup class="src"><a href="#F6-16-src-S2">S2</a></sup> <sup class="src"><a href="#F6-16-src-R5">R5</a></sup></figcaption></figure>
+
+<h2 id="F6-16-layer1">Layer 1 — the kid explanation</h2>
+<p>Everyone wants to know "how many came before me?" In a short line you can just count. In a huge hall, each table counts its own plates first. Then each table asks the tables before it: "how many did you have?" It does not need to ask all of them: as soon as one table says "I already know how many came before <em>me</em>, and here is the total including mine", you can stop asking and add up.</p>
+
+<h2 id="F6-16-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-16-l2-defs">Inclusive and exclusive</h3>
+<p>For the input 3 1 7 0 4 1 6 3, the inclusive scan is 3 4 11 11 15 16 22 25 and the exclusive scan is 0 3 4 11 11 15 16 22. <sup class="src"><a href="#F6-16-src-R1">R1</a></sup> The exclusive form answers "where does my output start?", which is what compaction, radix sort (<a href="#F6-18">F6-18</a>) and allocation need. One converts to the other by shifting, or by subtracting the element.</p>
+<h3 id="F6-16-l2-hs">Hillis–Steele</h3>
+<p>Listing 1 traces it: in step <i>d</i> = 1, 2, 4, every element <i>i</i> ≥ <i>d</i> adds element <i>i</i> − <i>d</i> of the <em>previous</em> array. After three steps the 8 elements hold the inclusive scan. <sup class="src"><a href="#F6-16-src-R1">R1</a></sup> It is short (log₂ <i>n</i> steps) but does more additions than necessary: 17 for <i>n</i> = 8, 1,793 for 256, 9,217 for 1,024, against 7, 255 and 1,023 for a sequential loop. <sup class="src"><a href="#F6-16-src-R1">R1</a></sup> Inside a warp, where all lanes work anyway, that does not matter; that is why <a href="#F6-15">F6-15</a>'s warp scan uses it.</p>
+<h3 id="F6-16-l2-bl">Blelloch</h3>
+<p>The up-sweep is a reduction tree that leaves partial sums in place (after it, the last element is 25, the total). The root is set to 0, and the down-sweep passes starting values down: at each node, the left child receives the node's value and the right child receives the node's value plus the left child's old sum. The result is the exclusive scan, 0 3 4 11 11 15 16 22, with 14 additions for 8 elements, 510 for 256, 2,046 for 1,024: about 2<i>n</i>. <sup class="src"><a href="#F6-16-src-R1">R1</a></sup> It takes twice as many steps as Hillis–Steele, each with a barrier when done in shared memory.</p>
+<h3 id="F6-16-l2-block">A practical block scan</h3>
+<p>Listing 3's <code>blockInclusiveScan</code> (lines 13–34) combines the two worlds: each warp scans its 32 values with shuffles (Hillis–Steele in registers); lane 31 of each warp writes the warp total to shared memory; after a barrier, warp 0 scans the warp totals; after another barrier, each warp adds the total of the warps before it. Two barriers per block, no bank conflicts, no second buffer. <sup class="src"><a href="#F6-16-src-H1">H1</a></sup></p>
+<h3 id="F6-16-l2-device">Device-wide: reduce-then-scan</h3>
+<p>One block can only scan its tile. For the whole array, Listing 3's <code>deviceScan</code> (lines 58–75) does what Listing 2's <code>reduceThenScan</code> does on the CPU: <code>scanTiles</code> scans each tile and writes its total; the totals are scanned (recursively, by the same function); <code>addOffsets</code> adds to each tile the scanned total of the tiles before it. <sup class="src"><a href="#F6-16-src-R2">R2</a></sup> The kernel boundaries order the passes; no block waits for another.</p>
+
+<h2 id="F6-16-layer3">Layer 3 — the engineer's depth</h2>
+<p>The board-by-the-door story has one hidden condition, residency; the precise version follows.</p>
+<h3 id="F6-16-l3-traffic">Why a single pass</h3>
+<p>A scan does very little arithmetic per element; its speed is set by memory traffic (<a href="#F6-09">F6-09</a>). Reduce-then-scan reads the input twice and writes the output once (the variant here: read, write, read and write again in <code>addOffsets</code>), plus the small middle pass. A single pass can read once and write once. Merrill and Garland's decoupled look-back achieves that while avoiding the serial chain of an older single-pass scheme, in which each tile waited for its predecessor's full prefix. <sup class="src"><a href="#F6-16-src-S2">S2</a></sup> The CUB 2.0.1 header <code>device_scan.cuh</code>, read in this build, states that <code>DeviceScan</code> implements it and cites "Single-pass Parallel Prefix Scan with Decoupled Look-back", NVIDIA Technical Report NVR-2016-002, 2016. <sup class="src"><a href="#F6-16-src-H2">H2</a></sup></p>
+<h3 id="F6-16-l3-lookback">The algorithm</h3>
+<p>Listing 2's <code>lookback</code> (lines 37–75) implements it with CPU threads standing in for blocks:</p>
+<ol>
+<li>A block takes the next tile number from an atomic counter (line 46), so tile <i>t</i> − 1 was taken before tile <i>t</i>.</li>
+<li>It reduces its tile and publishes status A with its aggregate (line 54; tile 0 publishes P directly).</li>
+<li>It looks back over tiles <i>t</i> − 1, <i>t</i> − 2, …: while a status is X it waits; it adds each value; it stops at the first P (lines 56–64).</li>
+<li>It publishes P with exclusive + aggregate (line 65), then writes its tile's outputs.</li>
+</ol>
+<p>Status and value are packed into one 64-bit word (lines 16–20), so a reader never sees a status from one write and a value from another; the stores use release and the loads acquire ordering (<a href="#F2-39">F2-39</a>). The threaded version passes every E4 size (1, 2, 255, 256, 257, 2^16 − 1, 2^16 + 1, 1,000,000) and input (random, sorted, reverse, all-equal) with 0 failures, as does reduce-then-scan. <sup class="src"><a href="#F6-16-src-R2">R2</a></sup> CUB's version, read in this build, has the same three states plus an out-of-bounds state (<code>SCAN_TILE_INVALID = 99</code>, <code>SCAN_TILE_PARTIAL</code>, <code>SCAN_TILE_INCLUSIVE</code>) and waits with a warp vote, <code>WARP_ANY(tile_descriptor.status == SCAN_TILE_INVALID, …)</code> (R5): a whole warp inspects 32 predecessors at once. <sup class="src"><a href="#F6-16-src-R5">R5</a></sup></p>
+<h3 id="F6-16-l3-progress">Why it does not deadlock</h3>
+<p>A tile waits only for tiles with smaller numbers. If tile numbers were simply <code>blockIdx.x</code>, block 1,000 could be resident and spinning while block 999 has not been scheduled, and if all slots were filled with such waiters, nothing would progress (<a href="#F6-12">F6-12</a>). Taking tile numbers from an atomic counter at the start of each block guarantees that every tile one waits for belongs to a block that has already started, and a started block runs to completion. <sup class="src"><a href="#F6-16-src-S2">S2</a></sup> That forward-progress argument is the heart of the method.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Whether CUB 2.0.1 obtains tile numbers from an atomic counter or relies on another guarantee was not traced in its source during this build; Listing 2 uses a counter because it makes the argument above explicit. Also not checked: the memory-ordering primitives CUB uses on the GPU, and whether a started block is guaranteed to keep making progress while other blocks spin (the argument above assumes it). Check: <code>cub/agent/agent_scan.cuh</code> and <code>single_pass_scan_operators.cuh</code> in your CUB version, and S2.</p></div>
+<h3 id="F6-16-l3-float">Determinism</h3>
+<p>For integers, any correct scan gives identical results. For floats, the CUB 2.0.1 header states that results "are not deterministic for pseudo-associative operators (e.g., addition of floating-point types)" and "may vary from run to run", because the look-back may combine different groupings of predecessors. <sup class="src"><a href="#F6-16-src-H2">H2</a></sup> E4 asks for results "identical to a CPU reference": that is achievable for integer keys and counts, and needs a tolerance for floats.</p>
+
+<h2 id="F6-16-hardware">How the hardware actually does it</h2>
+<p>A block scan maps to hardware as in the previous chapters: shuffles inside warps (<code>SHFL.UP</code>), shared memory and <code>BAR.SYNC</code> between warps (<a href="#F6-15">F6-15</a>). A device-wide scan adds two hardware facts. The tile status words live in global memory and are communicated through the L2 cache, the one level all SMs share, with fences ordering the payload before the status. <sup class="src"><a href="#F6-16-src-D1">D1</a></sup> And the look-back relies on blocks that have started being able to finish: once resident, a block keeps its SM resources until it exits (<a href="#F6-12">F6-12</a>). <sup class="src"><a href="#F6-16-src-D1">D1</a></sup></p>
+
+<h2 id="F6-16-worked">Worked example</h2>
+<p><b>Task.</b> Run Blelloch's down-sweep on the up-swept array 3 4 7 11 4 5 6 25 by hand.</p>
+<ol>
+<li>Clear the root: 3 4 7 11 4 5 6 <b>0</b>.</li>
+<li><i>d</i> = 4: node 7 (value 0), left child 3 (value 11). Left gets 0; right gets 0 + 11 = 11: 3 4 7 <b>0</b> 4 5 6 <b>11</b> (Listing 1 prints the same line). <sup class="src"><a href="#F6-16-src-R1">R1</a></sup></li>
+<li><i>d</i> = 2: pairs (1, 3) and (5, 7). Element 1 gets 0, element 3 gets 0 + 4 = 4; element 5 gets 11, element 7 gets 11 + 5 = 16: 3 0 7 4 4 11 6 16.</li>
+<li><i>d</i> = 1: pairs (0,1), (2,3), (4,5), (6,7): 0 3 4 11 11 15 16 22, the exclusive scan.</li>
+</ol>
+
+<h2 id="F6-16-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>scan_sim.cpp</code>: Hillis–Steele and Blelloch, traced and counted.</p>
+<pre class="listing" data-src="F6-16/scan_sim.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined scan_sim.cpp -o scan_sim</code>.</p>
+<pre class="output" data-run="F6-16/scan_sim"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–18</td><td>two buffers</td><td>Reads the old array, writes <code>next</code>, swaps.</td><td>The second buffer the forensic kernel lacks.</td></tr>
+<tr><td>32–39</td><td>up-sweep</td><td>A reduction tree in place.</td><td>Half of Blelloch.</td></tr>
+<tr><td>40–53</td><td>down-sweep</td><td>Root cleared; swap-and-add down the tree.</td><td>Produces the exclusive scan.</td></tr>
+<tr><td>72–80</td><td>counts</td><td>Steps and additions for 8 to 4,096 elements.</td><td>Work efficiency in numbers.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>device_scan.cpp</code>: reduce-then-scan and decoupled look-back on the CPU, tested on E4's cases.</p>
+<pre class="listing" data-src="F6-16/device_scan.cpp"></pre>
+<p><b>Build command</b>: the same g++ command (with <code>-pthread</code> implied by <code>std::thread</code> in g++ 13).</p>
+<pre class="output" data-run="F6-16/device_scan"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>16–20</td><td>status word</td><td>2 status bits and a 62-bit value in one word.</td><td>Status and value change together.</td></tr>
+<tr><td>22–35</td><td>reduce-then-scan</td><td>Tile sums; exclusive scan of sums; scan tiles with offsets.</td><td>The multi-pass baseline E4 asks for first.</td></tr>
+<tr><td>46</td><td>tile counter</td><td>Dynamic tile numbers.</td><td>Forward progress.</td></tr>
+<tr><td>54–65</td><td>publish, look back, publish</td><td>A, then the loop over predecessors, then P.</td><td>The algorithm of Figure 1.</td></tr>
+<tr><td>79–98</td><td>tests</td><td>E4 sizes × four input kinds against <code>std::inclusive_scan</code>.</td><td>E4's acceptance cases.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>scan.cu</code>: the device-wide scan on the GPU, checked against CUB (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-16/scan.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings scan.cu -o scan</code>.</p>
+<pre class="output" data-run="F6-16/scan"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Built for real; the run stopped at <code>cudaGetDevice</code> (R3). Expected, not observed: "pass" for both the listing and CUB at every size. The block scan hard-codes 32-lane warps (lines 16–29), which is correct for CUDA only; a HIP port must use <code>warpSize</code> as in <a href="#F6-15">F6-15</a>. What would be needed: an NVIDIA GPU and a rerun.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–34</td><td><code>blockInclusiveScan</code></td><td>Warp scans, warp totals, scan of totals, add offsets.</td><td>Two barriers per block.</td></tr>
+<tr><td>36–42</td><td><code>scanTiles</code></td><td>Scan a tile; the last thread writes the tile total.</td><td>Pass 1 and 3 merged into one kernel.</td></tr>
+<tr><td>44–48</td><td><code>addOffsets</code></td><td>Adds the scanned total of earlier tiles.</td><td>The last pass.</td></tr>
+<tr><td>58–75</td><td><code>deviceScan</code></td><td>Recursion on the tile sums.</td><td>Any size, any number of levels.</td></tr>
+<tr><td>93–97</td><td>CUB</td><td>Size query, allocate, <code>InclusiveSum</code>.</td><td>The reference for E4's "X % of CUB".</td></tr>
+</tbody></table></div>
+<p><b>Source evidence.</b> The tile states and the warp-vote wait loop in CUB 2.0.1:</p>
+<pre class="output" data-run="F6-16/cub_lookback"></pre>
+
+<h2 id="F6-16-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Tables do not take numbers at the door.</b> In the hall, table numbers are fixed; in a correct look-back, tile numbers are handed out in the order blocks start. The analogy hides the condition that prevents deadlock.</li>
+<li><b>The board by the door is not instantly up to date.</b> Writes to global memory become visible to other SMs only with the right ordering; a status could be seen before its value without fences or a single packed word.</li>
+<li><b>Counting plates is integer arithmetic.</b> A float scan's result depends on the grouping and can change between runs; plates cannot.</li>
+</ul>
+
+<h2 id="F6-16-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> a block scan is right for 32 threads and wrong from index 32 for larger blocks (the forensic lab). <b>Cause:</b> Hillis–Steele in place, one buffer. <b>Fix:</b> two buffers, or a barrier between the read and the write of each step, or warp shuffles.</li>
+<li><b>Symptom:</b> off by one element everywhere. <b>Cause:</b> inclusive and exclusive confused. <b>Fix:</b> test the first and last output against <code>std::inclusive_scan</code>/<code>std::exclusive_scan</code>.</li>
+<li><b>Symptom:</b> wrong only for sizes that are not a multiple of the tile. <b>Cause:</b> threads past the end read garbage or skip barriers. <b>Fix:</b> load the identity past the end; test E4's 2^k ± 1 sizes.</li>
+<li><b>Symptom:</b> a hand-written single-pass scan hangs on large inputs. <b>Cause:</b> tiles numbered by <code>blockIdx.x</code> waiting for unscheduled blocks. <b>Fix:</b> dynamic tile numbers from an atomic counter.</li>
+<li><b>Symptom:</b> overflow in the totals. <b>Cause:</b> 32-bit sums of many elements. <b>Fix:</b> a wider output type.</li>
+</ul>
+
+<div class="co transition" id="F6-16-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-14">F6-14</a> (reductions), <a href="#F6-15">F6-15</a> (warp scan with <code>shfl_up</code>), <a href="#F6-12">F6-12</a> (grid-wide ordering), SP203 <a href="#F2-39">F2-39</a> (release and acquire). <b>What carries over:</b> the reduction tree is the up-sweep; kernel boundaries order passes; release/acquire publishes data with a flag. <sup class="src"><a href="#F6-16-src-D3">D3</a></sup> <b>What changes:</b> a scan needs every partial result, not only the total, so it needs a second phase (down-sweep, or offsets); single-pass designs must reason about which blocks are guaranteed to have started. <sup class="src"><a href="#F6-16-src-S2">S2</a></sup> <b>What comes next:</b> <a href="#F6-17">F6-17</a> counts values into bins (a histogram), whose exclusive scan gives each radix-sort bucket its start in <a href="#F6-18">F6-18</a>.</p></div>
+
+<h2 id="F6-16-check">Check yourself</h2>
+<ol>
+<li>Give the inclusive and exclusive scans of 2 2 2 2.</li>
+<li>Why is Hillis–Steele acceptable inside a warp although it does more additions than Blelloch?</li>
+<li>How many barriers does Listing 3's block scan use, and what does each protect?</li>
+<li>In decoupled look-back, why can a tile stop at the first P, and why must it wait at an X?</li>
+<li>Apply: tiles 0–3 have aggregates 5, 7, 2, 9; tile 1 has published P = 12, tile 2 has published A = 2. What does tile 3 collect and publish?</li>
+<li>Why does CUB's look-back use a warp vote in its wait loop?</li>
+<li>How many memory accesses per element does reduce-then-scan need compared with a single pass?</li>
+<li>Explain in your own words why decoupled look-back cannot deadlock when each block takes its tile number from an atomic counter at the start.</li>
+</ol>
+
+<h2 id="F6-16-lab">Lab</h2>
+<p><b>Goal.</b> E4's scan part: block scan, device scan multi-pass, single-pass as a stretch; all identical to a CPU reference on E4's cases.</p>
+<p><b>Hardware and software needed.</b> Steps 1–4: g++ 13.3 (no GPU). Steps 5–7: an NVIDIA GPU with CUDA 12.0 and CUB. Folder <code>university/labs/F6-16</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use; a hanging single-pass scan on a GPU that drives a display can freeze it, so use a time limit.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-16</code>; read all outputs.</li>
+<li>Do the worked example by hand for the input 1 2 3 4 5 6 7 8 and check with Listing 1.</li>
+<li>In Listing 2, number tiles by thread index instead of the atomic counter (each worker takes tiles <i>w</i>, <i>w</i> + 4, …). Does it still pass? Why might it on a CPU but not in general?</li>
+<li>Add an exclusive variant to Listing 2 and test it on the same cases.</li>
+<li>On a GPU: run Listing 3; then time <code>deviceScan</code> and CUB for 2^24 and 2^28 elements; record the percentage against your X.</li>
+<li>On a GPU: write a single-pass scan kernel following Listing 2's <code>lookback</code> (stretch goal of E4).</li>
+<li>On a GPU: scan floats with CUB twice and compare bitwise.</li>
+</ol>
+<p><b>Expected observations.</b> Step 3: it passes here, because every CPU thread eventually runs (the OS schedules all threads); on a GPU, an unscheduled block never runs while resident blocks spin. Steps 5–7: your measurements; none in this build.</p>
+<p><b>Verification.</b> 0 failures on all E4 cases for every variant.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Listing 2 is slow → the sanitizers and 4 threads; reduce the largest size while experimenting.</li>
+<li>CUB size query returns 0 bytes → possible for tiny inputs; still allocate (<code>cudaMalloc</code> of 0 is allowed) or skip.</li>
+<li>Single-pass kernel hangs → check tile numbering and that status writes are not cached in registers (use <code>volatile</code> or atomics with release semantics).</li>
+</ul>
+<p><b>Extension.</b> Stream compaction: keep elements with a predicate using a scan of 0/1 flags for output positions, and compare with <a href="#F6-15">F6-15</a>'s warp-level compaction.</p>
+
+<h2 id="F6-16-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A block scan was developed with 32-thread blocks and passes its tests. In production, with 256-thread blocks, outputs from index 32 on are wrong; the error pattern changes between GPUs. The kernel computes, for <i>d</i> = 1, 2, 4, …: <code>if (i &gt;= d) a[i] += a[i - d]; __syncthreads();</code> on one shared array.</p>
+<p><b>Evidence pack.</b> A replay of the kernel with 8 warps, where each warp reads before it writes, but warps run in different orders within each step (<code>inplace_race.cpp</code>):</p>
+<pre class="listing" data-src="F6-16/inplace_race.cpp"></pre>
+<pre class="output" data-run="F6-16/inplace_race"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: how many outputs are wrong for each warp order, and where is the first wrong one?</li>
+<li>Hypotheses: a missing barrier between steps; overflow; a read-write race inside a step. Which evidence decides?</li>
+<li>Root cause: explain the first wrong index, 32, for <i>d</i> = 1.</li>
+<li>Explain why "warp 7 first" gives correct results, and why that is no comfort.</li>
+<li>Fix and prevention.</li>
+</ol>
+<p><b>Method hints.</b> Which element does lane 0 of warp 1 read in step <i>d</i> = 1, and who writes it?</p>
+
+<h2 id="F6-16-project">Mini-project</h2>
+<p><b>The scan module of the primitives library.</b> Inclusive and exclusive scans for <code>int</code> and <code>unsigned long long</code>, device-wide, reduce-then-scan; tests on E4's sizes and inputs; a timing row against CUB's <code>DeviceScan</code>. Stretch: a single-pass version with decoupled look-back.</p>
+<p><b>Rubric.</b> Both scans correct on all cases (4). Clean block scan without bank conflicts (2). Comparison with CUB (2). Stretch, correct and explained (2, bonus).</p>
+
+<h2 id="F6-16-summary">Summary</h2>
+<ul>
+<li>Inclusive includes the element; exclusive starts at the identity.</li>
+<li>Hillis–Steele: log₂ <i>n</i> steps, ~<i>n</i> log₂ <i>n</i> additions; Blelloch: 2 log₂ <i>n</i> steps, ~2<i>n</i> additions.</li>
+<li>Practical block scan: warp shuffles plus a scan of warp totals.</li>
+<li>Device-wide: reduce-then-scan (three passes), or single-pass decoupled look-back (CUB).</li>
+<li>Look-back waits only for tiles that started earlier: dynamic tile numbers make that true.</li>
+<li>Integer scans are deterministic; float scans may vary run to run.</li>
+</ul>
+
+<h2 id="F6-16-sources">Sources</h2>
+<ol>
+<li id="F6-16-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): memory fences, thread hierarchy. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-16-src-D3">D3 — Hwu, Kirk, El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): the prefix-sum chapter. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-16-src-S2">S2 — Duane Merrill and Michael Garland, "Single-pass Parallel Prefix Scan with Decoupled Look-back" (tier 5; cited in the CUB header as NVIDIA Technical Report NVR-2016-002, 2016). <i>Title only — the paper was not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-16-src-H1">H1 — CUDA 12.0 headers as installed, read in this build: <code>sm_30_intrinsics.h</code> (<code>__shfl_up_sync</code>). Tier 1.</li>
+<li id="F6-16-src-H2">H2 — CUB 2.0.1 headers as installed (libcub-dev 2.0.1-2), read in this build: <code>cub/device/device_scan.cuh</code> (decoupled look-back, the citation, the determinism note, quoted), <code>cub/agent/single_pass_scan_operators.cuh</code> (<code>ScanTileStatus</code>, the wait loop). Tier 1.</li>
+<li id="F6-16-src-R1">R1 — run of Listing 1 (<code>university/labs/F6-16/scan_sim.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-16-src-R2">R2 — run of Listing 2 (<code>device_scan.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-16-src-R3">R3 — build and run of Listing 3 (<code>scan.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F6-16-src-R4">R4 — run of <code>inplace_race.cpp</code> (<code>inplace_race.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-16-src-R5">R5 — CUB source excerpt (<code>cub_lookback.log</code>), read only.</li>
+</ol>
+
+<h2 id="F6-16-glossary">Glossary links</h2>
+<p><a href="#gl-scan-prefix-sum">Scan (prefix sum)</a> · <a href="#gl-inclusive-scan">Inclusive scan</a> · <a href="#gl-exclusive-scan">Exclusive scan</a> · <a href="#gl-hillis-steele-scan">Hillis–Steele scan</a> · <a href="#gl-blelloch-scan">Blelloch scan</a> · <a href="#gl-reduce-then-scan">Reduce-then-scan</a> · <a href="#gl-decoupled-look-back">Decoupled look-back</a></p>
+
+<h2 id="F6-16-next">Next chapter</h2>
+<p>Next: <a href="#F6-17">F6-17 Histograms and privatization</a>. Previous: <a href="#F6-15">F6-15 Warp-level primitives</a>. Back to the course: <a href="#CU301">CU301</a>.</p>
+
+<h2 id="F6-16-answers">Answers to Check yourself</h2>
+<ol>
+<li>Inclusive 2 4 6 8; exclusive 0 2 4 6.</li>
+<li>All 32 lanes execute every step anyway (one instruction for the warp), so extra additions cost no extra time; Hillis–Steele has the fewest steps.</li>
+<li>Two: the first after lane 31 writes the warp totals (warp 0 reads them); the second after warp 0 writes the scanned totals (all warps read them).</li>
+<li>A P holds the full inclusive prefix of that tile, so everything before it is included; an X has no value yet, and skipping it would miss its aggregate.</li>
+<li>It reads tile 2: A = 2 (adds 2), then tile 1: P = 12 (adds 12, stops). Exclusive = 14; it publishes P = 14 + 9 = 23. Check: 5 + 7 + 2 + 9 = 23.</li>
+<li>So that 32 lanes inspect 32 predecessor tiles at once and the loop exits only when none of them is still INVALID (R5).</li>
+<li>Reduce-then-scan reads the input twice and writes once (about 3<i>n</i>; this listing's variant writes then rereads in <code>addOffsets</code>); a single pass reads once and writes once (about 2<i>n</i>).</li>
+<li>A tile only waits for tiles with smaller numbers. With a counter, a smaller number was taken by a block that had already started, and a block that has started keeps its place on the SM and runs to completion, so every tile it waits for will publish its value. With <code>blockIdx.x</code> as the tile number, a resident block could wait for a block that has not been scheduled and never will be while the waiters hold all the slots.</li>
+</ol>
+<h3 id="F6-16-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Warp 0 first: 223 of 256 wrong, first at index 32. Warp 7 first: 0 wrong. Shuffled orders: 214, 219, 204, 216 wrong, first always 32 (R4).</p>
+<p><b>Hypotheses.</b> The barrier between steps is present in the replay and the errors remain. Overflow is impossible with values up to 256. A race inside a step fits: the result depends on warp order.</p>
+<p><b>Root cause.</b> At <i>d</i> = 1, lane 0 of warp 1 (index 32) reads <code>a[31]</code>, which lane 31 of warp 0 writes in the same step. If warp 0 runs first, index 32 adds the already updated value: a read-after-write within one step with no barrier between the read and the write. Inside one warp it cannot happen in the replay (all lanes read before any write), which is why 32-thread blocks passed.</p>
+<p><b>Why warp 7 first works.</b> Higher warps read before lower warps write, by luck of order. The hardware does not promise any order between warps, so a test that passes on one GPU proves nothing.</p>
+<p><b>Fix.</b> Two buffers (Listing 1, lines 12–18), or read into a register, <code>__syncthreads()</code>, then write, then <code>__syncthreads()</code>; or the warp-shuffle block scan of Listing 3. <b>Prevention:</b> test with the production block size; Compute Sanitizer racecheck; the rule of <a href="#F6-12">F6-12</a>: every shared write that others read needs a barrier between.</p>
+<p><b>How the evidence was produced:</b> <code>inplace_race.cpp</code> (a CPU replay with a seeded warp order); no GPU was used. The within-warp "all lanes read before any lane writes" rule is a modelling assumption.</p>

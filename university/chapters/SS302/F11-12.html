@@ -1,0 +1,207 @@
+<!--meta
+id: F11-12
+title: Untrusted input from devices
+course: SS302
+level: L3
+prereqs: F11-08; F11-09; F11-11; DR301; DR302; OS305 (F3-34)
+time: 6–9 hours including the lab
+hardware: none (host C++: g++ 13.3.0 with AddressSanitizer, as recorded in the lab logs)
+maps: Curriculum runbook 5.4 "Trust" row (device values untrusted; IOMMU for DMA) and B12 (user pointers); SS302 goal "treat device and network input as untrusted"
+analogy: F11 — a castle with gates and guards
+-->
+
+<h2 id="F11-12-hook">Story hook</h2>
+<p>A delivery arrives at the castle with its own paperwork: "this crate contains two hundred items; unpack them onto shelf seven." A careless quartermaster reads "two hundred" and starts counting items off the crate — but the crate holds three, and the fourth count reaches past the crate into the next delivery, and the next. The paperwork was written by the sender, who may be careless or hostile, yet it was obeyed as if it were the castle's own count. The rule the castle learns the hard way: numbers that come with the goods are claims, not facts. Check them against what actually arrived before acting.</p>
+<p>Devices and networks are exactly this: a USB stick, a network packet, a sensor, a radio link all hand your program lengths, counts, indices and offsets that an attacker may control. This chapter is the discipline for the whole boundary — treat every device-provided value as untrusted — and it ties together the bugs of <a href="#F11-07">F11-07</a>, the safe patterns of <a href="#F11-08">F11-08</a>, and the finding and hardening of <a href="#F11-09">F11-09</a> and <a href="#F11-10">F11-10</a>, applied where they matter most.</p>
+
+<h2 id="F11-12-able">What you will be able to do</h2>
+<ul>
+<li><b>Identify</b> the untrusted values a device or protocol hands you: lengths, counts, indices, offsets, descriptor contents.</li>
+<li><b>Validate</b> every such value against what was actually received, in the overflow-safe form, before using it.</li>
+<li><b>Explain</b> why hardware channels (DMA) need the IOMMU as well as software checks (the runbook "Trust" row).</li>
+<li><b>Diagnose</b> an over-read caused by a trusted length from a sanitizer report.</li>
+<li><b>Apply</b> the validate-at-the-boundary rule to a parser and turn malformed inputs into clean rejections.</li>
+</ul>
+
+<div class="co jargon" id="F11-12-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Untrusted input</dt><dd><b>Simple words:</b> data from outside your program that an attacker might control. <b>Analogy:</b> paperwork written by whoever sent the crate. <b>Precise:</b> any value crossing a trust boundary — a file, a network packet, a device register or descriptor, a user-space pointer — that must be validated before use because its source is not under your control. <sup class="src"><a href="#F11-12-src-D1">D1</a></sup></dd>
+<dt>Trust boundary</dt><dd><b>Simple words:</b> the line between code you control and data you do not. <b>Analogy:</b> the castle gate, where outside paperwork meets inside rules. <b>Precise:</b> the interface at which data of lower trust enters a higher-trust component; all validation must happen on the inside of it, once, before the data is used. <sup class="src"><a href="#F11-12-src-D1">D1</a></sup></dd>
+<dt>Descriptor</dt><dd><b>Simple words:</b> a small record a device gives describing itself or its data. <b>Analogy:</b> the crate's paperwork. <b>Precise:</b> a device-supplied structure (e.g. a USB configuration descriptor with a <code>wTotalLength</code>, or a DMA descriptor with address and length fields) whose every field is attacker-influenceable and must be bounded. <sup class="src"><a href="#F11-12-src-D2">D2</a></sup></dd>
+<dt>DMA</dt><dd><b>Simple words:</b> a device reading or writing memory directly, without the CPU copying each byte. <b>Analogy:</b> a courier allowed into the storeroom to fetch goods himself. <b>Precise:</b> Direct Memory Access — a device transfers data to/from memory over the bus; a malicious or buggy device can read or overwrite memory it was not meant to unless constrained. <sup class="src"><a href="#F11-12-src-D3">D3</a></sup></dd>
+<dt>IOMMU</dt><dd><b>Simple words:</b> a guard between devices and memory that limits which memory a device may touch. <b>Analogy:</b> a gatekeeper at the storeroom with a list of shelves each courier may use. <b>Precise:</b> an input–output memory management unit that translates device addresses through per-device tables and blocks accesses without a mapping, containing a malicious device's DMA. <sup class="src"><a href="#F11-12-src-D3">D3</a></sup></dd>
+<dt>Fail closed</dt><dd><b>Simple words:</b> when input is invalid, reject it and stop, rather than guessing. <b>Analogy:</b> refuse the crate whose paperwork does not match, do not unpack it anyway. <b>Precise:</b> a design in which an unexpected or malformed input leads to a safe refusal (error returned, operation aborted), never to undefined behaviour or a best-effort continue. <sup class="src"><a href="#F11-12-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F11-12-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the lab's bug: a configuration descriptor claims a <code>wTotalLength</code> larger than the bytes actually received, and a parser that trusts it walks off the end of the buffer.</p>
+<figure id="F11-12-fig1"><div class="svgbox">
+<svg viewBox="0 0 780 240" role="img" aria-labelledby="F11-12-f1t F11-12-f1d">
+<title id="F11-12-f1t">Figure 1: a trusted length walks off the end of the received bytes</title>
+<desc id="F11-12-f1d">A short block of four received bytes is drawn on the left: bLength, bDescriptorType, and a two-byte wTotalLength holding the value 200. A dashed outline extends far to the right, up to byte 200, labelled "claimed length". An arrow labelled "parser advances by trusted lengths" runs from the received bytes into the dashed region, crossing the boundary where the real bytes end at byte 4. At that boundary a red marker says "end of received data; reads past here are out of bounds". A note says the fixed parser checks wTotalLength is less than or equal to the bytes received and rejects otherwise.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="240"/>
+<text class="sv-tb" x="20" y="28">4 bytes received; paperwork claims 200</text>
+<rect class="sv-b1" x="40" y="50" width="70" height="40"/><text class="sv-tm" x="52" y="75">bLen</text>
+<rect class="sv-b1" x="110" y="50" width="70" height="40"/><text class="sv-tm" x="120" y="75">type</text>
+<rect class="sv-b6" x="180" y="50" width="120" height="40"/><text class="sv-tm" x="192" y="75">wTotal=200</text>
+<rect class="sv-dash" x="300" y="50" width="420" height="40"/><text class="sv-ts" x="420" y="75">claimed bytes 4 .. 199 (not received)</text>
+<line class="sv-line2" x1="60" y1="120" x2="700" y2="120"/><polygon class="sv-head" points="700,120 688,114 688,126"/>
+<text class="sv-ts" x="60" y="140">parser advances by trusted lengths, past the real end</text>
+<line class="sv-dash" x1="300" y1="44" x2="300" y2="150"/>
+<text class="sv-tm" x="306" y="168">end of received data (byte 4)</text>
+<text class="sv-tm" x="306" y="186">reads past here = out of bounds (R2)</text>
+<text class="sv-ts" x="20" y="218">Fix: require wTotalLength &lt;= bytes received, and each bLength within bounds; else reject (R3). Not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> A descriptor's <code>wTotalLength</code> claims 200 bytes but only 4 arrived; a parser that trusts it reads out of bounds. Data flow left to right. From the lab run (R2, R3). <sup class="src"><a href="#F11-12-src-R2">R2</a></sup> <sup class="src"><a href="#F11-12-src-R3">R3</a></sup></figcaption></figure>
+
+<h2 id="F11-12-layer1">Layer 1 — the kid explanation</h2>
+<p>When a program talks to a device or a network, the other side sends not just data but numbers that describe the data: "there are two hundred items", "the name is at position fifty", "skip forward thirty bytes". A careless program believes those numbers and uses them to decide where to read and write — and if the number is wrong (by accident or on purpose), the program reads or writes somewhere it should not. The rule is simple and strict: never trust a number that came from outside. Check it against what you actually received before you use it, and if it does not fit, refuse the whole thing.</p>
+
+<h2 id="F11-12-layer2">Layer 2 — the student explanation</h2>
+<p>The curriculum's universal method has a "Trust" row that states the rule for drivers: treat device-provided values — lengths, indices, descriptor contents — as untrusted, and remember that external devices (malicious USB, Thunderbolt/USB4) can attack through DMA and malformed descriptors, so enable the IOMMU. The same rule covers network packets and any protocol you parse. <sup class="src"><a href="#F11-12-src-D1">D1</a></sup></p>
+<p>Concretely, at every <b>trust boundary</b>, for every value that came from outside:</p>
+<ul>
+<li><b>Lengths and sizes</b>: check against the bytes actually received, in the overflow-safe form <code>off &lt;= size &amp;&amp; len &lt;= size - off</code> (never <code>off + len &lt;= size</code>, which can wrap — <a href="#F2-44">F2-44</a>). Also bound them to a sane maximum (<a href="#F11-07">F11-07</a>). <sup class="src"><a href="#F11-12-src-D4">D4</a></sup></li>
+<li><b>Indices</b>: check <code>i &lt; count</code> before use; a device can send an index past the array.</li>
+<li><b>Offsets</b>: check they land inside the buffer and that what they point to also fits.</li>
+<li><b>Counts and loop bounds</b>: a descriptor claiming a huge count or a zero advance can cause an over-read or a non-terminating loop; bound both.</li>
+</ul>
+<p>The lab shows this with a USB-configuration-style descriptor. The buggy parser trusts <code>wTotalLength</code> and each descriptor's <code>bLength</code> and advances through them; given a four-byte blob that claims a total of two hundred, it reads past the end and AddressSanitizer reports a heap-buffer-overflow (R2, Figure 1). The fixed parser checks that <code>wTotalLength</code> is within the received bytes and that each <code>bLength</code> is at least its header and fits, and it rejects malformed blobs cleanly (R3). <sup class="src"><a href="#F11-12-src-D2">D2</a></sup> <sup class="src"><a href="#F11-12-src-R2">R2</a></sup> <sup class="src"><a href="#F11-12-src-R3">R3</a></sup></p>
+
+<h2 id="F11-12-layer3">Layer 3 — the engineer's depth</h2>
+<p>Validation must happen once, on the inside of the boundary, and the validated result must be the only thing the rest of the code sees — otherwise a value is checked in one place and used unchecked in another (a time-of-check/time-of-use gap). For a parser that means: copy or bound the input up front, carry lengths with pointers (a <code>span</code>, <a href="#F11-08">F11-08</a>), and make every advance a checked step. The discipline pairs with <a href="#F11-09">F11-09</a>: a boundary parser is exactly the thing to fuzz, because its whole job is to survive hostile input, and the lab's descriptor parser, the ELF reader and the MAVLink scanner are all the same shape — read a length, bound it, advance. <sup class="src"><a href="#F11-12-src-D4">D4</a></sup></p>
+<p>Software checks are necessary but not sufficient when a device can touch memory directly. A device doing <b>DMA</b> writes to physical memory over the bus; no amount of pointer validation in the driver constrains where the device itself writes. That is why the "Trust" row also says to enable the <b>IOMMU</b>: it sits between devices and memory and only permits a device to access memory the kernel explicitly mapped for it, so a malicious USB4/Thunderbolt device or a compromised peripheral cannot read secrets or overwrite kernel memory by DMA. The driver still validates descriptor contents (the device can lie about lengths and indices in the rings it shares), and the IOMMU contains the hardware channel; both layers are needed, as you saw building drivers in <a href="#DR302">DR302</a>. <sup class="src"><a href="#F11-12-src-D3">D3</a></sup></p>
+<p>Two further boundaries reuse the same rule. User-space pointers into a kernel (B12) are untrusted input: a system call's pointer and length must be range-checked and copied through a fault-tolerant routine, with SMAP as the hardware backstop (<a href="#F11-10">F11-10</a>, <a href="#F3-29">F3-29</a>). And protocol input from a radio or network — the MAVLink scanner of <a href="#F11-09">F11-09</a> — is untrusted in the same way: a length byte on the wire is a claim about bytes that may not be there. The unifying idea is that "device", "network" and "user space" are all just sources outside your trust boundary, and one rule covers them: validate against reality, bound to a maximum, fail closed. <sup class="src"><a href="#F11-12-src-D1">D1</a></sup> <sup class="src"><a href="#F11-12-src-D5">D5</a></sup></p>
+
+<h2 id="F11-12-hardware">How the hardware actually does it</h2>
+<p>A memory-mapped device register is just an address; reading it returns whatever the device drives onto the bus, which the device chooses, so a value read from a register is as untrusted as a byte from the network — the hardware gives you no guarantee about it (<a href="#F2-50">F2-50</a>). <sup class="src"><a href="#F11-12-src-D2">D2</a></sup> For DMA, the device is a bus master: it issues its own memory transactions, and without an IOMMU those go to physical addresses the device names, anywhere in memory. The IOMMU is real hardware — a translation unit on the path from device to memory — that the kernel programs with per-device page tables; a device transaction to an unmapped address faults instead of succeeding, which is what contains a malicious device. The software lesson and the hardware lesson meet here: validate the numbers the device puts in the descriptors you read, and use the IOMMU to bound the memory the device can reach on its own. <sup class="src"><a href="#F11-12-src-D3">D3</a></sup></p>
+
+<h2 id="F11-12-worked">Worked example</h2>
+<p>Take the lab's descriptor blob <code>04 02 c8 00</code>: a four-byte configuration header with <code>bLength</code> 4, <code>bDescriptorType</code> 2, and <code>wTotalLength</code> = 0x00c8 = 200. Four bytes were received; the paperwork claims two hundred. The buggy parser reads <code>wTotalLength</code>, sets its loop limit to 200, and begins reading descriptor headers at offset 4 — which is already the end of the received data. Its first read of a byte at or past offset 4 is out of bounds, and AddressSanitizer reports a heap-buffer-overflow READ in <code>parse_config</code> (R2). The fixed parser first checks <code>wTotalLength &lt;= size</code> (200 &gt; 4, so it rejects) and would also check each descriptor's <code>bLength</code> is at least the two-byte header and that <code>pos + bLength &lt;= size</code>; given the hostile blob it returns "rejected: malformed descriptor" without reading anything out of bounds (R3). On a well-formed blob — header plus two two-byte descriptors, <code>wTotalLength</code> 8 — the fixed parser accepts and reports two descriptors (R4). The whole difference is three bounds checks on values that came from the device. <sup class="src"><a href="#F11-12-src-R2">R2</a></sup> <sup class="src"><a href="#F11-12-src-R3">R3</a></sup> <sup class="src"><a href="#F11-12-src-R4">R4</a></sup></p>
+
+<h2 id="F11-12-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>descparse.cc</code>: the descriptor parser; the bug is trusting the device's lengths, the fix is the <code>#ifdef FIXED</code> bounds checks (full file in the lab folder).</p>
+<pre class="listing" data-src="F11-12/descparse.cc"></pre>
+<table class="tw"><thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>34</td><td><code>unsigned w_total = p[2] | (p[3] &lt;&lt; 8);</code></td><td>Reads <code>wTotalLength</code> from the device.</td><td>Untrusted: it may exceed the bytes received.</td></tr>
+<tr><td>36–41</td><td><code>#ifdef FIXED if (w_total &gt; size) return -1;</code></td><td>The fix: the claim must not exceed reality.</td><td>Stops the loop limit from running past the buffer.</td></tr>
+<tr><td>47–50</td><td><code>b_length &lt; header || pos + b_length &gt; size</code></td><td>Bounds each descriptor and its advance.</td><td>Blocks a zero-advance loop and an over-long descriptor.</td></tr>
+<tr><td>53–56</td><td><code>type = p[pos + 1]; pos += b_length;</code></td><td>Reads a field and advances.</td><td>The out-of-bounds read when the checks are absent.</td></tr>
+</tbody></table>
+<p><b>The buggy parser</b> on the hostile four-byte blob that claims 200: AddressSanitizer catches the over-read:</p>
+<pre class="output" data-run="F11-12/buggy_evil"></pre>
+<p><b>The fixed parser</b> rejects the same blob cleanly — it fails closed:</p>
+<pre class="output" data-run="F11-12/fixed_evil"></pre>
+<p><b>The fixed parser</b> on a well-formed blob accepts it:</p>
+<pre class="output" data-run="F11-12/fixed_good"></pre>
+<p>The fixed parser's unit tests, run under both sanitizers over crafted malformed blobs (over-long total, zero length, length past end), all pass:</p>
+<pre class="output" data-run="F11-12/desc_tests"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The descriptor shape used here (a configuration header carrying a 16-bit <code>wTotalLength</code>, followed by descriptors each led by <code>bLength</code> and <code>bDescriptorType</code>) follows the USB configuration-descriptor layout at the level this lab needs, but the exact field offsets, the descriptor type codes, and the rules for nested interface and endpoint descriptors are <b>not</b> reproduced faithfully. Confirm them against the USB specification (the "Standard Device Descriptor Definitions" chapter) before parsing real USB data; the OS305 chapter on descriptors (<a href="#F3-34">F3-34</a>) is the university's starting point. The untrusted-length rule and its fix do not depend on these details.</p></div>
+
+<h2 id="F11-12-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A crate is physically bounded; a descriptor's claim is not.</b> The paperwork can claim any number; nothing physical stops a length field from naming megabytes. That is exactly why the check must be explicit in software. <sup class="src"><a href="#F11-12-src-D2">D2</a></sup></li>
+<li><b>A quartermaster can see the crate is empty; a DMA device bypasses the gate entirely.</b> A courier allowed into the storeroom (DMA) does not hand over paperwork to check — it fetches memory itself, which is why the IOMMU, not just descriptor validation, is needed. <sup class="src"><a href="#F11-12-src-D3">D3</a></sup></li>
+<li><b>"Refuse the crate" is clean at a gate; a device may keep sending.</b> Failing closed on one bad descriptor is right, but a real driver must also handle a device that floods, stalls or disappears — robustness beyond a single rejection (the driver design note of <a href="#DR302">DR302</a>). </li>
+</ul>
+
+<h2 id="F11-12-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> an over-read or crash when a device sends a short or crafted transfer. <b>Cause:</b> a length or count from the device used without checking against the bytes received. <b>How to find it:</b> AddressSanitizer names a heap-buffer-overflow in the parser; the input has a length field larger than the data. <b>Fix:</b> check <code>len &lt;= size - off</code> and bound to a maximum before use.</li>
+<li><b>Symptom:</b> a parser loops forever on some device input. <b>Cause:</b> an advance taken from the device that can be zero (a descriptor of length 0). <b>How to find it:</b> a timeout; the loop position never changes. <b>Fix:</b> require each advance to be at least the header size, and fail closed otherwise.</li>
+<li><b>Symptom:</b> validation exists but the bug still happens. <b>Cause:</b> a time-of-check/time-of-use gap — the value is checked once and re-read or re-used unchecked. <b>How to find it:</b> trace every use of the device value. <b>Fix:</b> validate once at the boundary and pass only the validated result inward (a bounded <code>span</code>).</li>
+</ul>
+
+<div class="co transition" id="F11-12-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F2-44">SP301</a> built a bounds-checked parser for untrusted files, <a href="#DR302">DR302</a> and <a href="#F3-34">OS305</a> read real device descriptors, and <a href="#F11-09">F11-09</a> fuzzed parsers. <b>What carries over:</b> the overflow-safe bounds check, the safe patterns of <a href="#F11-08">F11-08</a>, fuzzing and the coding standard of <a href="#F11-11">F11-11</a>. <sup class="src"><a href="#F11-12-src-D4">D4</a></sup> <b>What changes:</b> you now apply one rule to every boundary — device, network, user space — validate against reality, bound to a maximum, fail closed — and you add the hardware layer (IOMMU) where a device can touch memory directly. <b>What comes next:</b> this is the last chapter of SS302; the course practical reviews a provided parser against this discipline, and the project is a fuzzing campaign on a university program. The threat-modelling course <a href="#SS401">SS401</a> takes the trust-boundary idea to whole systems.</p></div>
+
+<h2 id="F11-12-check">Check yourself</h2>
+<ol>
+<li>List four kinds of device-provided value you must treat as untrusted, and the risk of trusting each.</li>
+<li>Write the overflow-safe check for "a field of length <code>len</code> at offset <code>off</code> fits in <code>size</code> bytes", and say why the naive form is wrong.</li>
+<li>Explain in your own words why validating descriptor contents is not enough when a device can do DMA.</li>
+<li>Which is true? (a) The IOMMU removes the need to validate descriptor lengths. (b) A device register read returns a trusted value. (c) A zero-length descriptor can cause a non-terminating loop. (d) Validating a value twice in two places is safer than once at the boundary.</li>
+<li>What does "fail closed" mean for a parser given a malformed descriptor?</li>
+<li>Apply it: a packet header says "payload length 1000" but you received 40 bytes. What must the parser do before copying the payload, and what should it do if the check fails?</li>
+<li>Predict, then run: feed the buggy parser the blob <code>04 02 c8 00</code> (claims 200 bytes). Predict what AddressSanitizer reports; then feed the fixed parser the same blob and predict its output. Check against <code>buggy_evil.out</code> and <code>fixed_evil.out</code>.</li>
+</ol>
+
+<h2 id="F11-12-lab">Lab</h2>
+<p><b>Goal.</b> See a descriptor parser over-read on a hostile blob under AddressSanitizer, then confirm the fixed parser rejects malformed input and accepts well-formed input.</p>
+<p><b>Hardware and software needed.</b> No hardware. Logged toolchain: <code>g++ 13.3.0</code> with <code>-fsanitize=address,undefined</code>. Run <code>university/labs/run_lab.sh university/labs/F11-12</code> from the repository root.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. In <code>buggy_evil.out</code>, find the heap-buffer-overflow READ and the function and line; relate it to <code>wTotalLength</code> = 200 over 4 received bytes (Figure 1).</li>
+<li>In <code>fixed_evil.out</code>, confirm the same blob is rejected as malformed (fail closed).</li>
+<li>In <code>fixed_good.out</code>, confirm the well-formed blob is accepted with two descriptors.</li>
+<li>In <code>desc_tests.out</code>, read the five checks (empty, over-long total, zero length, length past end, well-formed) and name which field each one abuses.</li>
+<li>Write the three bounds checks the fixed parser adds and, for each, the attack it blocks.</li>
+</ol>
+<p><b>Expected observations.</b> The buggy parser over-reads (ASan report); the fixed parser rejects the hostile blob and accepts the good one; the unit tests pass. <sup class="src"><a href="#F11-12-src-R2">R2</a></sup> <sup class="src"><a href="#F11-12-src-R3">R3</a></sup> <sup class="src"><a href="#F11-12-src-R4">R4</a></sup> <sup class="src"><a href="#F11-12-src-R1">R1</a></sup></p>
+<p><b>Verification.</b> <code>run_lab.sh</code> exits 0; the buggy build's ASan report names <code>parse_config</code>; the fixed build rejects the hostile blob and the unit tests print ALL TESTS PASSED.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The buggy parser does not over-read → your blob's <code>wTotalLength</code> did not exceed the bytes → use the provided <code>04 02 c8 00</code> (claims 200).</li>
+<li>The fixed parser rejects a good blob → the <code>wTotalLength</code> did not match the real length → set it to the true total (header plus descriptors).</li>
+<li>The loop never terminates → a descriptor with <code>bLength</code> 0 slipped through → ensure the <code>bLength &lt; header</code> check is present in the fixed build.</li>
+</ul>
+<p><b>Extension.</b> Fuzz the descriptor parser with the F11-09 harness: build the buggy target with coverage, seed it with a well-formed blob, and confirm the fuzzer finds the over-read; then fuzz the fixed build and confirm it survives.</p>
+
+<h2 id="F11-12-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A driver crashed when a particular USB stick was plugged in. The engineer captured the AddressSanitizer report from a host-side replay of the device's configuration descriptor through the lab parser.</p>
+<p><b>Evidence pack.</b> The real report from the buggy parser on the hostile descriptor:</p>
+<pre class="output" data-run="F11-12/buggy_evil"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what does the report say (READ/WRITE, size, function, line)? What is the size of the valid region versus the access?</li>
+<li>Hypotheses: name two device-provided values that could place the read out of bounds; which does the four-byte blob implicate?</li>
+<li>Root cause: which field did the parser trust, and against what should it have been checked?</li>
+<li>Fix: write the bounds check and say where it goes; add the per-descriptor checks too.</li>
+<li>Prevention: beyond the software fix, what hardware feature contains a malicious device that attacks by DMA, and why is it needed in addition to the parser fix?</li>
+</ol>
+<p><b>Method hints.</b> Compare <code>wTotalLength</code> (the claim) with the bytes received (the reality). The fix is the same overflow-safe shape as the ELF reader in <a href="#F2-44">F2-44</a>; the hardware answer is in the "Trust" row.</p>
+
+<h2 id="F11-12-project">Mini-project</h2>
+<p><b>Harden a boundary parser.</b> Take a parser for a device or protocol format (the descriptor parser here, a packet header, or the MAVLink scanner of <a href="#F11-09">F11-09</a>). List every value that crosses the trust boundary (lengths, counts, indices, offsets). For each, add a validated, overflow-safe, maximum-bounded check at the boundary, and make the parser fail closed. Write unit tests of malformed inputs for each check, run them under both sanitizers, and fuzz the result. Deliver: the before/after parser, the trust-boundary table, the tests, and the fuzzing log — plus one paragraph on what the IOMMU adds that your software checks cannot.</p>
+<p><b>Rubric.</b> Every boundary value identified and checked, overflow-safe and bounded (4). Fails closed on malformed input with tests (2). Fuzzed clean after the fix (2). Correct explanation of the IOMMU's role (2).</p>
+
+<h2 id="F11-12-summary">Summary</h2>
+<ul>
+<li>Every value from a device or network — length, count, index, offset, descriptor content — is untrusted and must be validated before use.</li>
+<li>Validate once, on the inside of the trust boundary, in the overflow-safe form, bounded to a sane maximum, and fail closed.</li>
+<li>The descriptor-length bug is the archetype: a parser that trusts <code>wTotalLength</code> or <code>bLength</code> walks off the received bytes.</li>
+<li>Software validation does not constrain DMA; the IOMMU bounds the memory a device can touch directly, and both layers are needed.</li>
+<li>"Device", "network" and "user space" are all sources outside the trust boundary; one rule covers them.</li>
+<li>Boundary parsers are the prime target to fuzz (F11-09) and to review (F11-11); this discipline ties the course together.</li>
+</ul>
+
+<h2 id="F11-12-sources">Sources</h2>
+<ol>
+<li id="F11-12-src-D1">"Systems Curriculum" universal method, stage (d) design note, the "Trust" row: device-provided values untrusted; malicious USB/Thunderbolt DMA; enable the IOMMU (a map to sources, AH-4; curriculum 5.4). <i>Quoted for the rule; technical claims are tagged to the documents below.</i></li>
+<li id="F11-12-src-D2">USB Implementers Forum, "Universal Serial Bus Specification": standard descriptor definitions, configuration descriptor and <code>wTotalLength</code> (tier 1). <i>Title only — not opened during this build; confirm field layouts (dossier gate G1 open).</i></li>
+<li id="F11-12-src-D3">Linux kernel documentation on the IOMMU and DMA protection, and on Thunderbolt/USB4 security levels (tier 2); the curriculum catalogue's IOMMU rows (C7). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-12-src-D4">ISO/IEC JTC1/SC22/WG21, C++ standard working draft: integer conversions and the overflow-safe comparison; <code>&lt;span&gt;</code> for carrying lengths (tier 1). <i>Title only — draft number to be recorded (dossier gate G1 open).</i></li>
+<li id="F11-12-src-D5">Intel Corporation, "Intel 64 and IA-32 Architectures Software Developer's Manual", Vol. 3, SMAP and fast system calls; curriculum B12 (user-pointer validation) (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-12-src-R1">R1 — lab run, step <code>desc_tests</code> (<code>desc_tests.log</code>): g++ 13.3.0 with <code>-fsanitize=address,undefined</code>, exit 0, ALL TESTS PASSED on five malformed/well-formed blobs.</li>
+<li id="F11-12-src-R2">R2 — lab run, step <code>buggy_evil</code> (<code>buggy_evil.log</code>): AddressSanitizer heap-buffer-overflow READ in <code>parse_config</code> on a 4-byte blob claiming <code>wTotalLength</code> 200.</li>
+<li id="F11-12-src-R3">R3 — lab run, step <code>fixed_evil</code> (<code>fixed_evil.log</code>): the fixed parser rejects the same blob as malformed (exit 1), no over-read.</li>
+<li id="F11-12-src-R4">R4 — lab run, step <code>fixed_good</code> (<code>fixed_good.log</code>): the fixed parser accepts a well-formed blob and reports two descriptors.</li>
+</ol>
+
+<h2 id="F11-12-glossary">Glossary links</h2>
+<p><a href="#gl-untrusted-input">Untrusted input</a> · <a href="#gl-trust-boundary">Trust boundary</a> · <a href="#gl-descriptor-ss302">Descriptor</a> · <a href="#gl-dma-ss302">DMA</a> · <a href="#gl-iommu">IOMMU</a> · <a href="#gl-fail-closed">Fail closed</a></p>
+
+<h2 id="F11-12-next">Next chapter</h2>
+<p>This is the last chapter of <a href="#SS302">SS302</a>. Previous: <a href="#F11-11">F11-11 Coding standards</a>. The course practical reviews a provided parser against this discipline; the project is a fuzzing campaign on a university program. Next course in the faculty: <a href="#SS401">SS401 Threat modelling</a>. Curriculum: the <a href="../SYSTEMS_CURRICULUM.html#method">universal method</a> 5.4 "Trust" row and <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (B12).</p>
+
+<h2 id="F11-12-answers">Answers to Check yourself</h2>
+<ol>
+<li>For example: a length/size (over-read or over-write if larger than the data); an index (out-of-bounds element access); an offset (points outside the buffer); a count or loop bound (over-read or non-terminating loop). Each, trusted, lets the device steer a read or write.</li>
+<li><code>off &lt;= size &amp;&amp; len &lt;= size - off</code>. The naive <code>off + len &lt;= size</code> can wrap around the integer maximum to a small value and pass even when the field is far out of bounds; the subtraction form cannot wrap once <code>off &lt;= size</code> holds.</li>
+<li>Because a DMA device writes to memory itself, over the bus, without going through the driver's code at all; validating the descriptors the driver reads does not constrain where the device's own transactions go. Only the IOMMU can bound that.</li>
+<li>(c). (a) the IOMMU bounds DMA but the driver still must validate descriptor contents the device supplies; (b) a register read returns whatever the device drives, untrusted; (d) checking in two places invites a time-of-check/time-of-use gap — validate once at the boundary.</li>
+<li>It means: on a malformed descriptor, return an error and stop, rather than guessing a value, continuing with partial data, or invoking undefined behaviour. The safe outcome is refusal.</li>
+<li>Before copying, check the claimed payload length against the bytes actually received (overflow-safe: <code>len &lt;= size - header_off</code>) and against a sane maximum. If the check fails, reject the packet (drop it / return an error) and do not copy — fail closed.</li>
+<li>AddressSanitizer reports a heap-buffer-overflow READ in <code>parse_config</code>, because the loop limit of 200 makes it read past the 4 received bytes. The fixed parser prints "rejected: malformed descriptor" because <code>wTotalLength</code> (200) exceeds the bytes received (4). The logs confirm both.</li>
+</ol>
+<footer>Corrections log: <a href="../_qa/F11-12.qa.html#corrections">F11-12 QA record</a>.</footer>

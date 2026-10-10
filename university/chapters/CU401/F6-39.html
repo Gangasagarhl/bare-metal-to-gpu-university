@@ -1,0 +1,328 @@
+<!--meta
+id: F6-39
+title: A tiled attention forward pass
+course: CU401
+level: L4
+prereqs: F6-38 (online softmax); F6-22 and F6-23 (shared-memory and register tiling); F6-20 (occupancy); F6-34 (reading SASS); MA201 (matrix multiplication)
+time: 12–16 hours including the lab
+hardware: Lab steps 4–6 need an NVIDIA GPU with a CUDA Toolkit and driver (record both) or a cloud GPU. The CPU model, the traffic counts, the register and SASS reading and the forensic lab need only g++ and nvcc (this build had no GPU)
+maps: Curriculum E12 (fused kernels: "a simple tiled attention forward pass"); 13.2 topics 6 and 7; course project MP3
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-39-hook">Story hook</h2>
+<p>Every evening the great kitchen hall prepares a tasting menu: each guest's plate is a blend of every dish on the buffet, weighted by how well each dish matches that guest's taste. The old method was thorough and slow. First the helpers wrote a giant chart: every guest against every dish, a matching score in each square. Then they turned each row of the chart into shares. Then, from the chart, they blended each plate. With a thousand guests and a thousand dishes, the chart had a million squares, and carrying it to and from the big pantry took most of the evening.</p>
+<p>Ayşe, who had learned Kenji's running-tally trick from the softmax station, asked a simple question: why write the chart at all? Each helper could take one tray of dishes at a time to the table, score them for her guests, fold them into a running blend, and forget the scores. When a better-matching dish appeared, she would scale down the blend so far, exactly as Kenji scaled his tally. At the end she divides once. The chart never exists.</p>
+<p>The new method worked beautifully, until the night a group of guests arrived who matched nothing on the first tray at all.</p>
+
+<h2 id="F6-39-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> the attention forward pass O = softmax(QK<sup>T</sup>/√d)·V and why the unfused version is dominated by the N × N score and probability matrices.</li>
+<li><b>Derive</b> the tiled algorithm: a running maximum m, normaliser l and unnormalised output per query row, updated once per key/value tile, and prove it equals the unfused result.</li>
+<li><b>Implement</b> a simple tiled attention kernel with K and V tiles staged in shared memory, and read its register, shared-memory and SASS reports.</li>
+<li><b>Count</b> global-memory traffic for both versions and predict how it scales with N, d and the tile sizes.</li>
+<li><b>Diagnose</b> silently zeroed output rows caused by fully masked tiles, and fix them with an empty-state guard.</li>
+</ul>
+
+<div class="co jargon" id="F6-39-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Attention (scaled dot-product)</dt><dd><b>Simple words:</b> each output row is a weighted average of value rows, with weights from how well a query matches each key. <b>Analogy:</b> each guest's plate is a blend of all dishes, weighted by matching score. <b>Precise:</b> for Q, K, V of size N × d, O = softmax(QK<sup>T</sup>/√d)·V, with the softmax taken over each row of the N × N score matrix S = QK<sup>T</sup>/√d. <sup class="src"><a href="#F6-39-src-D2">D2</a></sup></dd>
+<dt>Query, key, value</dt><dd><b>Simple words:</b> three tables of numbers: what each position is looking for, what each position offers, and what it contributes if chosen. <b>Analogy:</b> the guest's taste, the dish's label, the dish itself. <b>Precise:</b> rows q<sub>i</sub>, k<sub>j</sub>, v<sub>j</sub> ∈ ℝ<sup>d</sup>; score s<sub>ij</sub> = q<sub>i</sub>·k<sub>j</sub>/√d; output o<sub>i</sub> = Σ<sub>j</sub> p<sub>ij</sub>v<sub>j</sub> with p<sub>ij</sub> the row softmax of s<sub>i·</sub>. <sup class="src"><a href="#F6-39-src-D2">D2</a></sup></dd>
+<dt>Head dimension (d)</dt><dd><b>Simple words:</b> how many numbers describe one query, key or value. <b>Analogy:</b> how many flavours a taste card lists. <b>Precise:</b> the length of q<sub>i</sub>, k<sub>j</sub>, v<sub>j</sub> for one attention head; Listing 2 fixes d = 64 at compile time so that a query row and an output row fit in registers. <sup class="src"><a href="#F6-39-src-D2">D2</a></sup></dd>
+<dt>Masking (causal, padding)</dt><dd><b>Simple words:</b> hiding some keys from some queries. <b>Analogy:</b> some dishes are not offered to some guests. <b>Precise:</b> setting s<sub>ij</sub> = −∞ for hidden pairs so that p<sub>ij</sub> = 0; causal masking hides j &gt; i, padding masking hides positions that hold no real data (Listing 1 hides j &lt; pad, a left-padded sequence). <sup class="src"><a href="#F6-39-src-D2">D2</a></sup> <sup class="src"><a href="#F6-39-src-D3">D3</a></sup></dd>
+<dt>Tiled (flash-style) attention</dt><dd><b>Simple words:</b> computing attention one block of keys at a time, keeping only a running summary per query row, so the big score chart is never stored. <b>Analogy:</b> Ayşe's tray-by-tray blend. <b>Precise:</b> for each tile of B<sub>r</sub> query rows, iterate over tiles of B<sub>c</sub> key/value rows; keep per row the running maximum m, normaliser l and unnormalised output a; per tile, m′ = max(m, max<sub>j</sub> s<sub>ij</sub>), α = e<sup>m−m′</sup>, a ← αa + Σ<sub>j</sub> e<sup>s<sub>ij</sub>−m′</sup>v<sub>j</sub>, l ← αl + Σ<sub>j</sub> e<sup>s<sub>ij</sub>−m′</sup>; finally o = a/l. This is the structure of FlashAttention's forward pass. <sup class="src"><a href="#F6-39-src-D3">D3</a></sup> <sup class="src"><a href="#F6-39-src-D4">D4</a></sup></dd>
+<dt>IO-aware algorithm</dt><dd><b>Simple words:</b> an algorithm designed around how many bytes it moves, not only how many sums it does. <b>Analogy:</b> planning the evening around pantry trips. <b>Precise:</b> the FlashAttention paper's term for algorithms that minimise reads and writes between the GPU's large, slow memory and its small, fast on-chip memory. <sup class="src"><a href="#F6-39-src-D3">D3</a></sup></dd>
+<dt>Kernel (GPU)</dt><dd>As in <a href="#F6-01">F6-01</a>; not the operating-system kernel of <a href="#OS301">OS301</a>.</dd>
+</dl></div>
+
+<h2 id="F6-39-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the tiles of Listing 2 moving from global memory to shared memory to registers: the tiling diagram of <a href="#F6-22">F6-22</a>, with a softmax in the middle of the loop. Figure 2 compares what each version stores in global memory.</p>
+<figure id="F6-39-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-39-f1t F6-39-f1d">
+<title id="F6-39-f1t">Figure 1: tiles of the attention forward kernel moving global memory to shared memory to registers</title>
+<desc id="F6-39-f1d">Left column, global memory: matrix Q (N rows by d columns) with one highlighted tile of Br rows; matrices K and V (N by d) each divided into tiles of Bc rows, with tile j0 highlighted; matrix O (N by d) with the output tile highlighted. Middle column, shared memory of one thread block: kTile and vTile, each Bc by d, loaded together by all threads of the block, separated by barriers. Right column, registers of one thread, which owns one query row: q (d values, scaled), the score array s of Bc values for the current tile, the running max m, the normaliser l, and the accumulator acc of d values. Arrows: Q tile to registers once; K and V tile to shared memory for every j0; shared memory to registers in the score loop and the accumulate loop; acc divided by l to O once at the end. A note: the N by N matrices S and P never exist in global memory.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="16" y="22">global memory</text>
+<rect class="sv-b4" x="16" y="34" width="60" height="120"/><rect class="sv-b6" x="16" y="58" width="60" height="22"/><text class="sv-ts" x="28" y="50">Q</text><text class="sv-ts" x="80" y="73">Br rows</text>
+<rect class="sv-b4" x="136" y="34" width="60" height="120"/><rect class="sv-b5" x="136" y="94" width="60" height="22"/><text class="sv-ts" x="148" y="50">K</text>
+<rect class="sv-b4" x="206" y="34" width="60" height="120"/><rect class="sv-b5" x="206" y="94" width="60" height="22"/><text class="sv-ts" x="218" y="50">V</text>
+<text class="sv-ts" x="136" y="170">tile j0: Bc rows × d</text>
+<rect class="sv-b4" x="16" y="200" width="60" height="120"/><rect class="sv-b6" x="16" y="224" width="60" height="22"/><text class="sv-ts" x="28" y="216">O</text>
+<text class="sv-tb" x="320" y="22">shared memory (one block)</text>
+<rect class="sv-b3" x="320" y="40" width="150" height="40" rx="4"/><text class="sv-tm" x="330" y="64">kTile[Bc][d]</text>
+<rect class="sv-b3" x="320" y="92" width="150" height="40" rx="4"/><text class="sv-tm" x="330" y="116">vTile[Bc][d]</text>
+<text class="sv-ts" x="320" y="152">loaded by all threads,</text><text class="sv-ts" x="320" y="168">__syncthreads() before</text><text class="sv-ts" x="320" y="184">and after use</text>
+<text class="sv-tb" x="530" y="22">registers (one thread = one query row)</text>
+<rect class="sv-b1" x="530" y="40" width="210" height="30" rx="4"/><text class="sv-tm" x="540" y="60">qr[d] (scaled by 1/√d)</text>
+<rect class="sv-b2" x="530" y="80" width="210" height="30" rx="4"/><text class="sv-tm" x="540" y="100">s[Bc]: this tile's scores</text>
+<rect class="sv-b7" x="530" y="120" width="210" height="30" rx="4"/><text class="sv-tm" x="540" y="140">m, l (online softmax)</text>
+<rect class="sv-b1" x="530" y="160" width="210" height="30" rx="4"/><text class="sv-tm" x="540" y="180">acc[d] (unnormalised O row)</text>
+<line class="sv-line" x1="76" y1="69" x2="528" y2="55"/><polygon class="sv-head" points="520,50 521,60 529,55"/><text class="sv-ts" x="250" y="56">once</text>
+<line class="sv-line" x1="196" y1="105" x2="318" y2="62"/><polygon class="sv-head" points="309,61 313,70 319,62"/>
+<line class="sv-line" x1="266" y1="105" x2="318" y2="110"/><polygon class="sv-head" points="310,105 310,115 318,110"/><text class="sv-ts" x="270" y="132">every j0</text>
+<line class="sv-line" x1="470" y1="60" x2="528" y2="94"/><polygon class="sv-head" points="519,93 524,85 529,95"/>
+<line class="sv-line" x1="470" y1="112" x2="528" y2="174"/><polygon class="sv-head" points="519,171 526,165 529,175"/>
+<line class="sv-line" x1="530" y1="190" x2="78" y2="236"/><polygon class="sv-head" points="86,230 87,240 77,236"/><text class="sv-ts" x="250" y="232">acc / l, once at the end</text>
+<rect class="sv-b8" x="320" y="262" width="420" height="50" rx="6"/><text class="sv-tb" x="332" y="284">never stored: S = QKᵀ/√d and P = softmax(S)</text><text class="sv-ts" x="332" y="302">(N × N each in the unfused version)</text>
+</svg></div><figcaption><b>Figure 1.</b> Data movement in Listing 2 (arrows are data flow). Q and O cross global memory once per element; K and V are re-read once per query tile; scores live only in registers, one tile at a time. Tile sizes as in Listing 2: B<sub>r</sub> = B<sub>c</sub> = 32, d = 64. Not to scale. <sup class="src"><a href="#F6-39-src-D3">D3</a></sup> <sup class="src"><a href="#F6-39-src-D5">D5</a></sup></figcaption></figure>
+
+<figure id="F6-39-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F6-39-f2t F6-39-f2d">
+<title id="F6-39-f2t">Figure 2: global-memory traffic of unfused and tiled attention</title>
+<desc id="F6-39-f2d">Top: the unfused version as three kernels. Kernel 1 reads Q and K (N by d each) and writes S (N by N). Kernel 2 reads S and writes P (N by N). Kernel 3 reads P (N by N) and V (N by d) and writes O (N by d). Total floats: reads 2N squared plus 3Nd, writes 2N squared plus Nd. Bottom: the tiled version as one kernel: reads Q once (Nd), reads K and V once per query tile (2Nd times N over Br), writes O once (Nd). The measured counts from Listing 1 for N 512, d 64 and tiles of 64 are shown: unfused 622,592 floats read and 557,056 written; tiled 557,056 read and 32,768 written.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<text class="sv-tb" x="16" y="22">unfused: three kernels, N × N intermediates</text>
+<rect class="sv-b2" x="16" y="34" width="220" height="40" rx="6"/><text class="sv-ts" x="26" y="58">1: read Q, K → write S (N×N)</text>
+<rect class="sv-b2" x="266" y="34" width="220" height="40" rx="6"/><text class="sv-ts" x="276" y="58">2: read S → write P (N×N)</text>
+<rect class="sv-b2" x="516" y="34" width="228" height="40" rx="6"/><text class="sv-ts" x="526" y="58">3: read P, V → write O (N×d)</text>
+<line class="sv-line" x1="236" y1="54" x2="264" y2="54"/><polygon class="sv-head" points="258,49 258,59 266,54"/>
+<line class="sv-line" x1="486" y1="54" x2="514" y2="54"/><polygon class="sv-head" points="508,49 508,59 516,54"/>
+<text class="sv-tm" x="16" y="98">reads 2N² + 3Nd, writes 2N² + Nd floats</text>
+<text class="sv-ts" x="16" y="116">R1, N 512, d 64: 622,592 read + 557,056 written</text>
+<line class="sv-dash" x1="16" y1="134" x2="744" y2="134"/>
+<text class="sv-tb" x="16" y="158">tiled: one kernel, nothing N × N stored</text>
+<rect class="sv-b5" x="16" y="170" width="470" height="40" rx="6"/><text class="sv-ts" x="26" y="194">read Q once; read K, V once per query tile; write O once</text>
+<text class="sv-tm" x="16" y="232">reads Nd·(1 + 2N/Br), writes Nd floats</text>
+<text class="sv-ts" x="400" y="232">R1, tiles 64: 557,056 read + 32,768 written</text>
+</svg></div><figcaption><b>Figure 2.</b> Floats moved to and from global memory, in Listing 1's accounting (ideal reuse inside each kernel, no caches). The formulas are derived in Layer 2 and checked against the program's counters (R1). <sup class="src"><a href="#F6-39-src-R1">R1</a></sup> <sup class="src"><a href="#F6-39-src-D3">D3</a></sup></figcaption></figure>
+
+<h2 id="F6-39-layer1">Layer 1 — the kid explanation</h2>
+<p>For each guest you want a blend of all dishes, weighted by how well each dish matches the guest. The slow way writes a huge chart of every guest against every dish and carries it back and forth. The fast way never writes the chart: a helper takes one tray of dishes at a time, scores them for her guest, adds them to a running blend, and forgets the scores.</p>
+<p>The trick that makes this exact is the one from the softmax station. When a better-matching dish appears, the helper scales down her blend so far, then carries on. At the very end, she divides once by the running total. One last rule: if a whole tray has nothing her guest may eat, she must not "scale" by a nonsense number. She simply skips that tray.</p>
+
+<h2 id="F6-39-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-39-l2-def">The computation and its cost</h3>
+<p>One analogy sentence: the tasting menu is three matrix steps, and the chart is the expensive part. Scaled dot-product attention, for one head, computes S = QK<sup>T</sup>/√d (N × N), P = row-softmax(S) and O = PV (N × d). <sup class="src"><a href="#F6-39-src-D2">D2</a></sup> Written as three kernels (two GEMMs from <a href="#F6-35">F6-35</a> and the softmax of <a href="#F6-38">F6-38</a>), the intermediate S and P each have N<sup>2</sup> elements. Listing 1's <code>naive()</code> counts the floats each kernel moves, assuming ideal reuse inside each kernel:</p>
+<ul>
+<li>kernel 1 reads Q and K (2Nd) and writes S (N<sup>2</sup>);</li>
+<li>kernel 2 reads S and writes P (N<sup>2</sup> each);</li>
+<li>kernel 3 reads P and V (N<sup>2</sup> + Nd) and writes O (Nd).</li>
+</ul>
+<p>Total: 2N<sup>2</sup> + 3Nd reads and 2N<sup>2</sup> + Nd writes. For N = 512 and d = 64 that is 622,592 + 557,056 floats, exactly what R1 prints for the case <code>long</code>. Since d is fixed by the model (here 64) and N is the sequence length, the N<sup>2</sup> terms dominate as sequences grow, and so does the N<sup>2</sup> memory needed just to hold S. <sup class="src"><a href="#F6-39-src-D3">D3</a></sup></p>
+
+<h3 id="F6-39-l2-tiled">The tiled algorithm</h3>
+<p>The FlashAttention paper's forward pass avoids storing S and P by combining two ideas you already have: tiling (<a href="#F6-22">F6-22</a>) and the online softmax (<a href="#F6-38">F6-38</a>). <sup class="src"><a href="#F6-39-src-D3">D3</a></sup> <sup class="src"><a href="#F6-39-src-D4">D4</a></sup> For each query row i, keep three things: the running maximum m, the running normaliser l = Σ e<sup>s<sub>ij</sub>−m</sup> over the keys seen so far, and the running unnormalised output a = Σ e<sup>s<sub>ij</sub>−m</sup>v<sub>j</sub>. Process the keys in tiles. For a new tile with scores s<sub>ij</sub>:</p>
+<pre><code>m'  = max(m, max_j s_ij)
+alpha = exp(m - m')
+l   = alpha * l + sum_j exp(s_ij - m')
+a   = alpha * a + sum_j exp(s_ij - m') * v_j
+m   = m'
+... after the last tile:  o_i = a / l</code></pre>
+<p><b>Why it is exact.</b> This is <a href="#F6-38">F6-38</a>'s invariant extended by one vector. Before the update, l and a are sums of terms relative to m; multiplying by α = e<sup>m−m′</sup> re-expresses every old term relative to m′ (e<sup>s−m</sup>·e<sup>m−m′</sup> = e<sup>s−m′</sup>), and the new tile's terms are added relative to m′. After the last tile, l is the softmax denominator of the row and a is Σ<sub>j</sub> e<sup>s<sub>ij</sub>−m</sup>v<sub>j</sub>, so a/l = Σ<sub>j</sub> p<sub>ij</sub>v<sub>j</sub> = o<sub>i</sub>. The division happens once per output element instead of once per probability. Listing 1 compares <code>tiled()</code> with <code>naive()</code> on five cases, including sizes that are not multiples of the tiles, causal masking and padding: the largest difference is 1.79 × 10<sup>−7</sup>, at the level of FP32 rounding of values of order 1 (R1).</p>
+<pre class="output" data-run="F6-39/attention"></pre>
+
+<h3 id="F6-39-l2-traffic">Traffic of the tiled version</h3>
+<p>Per tile of B<sub>r</sub> query rows, <code>tiled()</code> reads the Q tile once (B<sub>r</sub>·d) and every K and V tile once (2Nd in total), and writes the O tile once. Over N/B<sub>r</sub> query tiles: reads Nd + (N/B<sub>r</sub>)·2Nd = Nd(1 + 2N/B<sub>r</sub>), writes Nd. For N = 512, d = 64, B<sub>r</sub> = 64: 32,768 × 17 = 557,056 reads and 32,768 writes (R1). Three conclusions follow, each worth more than a single speed-up number:</p>
+<ul>
+<li><b>Writes drop from O(N<sup>2</sup>) to O(Nd).</b> Nothing quadratic is ever stored; memory use is linear in N. <sup class="src"><a href="#F6-39-src-D3">D3</a></sup></li>
+<li><b>Reads are still quadratic, but divided by B<sub>r</sub>/d.</b> The ratio of the dominant terms, unfused 4N<sup>2</sup> against tiled 2N<sup>2</sup>d/B<sub>r</sub>, is 2B<sub>r</sub>/d. With B<sub>r</sub> = d = 64 that is 2; doubling B<sub>r</sub> doubles it. Larger query tiles mean more reuse of every K and V tile, limited by registers and shared memory (Layer 3).</li>
+<li><b>The work is the same.</b> Both versions compute every score and every exponential; the tiled one does a little more (the rescaling by α). Attention becomes cheaper because it moves fewer bytes, not because it does less arithmetic: the IO-aware argument of the paper. <sup class="src"><a href="#F6-39-src-D3">D3</a></sup></li>
+</ul>
+
+<h3 id="F6-39-l2-mask">Masking and the empty state</h3>
+<p>Masked scores are −∞, so their probabilities are e<sup>−∞</sup> = 0, which is what masking means. <sup class="src"><a href="#F6-39-src-D2">D2</a></sup> The danger is a tile in which <i>every</i> score of a row is masked. Then max<sub>j</sub> s<sub>ij</sub> = −∞; if the row's m is still −∞ (no visible key yet), m′ = −∞ and α = e<sup>−∞−(−∞)</sup> = e<sup>NaN</sup> = NaN, and the NaN poisons l and a for the rest of the row. This is the same trap as the empty-state merge of <a href="#F6-38">F6-38</a>. Listing 1's <code>guard</code> flag skips the update when m′ = −∞ (line 104); every case in R1 runs with the guard. The forensic lab shows what happens without it.</p>
+
+<h2 id="F6-39-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: a helper who keeps a whole guest's blend in her hands can serve fewer guests at once, so the tile sizes are a trade between reuse and how many helpers fit in the hall. Listing 2 is a teaching kernel: correct structure, deliberately simple, and far from a tuned FlashAttention implementation. Its reports show exactly where it is expensive.</p>
+<h3 id="F6-39-l3-resources">What the compiler reports</h3>
+<pre class="output" data-run="F6-39/resources"></pre>
+<ul>
+<li><b>168 registers per thread</b> on sm_80 (R3). One thread owns a whole query row: <code>qr[64]</code> and <code>acc[64]</code> alone are 128 values. With 32 threads per block, a block needs 5,376 registers; how many blocks fit on an SM follows from your GPU's register file size (device report, <a href="#F6-07">F6-07</a>) and the occupancy calculation of <a href="#F6-20">F6-20</a>. Write the number in your lab record; it will be low.</li>
+<li><b>16,384 bytes of shared memory</b>: kTile and vTile, 2 × 32 × 64 × 4 bytes. This is the reuse buffer: every K and V element loaded is used by all 32 query rows of the block.</li>
+<li><b>A 128-byte stack frame, no spills</b>: 128 bytes is exactly <code>float s[BC]</code> with B<sub>c</sub> = 32. The score loop's trip count <code>cols</code> is not a compile-time constant, so the compiler keeps <code>s</code> in local memory (<a href="#F6-03">F6-03</a>); the SASS has one <code>STL</code> and one <code>LDL</code> (R4). Making <code>cols</code> constant for full tiles (and handling the last tile separately) would let it live in registers.</li>
+</ul>
+<h3 id="F6-39-l3-design">From the teaching kernel to a fast one</h3>
+<p>The published FlashAttention kernels differ from Listing 2 in ways that each address one of the reports above. <sup class="src"><a href="#F6-39-src-D3">D3</a></sup> <sup class="src"><a href="#F6-39-src-D7">D7</a></sup></p>
+<ul>
+<li><b>Several threads per query row.</b> Splitting d across lanes (or using a warp per few rows) cuts registers per thread and allows larger B<sub>r</sub>, which Layer 2 showed is what reduces K/V traffic.</li>
+<li><b>Tensor cores for both matrix products.</b> QK<sup>T</sup> for a tile and PV for a tile are small GEMMs; with FP16 or BF16 inputs and FP32 accumulation they map onto the MMA units of <a href="#F6-26">F6-26</a>. Listing 2 does them with scalar FFMAs (458 FFMA instructions in the SASS, R4).</li>
+<li><b>Asynchronous copies and double buffering</b> (<a href="#F6-24">F6-24</a>): load the next K/V tile while computing on the current one, instead of the two <code>__syncthreads()</code> per tile of Listing 2.</li>
+<li><b>Loop order and work partitioning.</b> FlashAttention-2 reorganises which loop is outer and how work is split between warps to reduce non-matrix work and shared-memory traffic. <sup class="src"><a href="#F6-39-src-D7">D7</a></sup></li>
+<li><b>Masking that skips work.</b> With causal masking, whole tiles above the diagonal are fully masked; a production kernel does not load them at all, which removes almost half the work for long sequences.</li>
+</ul>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The list of differences between Listing 2 and the published FlashAttention and FlashAttention-2 kernels is written from the curriculum's reading list and general knowledge of those papers, which were not opened in this build. Before relying on any specific design choice, read Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness", and the FlashAttention-2 paper (D3, D7), and note the section that supports it.</p></div>
+<h3 id="F6-39-l3-precision">Precision and tolerances</h3>
+<p>Listing 2 keeps everything in FP32 and uses <code>__expf</code>, which the installed header documents as an approximation (<a href="#F6-38">F6-38</a>, H1). <sup class="src"><a href="#F6-39-src-H1">H1</a></sup> Its CPU check uses double precision on sampled rows. Production kernels use FP16 or BF16 inputs with FP32 statistics and accumulators, and the tolerance of your E12 acceptance test must be justified from those input formats (<a href="#F6-25">F6-25</a>). Note that tiling changes the order of additions in l and a: tiled and unfused results agree to rounding, not bit for bit (R1: up to 1.79 × 10<sup>−7</sup>).</p>
+
+<h2 id="F6-39-hardware">How the hardware actually does it</h2>
+<p>Each block of 32 threads is one warp (<a href="#F1-57">F1-57</a>). The tile load spreads B<sub>c</sub> × d = 2,048 floats per matrix over the 32 threads, consecutive threads loading consecutive floats, so the global loads are coalesced (<a href="#F6-08">F6-08</a>). In the score loop all 32 threads read the same <code>kTile[c][x]</code> at the same time: a shared-memory broadcast, which does not cause bank conflicts (<a href="#F6-11">F6-11</a>). The compiler turned these reads into 128-bit vector loads, <code>LDS.128</code> (32 of them in R4), four floats per instruction. The two exponentials per tile and row (α and each p) become <code>MUFU.EX2</code>, the special-function unit's base-2 exponential that <a href="#F6-38">F6-38</a> saw as <code>ex2.approx.f32</code> in PTX; the dot products and accumulations are <code>FFMA</code> fused multiply–adds; the two barriers per tile are <code>BAR.SYNC</code>. <sup class="src"><a href="#F6-39-src-D1">D1</a></sup> <sup class="src"><a href="#F6-39-src-D6">D6</a></sup></p>
+<pre class="output" data-run="F6-39/sass_loop"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The statements that a shared-memory broadcast to all lanes is conflict-free and that <code>MUFU.EX2</code> executes on the special-function units are from the course's earlier chapters (F6-11, F6-38) and their sources (the CUDA Programming Guide and the PTX ISA, title only); they are not documented for SASS in any file read in this build. The instruction names and counts in R4 are real.</p></div>
+
+<h2 id="F6-39-worked">Worked example</h2>
+<p>One query row, d = 1, two key tiles of two keys each, to see the rescaling by hand. Scores (already scaled) s = (1, 2 | 4, 3); values v = (10, 20 | 30, 40).</p>
+<ol>
+<li><b>Start.</b> m = −∞, l = 0, a = 0.</li>
+<li><b>Tile 1</b> (s = 1, 2). m′ = 2; α = e<sup>−∞</sup> = 0. Terms: e<sup>1−2</sup> = 0.367879, e<sup>0</sup> = 1. l = 0 + 1.367879 = 1.367879. a = 0 + 0.367879 × 10 + 1 × 20 = 23.678794. m = 2.</li>
+<li><b>Tile 2</b> (s = 4, 3). m′ = 4; α = e<sup>2−4</sup> = 0.135335. Terms: e<sup>0</sup> = 1, e<sup>−1</sup> = 0.367879. l = 0.135335 × 1.367879 + 1.367879 = 0.185122 + 1.367879 = 1.553001. a = 0.135335 × 23.678794 + 30 + 0.367879 × 40 = 3.204577 + 30 + 14.715178 = 47.919755.</li>
+<li><b>Divide.</b> o = 47.919755 / 1.553001 = 30.856.</li>
+<li><b>Check against the unfused formula.</b> Relative to the maximum 4: weights e<sup>−3</sup>, e<sup>−2</sup>, 1, e<sup>−1</sup> = 0.049787, 0.135335, 1, 0.367879; sum 1.553001 (the same l). Weighted sum 0.49787 + 2.70671 + 30 + 14.71518 = 47.91976; o = 30.856. Same result, as the proof promised.</li>
+</ol>
+<p><b>Traffic, for the lab's size.</b> N = 4,096, d = 64, B<sub>r</sub> = 32 (Listing 2): unfused reads 2N<sup>2</sup> + 3Nd = 33,554,432 + 786,432 = 34,340,864 floats and writes 2N<sup>2</sup> + Nd = 33,816,576 floats; tiled reads Nd(1 + 2N/B<sub>r</sub>) = 262,144 × 257 = 67,371,008 floats and writes 262,144. With B<sub>r</sub> = 32 = d/2, the tiled kernel <i>reads more</i> than the unfused chain (ratio 2B<sub>r</sub>/d = 1) but writes 129 times less, and needs no N × N buffer. Before timing anything, decide which of these your GPU will feel: that is Lab step 5.</p>
+
+<h2 id="F6-39-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>attention.cpp</code>: unfused and tiled attention on the CPU with traffic counters (input <code>attention.in</code>: name, N, d, B<sub>r</sub>, B<sub>c</sub>, pad, causal, guard; output in Layer 2, R1).</p>
+<pre class="listing" data-src="F6-39/attention.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>26–29</td><td><code>visible</code></td><td>Padding (j &lt; pad) and causal (j &gt; i) masks.</td><td>Both versions use the same mask.</td></tr>
+<tr><td>35–45</td><td>kernel 1 of <code>naive</code></td><td>S = QK<sup>T</sup>/√d with −∞ for hidden pairs; counts traffic.</td><td>N<sup>2</sup> floats written.</td></tr>
+<tr><td>46–62</td><td>kernel 2</td><td>Safe row softmax; a fully hidden row gives zeros, not NaN (line 53).</td><td>The reference must itself be safe.</td></tr>
+<tr><td>63–72</td><td>kernel 3</td><td>O = PV.</td><td>Reads N<sup>2</sup> + Nd.</td></tr>
+<tr><td>81–86</td><td>query tile, state</td><td>m = −∞, l = 0, acc = 0 per row.</td><td>The empty state.</td></tr>
+<tr><td>87–102</td><td>key tile, scores, tile max</td><td>Scores of one tile, kept only for this tile.</td><td>Nothing N × N exists.</td></tr>
+<tr><td>103–106</td><td><code>mNew</code>, <code>if (guard &amp;&amp; mNew == kNegInf) continue;</code></td><td>Skips a tile while the row has seen only hidden keys.</td><td>Prevents e<sup>−∞−(−∞)</sup> = NaN.</td></tr>
+<tr><td>107–120</td><td><code>alpha</code>, rescale, accumulate</td><td>The tiled update of Layer 2.</td><td>Rescale before adding the new tile.</td></tr>
+<tr><td>123–128</td><td>divide, <code>badRows</code></td><td>o = acc / l once; counts rows whose l is not finite.</td><td>Line 126's <code>l &gt; 0</code> test turns NaN rows into zeros: keep the counter.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>attn_fwd.cu</code>: the tiled forward pass on the GPU, one thread per query row.</p>
+<pre class="listing" data-src="F6-39/attn_fwd.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings attn_fwd.cu -o attn_fwd</code>, then <code>./attn_fwd</code>.</p>
+<pre class="output" data-run="F6-39/attn_fwd"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The build is real and warning-free; the run stopped at the first allocation with <code>cudaErrorNoDevice</code> (R2). On a GPU the program should print a worst error on sampled rows near FP32 rounding (the CPU model agrees with its reference to about 10<sup>−7</sup>, R1); this has not been observed, and no timing exists. Listing 2 has no masking; add Listing 1's mask and guard before using it on padded or causal inputs.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>19–21</td><td><code>D</code>, <code>BR</code>, <code>BC</code></td><td>Compile-time head dimension and tile sizes.</td><td>Lets <code>qr</code> and <code>acc</code> be register arrays.</td></tr>
+<tr><td>25–26</td><td><code>__shared__ kTile, vTile</code></td><td>16,384 bytes (R3).</td><td>The reuse buffer shared by 32 query rows.</td></tr>
+<tr><td>27–34</td><td>row, <code>active</code>, <code>qr</code>, <code>acc</code></td><td>Each thread loads its query row, pre-scaled by 1/√d.</td><td>Inactive threads stay: they must help load and reach the barriers.</td></tr>
+<tr><td>38–44</td><td>cooperative tile load</td><td>Threads stride over B<sub>c</sub> × D elements; zero-fill past N.</td><td>Coalesced loads; safe last tile.</td></tr>
+<tr><td>45</td><td><code>__syncthreads()</code></td><td>Tile complete before use.</td><td>Read-after-write across threads.</td></tr>
+<tr><td>46–56</td><td>scores, <code>tileMax</code></td><td>Dot products of the query row with each key of the tile.</td><td><code>s[BC]</code> becomes the 128-byte stack frame (R3).</td></tr>
+<tr><td>57–58</td><td><code>mNew</code>, <code>alpha = __expf(m - mNew)</code></td><td>Rescale factor; 0 on the first tile.</td><td>Without masking, mNew is finite after tile 1, so no guard is needed here.</td></tr>
+<tr><td>60–71</td><td>rescale and accumulate</td><td>acc ← α·acc + Σ p·v; l ← α·l + Σ p.</td><td>The online update with a vector state.</td></tr>
+<tr><td>72</td><td><code>__syncthreads()</code></td><td>Everyone done before the next load.</td><td>Write-after-read across threads.</td></tr>
+<tr><td>74–78</td><td>write <code>acc[x] / l</code></td><td>One division per output element.</td><td>O written once.</td></tr>
+<tr><td>107–132</td><td>CPU check</td><td>Double-precision reference for every 97th row.</td><td>Correctness evidence on a GPU.</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-39-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Helpers do not each carry a whole tray.</b> In Listing 2 a block of 32 threads shares each tray (tile) through shared memory; in faster kernels several threads share one guest. "One helper, one guest" is the teaching kernel, not the design.</li>
+<li><b>Forgetting the scores is not free.</b> In the kitchen, forgetting costs nothing; on the GPU, the backward pass of training needs the probabilities, so a training implementation must either store some statistics (m and l per row) or recompute scores. The forward pass in this chapter is only half of the story.</li>
+<li><b>The trays are not read once.</b> The story suggests every dish is carried to the table once; in fact every K and V tile is read once <i>per query tile</i> (Figure 2). Caches may help; the formula does not assume they do.</li>
+</ul>
+
+<h2 id="F6-39-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Rows of zeros (or NaN) only for long padding (forensic lab)</td><td>A fully masked first tile: α = e<sup>NaN</sup></td><td>Count rows with non-finite l; vary pad around B<sub>c</sub></td><td>Skip the update while m′ = −∞ (Listing 1, line 104)</td></tr>
+<tr><td>Small errors growing with N</td><td>Rescale applied after adding the new tile</td><td>Compare with the worked example</td><td>Rescale old state first, then add</td></tr>
+<tr><td>Wrong last rows when N is not a multiple of B<sub>r</sub></td><td>Inactive threads returned early and missed a barrier</td><td>Test N = 1000 (Listing 2)</td><td>Keep them in the loop with an <code>active</code> flag</td></tr>
+<tr><td>Garbage in the last key tile</td><td>Rows past N not zero-filled or not excluded</td><td>Test N = 1, 31, 33</td><td>Zero-fill and loop to <code>cols</code></td></tr>
+<tr><td>Kernel slow, profiler shows local memory traffic</td><td>A runtime-indexed register array (<code>s[BC]</code>)</td><td><code>-Xptxas -v</code> stack frame (R3), <code>LDL</code>/<code>STL</code> (R4)</td><td>Constant trip counts for full tiles</td></tr>
+<tr><td>Very low occupancy</td><td>168 registers per thread (R3)</td><td>Occupancy calculation (<a href="#F6-20">F6-20</a>)</td><td>Split a query row across threads</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-39-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-38">F6-38</a> (online softmax, empty-state guard), <a href="#F6-22">F6-22</a>–<a href="#F6-24">F6-24</a> (tiling, register blocking, asynchronous copies) and <a href="#F6-35">F6-35</a> (GEMMs from a library). <b>What carries over:</b> the online normaliser and its proof, tiles staged in shared memory between two barriers, the traffic arithmetic of the roofline, tolerance-based testing. <sup class="src"><a href="#F6-39-src-D4">D4</a></sup> <b>What changes:</b> most dangerous first: masking creates fully empty tiles, and the empty state now poisons a whole output vector, often silently (forensic lab); the state per row is a vector (d values), so registers, not arithmetic, limit the kernel (R3); the N × N intermediate disappears entirely, which changes what can be inspected when debugging. <sup class="src"><a href="#F6-39-src-D3">D3</a></sup> <b>What comes next:</b> <a href="#F6-40">F6-40</a> writes the same kind of kernels (reduction, softmax, GEMM) in Triton, where tiles are the language's basic unit, and compares the effort.</p></div>
+
+<h2 id="F6-39-check">Check yourself</h2>
+<ol>
+<li>Write the four update lines of the tiled algorithm for one row and one tile, and the final step.</li>
+<li>Explain in your own words why the tiled algorithm gives the same result as softmax followed by PV.</li>
+<li>Which statement is true? (a) The tiled kernel does fewer floating-point operations than the unfused one. (b) The tiled kernel never reads a K element more than once. (c) The tiled kernel writes O(Nd) floats instead of O(N<sup>2</sup>). (d) Tiled and unfused outputs are bit-identical.</li>
+<li>Compute by hand, as in the worked example, one row with d = 1, tiles (0, 5 | 5, 0), values (1, 2 | 3, 4). Check with the unfused formula.</li>
+<li>Predict, then run: add <code>pad_edge 128 32 32 32 32 0 0</code> to <code>forensic.in</code> (padding exactly one tile, guard off). How many rows have non-finite l? Then try pad 31.</li>
+<li>Apply to a new case: d = 128 instead of 64 with one thread per row. What happens to Listing 2's registers, and what would you change?</li>
+<li>Using Figure 2's formulas, for which B<sub>r</sub> does the tiled kernel read four times fewer floats than the unfused chain at d = 64 (dominant terms only)?</li>
+<li>Why must the threads with <code>active == false</code> in Listing 2 stay in the loop?</li>
+<li>Why does Listing 2 have a 128-byte stack frame, and how would you remove it?</li>
+</ol>
+
+<h2 id="F6-39-lab">Lab</h2>
+<p><b>Goal.</b> Milestone E12 (third part): "a simple tiled attention forward pass", with "Numerical agreement with an unfused reference; throughput reaches X % of the corresponding library implementation available on your platform (for example cuDNN's fused attention or the Composable Kernel attention examples)" (acceptance test, verbatim).</p>
+<p><b>Hardware and software needed.</b> Steps 1–3: g++ and nvcc only (this build: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>Cuda compilation tools, release 12.0, V12.0.140</code>, no GPU). Steps 4–6: an NVIDIA GPU with toolkit and driver recorded, or a cloud GPU; a library attention implementation if your platform has one. Lab folder <code>university/labs/F6-39</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-39</code>. Compare the outputs with this chapter, and check Figure 2's formulas against <code>attention.out</code> for two more cases you add.</li>
+<li>Read <code>resources.out</code> and <code>sass_loop.out</code>. Change <code>BC</code> to 16 and to 64; predict the stack frame and shared memory first, then rebuild (the <code>run.sh</code> command line) and compare.</li>
+<li>Add Listing 1's padding mask and guard to Listing 2 (a <code>pad</code> argument). Keep the threads' participation in loads and barriers unchanged.</li>
+<li>On a GPU: run Listing 2 for N = 1000 and N = 4096; the sampled error must be within the tolerance you wrote down first.</li>
+<li>Implement the unfused version (two cuBLAS GEMMs from <a href="#F6-35">F6-35</a> and your <a href="#F6-38">F6-38</a> softmax) and time both (median of 20 after warm-up) for N = 1,024, 4,096 and 16,384 at d = 64. Compare with your traffic predictions.</li>
+<li>If a library attention is available on your platform, time it with the same harness and fill the acceptance table with your X.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: R1–R5 as shown; tiled and unfused agree to about 10<sup>−7</sup>; the guard matters only when a whole tile is masked. On a GPU: your numbers, labelled "measured on &lt;GPU, driver, toolkit, date&gt;" (AH-23); the unfused version runs out of memory or slows down sharply at large N because of its N × N buffers. Nothing in steps 4–6 has been observed in this build.</p>
+<p><b>Verification.</b> The E12 acceptance test above; Compute Sanitizer reports no errors, including <code>racecheck</code> for the shared-memory tiles (<a href="#F6-05">F6-05</a>).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Error grows with N → rescale order or a missing α on l → re-run the worked example through your code.</li>
+<li>Racecheck reports a hazard on kTile → a missing barrier after the compute loop → line 72 of Listing 2.</li>
+<li>Out of memory in the unfused version → the N × N buffers: 16,384<sup>2</sup> floats is 1 GiB each → that is the point of this chapter; record it.</li>
+</ul>
+<p><b>Extension.</b> Split each query row across 4 threads (16 dimensions each) and combine dot products with a tile of 4 (<a href="#F6-36">F6-36</a>); measure registers, occupancy and time. Then add causal masking that skips fully masked tiles.</p>
+
+<h2 id="F6-39-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Mei's team uses Listing 1's <code>tiled()</code> as the bit-level reference model of their GPU kernel, guard disabled ("an optimisation: one branch fewer"). Unit tests with a padding of 10 positions pass. In production, batches are left-padded to the longest sequence, and some sequences carry 40 padding positions. Users report that the model's outputs for those batches "look like nothing": no error, no NaN alarms. The team's debug log prints, per configuration, the difference from the unfused reference, NaN counts, the number of rows whose final normaliser is not finite, and the number of all-zero output rows. The evidence is a real run of Listing 1 on the three configurations (<code>forensic.in</code>).</p>
+<p><b>Evidence pack.</b></p>
+<pre class="listing" data-src="F6-39/forensic.in"></pre>
+<pre class="output" data-run="F6-39/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which configuration fails, and which three numbers in the evidence show it? Why are there no NaN outputs?</li>
+<li>Hypotheses: list two causes (overflow in the exponentials; an invalid rescale factor from an empty tile). Which configuration difference separates them?</li>
+<li>Root cause: walk one row through the first key tile with pad = 40 and B<sub>c</sub> = 32, and show where NaN appears and why it never leaves l.</li>
+<li>Why did the pad = 10 test pass?</li>
+<li>Fix and verification: which line restores correctness, and which evidence line verifies it?</li>
+<li>Prevention: which test inputs and which runtime counter would have caught this?</li>
+</ol>
+<p><b>Method hints.</b> Compare pad with the tile size B<sub>c</sub>. Then follow m, α and l through the first two tiles for a row that sees only masked keys in tile 1. Finally read line 126 of Listing 1: what does <code>l &gt; 0</code> do with NaN?</p>
+
+<h2 id="F6-39-project">Mini-project</h2>
+<p><b>Attention for MP3.</b> Integrate a masked tiled attention forward kernel into your MP3 model with causal and padding masks. Provide: a test matrix (N = 1, 31, 32, 33, 1,000; pad 0, B<sub>c</sub> − 1, B<sub>c</sub>, B<sub>c</sub> + 1, N; causal on and off), a traffic table from the formulas, the compiler's register and shared-memory report, and measured times against the unfused version.</p>
+<p><b>Rubric.</b> All test cases agree with the unfused reference within a justified tolerance, including fully masked rows with documented output (4). Traffic and resource reports correct and explained (2). Measurement protocol and labelled numbers (2). One improvement made and its predicted and measured effect compared (2).</p>
+
+<h2 id="F6-39-summary">Summary</h2>
+<ul>
+<li>Attention is two matrix products around a row softmax; unfused, it stores two N × N matrices.</li>
+<li>The tiled forward pass keeps m, l and an unnormalised output row per query, rescales them by α = e<sup>m−m′</sup> per key tile, and divides once at the end; it is exact up to rounding.</li>
+<li>Writes drop from O(N<sup>2</sup>) to O(Nd); reads remain quadratic but shrink by 2B<sub>r</sub>/d; the arithmetic is the same.</li>
+<li>Fully masked tiles make α = e<sup>−∞−(−∞)</sup> = NaN unless the empty state is guarded; a <code>l &gt; 0</code> test then hides it as zeros.</li>
+<li>One thread per query row is simple and register-hungry (168 registers, R3); fast kernels split rows across threads and use tensor cores.</li>
+</ul>
+
+<h2 id="F6-39-sources">Sources</h2>
+<ol>
+<li id="F6-39-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1; the guide's registry records the page title "CUDA Programming Guide", version 13.x, when opened): shared memory, <code>__syncthreads()</code>, intrinsic functions. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-39-src-D2">D2 — Ashish Vaswani et al., "Attention Is All You Need" (tier 5, paper): scaled dot-product attention, masking. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-39-src-D3">D3 — Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré, "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (tier 5, paper; curriculum E12 reading): tiled forward pass with online softmax, IO-awareness, linear memory. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-39-src-D4">D4 — Maxim Milakov, Natalia Gimelshein, "Online normalizer calculation for softmax" (tier 5): the online normaliser (see <a href="#F6-38">F6-38</a>). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-39-src-D5">D5 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): tiling with shared memory. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-39-src-D6">D6 — NVIDIA, "CUDA Binary Utilities" and "Parallel Thread Execution ISA" (tier 1): SASS and PTX instruction names. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-39-src-D7">D7 — Tri Dao, "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (tier 5, paper; curriculum E12 reading). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-39-src-H1">H1 — CUDA 12.0 headers as installed (Ubuntu package nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>crt/device_functions.h</code> (<code>__expf</code>: "Returns an approximation to" e<sup>x</sup>). Tier 1.</li>
+<li id="F6-39-src-R1">R1 — run of Listing 1 (<code>attention.log</code>, input <code>attention.in</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with sanitizers, exit code 0.</li>
+<li id="F6-39-src-R2">R2 — build and run of Listing 2 (<code>attn_fwd.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>; untested on hardware, exit code 1.</li>
+<li id="F6-39-src-R3">R3 — ptxas report of <code>attnForward</code> for sm_80 (<code>resources.log</code>), compiled only.</li>
+<li id="F6-39-src-R4">R4 — SASS instruction counts of Listing 2 for sm_80 (<code>sass_loop.log</code>), CUDA 12.0 <code>cuobjdump</code>, compiled only.</li>
+<li id="F6-39-src-R5">R5 — run of Listing 1 on the forensic input (<code>forensic.log</code>), same g++, exit code 0.</li>
+</ol>
+
+<h2 id="F6-39-glossary">Glossary links</h2>
+<p><a href="#gl-attention-scaled-dot-product">Attention (scaled dot-product)</a> · <a href="#gl-query-key-value">Query, key, value</a> · <a href="#gl-head-dimension-d">Head dimension (d)</a> · <a href="#gl-masking-causal-padding">Masking (causal, padding)</a> · <a href="#gl-tiled-flash-style-attention">Tiled (flash-style) attention</a> · <a href="#gl-io-aware-algorithm">IO-aware algorithm</a> · <a href="#gl-online-normaliser">Online normaliser</a> · <a href="#gl-kernel-fusion">Kernel fusion</a> · <a href="#gl-shared-memory">Shared memory</a></p>
+
+<h2 id="F6-39-next">Next chapter</h2>
+<p>Next: <a href="#F6-40">F6-40 The same kernels in Triton: a productivity comparison</a>. Previous: <a href="#F6-38">F6-38</a>. Back to the course: <a href="#CU401">CU401</a>.</p>
+
+<h2 id="F6-39-answers">Answers to Check yourself</h2>
+<ol>
+<li>m′ = max(m, max<sub>j</sub> s<sub>ij</sub>); α = e<sup>m−m′</sup>; l ← αl + Σ<sub>j</sub> e<sup>s<sub>ij</sub>−m′</sup>; a ← αa + Σ<sub>j</sub> e<sup>s<sub>ij</sub>−m′</sup>v<sub>j</sub>; m ← m′. After the last tile: o = a/l.</li>
+<li>l and a are always sums of terms measured relative to the current maximum; multiplying by α re-measures the old terms relative to the new maximum, so after the last tile l is the softmax denominator and a the numerator-weighted sum of values; their quotient is the softmax-weighted average Σ p<sub>ij</sub>v<sub>j</sub>.</li>
+<li>(c). (a) is false: the same scores and exponentials, plus the rescaling. (b) is false: K and V are re-read once per query tile. (d) is false: the summation order differs, so results agree to rounding (R1).</li>
+<li>Tile 1 (0, 5): m = 5, l = e<sup>−5</sup> + 1 = 1.006738, a = 0.006738 × 1 + 1 × 2 = 2.006738. Tile 2 (5, 0): m′ = 5, α = 1; l = 1.006738 + 1 + 0.006738 = 2.013476; a = 2.006738 + 3 + 0.006738 × 4 = 5.033690. o = 5.033690/2.013476 = 2.5000. Unfused: weights (e<sup>−5</sup>, 1, 1, e<sup>−5</sup>) symmetric around the values, so o = (0.006738 + 2 + 3 + 0.026952)/2.013476 = 2.5000.</li>
+<li>With pad = 32 = B<sub>c</sub>, the first tile is fully masked for every row: all 128 rows have non-finite l and become zeros. With pad = 31, every row sees one visible key in the first tile, so m′ is finite: no bad rows. (Run it to confirm.)</li>
+<li><code>qr</code> and <code>acc</code> double to 256 values per thread, beyond what registers can hold comfortably: expect spills and very low occupancy. Split each row across several threads (each owning d/4 dimensions) and reduce the dot products within a tile.</li>
+<li>Ratio 2B<sub>r</sub>/d = 4 → B<sub>r</sub> = 2d = 128.</li>
+<li>They load part of every K/V tile and must reach both <code>__syncthreads()</code> calls; a thread that returned would leave part of the tile unloaded and the barrier incomplete.</li>
+<li>The array <code>s[BC]</code> is indexed in loops whose trip count <code>cols</code> is known only at run time, so the compiler places it in local memory (128 bytes = 32 floats). Handle full tiles with a compile-time trip count (and the last tile separately), so the loops can be unrolled and <code>s</code> kept in registers.</li>
+</ol>
+<h3 id="F6-39-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> <code>padded_prod</code> (pad 40, guard 0) has 128 rows with non-finite l, 128 all-zero output rows, and a maximum difference of 0.0599 from the reference (the size of the correct outputs). NaN outputs: 0, because line 126 writes 0 whenever <code>l &gt; 0</code> is false, and comparisons with NaN are false. <code>padded_test</code> (pad 10) and <code>padded_prod_fixed</code> (pad 40, guard 1) agree with the reference to about 3 × 10<sup>−8</sup>.</p>
+<p><b>Hypotheses.</b> Overflow would depend on the input values, which are the same in all three runs; it would not depend on pad. An invalid rescale from an empty tile depends exactly on whether pad ≥ B<sub>c</sub>, and the guard flag alone switches the failure off.</p>
+<p><b>Root cause.</b> Keys 0–31 form the first tile and all are padding (pad = 40): every score is −∞, tileMax = −∞, m′ = max(−∞, −∞) = −∞, α = e<sup>−∞−(−∞)</sup> = e<sup>NaN</sup> = NaN, and each p = e<sup>−∞−(−∞)</sup> = NaN, so l = 0·NaN + NaN = NaN and acc becomes NaN. In the next tile α = e<sup>−∞−m′</sup> = 0, but NaN × 0 = NaN, so l and acc stay NaN for the rest of the row. Every row has the same padding, so all 128 rows fail.</p>
+<p><b>Why the test passed.</b> With pad = 10 &lt; B<sub>c</sub> = 32, every row sees visible keys in its first tile, so m′ is finite from the start and the empty state never meets the update.</p>
+<p><b>Fix and verification.</b> Re-enable line 104: skip the tile while m′ = −∞. Verified by <code>padded_prod_fixed</code>: 0 bad rows, difference 3.73 × 10<sup>−8</sup>.</p>
+<p><b>Prevention.</b> Tests with pad = 0, B<sub>c</sub> − 1, B<sub>c</sub>, B<sub>c</sub> + 1 and N (fully masked rows, with a defined output); a debug counter of rows with non-finite l, reported instead of being hidden by the <code>l &gt; 0</code> test. <b>How the evidence was produced:</b> real runs of Listing 1 with guard 0 and 1; no GPU involved.</p>

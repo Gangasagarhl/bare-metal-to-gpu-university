@@ -1,0 +1,303 @@
+<!--meta
+id: F10-29
+title: hwdef and board porting
+course: DN303
+level: L4
+prereqs: F10-27, F10-28; DN202 (F10-07 Inside a flight controller, F10-10 ESC protocols); BR-05; OS305 (F3-39)
+time: 10–14 hours including the lab
+hardware: none for the lab (Python 3.13.16 and g++ 13.3.0, as used in this build); the optional board part needs a flight controller with a working bootloader and a recovery path (SWD probe or a DFU mode documented by the board maker), with no propellers anywhere on the bench
+maps: ArduPilot documentation (Dev site: porting to a new flight controller board, hwdef files, bootloader); the microcontroller's datasheet and reference manual; prepares MP7 (ArduPilot path)
+analogy: F10 — carrying a tray of drinks while walking
+-->
+
+<h2 id="F10-29-hook">Story hook</h2>
+<p>Kofi moves to a new restaurant. His carrying skills are the same, but nothing else is: the bar is on the left, the kitchen hatch is up three steps, table 12 is behind a pillar. On his first evening the manager hands him a floor plan. With it, he is a good waiter on day one. Without it, or with a plan that has two tables swapped, he spills drinks on strangers.</p>
+<p>A flight controller board is a new restaurant for ArduPilot. The vehicle code and the libraries are the carrying skills. What changes from board to board is which pin does what, which bus each sensor hangs on, how the sensor is rotated on the board, where the flash memory is divided. All of that is written in one text file per board, and a generator turns it into code. This chapter is about that floor plan: how to write one, check it, and find the mistake when a board misbehaves.</p>
+
+<h2 id="F10-29-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> why ArduPilot describes each ChibiOS board in a text file and generates code from it, and what the file must contain.</li>
+<li><b>Build</b> a board description from a schematic and the MCU's pin and DMA tables, and check it with a generator before any firmware is built.</li>
+<li><b>Plan</b> a flash layout (bootloader, parameter storage, application) that respects the MCU's erase sectors.</li>
+<li><b>Diagnose</b> a board revision that lost DMA on a serial port, from the generator's output alone.</li>
+<li><b>Plan</b> the bring-up order of a new board port, with a recovery path.</li>
+</ul>
+
+<div class="co jargon" id="F10-29-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Board description (hwdef)</dt><dd><b>Simple words:</b> a text file that says what every pin of a flight controller's chip is used for and which sensors are on the board. <b>Analogy:</b> the floor plan of a new restaurant. <b>Precise:</b> a per-board configuration file read at build time by a generator script, which checks it against the microcontroller's tables and produces headers and linker settings for the HAL backend; ArduPilot documents such "hwdef" files for its ChibiOS boards. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup></dd>
+<dt>Alternate function (pin mux)</dt><dd><b>Simple words:</b> one of the jobs a chip's pin can be switched to. <b>Analogy:</b> a doorway that can be the way to the kitchen or the way to the bar, but not both at once. <b>Precise:</b> a peripheral signal (UART transmit, SPI clock, timer channel) that a pin can be routed to by the GPIO configuration; the possible functions of each pin are listed in the MCU's datasheet, and a pin carries one function at a time. <sup class="src"><a href="#F10-29-src-D6">D6</a></sup></dd>
+<dt>DMA stream (DMA channel)</dt><dd><b>Simple words:</b> a helper in the chip that moves data between a peripheral and memory without the processor. <b>Analogy:</b> a trolley that carries glasses between bar and tables while the waiter does other things. <b>Precise:</b> one of a fixed number of DMA engine channels; each peripheral request can be served only by certain streams (a table in the reference manual), and a stream serves one request at a time unless the software shares it. <sup class="src"><a href="#F10-29-src-D6">D6</a></sup> <sup class="src"><a href="#F10-29-src-O2">O2</a></sup></dd>
+<dt>DMA allocation</dt><dd><b>Simple words:</b> deciding which peripheral gets which DMA helper. <b>Analogy:</b> sharing out a few trolleys between many jobs. <b>Precise:</b> the assignment of streams to peripheral requests at build time, under the constraint that each request may use only its listed streams; when streams run out, some requests run without DMA or share a stream. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup> <sup class="src"><a href="#F10-29-src-R1">R1</a></sup></dd>
+<dt>Board ID</dt><dd><b>Simple words:</b> a number that says which board a firmware file was built for. <b>Analogy:</b> the restaurant's name on the floor plan. <b>Precise:</b> an identifier compiled into both the bootloader and the application image; the bootloader and the upload tools compare them so that firmware for one board is not flashed onto another. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup></dd>
+<dt>Bootloader (flight controller)</dt><dd><b>Simple words:</b> a small program at the start of the chip's flash that can load new firmware over USB. <b>Analogy:</b> the restaurant's back door, through which the new floor plan is delivered. <b>Precise:</b> a separate image in the first flash sector(s) that runs after reset, waits briefly for an upload over USB or serial, checks the image, and then jumps to the application at a fixed offset. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup> <sup class="src"><a href="#F10-29-src-D6">D6</a></sup></dd>
+<dt>Sensor orientation (rotation)</dt><dd><b>Simple words:</b> how a sensor chip is turned on the board compared with the board's forward direction. <b>Analogy:</b> a sign on the plan saying "this table faces the window". <b>Precise:</b> a fixed rotation applied in software to a sensor's axes so that its readings are expressed in the board frame; a wrong rotation makes the estimator see rolls as pitches or the wrong sign. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup></dd>
+</dl></div>
+
+<h2 id="F10-29-pictures">The idea in pictures</h2>
+<figure id="F10-29-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 300" role="img" aria-labelledby="F10-29-f1t F10-29-f1d">
+<title id="F10-29-f1t">Figure 1: from board file to firmware</title>
+<desc id="F10-29-f1d">Left: two input boxes, "MCU tables (pins, DMA, flash sectors) typed from the datasheet and reference manual" and "board file (pins, devices, serial order, DMA wanted, board id)". Both feed a generator box in the middle labelled "generator: check, then allocate". The generator has two outputs: on success "generated header and linker settings", which together with "vehicle code, libraries, HAL backend" feed "build", which produces "firmware image with board id"; on failure "errors: no header". A dashed arrow from the build output goes to a box "bootloader checks board id".</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="300"/>
+<rect class="sv-b4" x="20" y="30" width="230" height="70" rx="6"/><text class="sv-tb" x="32" y="54">MCU tables</text><text class="sv-ts" x="32" y="74">pins, DMA, flash sectors</text><text class="sv-ts" x="32" y="91">from datasheet + manual</text>
+<rect class="sv-b1" x="20" y="130" width="230" height="70" rx="6"/><text class="sv-tb" x="32" y="154">board file</text><text class="sv-ts" x="32" y="174">pins, devices, serial order</text><text class="sv-ts" x="32" y="191">DMA wanted, board id</text>
+<line class="sv-line" x1="250" y1="65" x2="320" y2="110"/><polygon class="sv-head" points="320,110 310,108 315,100"/>
+<line class="sv-line" x1="250" y1="165" x2="320" y2="125"/><polygon class="sv-head" points="320,125 315,134 310,126"/>
+<rect class="sv-b5" x="320" y="85" width="200" height="60" rx="6"/><text class="sv-tb" x="334" y="110">generator</text><text class="sv-ts" x="334" y="130">check, then allocate</text>
+<line class="sv-line" x1="420" y1="145" x2="420" y2="225"/><polygon class="sv-head" points="420,225 415,217 425,217"/>
+<rect class="sv-b6" x="340" y="225" width="160" height="40" rx="6"/><text class="sv-t" x="352" y="250">errors: no header</text>
+<line class="sv-line" x1="520" y1="115" x2="580" y2="115"/><polygon class="sv-head" points="580,115 572,110 572,120"/>
+<rect class="sv-b2" x="580" y="85" width="280" height="60" rx="6"/><text class="sv-tb" x="592" y="110">generated header</text><text class="sv-ts" x="592" y="130">and linker settings</text>
+<rect class="sv-b3" x="580" y="20" width="280" height="44" rx="6"/><text class="sv-ts" x="592" y="46">vehicle code, libraries, HAL backend</text>
+<line class="sv-line" x1="720" y1="145" x2="720" y2="180"/><polygon class="sv-head" points="720,180 715,172 725,172"/>
+<rect class="sv-b8" x="580" y="180" width="280" height="40" rx="6"/><text class="sv-t" x="592" y="205">build: firmware image + board id</text>
+<line class="sv-dash" x1="720" y1="220" x2="720" y2="250"/><polygon class="sv-head" points="720,250 715,242 725,242"/>
+<rect class="sv-box" x="580" y="250" width="280" height="40" rx="6"/><text class="sv-t" x="592" y="275">bootloader checks the board id</text>
+<text class="sv-ts" x="270" y="215">refuse</text><text class="sv-ts" x="528" y="105">accept</text>
+</svg></div><figcaption><b>Figure 1.</b> The pipeline of a board port, as ArduPilot documents it for ChibiOS boards and as this chapter's lab implements it with its own file format: tables from the MCU's documents, a board file, a generator that refuses mistakes, a build, and a board check at upload time. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup> <sup class="src"><a href="#F10-29-src-R1">R1</a></sup></figcaption></figure>
+
+<figure id="F10-29-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 250" role="img" aria-labelledby="F10-29-f2t F10-29-f2d">
+<title id="F10-29-f2t">Figure 2: the DMA conflict between rev A and rev B</title>
+<desc id="F10-29-f2d">Two panels. Left, rev A: requests SPI1_RX, SPI1_TX, UART1_RX, UART3_RX, UART2_RX, TIM1_UP each connected to a stream; UART3_RX goes to D1S1. Right, rev B: SPI2_RX and SPI2_TX are inserted before UART1_RX in the wanted list; SPI2_RX takes D1S1, the first of its two possible streams D1S1 and D1S3; UART3_RX, which can only use D1S1, has no stream and is marked "interrupt per byte". A note says D1S3 stayed free.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="250"/>
+<text class="sv-tb" x="20" y="24">rev A (R1)</text><text class="sv-tb" x="460" y="24">rev B (R3)</text>
+<rect class="sv-b1" x="20" y="40" width="130" height="28" rx="4"/><text class="sv-t" x="30" y="59">UART3_RX</text>
+<line class="sv-line" x1="150" y1="54" x2="240" y2="54"/><polygon class="sv-head" points="240,54 232,49 232,59"/>
+<rect class="sv-b2" x="240" y="40" width="80" height="28" rx="4"/><text class="sv-t" x="252" y="59">D1S1</text>
+<rect class="sv-box" x="240" y="80" width="80" height="28" rx="4"/><text class="sv-t" x="252" y="99">D1S3</text>
+<text class="sv-ts" x="20" y="140">UART3_RX can use only D1S1;</text><text class="sv-ts" x="20" y="158">D1S1 is free in rev A: DMA.</text>
+<rect class="sv-b5" x="460" y="40" width="130" height="28" rx="4"/><text class="sv-t" x="470" y="59">SPI2_RX</text>
+<line class="sv-line" x1="590" y1="54" x2="680" y2="54"/><polygon class="sv-head" points="680,54 672,49 672,59"/>
+<rect class="sv-b2" x="680" y="40" width="80" height="28" rx="4"/><text class="sv-t" x="692" y="59">D1S1</text>
+<rect class="sv-box" x="680" y="80" width="80" height="28" rx="4"/><text class="sv-t" x="692" y="99">D1S3</text><text class="sv-ts" x="770" y="99">left free</text>
+<rect class="sv-b6" x="460" y="120" width="130" height="28" rx="4"/><text class="sv-t" x="470" y="139">UART3_RX</text>
+<line class="sv-dash" x1="590" y1="134" x2="680" y2="64"/>
+<text class="sv-ts" x="600" y="170">no free stream: interrupt per byte</text>
+<text class="sv-ts" x="460" y="200">greedy order: SPI2_RX was asked before UART3_RX</text>
+<text class="sv-ts" x="460" y="220">and took the one stream UART3_RX can use</text>
+</svg></div><figcaption><b>Figure 2.</b> Why rev B's TELEM2 port lost DMA. Only the streams involved are drawn. The fix is to give SPI2_RX its other stream D1S3; a generator that tries the most constrained requests first finds it automatically. <sup class="src"><a href="#F10-29-src-R1">R1</a></sup> <sup class="src"><a href="#F10-29-src-R3">R3</a></sup></figcaption></figure>
+
+<h2 id="F10-29-layer1">Layer 1 — the kid explanation</h2>
+<p>A flight controller is a little computer chip with many legs (pins). Each leg can do a few different jobs: talk to a radio, read a sensor, drive a motor. The board maker decides which leg does which job and solders the parts to them.</p>
+<p>ArduPilot cannot guess what the maker decided. So each board gets a list: "leg 9 talks to radio one, leg 5 is the clock for the sensor bus, the sensor is turned a quarter turn". A helper program reads the list, checks that each leg really can do that job, and writes code for the board. If the list has a mistake, the helper says no, before anything is flashed.</p>
+<p>The chip also has a few helpers that move data on their own. There are not enough for every job, and some jobs can use only one particular helper. Deciding who gets which helper is a puzzle the helper program solves, and sometimes solves badly.</p>
+
+<h2 id="F10-29-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F10-29-l2-what">What a board description contains</h3>
+<p>The floor plan lists what is where; Kofi's skills stay the same. The ArduPilot porting documentation describes a board for the ChibiOS backend as a directory with a text definition file (and one for the bootloader), from which a script generates the board's headers at build time. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup> The file names the microcontroller; sets clocks and flash size; gives each used pin its function and a label; lists the devices on SPI and I2C buses with their chip selects and the sensor drivers with their orientation; sets the order in which UARTs become the flight stack's serial ports; sets default parameters; and gives the board ID. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup> <sup class="src"><a href="#F10-29-src-D4">D4</a></sup> The generator then emits pin configuration, peripheral settings and DMA assignments for ChibiOS/HAL, so that no board-specific C code is written for a board that uses known parts. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>No ArduPilot document or source file was opened in this build. Recalled, not checked: board directories under <code>libraries/AP_HAL_ChibiOS/hwdef/</code>; files <code>hwdef.dat</code> and <code>hwdef-bl.dat</code>; a generator script named <code>chibios_hwdef.py</code> with a DMA resolver script beside it and per-MCU Python tables; keywords such as <code>MCU</code>, <code>APJ_BOARD_ID</code>, <code>OSCILLATOR_HZ</code>, <code>FLASH_SIZE_KB</code>, <code>FLASH_RESERVE_START_KB</code>, <code>SERIAL_ORDER</code>, <code>SPIDEV</code>, <code>IMU</code>, <code>COMPASS</code>, <code>BARO</code>, <code>DMA_PRIORITY</code>, <code>DMA_NOSHARE</code>, <code>define</code>, <code>env</code> and <code>include</code>; a registry of board IDs in the source tree; and a build configured with <code>./waf configure --board &lt;name&gt;</code>. Every keyword, file name and path must be checked in the porting documentation (D2) and an existing board directory of the source tree (D4) at the release in the dossier. This chapter's lab uses its own format and none of these keywords.</p></div>
+<h3 id="F10-29-l2-lab">The lab's board file and generator</h3>
+<p>Listing 1 is the university's generator for a pretend MCU (U-MCU1, 25 pins, 11 DMA requests) and a pretend flight controller (U-FC1). The MCU table is what a porter types from the datasheet's alternate-function table and the reference manual's DMA request table; the board file is what she types from the schematic. <sup class="src"><a href="#F10-29-src-D6">D6</a></sup> The generator refuses a pin that cannot carry the requested function, a pin used twice, an incomplete peripheral (a UART with TX but no RX), a chip select that is not a single output, and a serial port with no pins. For the correct rev A file it assigns all six wanted DMA requests and writes a header; for a file with three typing mistakes it reports five errors and writes nothing. <sup class="src"><a href="#F10-29-src-R1">R1</a></sup> <sup class="src"><a href="#F10-29-src-R2">R2</a></sup> Listing 2 is firmware-side code built against the generated header: it never names a pin and reports, per serial port, whether receive uses DMA. <sup class="src"><a href="#F10-29-src-R1">R1</a></sup></p>
+<h3 id="F10-29-l2-flash">Flash layout, bootloader and board ID</h3>
+<p>The flash of a microcontroller is erased only in whole sectors, often of unequal sizes. <sup class="src"><a href="#F10-29-src-D6">D6</a></sup> ArduPilot's documentation describes a bootloader at the start of flash, a reserved area for parameter storage on boards without a separate storage chip, and the application linked to start after them; the bootloader and the application carry the same board ID, and the upload tools refuse a mismatch. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup> Listing 3 plans this for U-MCU1 (four 16 KiB sectors, one 64 KiB, seven 128 KiB): bootloader in sector 0, storage in sectors 1–2, and the application from 48 KiB (0xC000) with 126 KiB spare. <sup class="src"><a href="#F10-29-src-R4">R4</a></sup> Two sectors for storage allow one to be written while the other still holds a valid copy, so a power loss during a parameter save does not lose all parameters; whether a given flight stack does this, and how, is in its documentation. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Recalled, not checked: ArduPilot's firmware files for upload have an <code>.apj</code> form with the board ID inside; the bootloaders are built from the same tree with a bootloader board file; storage in flash uses a scheme with two sectors. Check the file formats, the bootloader's behaviour and the storage scheme in D2 and D4.</p></div>
+
+<h2 id="F10-29-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F10-29-l3-dma">DMA allocation is a matching problem</h3>
+<ul>
+<li><b>Greedy in a fixed order can fail where a solution exists.</b> Listing 1 gives each request the first free stream in the order of the wanted list. In rev B, SPI2_RX takes D1S1 although D1S3 would do; UART3_RX, which can use only D1S1, is left without DMA. <sup class="src"><a href="#F10-29-src-R3">R3</a></sup> Assigning the most constrained requests first, or solving the bipartite matching exactly, finds the assignment with both on DMA. <sup class="src"><a href="#F10-29-src-O2">O2</a></sup></li>
+<li><b>Sharing is the other way out.</b> A stream can serve two peripherals if the driver releases it between transfers; this costs latency and a lock, and is risky for a receiver that must be ready at all times (a UART receiving telemetry) and harmless for bursty, driver-initiated transfers (an SPI read the driver starts). ArduPilot's documentation describes DMA sharing and settings that forbid it for particular peripherals. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup></li>
+<li><b>Without DMA, every byte is an interrupt.</b> A UART at high bit rate without receive DMA asks the CPU for every byte; with a cooperative main loop (<a href="#F10-28">F10-28</a>) and other high-priority interrupts, a late interrupt means an overwritten receive register and a lost byte. A MAVLink frame with one lost byte fails its checksum and is discarded whole (<a href="#F10-30">F10-30</a>). The lab shows the allocation, not the loss: the loss rate depends on the bit rate, the interrupt load and the hardware's receive buffer, which this build did not measure.</li>
+</ul>
+<h3 id="F10-29-l3-checks">What a generator can and cannot check</h3>
+<p>A generator can check everything that follows from the tables: pin functions, double use, completeness, DMA reachability, flash sizes. It cannot check that the tables are right (a typo in the MCU table makes every board wrong), that the schematic matches the board file, or anything electrical: pull-ups on I2C, the voltage of a GPIO, a swapped TX/RX on the connector. Those need the bench: a continuity check, an oscilloscope, a loop-back test per port. <sup class="src"><a href="#F10-29-src-R2">R2</a></sup> <sup class="src"><a href="#F10-29-src-S1">S1</a></sup></p>
+<h3 id="F10-29-l3-orient">Sensor orientation</h3>
+<p>The rotation of each IMU and compass is a board fact, not a user setting. A wrong rotation is a dangerous error: the estimator receives consistent but wrongly labelled data, the attitude estimate may look plausible on the bench, and a controller acting on a sign error diverges in the first second of flight (the instability of <a href="#F10-17">F10-17</a> with the gain sign reversed). Verify each sensor's axes by tilting the board by hand in each direction and comparing the ground station's attitude display, before any motor is connected. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup> <sup class="src"><a href="#F10-29-src-S1">S1</a></sup></p>
+<h3 id="F10-29-l3-order">Bring-up order</h3>
+<ol>
+<li>Recovery path first: SWD probe or the MCU's ROM DFU mode, tested once.</li>
+<li>Bootloader: build, flash, see the USB device appear. </li>
+<li>Application with a minimal board file: USB console, LEDs, one UART.</li>
+<li>One bus and one sensor at a time; rotation check per sensor.</li>
+<li>Serial ports with loop-back tests at the highest bit rate in use; DMA report.</li>
+<li>Motor outputs with an oscilloscope, no ESCs; then ESCs without propellers (DN202).</li>
+<li>Logging and storage: power-cycle during a parameter save.</li>
+</ol>
+<p>Each step adds one unknown; when something fails, only the newest step is suspect. This is the bring-up discipline of BR-05 applied to a flight stack. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup></p>
+
+<h2 id="F10-29-hardware">How the hardware actually does it</h2>
+<p>At reset the MCU runs the bootloader from the start of flash. The bootloader sets up clocks and USB, waits a short time for an upload, checks that a valid application is present, and jumps to it: it sets the vector table offset register to the application's start (0xC000 in Listing 3's plan) and loads the stack pointer and reset vector from there. <sup class="src"><a href="#F10-29-src-D6">D6</a></sup> <sup class="src"><a href="#F10-29-src-D2">D2</a></sup> The application's startup code (ChibiOS's, configured from the generated header) then programs the GPIO mode and alternate-function registers of every pin, enables peripheral clocks, and configures the DMA streams that the generator assigned; from then on, the HAL drivers of <a href="#F10-27">F10-27</a> use them. <sup class="src"><a href="#F10-29-src-D1">D1</a></sup> If the application was linked for the wrong offset, the jump lands in the middle of code and the board appears dead with a working bootloader, the classic symptom of a flash-layout mismatch.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The exact boot sequence of ArduPilot's bootloader (wait time, image check, how it hands over) is described here from general Cortex-M practice, not from its source. Check D2 and D4. The register names belong to Cortex-M parts and the vendor's reference manual (D6), which has not been chosen.</p></div>
+
+<h2 id="F10-29-worked">Worked example</h2>
+<p><b>Task.</b> Rev B adds a second IMU on SPI2. Show by hand why UART3_RX loses DMA under Listing 1's greedy rule, and find an allocation that keeps everything on DMA.</p>
+<ol>
+<li><b>The wanted list, in order:</b> SPI1_RX, SPI1_TX, SPI2_RX, SPI2_TX, UART1_RX, UART3_RX, UART2_RX, TIM1_UP. <sup class="src"><a href="#F10-29-src-R3">R3</a></sup></li>
+<li><b>Greedy pass:</b> SPI1_RX → D2S0; SPI1_TX → D2S3; SPI2_RX → D1S1 (first of D1S1, D1S3); SPI2_TX → D1S4 (only option); UART1_RX → D2S2 (first of D2S2, D2S5); UART3_RX → options D1S1 only, taken → none; UART2_RX → D1S5; TIM1_UP → D2S5 (only option). The generator prints exactly this. <sup class="src"><a href="#F10-29-src-R3">R3</a></sup></li>
+<li><b>Most-constrained first:</b> requests with one option: SPI2_TX (D1S4), UART1_TX (not wanted), UART2_RX (D1S5), UART3_RX (D1S1), TIM1_UP (D2S5). Assign them. Then two-option requests: SPI1_RX → D2S0; SPI1_TX → D2S3; SPI2_RX → D1S3 (D1S1 is taken); UART1_RX → D2S2 (D2S5 taken). All eight are served.</li>
+<li><b>Check:</b> every stream is used at most once: D2S0, D2S3, D1S3, D1S4, D2S2, D1S1, D1S5, D2S5. Yes.</li>
+<li><b>Lesson:</b> the board file was correct; the allocation algorithm was too simple. Either improve the generator (lab step 3) or order the wanted list with constrained requests first.</li>
+</ol>
+
+<h2 id="F10-29-code">Code walk-through</h2>
+<p>All files are in <code>university/labs/F10-29</code>; <code>university/labs/run_lab.sh university/labs/F10-29</code> ran them (Python 3.13.16; g++ 13.3.0 with <code>-std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined</code>).</p>
+<p><b>Listing 0</b> — the inputs: the pretend MCU's tables and the rev A board file.</p>
+<pre class="listing" data-src="F10-29/umcu1.txt"></pre>
+<pre class="listing" data-src="F10-29/uboard.txt"></pre>
+<p><b>Listing 1</b> — <code>gen_board.py</code>: check and generate.</p>
+<pre class="listing" data-src="F10-29/gen_board.py"></pre>
+<pre class="output" data-run="F10-29/gen"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–29</td><td><code>read_lines</code>, <code>load_mcu</code></td><td>Reads the MCU's pin and DMA tables.</td><td>The tables are the ground truth; a typo here breaks every board.</td></tr>
+<tr><td>32–33</td><td><code>NEEDS</code></td><td>The signals each kind of peripheral needs.</td><td>Catches the half-wired UART.</td></tr>
+<tr><td>43–71</td><td>parse loop</td><td>Reads the board file; checks each pin's function and double use.</td><td>Errors carry the board file's line number, so the porter can fix them.</td></tr>
+<tr><td>73–96</td><td>completeness checks</td><td>Peripherals complete, chip selects single outputs, devices and serial ports exist.</td><td>Checks that follow from the tables, before any build.</td></tr>
+<tr><td>98–114</td><td>DMA allocation</td><td>Greedy: first free stream, in wanted order; a warning when none is free.</td><td>The weakness the forensic lab exposes.</td></tr>
+<tr><td>116–128</td><td>report</td><td>Prints assignments and serial order; stops on errors.</td><td>A generator that writes a header despite errors would hide them.</td></tr>
+<tr><td>130–151</td><td>header</td><td>Writes <code>constexpr</code> tables.</td><td>The firmware reads board facts only from here.</td></tr>
+</tbody></table></div>
+<p>The generated header for rev A:</p>
+<pre class="listing" data-src="F10-29/board_gen.h.txt"></pre>
+<p>A board file with three typing mistakes (TX/RX pin typo, CS on a pin already used, a missing GPS RX line):</p>
+<pre class="listing" data-src="F10-29/uboard_bad.txt"></pre>
+<pre class="output" data-run="F10-29/gen_bad"></pre>
+<p>Expected failure: exit code 1 and no header. <sup class="src"><a href="#F10-29-src-R2">R2</a></sup></p>
+<p><b>Listing 2</b> — <code>board_use.cc</code>: firmware-side code built against the header.</p>
+<pre class="listing" data-src="F10-29/board_use.cc"></pre>
+<pre class="output" data-run="F10-29/board_use"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8</td><td><code>#include "board_gen.h"</code></td><td>The generated header, written by run.sh into the build directory.</td><td>The same source builds for every board file.</td></tr>
+<tr><td>12–30</td><td><code>dmaStream</code>, <code>labelOf</code></td><td>Look-ups in the generated tables.</td><td>No pin name appears in the firmware code.</td></tr>
+<tr><td>39–57</td><td>serial loop</td><td>Prints, per serial port, its label and whether receive uses DMA.</td><td>Turns the allocation into a statement about each port.</td></tr>
+<tr><td>58–68</td><td>SPI devices, self-check</td><td>Lists devices; warns if a telemetry port has no receive DMA.</td><td>A boot-time check that would have caught the forensic case.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>flash_layout.cpp</code>: bootloader, storage and application in whole sectors.</p>
+<pre class="listing" data-src="F10-29/flash_layout.cpp"></pre>
+<pre class="output" data-run="F10-29/flash_layout"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–21</td><td>sector table, sizes</td><td>U-MCU1's sectors and the three images' sizes.</td><td>On a real port, from the reference manual and the build outputs.</td></tr>
+<tr><td>23–29</td><td>offsets</td><td>Start offset of every sector.</td><td>The application's link address is a sector boundary.</td></tr>
+<tr><td>32</td><td><code>plan</code></td><td>Sector 0, sectors 1–2, sectors 3–11.</td><td>Regions in whole sectors, so erasing one never touches another.</td></tr>
+<tr><td>34–51</td><td>fit check</td><td>Sums each region and compares with its need.</td><td>Rejects a layout before anything is linked.</td></tr>
+<tr><td>52–54</td><td>link offset</td><td>Prints 48 KiB = 0xC000.</td><td>The number the linker script and the bootloader must agree on.</td></tr>
+</tbody></table></div>
+
+<h2 id="F10-29-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Kofi notices when a floor plan is plainly wrong; firmware follows its board file exactly.</b> A wrong rotation or a swapped pin is obeyed without complaint unless a check was written for it. <sup class="src"><a href="#F10-29-src-R2">R2</a></sup></li>
+<li><b>Trolleys can be shared by asking; DMA streams can be reached only by the requests the silicon wires to them.</b> No board file can give UART3_RX a stream outside its row of the table. <sup class="src"><a href="#F10-29-src-D6">D6</a></sup></li>
+<li><b>A restaurant floor plan describes one building; a board file can describe a wrong chip.</b> If the MCU line names the wrong part, every check passes against the wrong tables.</li>
+</ul>
+
+<h2 id="F10-29-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> board dead after flashing, bootloader still works. <b>Cause:</b> application linked for another offset or with another board ID. <b>How to find it:</b> compare the linker's start address with the flash layout; read the image's board ID. <b>Fix:</b> one source of truth for the layout.</li>
+<li><b>Symptom:</b> a sensor is "not found". <b>Cause:</b> wrong chip select, wrong bus, missing pull-up, wrong driver. <b>How to find it:</b> the boot messages, then an oscilloscope on CS and SCK. <b>Fix:</b> correct the board file; check the schematic.</li>
+<li><b>Symptom:</b> attitude on the ground station moves the wrong way when tilting the board. <b>Cause:</b> wrong sensor rotation. <b>How to find it:</b> tilt test per axis. <b>Fix:</b> correct the rotation in the board file. Never fly before this test passes.</li>
+<li><b>Symptom:</b> one telemetry port loses packets at high bit rate, others do not. <b>Cause:</b> no receive DMA on that port. <b>How to find it:</b> the generator's DMA report (forensic lab). <b>Fix:</b> reorder or improve the allocation; forbid sharing for that port.</li>
+<li><b>Symptom:</b> serial ports numbered differently from the board's labels. <b>Cause:</b> serial order in the board file does not follow the documentation's convention. <b>How to find it:</b> loop-back test per port. <b>Fix:</b> correct the order; document it for users.</li>
+</ul>
+
+<div class="co transition" id="F10-29-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F10-27">F10-27</a> placed the HAL between vehicle code and hardware, and <a href="#F10-28">F10-28</a> showed what runs above it. <b>What carries over:</b> pin multiplexing, DMA and linker scripts from bare-metal work (BR-05, OS305), and the habit of reading the MCU's own documents. <sup class="src"><a href="#F10-29-src-D6">D6</a></sup> <b>What changes:</b> most dangerous first, a wrong board fact (rotation, pin, offset) is now compiled into a flight stack that obeys it in the air; you no longer write the pin set-up code yourself, a generator does, so your work becomes writing correct tables and checking the generator's choices; and the board must coexist with a bootloader and an upload tool that check its identity. <sup class="src"><a href="#F10-29-src-D2">D2</a></sup> <b>What comes next:</b> <a href="#F10-30">F10-30</a> moves from the board to the link: MAVLink, the protocol every serial port of this chapter carries to ground stations and companion computers.</p></div>
+
+<h2 id="F10-29-check">Check yourself</h2>
+<ol>
+<li>Name five kinds of facts a board description must contain.</li>
+<li>Which of these can a generator check from the MCU tables alone? (a) PA6 cannot be a GPIO output on U-MCU1. (b) The IMU is rotated by 90° on the board. (c) UART2 has TX but no RX pin. (d) The I2C bus has pull-up resistors.</li>
+<li>Explain why the application must start at a sector boundary.</li>
+<li>In rev A, which stream does UART3_RX use, and why does rev B take it away?</li>
+<li>Predict, then run: in a copy of <code>uboard_revb.txt</code>, move <code>UART3_RX</code> to the front of the DMA wanted list. What does the generator print for SPI2_RX?</li>
+<li>Apply to a new case: a board's application is 990 KiB. Using Listing 3's sectors, can you keep two storage sectors? Propose a layout or show that none exists.</li>
+<li>Why is a wrong sensor rotation more dangerous than a missing sensor?</li>
+<li>Why must the recovery path be tested before the first flash of a new bootloader?</li>
+</ol>
+
+<h2 id="F10-29-lab">Lab</h2>
+<p><b>Goal.</b> Write and check a board description, improve the DMA allocator, plan a flash layout, and (optionally) study a real board directory.</p>
+<p><b>Hardware and software needed.</b> Part A: none; Python 3.13.16 and g++ 13.3.0 as used in this build; <code>university/labs/run_lab.sh university/labs/F10-29</code>. Part B: the ArduPilot source tree at the dossier's release; a board from the documentation's supported list, an SWD probe or documented DFU recovery.</p>
+<div class="co safety"><span class="lbl">Safety</span><p>Part B: no propellers on the bench; ESCs disconnected until the motor-output step; a current-limited bench supply. Flashing a bootloader can make a board unrecoverable without a working SWD or DFU path: test recovery first. <sup class="src"><a href="#F10-29-src-S1">S1</a></sup></p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab; read <code>gen.out</code>, <code>gen_bad.out</code> and the generated header.</li>
+<li>Write a board file for a "U-FC2" from this description: TELEM1 on UART1 (PB6/PB7), GPS on UART4 (PA0/PA1), IMU on SPI1 with CS on PA4, external I2C on I2C2 (PB10/PB11), four motors on TIM1. Run the generator; fix every error it reports and explain each.</li>
+<li>Change <code>gen_board.py</code> to assign DMA most-constrained-first. Show that rev B then gets DMA for all eight requests (the worked example's result), and that rev A's assignment is still valid.</li>
+<li>Extend Listing 3 so that it finds the largest application that fits with two storage sectors, and prints the link offset for it.</li>
+<li>Part B (untested in this build): open an existing board directory in the ArduPilot source tree, list its keywords, and map each to the lab's format; build its firmware following D2.</li>
+</ol>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Part B is <b>untested in this build</b>: no ArduPilot source tree or board was available. Directory names, the build command and the bootloader-flashing procedure are to be taken from the porting documentation (D2) for the release in the dossier.</p></div>
+<p><b>Expected observations.</b> Step 2: errors for any pin typed outside the MCU table (UART4 on PA0/PA1 is valid in U-MCU1; I2C2 on PB10/PB11 is valid but collides with nothing only if UART3 is not used). Step 3: all eight requests on DMA, SPI2_RX on D1S3.</p>
+<p><b>Verification.</b> Generator exit 0 with no warnings; <code>board_use</code> self-check PASS for rev B after your fix.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>"pin does not exist" → the pin is missing from <code>umcu1.txt</code> → check the spelling (PA9, not PA09).</li>
+<li>"missing signal(s)" for a timer → timers are exempt in the completeness check; if you added one, see line 76.</li>
+<li><code>board_use</code> does not compile → the header was not regenerated → run.sh writes it into <code>.build</code>; build with <code>-I.build</code>.</li>
+</ul>
+<p><b>Extension.</b> Replace the allocator with an exact bipartite matching and add a "no sharing" flag per request.</p>
+
+<h2 id="F10-29-forensic">Forensic lab</h2>
+<p><b>Scenario: "Rev B drops the companion link".</b> U-FC1 rev B adds a second IMU. The companion computer on TELEM2 (115,200 bit/s here, higher in the next project) now loses about one MAVLink frame in twenty during busy flight; TELEM1 at the same rate is fine; rev A boards are fine with the same firmware version. Ama has the two board files, the generator outputs, and the boot report.</p>
+<p><b>Evidence pack.</b> The rev B board file (diff with rev A: four pins, one SPI device, one IMU, SPI2 in the DMA list), the generator output and the boot report (both produced by this lab; synthetic boards; the loss rate in the scenario is part of the story, not a measurement).</p>
+<pre class="listing" data-src="F10-29/uboard_revb.txt"></pre>
+<pre class="output" data-run="F10-29/forensic_gen"></pre>
+<pre class="output" data-run="F10-29/forensic_use"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what differs between rev A's and rev B's DMA assignments?</li>
+<li>Hypotheses: list three causes for losses on one port only, and the evidence that would separate them.</li>
+<li>Root cause: explain the chain from "added IMU2" to "frames lost on TELEM2".</li>
+<li>Fix and verification.</li>
+<li>Prevention: what should fail the build next time?</li>
+</ol>
+<p><b>Method hints.</b> Look for the one WARNING line, then for which stream UART3_RX can use (<code>umcu1.txt</code>) and who has it.</p>
+
+<h2 id="F10-29-project">Mini-project</h2>
+<p><b>A board-file reviewer.</b> Extend the generator into a review tool that also reads a netlist export (a CSV of connector pin → MCU pin you write for U-FC1) and reports mismatches between schematic and board file, ports without receive DMA, and sensors without a rotation. Test it on rev A, rev B and two planted errors of your own.</p>
+<p><b>Rubric.</b> Checks correct, each with a test (4). DMA allocation optimal on the given boards (2). Clear report with line numbers (2). Honest list of what it cannot check (2).</p>
+
+<h2 id="F10-29-summary">Summary</h2>
+<ul>
+<li>ArduPilot describes each ChibiOS board in a text file; a generator checks it and produces the board's configuration.</li>
+<li>A board file holds the MCU, pin functions and labels, bus devices and chip selects, sensor rotations, serial order, DMA wishes, flash layout and board ID.</li>
+<li>A generator can check what follows from the MCU's tables; electrical facts and the schematic need the bench.</li>
+<li>DMA allocation is a matching problem; a greedy order can starve a request that a better order would serve.</li>
+<li>Flash regions must be whole sectors; the application's start offset must agree with the bootloader.</li>
+<li>Rotation errors are flight-critical; check each sensor by tilting before any motor is connected.</li>
+<li>Bring up one unknown at a time, with a tested recovery path.</li>
+</ul>
+
+<h2 id="F10-29-sources">Sources</h2>
+<ol>
+<li id="F10-29-src-D1">ChibiOS project, "ChibiOS documentation" (HAL reference; tier 2): PAL (pin) driver, board initialisation. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F10-29-src-D2">ArduPilot project, "ArduPilot documentation" (Dev site; tier 2): porting to a new flight controller board, hwdef files, bootloader, board IDs, DMA sharing, sensor orientation. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F10-29-src-D4">ArduPilot project, ArduPilot source repository (tier 4) at the release tag in the dossier: board directories, the hwdef generator and DMA resolver. <i>Not opened during this build (dossier gate G1 open).</i></li>
+<li id="F10-29-src-D6">The datasheet (alternate-function table), reference manual (DMA request mapping, flash organisation, vector table offset) of the microcontroller on the course's flight controller (tier 1, dossier part F). <i>Not yet chosen.</i></li>
+<li id="F10-29-src-O2">University course OS305 and BR-05 (DMA, interrupts, linker scripts), and a standard algorithms text for bipartite matching (title to be chosen by the Source Researcher). <i>Not opened during this build.</i></li>
+<li id="F10-29-src-S1">University Authoring Guide, section "Honesty first" and the DN202 bench-safety rules (propellers off, current-limited supply, recovery path) — opened in this build.</li>
+<li id="F10-29-src-R1">R1 — lab run of <code>gen_board.py</code> on rev A and of <code>board_use.cc</code> against its header (<code>gen.log</code>, <code>board_use.log</code>); Python 3.13.16, g++ 13.3.0; exit code 0.</li>
+<li id="F10-29-src-R2">R2 — lab run of <code>gen_board.py</code> on <code>uboard_bad.txt</code> (<code>gen_bad.log</code>); exit code 1, expected.</li>
+<li id="F10-29-src-R3">R3 — lab run on rev B (<code>forensic_gen.log</code>, <code>forensic_use.log</code>); exit code 0 with one warning.</li>
+<li id="F10-29-src-R4">R4 — lab run of <code>flash_layout.cpp</code> (<code>flash_layout.log</code>); g++ 13.3.0; exit code 0.</li>
+</ol>
+
+<h2 id="F10-29-glossary">Glossary links</h2>
+<p><a href="#gl-board-description-hwdef">Board description (hwdef)</a> · <a href="#gl-alternate-function-pin-mux">Alternate function (pin mux)</a> · <a href="#gl-dma-stream-dma-channel">DMA stream (DMA channel)</a> · <a href="#gl-dma-allocation">DMA allocation</a> · <a href="#gl-board-id">Board ID</a> · <a href="#gl-bootloader-flight-controller">Bootloader (flight controller)</a> · <a href="#gl-sensor-orientation-rotation">Sensor orientation (rotation)</a></p>
+
+<h2 id="F10-29-next">Next chapter</h2>
+<p>Next: <a href="#F10-30">F10-30 MAVLink: messages, microservices, dialects</a>. Previous: <a href="#F10-28">F10-28 ArduPilot architecture</a>. Back to the course: <a href="#DN303">DN303</a>.</p>
+
+<h2 id="F10-29-answers">Answers to Check yourself</h2>
+<ol>
+<li>Any five of: the MCU; each used pin's function and label; bus devices and chip selects; sensor drivers and rotations; serial port order; DMA wishes or restrictions; clocks; flash size and reserved areas; board ID; default parameters.</li>
+<li>(a) and (c). (b) is a fact about how the chip is soldered; (d) is electrical. Both need the schematic and the bench.</li>
+<li>Flash is erased in whole sectors; if the application shared a sector with the bootloader or storage, updating it would erase the other region too.</li>
+<li>D1S1 (R1). In rev B, SPI2_RX comes earlier in the wanted list and takes D1S1, the first of its two options; UART3_RX has no other option (R3).</li>
+<li>UART3_RX gets D1S1; SPI2_RX then finds D1S1 taken and gets D1S3. All eight requests get DMA. Run it to confirm.</li>
+<li>Sectors 3–11 give 976 KiB, too small. Moving storage to sectors 1 and 2 is already the minimum before the application; putting storage at the end (two 128 KiB sectors) leaves sectors 1–9 = 48+64+5×128 = 752 KiB: also too small. With these sectors no layout keeps two storage sectors for a 990 KiB application; options are a smaller image, one storage sector with an external storage chip, or a part with more flash.</li>
+<li>A missing sensor is detected at boot and the vehicle refuses to arm; a wrong rotation passes every boot check and turns the controller's feedback sign wrong in the air.</li>
+<li>A faulty bootloader can stop the board from accepting any further upload over USB; only an independent path (SWD or ROM DFU) can recover it, and it must be known to work before it is needed.</li>
+</ol>
+<h3 id="F10-29-forensic-key">Forensic lab answer key</h3>
+<p><b>How the evidence was made.</b> <code>run.sh</code> ran the generator on <code>uboard_revb.txt</code> and built <code>board_use.cc</code> against the resulting header. The loss rate in the scenario is invented for the story; the lab shows the allocation that would cause it.</p>
+<p><b>Observation.</b> Rev B: UART3_RX → none, with the warning "no free DMA stream for UART3_RX (its streams: D1S1 by SPI2_RX)"; the boot report says SERIAL2 (TELEM2) receives by interrupt per byte, self-check WARN. Rev A: UART3_RX → D1S1, PASS. <sup class="src"><a href="#F10-29-src-R3">R3</a></sup> <sup class="src"><a href="#F10-29-src-R1">R1</a></sup></p>
+<p><b>Root cause.</b> Adding IMU2 put SPI2_RX before UART3_RX in the DMA wanted list; the greedy allocator gave SPI2_RX its first option D1S1, the only stream UART3_RX can use. TELEM2 then receives one interrupt per byte; under flight load some interrupts are served after the next byte arrives, a byte is lost, and the frame fails its checksum. Wrong hypotheses: radio or cable (TELEM1 is fine, rev A is fine with the same firmware); firmware bug (same firmware on both revisions).</p>
+<p><b>Fix and verification.</b> Give SPI2_RX stream D1S3 (move UART3_RX earlier in the wanted list, or make the allocator most-constrained-first); expected: all eight requests on DMA, self-check PASS; then a loop-back test on TELEM2 at the highest bit rate under flight-like load, on the bench.</p>
+<p><b>Prevention.</b> Make "telemetry port without receive DMA" a build error, not a warning, and run the generator on every board revision in CI.</p>

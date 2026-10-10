@@ -1,0 +1,323 @@
+<!--meta
+id: F7-11
+title: The Local Data Share and its banks
+course: HP302
+level: L3
+prereqs: F7-10; HW301 (F1-58); CU302 (shared-memory tiling) recommended
+time: 8–12 hours including the lab
+hardware: none for the bank model, the ISA steps, the occupancy check and the forensic lab (this build: no GPU); running Listings 2 and 3 and measuring bank conflicts needs an AMD GPU listed in the ROCm compatibility matrix
+maps: Curriculum E10 (AMD part: LDS accesses and synchronization in the ISA); 13.1 vocabulary table (software-managed on-chip memory: Local Data Share, banked); 13.2 topic "Bank conflicts: shared memory / LDS access patterns, padding and swizzling"; course lab "occupancy experiments varying LDS"; ISA guides (item 69)
+analogy: F7 — the great kitchen hall (second building: AMD)
+-->
+
+<h2 id="F7-11-hook">Story hook</h2>
+<p>In the second building, every group of rows shares a table. The table has drawers along its edge, numbered in order, and each drawer can hand out one thing per moment. Ingredients are laid out in the drawers in order: the first in drawer 0, the next in drawer 1, and so on, round and round.</p>
+<p>Lucía's group is turning a big square of numbers on its side: they take it in row by row and must give it out column by column. Taking a row in is easy: the helpers reach into neighbouring drawers. Giving a column out is a disaster: with 64 numbers in each row, every number of a column sits in the same drawer, so 64 helpers queue at one drawer while the others stand still.</p>
+<p>Lucía knows the old trick from the first building: leave one empty slot at the end of every row, so that a column runs diagonally across the drawers. It works. But the next morning her group is told that their table is now slightly too big, and one group fewer fits in the hall. This chapter is about that table, AMD's Local Data Share: how it is banked, how to see its accesses in the ISA, how padding and swizzling remove conflicts, and what the extra bytes cost in occupancy.</p>
+
+<h2 id="F7-11-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what the LDS is, how HIP's <code>__shared__</code> maps to it, and why only the waves of one workgroup can use the same allocation.</li>
+<li><b>Compute</b> with a bank model the number of passes for a wave-wide LDS access, for any stride, with the bank count and the number of lanes served together as parameters.</li>
+<li><b>Read</b> LDS instructions in AMD ISA: <code>ds_write_b32</code>, <code>ds_write2st64_b32</code>, <code>ds_read2_b32</code>, <code>ds_read_b32</code>, and the barrier <code>s_barrier</code>.</li>
+<li><b>Remove</b> a column-access conflict by padding (pitch 65) or by an XOR swizzle, and state what each costs.</li>
+<li><b>Predict</b> occupancy from LDS per workgroup, and show that padding a 64 × 64 tile drops occupancy from 4 to 3 waves per SIMD in this build's model.</li>
+</ul>
+
+<div class="co jargon" id="F7-11-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>LDS (Local Data Share)</dt><dd><b>Simple words:</b> AMD's fast on-chip memory that the work-items of one workgroup share. <b>Analogy:</b> the table in the middle of a group of rows. <b>Precise:</b> a software-managed memory in each CU; HIP's <code>__shared__</code> variables are placed there; it is accessed with <code>ds_</code> instructions; its size per workgroup is recorded as <code>.group_segment_fixed_size</code> and reported as "LDS Size [bytes/block]"; AMD's name for what CUDA calls shared memory. <sup class="src"><a href="#F7-11-src-D2">D2</a></sup> <sup class="src"><a href="#F7-11-src-D5">D5</a></sup> <sup class="src"><a href="#F7-11-src-R4">R4</a></sup></dd>
+<dt>LDS bank</dt><dd><b>Simple words:</b> one of several independent parts of the LDS, each able to serve one word at a time. <b>Analogy:</b> one drawer of the table. <b>Precise:</b> the LDS is divided into banks; consecutive 4-byte words are in consecutive banks; an access in which several lanes need different words of the same bank is split into several passes (a bank conflict); lanes reading the same word are served together (broadcast). The bank count and how many lanes are served together are product facts (D2). <sup class="src"><a href="#F7-11-src-D2">D2</a></sup></dd>
+<dt>Pass (of an LDS access)</dt><dd><b>Simple words:</b> one round in which each bank hands out at most one word. <b>Analogy:</b> one moment at the drawers. <b>Precise:</b> in this chapter's model (Listing 1), the number of passes of one wave-wide access is the sum, over groups of lanes served together, of the largest number of distinct words any single bank must deliver; the minimum for 64 different words is 64 / banks.</dd>
+<dt>Padding (of an LDS tile)</dt><dd><b>Simple words:</b> adding unused words at the end of each row so that a column is spread over the banks. <b>Analogy:</b> one empty slot at the end of every row of drawers. <b>Precise:</b> declaring <code>tile[64][65]</code> instead of <code>tile[64][64]</code>: element (r, c) is at word 65r + c, so a column's words have stride 65, which in a model with 32 banks hits every bank (R1). Costs 256 bytes more per tile (R4).</dd>
+<dt>Swizzle (XOR)</dt><dd><b>Simple words:</b> storing each row's elements in a shuffled order, so that a column lands in different banks without extra space. <b>Analogy:</b> each row puts its ingredients in the drawers in a different order, by a rule everybody knows. <b>Precise:</b> storing element (r, c) at word 64r + (c XOR r); a column read then touches words 64l + (c XOR l), which in the model spread over the banks like padding does (R1), with no extra bytes (R4) but extra address instructions (R2).</dd>
+<dt><code>s_barrier</code></dt><dd><b>Simple words:</b> the instruction where all waves of a workgroup wait for each other. <b>Analogy:</b> everyone at the table stops until the whole group has put its ingredients down. <b>Precise:</b> the workgroup barrier instruction that HIP's <code>__syncthreads()</code> compiles to on gfx90a (R2); HIP 5.7 implements <code>__syncthreads()</code> as <code>__barrier(__CLK_LOCAL_MEM_FENCE)</code>, a barrier with an LDS memory fence. <sup class="src"><a href="#F7-11-src-H1">H1</a></sup> <sup class="src"><a href="#F7-11-src-R2">R2</a></sup></dd>
+</dl></div>
+
+<h2 id="F7-11-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the column read of the transpose (Listing 2) in the bank model: the first eight lanes of a wave read column 0 of the tile. With pitch 64, lane <i>l</i> reads word 64<i>l</i>, and every word is in bank 0: the lanes are served one after another. With pitch 65, lane <i>l</i> reads word 65<i>l</i>, in bank <i>l</i> (modulo the bank count), and they are served together. The swizzled tile gives the same spread as padding without the extra column.</p>
+<figure id="F7-11-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 380" role="img" aria-labelledby="F7-11-f1t F7-11-f1d">
+<title id="F7-11-f1t">Figure 1: lanes to banks for a column read, with pitch 64 (conflict) and pitch 65 (padded, no conflict)</title>
+<desc id="F7-11-f1d">Two panels side by side, each showing lanes 0 to 7 on the left and banks 0 to 7 on the right, the first eight of 64 lanes and of 32 model banks. Left panel, tile[64][64]: lane l reads word 64 times l; all eight arrows go to bank 0, labelled "64 words in one bank: 64 passes in the model". Right panel, tile[64][65]: lane l reads word 65 times l; lane 0 goes to bank 0, lane 1 to bank 1, and so on to lane 7 to bank 7, labelled "one word per bank per group of 32 lanes: 2 passes". Below: XOR swizzle on tile[64][64]: lane l reads word 64 l plus (c xor l), same spread as padding, 2 passes, no extra bytes but extra address instructions. Bank count 32 is the model's parameter, not a documented value.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="380"/>
+<text class="sv-tb" x="20" y="24">tile[64][64]: lane l reads word 64·l</text>
+<text class="sv-tb" x="400" y="24">tile[64][65] (padded): lane l reads word 65·l</text>
+<g>
+<rect class="sv-b2" x="20" y="40" width="80" height="24"/><text class="sv-ts" x="28" y="57">lane 0</text>
+<rect class="sv-b2" x="20" y="70" width="80" height="24"/><text class="sv-ts" x="28" y="87">lane 1</text>
+<rect class="sv-b2" x="20" y="100" width="80" height="24"/><text class="sv-ts" x="28" y="117">lane 2</text>
+<rect class="sv-b2" x="20" y="130" width="80" height="24"/><text class="sv-ts" x="28" y="147">lane 3</text>
+<rect class="sv-b2" x="20" y="160" width="80" height="24"/><text class="sv-ts" x="28" y="177">lane 4</text>
+<rect class="sv-b2" x="20" y="190" width="80" height="24"/><text class="sv-ts" x="28" y="207">lane 5</text>
+<rect class="sv-b2" x="20" y="220" width="80" height="24"/><text class="sv-ts" x="28" y="237">lane 6</text>
+<rect class="sv-b2" x="20" y="250" width="80" height="24"/><text class="sv-ts" x="28" y="267">lane 7</text>
+<rect class="sv-b5" x="250" y="40" width="90" height="24"/><text class="sv-ts" x="258" y="57">bank 0 ×8</text>
+<rect class="sv-box" x="250" y="70" width="90" height="24"/><text class="sv-ts" x="258" y="87">bank 1</text>
+<rect class="sv-box" x="250" y="100" width="90" height="24"/><text class="sv-ts" x="258" y="117">bank 2</text>
+<rect class="sv-box" x="250" y="130" width="90" height="24"/><text class="sv-ts" x="258" y="147">bank 3</text>
+<rect class="sv-box" x="250" y="160" width="90" height="24"/><text class="sv-ts" x="258" y="177">bank 4</text>
+<rect class="sv-box" x="250" y="190" width="90" height="24"/><text class="sv-ts" x="258" y="207">bank 5</text>
+<rect class="sv-box" x="250" y="220" width="90" height="24"/><text class="sv-ts" x="258" y="237">bank 6</text>
+<rect class="sv-box" x="250" y="250" width="90" height="24"/><text class="sv-ts" x="258" y="267">bank 7</text>
+<line class="sv-line" x1="100" y1="52" x2="246" y2="52"/><polygon class="sv-head" points="250,52 240,47 240,57"/>
+<line class="sv-line" x1="100" y1="82" x2="246" y2="54"/>
+<line class="sv-line" x1="100" y1="112" x2="246" y2="56"/>
+<line class="sv-line" x1="100" y1="142" x2="246" y2="57"/>
+<line class="sv-line" x1="100" y1="172" x2="246" y2="58"/>
+<line class="sv-line" x1="100" y1="202" x2="246" y2="59"/>
+<line class="sv-line" x1="100" y1="232" x2="246" y2="60"/>
+<line class="sv-line" x1="100" y1="262" x2="246" y2="61"/>
+<text class="sv-ts" x="20" y="298">all words in bank 0: served one by one</text>
+<text class="sv-ts" x="20" y="314">model: 64 passes for 64 lanes (R1)</text>
+</g>
+<g>
+<rect class="sv-b2" x="400" y="40" width="80" height="24"/><text class="sv-ts" x="408" y="57">lane 0</text>
+<rect class="sv-b2" x="400" y="70" width="80" height="24"/><text class="sv-ts" x="408" y="87">lane 1</text>
+<rect class="sv-b2" x="400" y="100" width="80" height="24"/><text class="sv-ts" x="408" y="117">lane 2</text>
+<rect class="sv-b2" x="400" y="130" width="80" height="24"/><text class="sv-ts" x="408" y="147">lane 3</text>
+<rect class="sv-b2" x="400" y="160" width="80" height="24"/><text class="sv-ts" x="408" y="177">lane 4</text>
+<rect class="sv-b2" x="400" y="190" width="80" height="24"/><text class="sv-ts" x="408" y="207">lane 5</text>
+<rect class="sv-b2" x="400" y="220" width="80" height="24"/><text class="sv-ts" x="408" y="237">lane 6</text>
+<rect class="sv-b2" x="400" y="250" width="80" height="24"/><text class="sv-ts" x="408" y="267">lane 7</text>
+<rect class="sv-b4" x="630" y="40" width="90" height="24"/><text class="sv-ts" x="638" y="57">bank 0</text>
+<rect class="sv-b4" x="630" y="70" width="90" height="24"/><text class="sv-ts" x="638" y="87">bank 1</text>
+<rect class="sv-b4" x="630" y="100" width="90" height="24"/><text class="sv-ts" x="638" y="117">bank 2</text>
+<rect class="sv-b4" x="630" y="130" width="90" height="24"/><text class="sv-ts" x="638" y="147">bank 3</text>
+<rect class="sv-b4" x="630" y="160" width="90" height="24"/><text class="sv-ts" x="638" y="177">bank 4</text>
+<rect class="sv-b4" x="630" y="190" width="90" height="24"/><text class="sv-ts" x="638" y="207">bank 5</text>
+<rect class="sv-b4" x="630" y="220" width="90" height="24"/><text class="sv-ts" x="638" y="237">bank 6</text>
+<rect class="sv-b4" x="630" y="250" width="90" height="24"/><text class="sv-ts" x="638" y="267">bank 7</text>
+<line class="sv-line" x1="480" y1="52" x2="626" y2="52"/><polygon class="sv-head" points="630,52 620,47 620,57"/>
+<line class="sv-line" x1="480" y1="82" x2="626" y2="82"/><polygon class="sv-head" points="630,82 620,77 620,87"/>
+<line class="sv-line" x1="480" y1="112" x2="626" y2="112"/><polygon class="sv-head" points="630,112 620,107 620,117"/>
+<line class="sv-line" x1="480" y1="142" x2="626" y2="142"/><polygon class="sv-head" points="630,142 620,137 620,147"/>
+<line class="sv-line" x1="480" y1="172" x2="626" y2="172"/><polygon class="sv-head" points="630,172 620,167 620,177"/>
+<line class="sv-line" x1="480" y1="202" x2="626" y2="202"/><polygon class="sv-head" points="630,202 620,197 620,207"/>
+<line class="sv-line" x1="480" y1="232" x2="626" y2="232"/><polygon class="sv-head" points="630,232 620,227 620,237"/>
+<line class="sv-line" x1="480" y1="262" x2="626" y2="262"/><polygon class="sv-head" points="630,262 620,257 620,267"/>
+<text class="sv-ts" x="400" y="298">one word per bank: served together</text>
+<text class="sv-ts" x="400" y="314">model: 2 passes for 64 lanes, the minimum (R1)</text>
+</g>
+<line class="sv-line2" x1="20" y1="330" x2="740" y2="330"/>
+<text class="sv-ts" x="20" y="350">XOR swizzle, tile[64][64]: lane l reads word 64·l + (c XOR l): same spread as padding, 2 passes (R1),</text>
+<text class="sv-ts" x="20" y="368">no extra bytes, more address instructions (R2). Lanes 0–7 and banks 0–7 of 64 lanes and 32 model banks shown.</text>
+</svg></div><figcaption><b>Figure 1.</b> Threads to banks for the column read of a 64 × 64 transpose tile: conflict with pitch 64, no conflict with pitch 65 (padded) or with an XOR swizzle. Arrows are data requests from lanes to banks. The bank count of 32 and "64 lanes served together" are the parameters of Listing 1, not documented values for gfx90a (unverified box in Layer 2). <sup class="src"><a href="#F7-11-src-R1">R1</a></sup> <sup class="src"><a href="#F7-11-src-R2">R2</a></sup> <sup class="src"><a href="#F7-11-src-D2">D2</a></sup></figcaption></figure>
+
+<h2 id="F7-11-layer1">Layer 1 — the kid explanation</h2>
+<p>A group of rows shares one table with many drawers. Each drawer can hand out one thing at a time. If every helper wants something from a different drawer, everybody is served at once. If many helpers want different things from the same drawer, they queue, one after another.</p>
+<p>How things are laid out in the drawers decides who queues. Lay a row of 64 numbers across the drawers, and the next row starts again at drawer 0: then all numbers in one column are in the same drawer. Leave one slot empty at the end of each row, and every row starts one drawer later. Now a column runs across all the drawers, and nobody queues. The price is a slightly bigger table.</p>
+
+<h2 id="F7-11-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F7-11-l2-what">What the LDS is in HIP and in the code object</h3>
+<p>A HIP variable declared <code>__shared__</code> inside a kernel lives in the LDS. Each workgroup gets its own copy for its whole lifetime, and only the work-items of that workgroup can reach it. <sup class="src"><a href="#F7-11-src-D1">D1</a></sup> <sup class="src"><a href="#F7-11-src-D2">D2</a></sup> The compiler adds up the static <code>__shared__</code> variables and records the total: Listing 3, which declares <code>__shared__ float buf[BYTES / 4]</code>, reported LDS sizes of exactly 4,096, 8,192, 16,384, 32,768 and 65,536 bytes for its five instances, and the transpose tiles reported 16,384 bytes for <code>tile[64][64]</code> and 16,640 for <code>tile[64][65]</code> (R4). <sup class="src"><a href="#F7-11-src-R4">R4</a></sup> HIP also has dynamically sized LDS (<code>extern __shared__</code> with a size given at launch), as CUDA has; HP301 showed the launch syntax. <sup class="src"><a href="#F7-11-src-D1">D1</a></sup></p>
+<p>LDS is read and written with <code>ds_</code> ("data share") instructions, and the workgroup meets at <code>s_barrier</code>, which is what <code>__syncthreads()</code> became in R2. <sup class="src"><a href="#F7-11-src-R2">R2</a></sup> <sup class="src"><a href="#F7-11-src-H1">H1</a></sup> The barrier matters: in Listing 2, wave 0 reads a column that waves 1–3 wrote. Without the barrier, a wave could read before the others have written.</p>
+<h3 id="F7-11-l2-banks">The bank model</h3>
+<p>HW301 (F1-58) introduced banks with a model of 32 banks of 4 bytes. On AMD the questions are the same, and the answers are product facts: how many banks, how wide, and how many lanes of a 64-lane wave are served together. Listing 1 therefore keeps both numbers as parameters and prints three columns: 32 banks with all 64 lanes served together, 32 banks with 32 lanes at a time, and 64 banks with 64 lanes. <sup class="src"><a href="#F7-11-src-D2">D2</a></sup></p>
+<p>Some conclusions hold in all three columns (R1). A row access (stride 1) needs the minimum number of passes. A stride of 2 doubles it, 4 quadruples it; a stride equal to the bank count or a multiple of it puts every lane in the same bank. Stride 64, the column of a <code>tile[64][64]</code>, is the worst case in every column: 64 passes. Strides 33 and 65 return to the minimum, and so does the XOR swizzle. Broadcast (every lane reads the same word) costs one pass per group of lanes served together. <sup class="src"><a href="#F7-11-src-R1">R1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Bank count and service group of the LDS on gfx90a (and other targets).</b> The number of LDS banks, the bank width, how many lanes of a wave64 access are served per cycle, how wide accesses (<code>ds_read_b64</code>, <code>ds_read_b128</code>, <code>ds_read2</code>) are split, and how broadcast works were not read in a document in this build. Listing 1 shows that the qualitative conclusions (stride 64 is worst, odd pitches and XOR swizzles are best) are the same for the three parameter choices, but the pass counts differ. Check: the CDNA2 ISA reference guide, chapter on the Local Data Share (D2); measure on the GPU with the profiler's LDS bank-conflict counter if your profiler version has one (D7).</p></div>
+<h3 id="F7-11-l2-occ">LDS and occupancy</h3>
+<p>F7-10's calculator has an LDS rule: workgroups per CU = ⌊LDS per CU / LDS per workgroup⌋, and waves per SIMD = workgroups × waves per workgroup / 4, at most 8. With the model value of 64 KiB per CU, Listing 3's five instances give 8, 8, 4, 2 and 1 waves per SIMD, and the compiler reported exactly these (R4). <sup class="src"><a href="#F7-11-src-R4">R4</a></sup> The transpose tiles show the price of padding: 16,384 bytes allow 4 workgroups per CU (4 waves per SIMD); 16,640 bytes allow only 3 (65,536 / 16,640 = 3.9), so occupancy falls from 4 to 3 (R4). The swizzled tile keeps 16,384 bytes and occupancy 4 (R4).</p>
+
+<h2 id="F7-11-layer3">Layer 3 — the engineer's depth</h2>
+<p>In the analogy: the shape of the request each helper makes is written on the recipe card, and the person who reads the card can tell in advance whether helpers will queue at one drawer.</p>
+<h3 id="F7-11-l3-isa">The LDS instructions of the three transposes</h3>
+<p>The <code>lds_isa</code> step prints the <code>ds_</code> and barrier instructions of Listing 2's three kernels for gfx90a (R2). Each workgroup is 64 × 4 work-items, so each wave is one value of <code>threadIdx.y</code>, and each work-item moves 16 elements.</p>
+<ul>
+<li><b>Naive, writes:</b> eight <code>ds_write2st64_b32 v0, v20, v21 offset1:4</code>-style instructions, each writing two words. The "st64" form scales its two offsets by 64 words: <code>offset1:4</code> means 4 × 64 words = 4 rows further, which is exactly the loop step <code>r += ROWS</code> with 64 words per row. The compiler could pack two writes into one instruction because the pitch is 64. <sup class="src"><a href="#F7-11-src-R2">R2</a></sup> <sup class="src"><a href="#F7-11-src-D2">D2</a></sup></li>
+<li><b>Padded, writes:</b> sixteen <code>ds_write_b32</code> with offsets 0, 1,040, 2,080, … bytes; 1,040 = 4 rows × 65 words × 4 bytes. With pitch 65 the st64 form no longer fits, so the compiler used one instruction per word (R2).</li>
+<li><b>Naive and padded, reads:</b> eight <code>ds_read2_b32 v[4:5], v8 offset1:4</code>-style instructions in both: two words 4 apart (offsets of <code>ds_read2</code> count words), that is <code>tile[tx][ty + r]</code> and <code>tile[tx][ty + r + 4]</code>. The instructions are identical; the conflict is not in the instruction but in the address in <code>v8</code>, which is <code>tx × 64 + ty</code> words in one kernel and <code>tx × 65 + ty</code> in the other (R2). <sup class="src"><a href="#F7-11-src-R2">R2</a></sup></li>
+<li><b>Swizzled:</b> sixteen <code>ds_write_b32</code> and sixteen single <code>ds_read_b32</code>, each with its own address register, 16 <code>v_xor_b32</code> instructions, and 385 instructions in total against 276 (naive) and 293 (padded) (R2). The swizzle buys conflict-free access without extra LDS, and pays in address arithmetic. <sup class="src"><a href="#F7-11-src-R2">R2</a></sup></li>
+</ul>
+<p>The lesson for reading ISA: a bank conflict is a property of the addresses the lanes compute, not of the opcode. To find one, follow the address register back to its arithmetic and work out the stride across lanes, as you do for coalescing of global loads (CU201).</p>
+<h3 id="F7-11-l3-choose">Padding or swizzle?</h3>
+<div class="tw"><table>
+<thead><tr><th>Choice</th><th>Bank passes (model, R1)</th><th>LDS per tile (R4)</th><th>Occupancy (R4)</th><th>Instructions (R2)</th></tr></thead>
+<tbody>
+<tr><td>Naive <code>tile[64][64]</code></td><td>64 per column read</td><td>16,384 B</td><td>4</td><td>276</td></tr>
+<tr><td>Padded <code>tile[64][65]</code></td><td>2</td><td>16,640 B</td><td>3</td><td>293</td></tr>
+<tr><td>XOR swizzle <code>tile[64][64]</code></td><td>2</td><td>16,384 B</td><td>4</td><td>385</td></tr>
+</tbody></table></div>
+<p>Which is fastest cannot be read from this table. It depends on whether the kernel is limited by LDS throughput, by memory latency (where occupancy helps, F1-60) or by instruction issue (where 109 extra instructions hurt). A transpose reads and writes every element in global memory once and does no arithmetic, so global memory may well dominate; whether the LDS conflict matters on your GPU is measured, not assumed (F7-14). A third option is to pad less wastefully: the occupancy step for this tile lies between 13,107 and 16,384 bytes (5 workgroups need ≤ 13,107; 4 need ≤ 16,384), so any padding that stays at or under 16,384 bytes keeps occupancy 4, for example a tile of 63 × 65 words if the algorithm allows it. <sup class="src"><a href="#F7-11-src-R4">R4</a></sup></p>
+<h3 id="F7-11-l3-other">Other LDS users</h3>
+<p>The LDS hardware is also used by instructions that do not touch LDS memory: <code>ds_bpermute_b32</code>, which HIP 5.7 uses for <code>__shfl</code> (F7-12), and <code>ds_swizzle</code>, a fixed-pattern exchange. <sup class="src"><a href="#F7-11-src-H1">H1</a></sup> <sup class="src"><a href="#F7-11-src-D2">D2</a></sup> They are counted in the <code>lgkmcnt</code> counter of <code>s_waitcnt</code>, like LDS loads (F1-60, F7-13); whether they also compete with LDS accesses for throughput is a product fact (D2).</p>
+
+<h2 id="F7-11-hardware">How the hardware actually does it</h2>
+<p>The LDS is a memory inside the CU. When a workgroup is dispatched, the hardware reserves a contiguous region of it of the size recorded in the kernel descriptor (<code>.amdhsa_group_segment_fixed_size</code>, plus any dynamic size given at launch), and all waves of the workgroup address that region from offset 0. <sup class="src"><a href="#F7-11-src-D2">D2</a></sup> <sup class="src"><a href="#F7-11-src-D5">D5</a></sup> A <code>ds_</code> instruction sends one address per active lane; the LDS splits the request among its banks and returns the results; the wave continues and waits for the data with <code>s_waitcnt lgkmcnt(…)</code> only when it needs it. <sup class="src"><a href="#F7-11-src-D2">D2</a></sup> When the workgroup's last wave ends, the region is free for another workgroup, which is why LDS per workgroup limits how many workgroups a CU can hold.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The LDS size per CU on gfx90a (64 KiB in this chapter is the value that reproduces the compiler's figures, R4), the largest LDS allocation per workgroup (the compiler accepted 65,536 bytes, R4), the allocation granularity, the bank count and width, the latency of an LDS access and the throughput per cycle were not read in a document in this build. Check: CDNA2 ISA guide, Local Data Share chapter (D2); CDNA whitepaper of the named product (D6); LLVM AMDGPU user guide, kernel descriptor and LDS sections (D5).</p></div>
+
+<h2 id="F7-11-worked">Worked example</h2>
+<p><b>Task.</b> A reduction kernel for gfx90a stores partial sums in LDS as <code>float part[16][32]</code>, with workgroups of 512 (8 waves). In the second phase, lane <i>l</i> of wave 0 reads <code>part[l % 16][l / 16]</code>. (a) What stride across lanes does that read have, and how many passes does Listing 1's model predict with 32 banks? (b) What is the LDS size and the occupancy limit from LDS, if VGPRs allow 8? (c) Propose a conflict-free layout.</p>
+<ol>
+<li>(a) Word address of lane <i>l</i>: 32 × (<i>l</i> mod 16) + ⌊<i>l</i> / 16⌋. For lanes 0–15 the words are 0, 32, 64, …, 480: stride 32, all in bank 0. Lanes 16–31 start at word 1, also stride 32, all in bank 1, and so on. Each group of 16 lanes hits one bank with 16 different words. In the 32 / 64 model, the 64 lanes form 4 groups in 4 banks: the busiest bank delivers 16 words, so 16 passes. (The model's stride-32 line gives 64 passes for 64 lanes all in one bank; here the extra ⌊<i>l</i> / 16⌋ term spreads the four groups over four banks.)</li>
+<li>(b) 16 × 32 × 4 = 2,048 bytes. 65,536 / 2,048 = 32 workgroups by LDS, × 8 waves / 4 SIMDs = 64 → capped at 8. LDS does not limit this kernel.</li>
+<li>(c) Declare <code>float part[16][33]</code> (2,112 bytes, still 8 waves): word = 33 × (<i>l</i> mod 16) + ⌊<i>l</i> / 16⌋, so lanes 0–15 hit banks 0–15, lanes 16–31 banks 1–16, and so on; each bank now serves at most 4 different words: 4 passes instead of 16 in the 32 / 64 model. Or change the phase-1 layout so that phase 2 reads consecutive words (stride 1 across lanes): 2 passes, the minimum. (Lab Engineer's check of both patterns with Listing 1's <code>passes</code> function in scratch space: 16 and 4 passes in the 32 / 64 model; not in the recorded output. Lab step 3 asks you to add them.)</li>
+</ol>
+
+<h2 id="F7-11-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>lds_banks.cpp</code>: a bank model of the LDS with the bank count and the service group as parameters.</p>
+<pre class="listing" data-src="F7-11/lds_banks.cpp"></pre>
+<p><b>Build command</b> (the one actually used): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined lds_banks.cpp -o lds_banks</code>, then <code>./lds_banks</code>.</p>
+<pre class="output" data-run="F7-11/lds_banks"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–30</td><td><code>passes</code></td><td>For each group of lanes served together, finds the bank with the most distinct words; sums.</td><td>Distinct words: lanes reading the same word share a pass (broadcast).</td></tr>
+<tr><td>32–39</td><td><code>strided</code></td><td>Word address <code>start + stride × l</code> for each lane.</td><td>Every row or column access of a tile is a stride.</td></tr>
+<tr><td>43–44</td><td><code>lanes</code>, <code>banks</code></td><td>64 lanes, 32 banks.</td><td>Parameters, not facts (unverified box).</td></tr>
+<tr><td>49–61</td><td>stride cases</td><td>Nine patterns in three model variants.</td><td>Which conclusions survive the change of parameters.</td></tr>
+<tr><td>62–71</td><td>swizzle case</td><td>Column 5 read from a tile stored as <code>64r + (c ^ r)</code>.</td><td>The swizzle's spread, as Listing 2 uses it.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>transpose_lds.hip</code>: transpose through a 64 × 64 LDS tile, naive, padded and swizzled (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-11/transpose_lds.hip"></pre>
+<p><b>Build command</b> (the one actually used): <code>hipcc -std=c++17 -O2 --offload-arch=gfx90a transpose_lds.hip -o transpose_lds</code>, then <code>./transpose_lds</code>.</p>
+<pre class="output" data-run="F7-11/transpose_lds"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–15</td><td><code>template &lt;int PITCH&gt; … __launch_bounds__(TILE * ROWS)</code></td><td>One kernel for pitch 64 and 65; workgroups of 256.</td><td>The only difference between naive and padded is one number.</td></tr>
+<tr><td>20–22</td><td>first loop</td><td>Each wave writes one row of the tile per step: neighbours to neighbouring words.</td><td>Row writes: no conflict at either pitch.</td></tr>
+<tr><td>23</td><td><code>__syncthreads()</code></td><td>All waves wait until the tile is complete.</td><td>Became <code>s_barrier</code> (R2).</td></tr>
+<tr><td>26–28</td><td>second loop</td><td>Lane <i>tx</i> reads <code>tile[tx][ty + r]</code>: a column.</td><td>Stride = PITCH: 64 conflicts, 65 does not (R1).</td></tr>
+<tr><td>31–47</td><td><code>transposeSwizzle</code></td><td>Stores element (row, c) at column <code>c ^ row</code>; reads it back at <code>col ^ tx</code>.</td><td>Same tile size as naive; conflict-free in the model.</td></tr>
+<tr><td>main</td><td>three versions, one check</td><td>Clears the output, runs one version, compares all elements with the transpose.</td><td>A conflict fix that breaks correctness is caught.</td></tr>
+</tbody></table></div>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listings 2 and 3 were built for real; their runs stopped at the first runtime call with the runtime's own error (no AMD GPU in the build container). Expected on a GPU, from the code: <code>checked 3 versions of 1048576 elements, 0 errors</code>. The correctness of the swizzle was argued (element (r, c) is stored at <code>c ^ r</code> and read back at <code>(ty + r) ^ tx</code> for row <code>tx</code>), not run. No time or bandwidth was measured. Needed: an AMD GPU from the ROCm compatibility matrix (D8).</p></div>
+<p>The <code>lds_isa</code> step: the LDS instructions and barrier of the three kernels for gfx90a, and the whole kernel's instruction count.</p>
+<pre class="output" data-run="F7-11/lds_isa"></pre>
+
+<p><b>Listing 3</b> — <code>lds_occ.hip</code>: the same small kernel with 4 to 64 KiB of LDS per workgroup (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F7-11/lds_occ.hip"></pre>
+<pre class="output" data-run="F7-11/lds_occ"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–9</td><td><code>template &lt;int BYTES&gt; … __launch_bounds__(256)</code></td><td>One instance per LDS size; workgroups of 4 waves.</td><td>Keeps VGPRs out of the way so that LDS is the limiter.</td></tr>
+<tr><td>11</td><td><code>__shared__ float buf[BYTES / 4]</code></td><td>Static LDS of exactly BYTES.</td><td>The compiler's "LDS Size" (R4).</td></tr>
+<tr><td>13–17</td><td>fill, barrier, read</td><td>Uses the buffer so that the compiler cannot remove it.</td><td>An unused <code>__shared__</code> array could be optimised away.</td></tr>
+</tbody></table></div>
+<p>The <code>lds_occupancy</code> step: F7-10's calculator fed with the compiler's LDS and VGPR numbers for Listings 2 and 3.</p>
+<pre class="output" data-run="F7-11/lds_occupancy"></pre>
+
+<h2 id="F7-11-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Drawers do not hold whole ingredients.</b> A bank delivers one 4-byte word per pass in the model; an 8- or 16-byte access (<code>ds_read_b64</code>, <code>ds_read2_b32</code>) touches several banks and may be split, by rules that depend on the product (D2).</li>
+<li><b>Helpers asking for the same thing do not queue.</b> In a kitchen, two helpers wanting the same bowl must take turns; in the LDS, lanes reading the same word are served together (broadcast, R1).</li>
+<li><b>The table is not "slightly too big" in a smooth way.</b> Occupancy falls in steps: 256 extra bytes cost a whole wave per SIMD here (4 → 3, R4), while thousands of bytes below the edge cost nothing.</li>
+</ul>
+
+<h2 id="F7-11-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Transpose or column-read kernel slower than expected; profiler shows LDS bank conflicts</td><td>Column access with pitch = multiple of the bank count</td><td>Work out the address stride across lanes from the ISA's address register; run it through Listing 1</td><td>Pad to an odd pitch or swizzle</td></tr>
+<tr><td>Occupancy dropped after padding</td><td>LDS per workgroup crossed a step edge</td><td>Resource report "LDS Size", then F7-10's calculator</td><td>Swizzle, or pad within the step</td></tr>
+<tr><td>Wrong results only sometimes, after changing a tile loop</td><td>Missing <code>__syncthreads()</code> between writing and reading the tile</td><td>Look for <code>s_barrier</code> between the <code>ds_write</code> and <code>ds_read</code> groups</td><td>Add the barrier; keep it outside divergent code</td></tr>
+<tr><td>Compile error about LDS size, or a launch failure with large dynamic LDS</td><td>More LDS than one workgroup may have</td><td>Sum static and dynamic sizes; compare with the documented limit (D2)</td><td>Smaller tiles; split the work</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F7-11-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F7-10">F7-10</a> counted registers and occupancy; <a href="#F1-58">F1-58</a> introduced banks and padding with a 32-bank model; CU302 tiled GEMM through shared memory. <b>What carries over:</b> a per-workgroup scratchpad, filled and read around a barrier; banks; padding; LDS per workgroup as an occupancy limit. <sup class="src"><a href="#F7-11-src-D2">D2</a></sup> <b>What changes:</b> AMD calls it the LDS and accesses it with <code>ds_</code> instructions; a wave has 64 lanes to serve, so how many lanes are served together matters; the compiler packs accesses differently depending on the pitch (<code>ds_write2st64</code> only for pitch 64); padding can cost a wave per SIMD; bank details must come from the product's ISA guide. <sup class="src"><a href="#F7-11-src-R2">R2</a></sup> <sup class="src"><a href="#F7-11-src-R4">R4</a></sup> <b>What comes next:</b> <a href="#F7-12">F7-12</a> moves data between lanes without LDS memory, with shuffles that use the LDS hardware (<code>ds_bpermute_b32</code>) and with 64-bit ballot masks.</p></div>
+
+<h2 id="F7-11-check">Check yourself</h2>
+<ol>
+<li>Where does a HIP <code>__shared__</code> array live on AMD, and which metadata field records its size?</li>
+<li>In Listing 1's output, why does broadcast cost 1 pass in the "32 / 64" column but 2 in the "32 / 32" column?</li>
+<li>Which statement is true? (a) The padded transpose uses different read instructions from the naive one. (b) The read instructions are the same; the addresses differ. (c) Padding removes the barrier. (d) Swizzling increases the LDS size.</li>
+<li>Explain in your own words why <code>ds_write2st64_b32</code> appears in the naive kernel but not in the padded one.</li>
+<li>Compute: a kernel uses 24 KiB of LDS per workgroup of 256 and 40 VGPRs. What occupancy does the model give, and how much could the tile grow before occupancy falls?</li>
+<li>Apply: a 32 × 32 tile of <code>double</code> (8-byte) values is read by columns. Using 4-byte words in Listing 1's model, what is the word stride between lanes for pitch 32, and which pitch (in doubles) would you try first?</li>
+<li>Predict, then run: add a case "stride 64 starting at word 1" to Listing 1. Will it change the pass count? Run it.</li>
+<li>Why is a bank conflict invisible in the opcode, and what do you follow in the ISA to find one?</li>
+</ol>
+
+<h2 id="F7-11-lab">Lab</h2>
+<p><b>Goal.</b> Find LDS accesses and synchronization in the ISA of a tiled kernel, compare three conflict strategies by model, size and instruction count, and run the course's "occupancy experiment varying LDS" (curriculum E10, AMD part).</p>
+<p><b>Hardware and software needed.</b> g++ 13.3; hipcc (HIP 5.7) driving clang 17.0.6, as in the run logs; the folders <code>university/labs/F7-11</code> and <code>university/labs/F7-10</code> (the calculator). No GPU for steps 1–5; an AMD GPU and a profiler (F7-14) for step 6.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F7-11</code>. Every log ends with an exit code; the GPU runs end with exit code 1 and the runtime's no-device error.</li>
+<li>In <code>lds_isa.out</code>, mark the writes, the barrier and the reads of each kernel. Decode two offsets of each kernel into rows and columns.</li>
+<li>Add the worked example's two patterns to Listing 1 and compare their pass counts with the answer above.</li>
+<li>Add an instance with pitch 66 and one with pitch 72 to Listing 2 (and the matching strides to Listing 1). Predict their LDS size, occupancy and model passes before re-running.</li>
+<li>Add <code>launch&lt;12288&gt;</code> and <code>launch&lt;20480&gt;</code> to Listing 3 and predict their occupancy with the model.</li>
+<li>On a GPU: run Listing 2 under the profiler (F7-14). Record time per kernel and any LDS bank-conflict counter your profiler offers; decide which strategy wins on your GPU and why.</li>
+</ol>
+<p><b>Expected observations.</b> Different write instructions for pitch 64 and 65, identical read instructions; padding costs one wave per SIMD; the swizzle keeps occupancy and adds instructions; the calculator matches the compiler on every case.</p>
+<p><b>Verification.</b> Milestone E10's acceptance test, verbatim: "For each listing you identify: global loads and their width, shared/LDS accesses, synchronization, the FMA or matrix instructions, any register spills; and you predict one change, make it, and confirm the predicted effect in the profiler." For Listing 2: global loads of 4 bytes per lane, LDS writes and reads (<code>ds_write*</code>, <code>ds_read*</code>), one <code>s_barrier</code>, no FMA, no spills; steps 4–5 are the predicted changes; the profiler confirmation is step 6.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>lds_occupancy</code> prints MISMATCH → your compiler's LDS rule differs (version or target); record it and look up the LDS granularity in D2/D5.</li>
+<li>An instance is missing from <code>lds_isa.out</code> → the kernel's mangled name changed; print the labels with <code>grep '^_Z' </code> on the assembly and update <code>run.sh</code>.</li>
+<li>The compiler rejects a large <code>__shared__</code> array → you exceeded the per-workgroup limit; that is evidence for your passport.</li>
+</ul>
+<p><b>Extension.</b> Write a fourth transpose that reads the tile with 8-byte accesses (<code>float2</code>) and predict, with Listing 1 extended to two-word accesses, whether it conflicts.</p>
+
+<h2 id="F7-11-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A team fixed bank conflicts in their transpose by padding the tile, as the textbook says. The profiler on their GPU showed the conflicts gone, yet the kernel did not get faster, and another metric moved the wrong way. The team lead asks you to explain from the build evidence before they spend time on the GPU.</p>
+<p><b>Evidence pack.</b> The bank model (R1), the compiler's LDS and occupancy figures (R4) and the ISA summary (R2) of this build:</p>
+<pre class="output" data-run="F7-11/lds_banks"></pre>
+<pre class="output" data-run="F7-11/lds_occupancy"></pre>
+<pre class="output" data-run="F7-11/lds_isa"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: what did padding change in model passes, LDS size, occupancy and instruction count?</li>
+<li>Hypotheses: (a) the conflicts were not really removed; (b) the padded kernel lost occupancy; (c) the padded kernel issues more instructions. Which evidence supports each?</li>
+<li>Root cause: which "metric moved the wrong way" do you expect the team saw, and why?</li>
+<li>Fix: propose a version that removes the conflicts without the side effect, and give its numbers from the evidence.</li>
+<li>Prevention: what would you add to the team's checklist for LDS changes?</li>
+</ol>
+<p><b>Method hints.</b> Put every candidate through the three views: banks (model), occupancy (calculator), instructions (ISA). A fix judged by one view only can move another the wrong way.</p>
+
+<h2 id="F7-11-project">Mini-project</h2>
+<p><b>Hardware passport, LDS section.</b> Add: LDS per CU and per workgroup (DOC with section, or TOOL: the largest <code>__shared__</code> size your compiler accepts, and the calculator's match on at least five sizes), bank count and width (DOC or TBD), and whether your profiler has a bank-conflict counter (TOOL, F7-14). Tuning note: the LDS step edges for workgroups of 256 on your target, and which of padding or swizzling you would choose for a 64 × 64 float tile, with the evidence.</p>
+<p><b>Rubric.</b> Values tagged and recorded (4). Step edges computed and checked against the compiler (3). Choice justified with all three views (3).</p>
+
+<h2 id="F7-11-summary">Summary</h2>
+<ul>
+<li>HIP's <code>__shared__</code> is the LDS, one region per workgroup; its size is in the metadata and the resource report.</li>
+<li>LDS is accessed with <code>ds_</code> instructions; <code>__syncthreads()</code> is <code>s_barrier</code> with an LDS fence.</li>
+<li>Banks serve one word per pass; strides that are multiples of the bank count conflict; odd pitches and XOR swizzles spread a column.</li>
+<li>Conflicts live in the addresses, not the opcodes: follow the address register.</li>
+<li>Padding a 64 × 64 float tile adds 256 bytes and cost a wave per SIMD (4 → 3) in this build's model; swizzling keeps 16,384 bytes and adds instructions (276 → 385).</li>
+<li>Bank count and service width are product facts to read in the ISA guide.</li>
+</ul>
+
+<h2 id="F7-11-sources">Sources</h2>
+<ol>
+<li id="F7-11-src-D1">D1 — AMD, HIP documentation: HIP Programming Guide (memory spaces, shared memory, dynamic shared memory) (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F7-11-src-D2">D2 — AMD, "AMD Instinct MI200" Instruction Set Architecture reference guide (CDNA2) (tier 1): Local Data Share, <code>ds_</code> instructions (including <code>ds_read2</code>, <code>ds_write2st64</code>, <code>ds_bpermute</code>, <code>ds_swizzle</code>), <code>s_barrier</code>, <code>s_waitcnt</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-11-src-D5">D5 — LLVM project, "User Guide for AMDGPU Backend" (tier 2): kernel descriptor (<code>group_segment_fixed_size</code>), LDS allocation. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-11-src-D6">D6 — AMD, CDNA architecture whitepaper for the named product (tier 1): LDS size. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-11-src-D7">D7 — AMD, rocprofv3 and ROCm Compute Profiler documentation (tier 1/2): LDS metrics. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-11-src-D8">D8 — AMD, ROCm documentation: compatibility matrix (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F7-11-src-H1">H1 — HIP 5.7 headers installed in the build container, read in this build (tier 4): <code>hip/amd_detail/amd_device_functions.h</code> (<code>__syncthreads</code> as <code>__barrier(__CLK_LOCAL_MEM_FENCE)</code>), <code>hip/amd_detail/amd_warp_functions.h</code> (<code>__shfl*</code> through <code>__builtin_amdgcn_ds_bpermute</code>). Facts about HIP 5.7 only.</li>
+<li id="F7-11-src-R1">R1 — run of Listing 1 (<code>university/labs/F7-11/lds_banks.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0.</li>
+<li id="F7-11-src-R2">R2 — <code>lds_isa</code> step (<code>lds_isa.log</code>), Ubuntu clang 17.0.6 (the compiler hipcc drives; HIP 5.7), compiled only, exit code 0.</li>
+<li id="F7-11-src-R4">R4 — <code>lds_occupancy</code> step (<code>lds_occupancy.log</code>), g++ 13.3.0 and the same clang, compiled only, exit code 0.</li>
+</ol>
+
+<h2 id="F7-11-glossary">Glossary links</h2>
+<p><a href="#gl-lds">LDS</a> · <a href="#gl-lds-local-data-share">LDS (Local Data Share)</a> · <a href="#gl-shared-memory">Shared memory</a> · <a href="#gl-bank-conflict">Bank conflict</a> · <a href="#gl-lds-bank">LDS bank</a> · <a href="#gl-pass-of-an-lds-access">Pass (of an LDS access)</a> · <a href="#gl-padding-of-an-lds-tile">Padding (of an LDS tile)</a> · <a href="#gl-swizzle-xor">Swizzle (XOR)</a> · <a href="#gl-s-barrier">s_barrier</a> · <a href="#gl-occupancy-amd">Occupancy (AMD)</a></p>
+
+<h2 id="F7-11-next">Next chapter</h2>
+<p>Next: <a href="#F7-12">F7-12 Cross-lane operations and 64-bit lane masks</a>. Previous: <a href="#F7-10">F7-10 Vector and scalar registers and occupancy</a>. Course: <a href="#HP302">HP302</a>.</p>
+
+<h2 id="F7-11-answers">Answers to Check yourself</h2>
+<ol>
+<li>In the LDS of the CU running the workgroup; <code>.group_segment_fixed_size</code> in the metadata (and "LDS Size" in the resource report, R4).</li>
+<li>In the "32 / 64" model all 64 lanes are one group and need one word: 1 pass. In "32 / 32" the wave is served as two groups of 32, each needing one pass: 2 (R1). Which is right for gfx90a is a product fact (unverified box).</li>
+<li>(b) (R2). (a) is the common misreading: the instructions are identical <code>ds_read2_b32</code>. (c) is wrong: <code>s_barrier</code> is in both. (d) is wrong: the swizzled tile is 16,384 bytes, the same as naive (R4).</li>
+<li>The st64 form encodes two offsets in units of 64 words. With pitch 64, rows r and r + 4 are 4 × 64 words apart, which fits; with pitch 65 they are 260 words apart, not a multiple of 64, so the compiler used one <code>ds_write_b32</code> per word with byte offsets (1,040 per 4 rows, R2).</li>
+<li>65,536 / 24,576 = 2.67 → 2 workgroups × 4 waves / 4 SIMDs = 2 (as plan F in F7-10). Occupancy rises to 3 only below 65,536 / 3 = 21,845 bytes, so the tile would have to shrink; it can grow up to 32,768 bytes and stay at 2.</li>
+<li>One double is two 4-byte words, so pitch 32 doubles = 64 words: the word stride between lanes is 64, the worst case (all lanes in one bank in the model). Try pitch 33 doubles (66 words): an even stride, so check it with Listing 1 extended to two-word accesses; pitch 32 doubles plus one float of padding (65 words) is the odd-stride alternative, at the cost of alignment. Which split of 8-byte accesses the hardware uses is the unverified point of Layer 2.</li>
+<li>No: starting at word 1 moves every lane by one bank, so they all meet in bank 1 instead of bank 0; still 64 passes. (Lab Engineer's reasoning; add the case and run it.)</li>
+<li>The opcode is the same for a conflicting and a conflict-free access (<code>ds_read2_b32</code> in both kernels, R2); the conflict depends on the per-lane addresses. Follow the address VGPR back to the arithmetic that computed it and find its stride across lanes.</li>
+</ol>
+<h3 id="F7-11-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Model: column reads go from 64 passes to 2 (R1). LDS: 16,384 → 16,640 bytes; occupancy 4 → 3 (R4). Instructions: 276 → 293 (R2).</p>
+<p><b>Hypotheses.</b> (a) Not supported: the model and, in the scenario, the profiler agree that the conflicts are gone. (b) Supported: R4, by the LDS step. (c) Supported, mildly: 17 more instructions, mostly the 16 single <code>ds_write_b32</code> replacing 8 <code>ds_write2st64_b32</code>.</p>
+<p><b>Root cause.</b> The expected "wrong way" metric is occupancy (or the profiler's measure of resident waves): one wave per SIMD fewer, because the padded tile crossed the 16,384-byte step. For a transpose, which does no arithmetic and waits mostly on global memory (to be confirmed with the profiler), fewer waves means less latency hiding, which can cancel the gain from removing conflicts.</p>
+<p><b>Fix and verification.</b> The XOR swizzle: 2 passes in the model, 16,384 bytes, occupancy 4 (R1, R4), at the cost of 385 instructions (R2). Or a padded tile that stays within 16,384 bytes. Verify on the GPU by timing all three under the profiler (lab step 6).</p>
+<p><b>Prevention.</b> For every LDS change, record the three views (bank passes, occupancy, instruction count) in the review, and run the resource report in CI to catch occupancy drops. <b>How the evidence was produced:</b> the Lab Engineer ran Listing 1, compiled Listings 2 and 3 for gfx90a, and fed the compiler's numbers to F7-10's calculator; the team's profiler observations are the scenario.</p>

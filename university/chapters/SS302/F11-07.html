@@ -1,0 +1,212 @@
+<!--meta
+id: F11-07
+title: How memory bugs become attacks
+course: SS302
+level: L3
+prereqs: SP201 (F2-19, F2-20, F2-23, F2-25); SP202 (F2-29); SP301 (F2-44)
+time: 6–9 hours including the lab
+hardware: none (host C++: g++ 13.3.0 with AddressSanitizer and UndefinedBehaviorSanitizer, as recorded in the lab logs)
+maps: Curriculum P2 (reading a binary; parsers as untrusted-input targets) and the runbook 5.4 "Trust" row; SS302 goal "explain how memory bugs become exploits"
+analogy: F11 — a castle with gates and guards
+-->
+
+<h2 id="F11-07-hook">Story hook</h2>
+<p>At the castle gate a guard reads orders from a slate: sixteen boxes for a visitor's name, then one box that says <i>let in: yes or no</i>. A clerk copies each name onto the slate. One morning a visitor gives a name far longer than sixteen letters. The clerk, told only "copy the name", keeps writing past the sixteenth box and over the <i>let in</i> box, turning its <i>no</i> into a <i>yes</i>. Nobody checked a password. Nobody lied about who they were. A length that was too long, copied by a clerk who never counted, opened the gate.</p>
+<p>That is the whole of this chapter. Most attacks on programs written in C and C++ are not clever tricks with secret knowledge; they are ordinary memory bugs — writing past the end of a buffer, using memory after it is freed, trusting a number that wrapped around — that an attacker arranges to land on something that matters. You will make three of them happen on your own machine, watch the sanitizer catch them, and see why the next three chapters exist.</p>
+
+<h2 id="F11-07-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> how an out-of-bounds write, a use-after-free and an integer overflow each turn into a change the program never intended.</li>
+<li><b>Describe</b> the path from "a buffer is one byte too small" to "the attacker chose what the program does next".</li>
+<li><b>Run</b> a program under AddressSanitizer and UndefinedBehaviorSanitizer and read the report it prints.</li>
+<li><b>Distinguish</b> a bug the sanitizer catches from the same bug running silently in a production build.</li>
+<li><b>Apply</b> the idea to a new case: given a struct layout, say which field an overflow would reach.</li>
+</ul>
+
+<div class="co jargon" id="F11-07-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Memory safety</dt><dd><b>Simple words:</b> every read and write touches only memory the program is allowed to touch, and only while it is valid. <b>Analogy:</b> writing only inside your own boxes on the slate, and only while the slate is yours. <b>Precise:</b> the property that a program has no out-of-bounds access, no use of freed or uninitialised memory, and no type-confused access; C and C++ do not guarantee it, so the programmer must. <sup class="src"><a href="#F11-07-src-D1">D1</a></sup></dd>
+<dt>Buffer overflow</dt><dd><b>Simple words:</b> writing more into a fixed-size area than it holds, so the extra spills into whatever is next. <b>Analogy:</b> writing a name past its boxes onto the next field. <b>Precise:</b> a write (or read) beyond the bounds of an array or allocation; the neighbouring bytes may be another variable, a saved return address, heap metadata or a function pointer. <sup class="src"><a href="#F11-07-src-D2">D2</a></sup></dd>
+<dt>Use-after-free</dt><dd><b>Simple words:</b> using a pointer to memory that has already been given back. <b>Analogy:</b> reading orders off a slate that was already wiped and handed to someone else. <b>Precise:</b> dereferencing a pointer after the object it referred to has been freed or has ended its lifetime; the memory may now hold something else, so the read or write is attacker-influenceable. <sup class="src"><a href="#F11-07-src-D1">D1</a></sup></dd>
+<dt>Integer overflow</dt><dd><b>Simple words:</b> a number grows past the biggest its type can hold and wraps to a small one. <b>Analogy:</b> a tally sheet that only has three digits rolling from 999 back to 000. <b>Precise:</b> an arithmetic result outside the representable range of the type; for unsigned types it wraps modulo 2<sup>n</sup>, for signed types it is undefined behaviour. A size computed this way can be far too small. <sup class="src"><a href="#F11-07-src-D3">D3</a></sup></dd>
+<dt>Exploit</dt><dd><b>Simple words:</b> an input crafted so that a bug does something useful for an attacker. <b>Analogy:</b> a name chosen precisely so the overflow lands on the <i>let in</i> box. <b>Precise:</b> an input or sequence of inputs that drives a vulnerability to a goal — changing data, redirecting control flow, or leaking memory — rather than merely crashing. <sup class="src"><a href="#F11-07-src-D1">D1</a></sup></dd>
+<dt>Sanitizer</dt><dd><b>Simple words:</b> a checker the compiler builds into the program so it reports its own memory mistakes as it runs. <b>Analogy:</b> an inspector watching the clerk, who shouts the moment a pen leaves the boxes. <b>Precise:</b> compiler instrumentation (here <code>-fsanitize=address</code> and <code>-fsanitize=undefined</code>) with a runtime that detects out-of-bounds access, use-after-free, and undefined behaviour and prints a diagnostic. <sup class="src"><a href="#F11-07-src-D4">D4</a></sup></dd>
+</dl></div>
+
+<h2 id="F11-07-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the first demo's memory: a sixteen-byte name field with an <code>is_admin</code> flag right after it, inside one small struct on the stack. A copy that does not stop at sixteen writes the overflow straight onto the flag.</p>
+<figure id="F11-07-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F11-07-f1t F11-07-f1d">
+<title id="F11-07-f1t">Figure 1: an over-long name overwrites the admin flag</title>
+<desc id="F11-07-f1d">A horizontal row of memory for one struct, 20 bytes. The first 16 bytes are the field "user" (name), drawn as sixteen small cells. The next 4 bytes are the field "is_admin", one wider cell, initially holding 0. Above, an arrow labelled "copy of a 20-byte name" sweeps left to right across all 20 bytes, past the 16-byte name and into is_admin, which then shows the value 0x41414141 (the bytes of 'A'). A caption note says the write stays inside the struct, so AddressSanitizer does not flag it, but UndefinedBehaviorSanitizer flags the array index 16.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<text class="sv-tb" x="20" y="30">struct Account on the stack (20 bytes)</text>
+<text class="sv-ts" x="20" y="52">copy of a 20-byte attacker name (no bound check)</text>
+<line class="sv-line2" x1="40" y1="70" x2="700" y2="70"/><polygon class="sv-head" points="700,70 688,64 688,76"/>
+<g>
+<rect class="sv-b1" x="40" y="90" width="400" height="48"/>
+<text class="sv-tm" x="60" y="119">user[0..15]  (16-byte name field)</text>
+<rect class="sv-b8" x="440" y="90" width="180" height="48"/>
+<text class="sv-tm" x="455" y="113">is_admin</text>
+<text class="sv-tm" x="455" y="131">0 -&gt; 0x41414141</text>
+</g>
+<text class="sv-ts" x="40" y="162">bytes 0 .............................. 15</text>
+<text class="sv-ts" x="440" y="162">bytes 16 .. 19</text>
+<text class="sv-t" x="40" y="200">The 17th byte onward has nowhere legitimate to go: it lands on the next field.</text>
+<text class="sv-ts" x="40" y="224">Not to scale. The flag's bytes become nonzero, so the "if (is_admin)" test now passes (R2).</text>
+</svg></div><figcaption><b>Figure 1.</b> A 20-byte copy into a 16-byte field reaches <code>is_admin</code>, which sits immediately after it in the struct. Data flow, left to right. Values from the lab run (R2). <sup class="src"><a href="#F11-07-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F11-07-layer1">Layer 1 — the kid explanation</h2>
+<p>A program keeps its information in boxes called memory. Each box has a number, and the program is supposed to write only in the boxes it set aside for a job. A <b>buffer overflow</b> is when it writes past the last box of one job into the boxes of the next job. If the next box happened to hold "is this user an administrator?", the overflow can switch it on. The program did not decide to make the visitor an administrator; a careless copy did.</p>
+<p>There are a few ways to make this kind of mess. You can write past the end (overflow). You can keep using a box after you gave it back (use-after-free). You can let a counter roll over so you ask for far too few boxes and then write too many things into them (integer overflow). An attacker's craft is choosing exactly what to write and where, so the accident lands on something that helps them.</p>
+
+<h2 id="F11-07-layer2">Layer 2 — the student explanation</h2>
+<p>C++ gives you direct, unchecked access to memory, which is why it is fast and why it is dangerous. An array write such as <code>a.user[i] = c</code> does no bounds check: if <code>i</code> is 16 and the array has 16 elements, the write goes to whatever memory follows. <sup class="src"><a href="#F11-07-src-D1">D1</a></sup> Whether that memory is another local variable, the function's saved return address, or metadata the allocator keeps, depends on layout — and attackers study layout. The accident is always the same; the <i>consequence</i> is chosen.</p>
+<p>Three families cover most of what you will meet:</p>
+<ul>
+<li><b>Spatial</b> errors: reading or writing outside an object's bounds (overflow, under-read, off-by-one). <sup class="src"><a href="#F11-07-src-D2">D2</a></sup></li>
+<li><b>Temporal</b> errors: using memory outside its lifetime (use-after-free, double free, use of a dangling pointer or iterator). <sup class="src"><a href="#F11-07-src-D1">D1</a></sup></li>
+<li><b>Type and value</b> errors that lead to the first two: integer overflow in a size, a signed/unsigned mix-up, an uninitialised length. <sup class="src"><a href="#F11-07-src-D3">D3</a></sup></li>
+</ul>
+<p>The worst consequence is <b>control-flow hijack</b>: overwriting a value the processor will later load into the instruction pointer — a saved return address, a function pointer, a C++ virtual-table pointer — so that the attacker chooses the next instruction. The second demo does this with a function pointer; the castle guard now follows the attacker's orders.</p>
+
+<h2 id="F11-07-layer3">Layer 3 — the engineer's depth</h2>
+<p>An exploit is a chain, and every link is a specific fact about the target. A classic stack chain reads: (1) an unchecked copy into a stack buffer; (2) the buffer sits below the saved return address; (3) the attacker writes a chosen address there; (4) on <code>ret</code> the processor jumps to it. Each defence in <a href="#F11-10">F11-10</a> breaks one link — a stack canary detects step 3, a non-executable stack blocks jumping to injected code, address randomisation hides the address needed in step 3. Because the links are independent, defences stack: break any one and the chain fails, which is why real systems use several at once. <sup class="src"><a href="#F11-07-src-D5">D5</a></sup></p>
+<p>Not every memory bug is exploitable, and honest engineering does not pretend otherwise. A read one byte past a buffer may only crash; a write the attacker fully controls, to a location they choose, is a "write-what-where" and is usually serious. Triage asks: read or write? how much of the offset and the value does the attacker control? what lives at the target? Sanitizers answer the first questions precisely — the report says READ or WRITE, the size, and the faulting address relative to the object — which is why they are the first tool you reach for. <sup class="src"><a href="#F11-07-src-D4">D4</a></sup></p>
+<p>One limit matters from the start: a sanitizer reports what it can see. AddressSanitizer places red zones <i>around allocations</i>, so it catches a write that leaves an object, but not a write that stays inside one correctly sized object yet lands on the wrong field — the <code>is_admin</code> case of demo 1 (Figure 1). There, a different check saves you: UndefinedBehaviorSanitizer knows the static array bound <code>char[16]</code> and flags the index 16 (R3). Use both, and know what each one sees. <sup class="src"><a href="#F11-07-src-D4">D4</a></sup> <sup class="src"><a href="#F11-07-src-R3">R3</a></sup></p>
+
+<h2 id="F11-07-hardware">How the hardware actually does it</h2>
+<p>The processor has no idea what a "buffer" is. It executes loads and stores to addresses and jumps to whatever address is in the instruction pointer; the meaning of a region as "a name" or "a return address" lives only in the compiler's plan. That is exactly why overwriting the bytes of a return address works: to the processor they were never special, so a <code>ret</code> happily loads the attacker's value and jumps there. <sup class="src"><a href="#F11-07-src-D5">D5</a></sup> The hardware defences you meet later add meaning the processor <i>does</i> enforce: a no-execute bit per page (so a jump into data faults), and supervisor-mode checks (so the kernel cannot be tricked into running or reading user pages) — all in <a href="#F11-10">F11-10</a>. The integer overflow of demo 3 is pure hardware arithmetic: a 32-bit multiply keeps only the low 32 bits, and <code>0x40000001 × 4</code> keeps <code>0x4</code>, so the program asks the allocator for four bytes (R5). <sup class="src"><a href="#F11-07-src-D3">D3</a></sup> <sup class="src"><a href="#F11-07-src-R5">R5</a></sup></p>
+
+<h2 id="F11-07-worked">Worked example</h2>
+<p>Take demo 1's struct: <code>struct Account { char user[16]; int is_admin; };</code>. On this platform <code>sizeof(Account)</code> is 20: sixteen bytes of name, then four bytes of flag, with no padding because <code>int</code>'s four-byte alignment is already met at offset 16. A copy of a name that is exactly twenty bytes long writes indices 0 through 19. Indices 0–15 fill the name; indices 16–19 are the four bytes of <code>is_admin</code>. Twenty bytes of <code>'A'</code> (<code>0x41</code>) make <code>is_admin</code> read as <code>0x41414141</code> = 1,094,795,585, which is nonzero, so <code>if (a.is_admin)</code> is true. The lab's plain build prints exactly that number and "ADMIN ACCESS GRANTED" (R2). Crucially, twenty bytes is <i>in bounds of the struct</i>: the write never leaves the 20-byte object, so there is no heap or stack red zone to trip — the corruption is of the wrong field, not of the wrong allocation. A twenty-one-byte name <i>would</i> leave the object and AddressSanitizer would catch that. The attacker picks twenty. <sup class="src"><a href="#F11-07-src-R2">R2</a></sup></p>
+
+<h2 id="F11-07-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>adjacent.cc</code> (the vulnerable copy; the full file is in the lab folder).</p>
+<pre class="listing" data-src="F11-07/adjacent.cc"></pre>
+<p>Built plain, with a safe name and then a twenty-byte name:</p>
+<pre class="output" data-run="F11-07/adjacent_plain"></pre>
+<p>The same program built with both sanitizers, given the twenty-byte name, is caught — not by AddressSanitizer (the write stayed inside the struct) but by UndefinedBehaviorSanitizer, which knows the array has sixteen elements:</p>
+<pre class="output" data-run="F11-07/adjacent_asan"></pre>
+<table class="tw"><thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–22</td><td><code>struct Account { char user[16]; int is_admin; };</code></td><td>Puts the flag immediately after the name.</td><td>The overflow has a meaningful neighbour to land on.</td></tr>
+<tr><td>25–30</td><td><code>for (i &lt; strlen(src)) a.user[i] = src[i];</code></td><td>Copies the whole source, never comparing to 16.</td><td>This single missing bound is the vulnerability.</td></tr>
+<tr><td>41</td><td><code>a.is_admin = 0;</code></td><td>Nobody is admin to start.</td><td>Only the overflow changes it; no logic grants admin.</td></tr>
+<tr><td>45–46</td><td><code>if (a.is_admin) ... "ADMIN"</code></td><td>Acts on the corrupted flag.</td><td>A memory bug became a security decision.</td></tr>
+</tbody></table>
+<p>The control-flow demo <code>hijack.cc</code> overwrites a function pointer that sits after a name field, redirecting a later call from <code>handle_request</code> to <code>grant_root</code>:</p>
+<pre class="output" data-run="F11-07/hijack_plain"></pre>
+<p>The integer-overflow demo <code>intoverflow.cc</code> computes a 32-bit size that wraps to four, allocates four bytes, then writes a billion items; AddressSanitizer catches the heap write immediately:</p>
+<pre class="output" data-run="F11-07/intoverflow_asan"></pre>
+<p>The fixed versions of all three (bounded names as <code>std::string</code>, overflow-safe and bounded sizes, owning containers) are in <code>safe.cpp</code> and run cleanly under both sanitizers:</p>
+<pre class="output" data-run="F11-07/safe"></pre>
+
+<h2 id="F11-07-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The slate's boxes are not labelled in memory.</b> The processor does not know which bytes are "the name" and which are "the flag"; that meaning exists only in the compiler's layout. A guard can see the <i>let in</i> box; the hardware cannot. <sup class="src"><a href="#F11-07-src-D5">D5</a></sup></li>
+<li><b>A castle has a handful of gates; a program has thousands.</b> Every input — a file, a packet, a device register, an environment variable — is a potential entrance. The analogy undercounts the attack surface. <sup class="src"><a href="#F11-07-src-D1">D1</a></sup></li>
+<li><b>Overflows can reach backwards and sideways, not just forward.</b> Depending on layout and the bug, a write can land before an object or on allocator metadata, not only on the next field. The tidy left-to-right picture is one case of many.</li>
+</ul>
+
+<h2 id="F11-07-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> "it worked for me" — the bug does nothing in a normal build. <b>Cause:</b> the corruption landed on padding or unused memory this time. <b>How to find it:</b> build with <code>-fsanitize=address,undefined</code> and run your tests and fuzzer (<a href="#F11-09">F11-09</a>). <b>Fix:</b> treat any sanitizer report as a real bug, even if the program "seemed fine".</li>
+<li><b>Symptom:</b> a crash with a corrupted backtrace or a jump to a nonsensical address. <b>Cause:</b> a saved return address or function pointer was overwritten. <b>How to find it:</b> the AddressSanitizer report names the overflowed object and the write size; a debugger shows the clobbered frame. <b>Fix:</b> bound the copy; the defences of <a href="#F11-10">F11-10</a> turn a silent hijack into a clean abort.</li>
+<li><b>Symptom:</b> AddressSanitizer says nothing but the value is wrong. <b>Cause:</b> an intra-object overwrite (demo 1) or an uninitialised read — ASan does not model either. <b>How to find it:</b> add UndefinedBehaviorSanitizer and MemorySanitizer-style thinking; prefer bounded types so the case cannot arise. <b>Fix:</b> <code>std::array</code>/<code>std::span</code> with checked indices, covered in <a href="#F11-08">F11-08</a>.</li>
+</ul>
+
+<div class="co transition" id="F11-07-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F2-19">SP201</a> taught pointers, object lifetime and undefined behaviour, and <a href="#F2-44">SP301</a> built a bounds-checked ELF reader against untrusted bytes. <b>What carries over:</b> the C++ memory model, pointers and arrays, and the habit of building with sanitizers from <a href="#F2-29">SP202</a>. <sup class="src"><a href="#F11-07-src-D1">D1</a></sup> <b>What changes:</b> you now read these bugs as an attacker does — as a chain from a length error to a chosen outcome — and you weigh exploitability, not just correctness. <b>What comes next:</b> <a href="#F11-08">F11-08</a> prevents the spatial and temporal bugs in C++ with bounds, lifetimes and ownership; <a href="#F11-09">F11-09</a> finds them with sanitizers and fuzzing; <a href="#F11-10">F11-10</a> hardens the binary so a surviving bug is harder to exploit.</p></div>
+
+<h2 id="F11-07-check">Check yourself</h2>
+<ol>
+<li>Name the three families of memory bug in this chapter and give one example of each.</li>
+<li>In <code>struct Account { char user[16]; int is_admin; };</code>, how many bytes must a name be to reach <code>is_admin</code> without leaving the struct, and why does AddressSanitizer stay quiet at that length?</li>
+<li>Explain in your own words why overwriting a saved return address lets an attacker choose what runs next.</li>
+<li>Which statement is true? (a) Every buffer overflow is exploitable. (b) AddressSanitizer catches all memory bugs. (c) An unsigned 32-bit multiply can wrap to a small number and cause an undersized allocation. (d) A read past a buffer is always harmless.</li>
+<li>Why does <code>0x40000001 * 4</code> in a 32-bit type give 4?</li>
+<li>Apply it: in <code>struct R { char name[8]; void (*fp)(); };</code> on a 64-bit machine, how many bytes of name overwrite the first byte of <code>fp</code>? What is the danger once <code>fp</code> is attacker-controlled?</li>
+<li>Predict, then run: build <code>adjacent.cc</code> plain and give it a 15-byte name. Does <code>is_admin</code> change? Now give it 20 bytes. Explain both results from Figure 1.</li>
+</ol>
+
+<h2 id="F11-07-lab">Lab</h2>
+<p><b>Goal.</b> Make three memory bugs become visible consequences, and see what each sanitizer does and does not catch.</p>
+<p><b>Hardware and software needed.</b> No hardware. Logged toolchain: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with <code>-fsanitize=address,undefined</code>. Run <code>university/labs/run_lab.sh university/labs/F11-07</code> from the repository root.</p>
+<p><b>Safety.</b> None beyond normal computer use. These are self-contained demonstrations; they attack nothing outside their own process.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Read <code>adjacent_plain.out</code>: the safe name is a normal user; the 20-byte name is "ADMIN ACCESS GRANTED".</li>
+<li>Read <code>adjacent_asan.out</code>: note that UndefinedBehaviorSanitizer, not AddressSanitizer, reports the overflow, and say why (Layer 3).</li>
+<li>Read <code>hijack_plain.out</code>: the handler changed from <code>handle_request</code> to <code>grant_root</code> and the wrong function ran.</li>
+<li>Read <code>intoverflow_asan.out</code>: AddressSanitizer reports a heap-buffer-overflow WRITE; find the wrapped size on the first line of the output.</li>
+<li>Read <code>safe.out</code>: all three fixes pass. For each fix, name which bug it removes.</li>
+</ol>
+<p><b>Expected observations.</b> Plain builds show the corruption and the hijack; the sanitized integer-overflow build aborts with a heap-buffer-overflow report; the fixed build prints ALL TESTS PASSED. <sup class="src"><a href="#F11-07-src-R2">R2</a></sup> <sup class="src"><a href="#F11-07-src-R4">R4</a></sup> <sup class="src"><a href="#F11-07-src-R5">R5</a></sup> <sup class="src"><a href="#F11-07-src-R1">R1</a></sup></p>
+<p><b>Verification.</b> <code>run_lab.sh</code> exits 0; <code>safe.cpp</code> runs clean under both sanitizers; each demo's output matches its <code>.log</code>.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Plain build does not grant admin on 20 bytes → your compiler padded the struct or reordered locals → inspect with <code>-fdump-lang-class</code> or print <code>offsetof(Account, is_admin)</code>; the demo assumes offset 16.</li>
+<li>No UBSan line for <code>adjacent_asan</code> → you dropped <code>-fsanitize=undefined</code> → re-add it; ASan alone will not report the intra-object case.</li>
+<li><code>intoverflow</code> seems to hang → you passed a count that does not wrap; use the default (1073741825) so the first out-of-bounds write happens at once.</li>
+</ul>
+<p><b>Extension.</b> Change <code>adjacent.cc</code>'s name field to <code>char user[8]</code> and find the smallest name that grants admin. Then make the overflow 21 bytes and confirm AddressSanitizer now reports it (the write left the struct).</p>
+
+<h2 id="F11-07-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A service crashed in testing. The on-call engineer kept the AddressSanitizer report from the integer-overflow demo and asks: is this a bug we can ignore, or a serious vulnerability?</p>
+<p><b>Evidence pack.</b> The real report from the lab run:</p>
+<pre class="output" data-run="F11-07/intoverflow_asan"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: is the faulting access a READ or a WRITE, and of what size? Quote the line.</li>
+<li>Hypotheses: name two things that could place the write out of bounds; which does the first line of program output support?</li>
+<li>Root cause: trace the wrong size back to the arithmetic. Why is it four bytes?</li>
+<li>Fix: give two independent fixes (one to the arithmetic, one to the input policy).</li>
+<li>Prevention: what build setting and what test would have caught this before release?</li>
+</ol>
+<p><b>Method hints.</b> The AddressSanitizer summary line classifies the bug (READ/WRITE, heap/stack/global). The program's own first line prints the wrapped size. Work backwards from the size to the multiply.</p>
+
+<h2 id="F11-07-project">Mini-project</h2>
+<p><b>The bug-to-consequence table.</b> Take three small programs from your earlier courses (or write three ten-line ones) with, respectively, a spatial, a temporal and an integer bug. For each: build plain and show the wrong behaviour; build with both sanitizers and capture the report; classify exploitability (read/write, control over offset and value, what is at the target); and write the one-line fix. Deliver the three programs, their logs and a one-page table.</p>
+<p><b>Rubric.</b> Three distinct bug families demonstrated (3). Sanitizer report captured and read correctly for each (3). Exploitability triage is honest and specific (2). Fixes correct and minimal (2).</p>
+
+<h2 id="F11-07-summary">Summary</h2>
+<ul>
+<li>Most attacks on C/C++ programs are ordinary memory bugs aimed on purpose at something that matters.</li>
+<li>Spatial (out-of-bounds), temporal (use-after-free) and value (integer-overflow) bugs are the main families.</li>
+<li>The worst outcome is control-flow hijack: overwriting a return address or function pointer so the attacker chooses the next instruction.</li>
+<li>An exploit is a chain of specific facts about the target; defences (F11-10) each break one link.</li>
+<li>Sanitizers catch most of these and classify them, but each has blind spots: ASan sees out-of-allocation writes, UBSan sees known-bound index errors; use both.</li>
+<li>Not every bug is exploitable; triage asks read-or-write, how much the attacker controls, and what is at the target.</li>
+</ul>
+
+<h2 id="F11-07-sources">Sources</h2>
+<ol>
+<li id="F11-07-src-D1">B. Stroustrup and H. Sutter (eds.), "C++ Core Guidelines", profiles on type, bounds and lifetime safety (tier 2/1). <i>Title only — not opened during this build; the Source Researcher must confirm section titles (dossier gate G1 open).</i></li>
+<li id="F11-07-src-D2">Software Engineering Institute, Carnegie Mellon University, "SEI CERT C++ Coding Standard", rules on array bounds and memory management (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-07-src-D3">ISO/IEC JTC1/SC22/WG21, C++ standard working draft: integer conversions, unsigned wraparound and signed overflow as undefined behaviour (tier 1). <i>Title only — draft number to be recorded (dossier gate G1 open).</i></li>
+<li id="F11-07-src-D4">GCC and LLVM documentation for AddressSanitizer and UndefinedBehaviorSanitizer: what each detects and its limits (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-07-src-D5">Intel Corporation, "Intel 64 and IA-32 Architectures Software Developer's Manual", Vol. 1 (call/return, the stack) and Vol. 3 (paging, the no-execute bit) (tier 1; curriculum item 10). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F11-07-src-R1">R1 — lab run, step <code>safe</code> (<code>safe.log</code>): g++ 13.3.0 with <code>-fsanitize=address,undefined</code>, exit code 0, ALL TESTS PASSED.</li>
+<li id="F11-07-src-R2">R2 — lab run, step <code>adjacent_plain</code> (<code>adjacent_plain.log</code>): plain build, the 20-byte name prints is_admin 1094795585 and ADMIN ACCESS GRANTED.</li>
+<li id="F11-07-src-R3">R3 — lab run, step <code>adjacent_asan</code> (<code>adjacent_asan.log</code>): UndefinedBehaviorSanitizer reports "index 16 out of bounds for type 'char [16]'".</li>
+<li id="F11-07-src-R4">R4 — lab run, step <code>hijack_plain</code> (<code>hijack_plain.log</code>): the handler changed to grant_root and ran.</li>
+<li id="F11-07-src-R5">R5 — lab run, step <code>intoverflow_asan</code> (<code>intoverflow_asan.log</code>): AddressSanitizer heap-buffer-overflow WRITE after the size wrapped to 4.</li>
+</ol>
+
+<h2 id="F11-07-glossary">Glossary links</h2>
+<p><a href="#gl-memory-safety">Memory safety</a> · <a href="#gl-buffer-overflow">Buffer overflow</a> · <a href="#gl-use-after-free">Use after free</a> · <a href="#gl-integer-overflow">Integer overflow</a> · <a href="#gl-exploit">Exploit</a> · <a href="#gl-control-flow-hijack">Control-flow hijack</a></p>
+
+<h2 id="F11-07-next">Next chapter</h2>
+<p>Next: <a href="#F11-08">F11-08 Bounds, lifetimes and ownership in C++</a>. Course: <a href="#SS302">SS302</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#found">Foundations</a> (milestone P2) and the <a href="../SYSTEMS_CURRICULUM.html#method">universal method</a> 5.4 "Trust" row.</p>
+
+<h2 id="F11-07-answers">Answers to Check yourself</h2>
+<ol>
+<li>Spatial (out-of-bounds write/read, e.g. a buffer overflow); temporal (using memory after its lifetime, e.g. use-after-free); value (an integer overflow in a size, or an uninitialised/sign-confused length).</li>
+<li>Twenty bytes: sixteen fill the name, four more fill <code>is_admin</code>, and twenty is exactly <code>sizeof(Account)</code>, so the write never leaves the object. AddressSanitizer only guards the edges of an allocation, so a write that stays inside it is invisible to ASan.</li>
+<li>On return, the processor loads the saved return address into the instruction pointer and jumps there. If the attacker put their chosen address in that slot, the processor runs the attacker's chosen code — the program's control flow is now theirs.</li>
+<li>(c). (a) many overflows only crash; (b) ASan misses intra-object overwrites and uninitialised reads; (d) an out-of-bounds read can leak secrets or crash.</li>
+<li>In 32 bits only the low 32 bits are kept. <code>0x40000001 × 4 = 0x100000004</code>; dropping the top bit leaves <code>0x4</code>.</li>
+<li>Eight bytes fill <code>name</code>; the ninth byte is the first byte of <code>fp</code> (no padding, since a function pointer's 8-byte alignment is met at offset 8). Once <code>fp</code> is attacker-controlled, the next call through it transfers control wherever the attacker chose: control-flow hijack.</li>
+<li>Fifteen bytes stay within the name and leave <code>is_admin</code> zero, so the user stays normal. Twenty bytes reach all four bytes of <code>is_admin</code>, making it nonzero and granting admin, exactly as Figure 1 shows — and still in bounds of the struct, so a plain build runs without complaint.</li>
+</ol>
+<footer>Corrections log: <a href="../_qa/F11-07.qa.html#corrections">F11-07 QA record</a>.</footer>

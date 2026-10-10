@@ -1,0 +1,342 @@
+<!--meta
+id: F3-29
+title: User mode and system calls
+course: OS303
+level: L3–L4
+prereqs: F3-28; F3-19; F3-21; F2-47; F2-49
+time: 12–16 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with TCG, CPU model "max" for SMEP and SMAP)
+maps: Curriculum Track B, milestone B12 (ring 3, SYSCALL/SYSRET, safe user copies, SMEP/SMAP); course forensic case "the kernel trusted a user pointer"
+analogy: F3 — the school (student areas, staff-only rooms, the office window)
+-->
+
+<h2 id="F3-29-hook">Story hook</h2>
+<p>Students may not enter the school office. They come to a window, fill in a form, and a clerk does the job for them: photocopies, letters, notices. One form says "photocopy the sheet in my bag, compartment 3". The careful clerk asks to see compartment 3, checks that it really is in the student's own bag, and copies it through the window. The careless clerk reaches straight into whatever the form names.</p>
+<p>One day a student writes "compartment 3 of the staff safe". The careless clerk dutifully reaches into the staff safe. On another day a student names a compartment that does not exist, and the careless clerk, reaching into thin air, falls over and takes the whole office down with them.</p>
+<p>The school's fix has two parts. Clerks must check every address on a form against the student's own bag, and copy only through a special procedure that survives empty compartments. And a new rule, enforced by the building itself: staff hands simply do not work inside student bags unless the clerk has explicitly opened the "copy" procedure. This chapter builds the window (system calls), the careful clerk (checked, fault-tolerant copies) and the building rule (SMAP), and shows the careless clerk's crash in a recorded kernel dump.</p>
+
+<h2 id="F3-29-able">What you will be able to do</h2>
+<ul>
+<li><b>Run</b> code in ring 3 in its own half of the address space, with user segments and user page permissions.</li>
+<li><b>Configure</b> SYSCALL and SYSRET (EFER, STAR, LSTAR, FMASK) and write the entry path: <code>swapgs</code>, stack switch, frame, dispatch, return.</li>
+<li><b>Define</b> a small, stable system-call ABI with numbers and error codes, and a user library that calls it.</li>
+<li><b>Validate</b> user pointers without overflow, and copy user memory through routines that turn a fault into an error code using an exception table.</li>
+<li><b>Enable</b> SMEP and SMAP when the CPU has them, and explain what each one stops.</li>
+<li><b>Diagnose</b> "the kernel trusted a user pointer" from a crash dump with the faulting address, the error code and a backtrace.</li>
+</ul>
+
+<div class="co jargon" id="F3-29-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Privilege level (ring)</dt><dd><b>Simple words:</b> how much the code currently running is allowed to do. <b>Analogy:</b> staff or student. <b>Precise:</b> on x86, the current privilege level (CPL) is the low two bits of CS: 0 for the kernel, 3 for user code; privileged instructions and supervisor pages fault at CPL 3. <sup class="src"><a href="#F3-29-src-D1">D1</a></sup> <sup class="src"><a href="#F3-29-src-R2">R2</a></sup></dd>
+<dt>User mode and kernel mode</dt><dd><b>Simple words:</b> the two worlds code runs in: limited and all-powerful. <b>Analogy:</b> student areas and staff-only rooms. <b>Precise:</b> ring 3 and ring 0; the switch happens only through defined gates (system calls, interrupts, exceptions) and the return instructions. <sup class="src"><a href="#F3-29-src-D1">D1</a></sup></dd>
+<dt>System call</dt><dd><b>Simple words:</b> a request from a user program to the kernel. <b>Analogy:</b> the office window and its form. <b>Precise:</b> here the <code>syscall</code> instruction with the call number in RAX and arguments in RDI, RSI, RDX (R10, R8, R9), result in RAX; the kernel's entry point is set in the LSTAR MSR. <sup class="src"><a href="#F3-29-src-D2">D2</a></sup></dd>
+<dt>SYSCALL and SYSRET</dt><dd><b>Simple words:</b> the fast "enter kernel" and "return to user" instructions of x86-64. <b>Analogy:</b> the window's hatch, opening and closing. <b>Precise:</b> SYSCALL saves RIP in RCX and RFLAGS in R11, masks RFLAGS with FMASK, loads kernel CS/SS from STAR and jumps to LSTAR; SYSRET reverses it, loading user CS/SS from another field of STAR. Neither switches the stack. <sup class="src"><a href="#F3-29-src-D2">D2</a></sup></dd>
+<dt>Model-specific register (MSR)</dt><dd><b>Simple words:</b> a numbered CPU configuration register, read and written with special instructions. <b>Analogy:</b> the settings panel in the caretaker's room. <b>Precise:</b> registers accessed with <code>rdmsr</code>/<code>wrmsr</code> by number in ECX; here EFER, STAR, LSTAR, FMASK, GS base and kernel GS base. <sup class="src"><a href="#F3-29-src-D3">D3</a></sup></dd>
+<dt>SWAPGS</dt><dd><b>Simple words:</b> an instruction that swaps the user's GS base with the kernel's. <b>Analogy:</b> swapping the student's badge for the staff badge at the door. <b>Precise:</b> exchanges the GS base with the IA32_KERNEL_GS_BASE MSR, so that on entry from ring 3 <code>%gs</code> points at this CPU's <code>Cpu</code> (F3-28) and on exit back at the user's value. <sup class="src"><a href="#F3-29-src-D1">D1</a></sup></dd>
+<dt>SMEP</dt><dd><b>Simple words:</b> the CPU refuses to run user-page code while in kernel mode. <b>Analogy:</b> staff never follow instructions written in a student's notebook. <b>Precise:</b> Supervisor Mode Execution Prevention, CR4 bit 20: an instruction fetch at CPL 0 from a user page faults. <sup class="src"><a href="#F3-29-src-D1">D1</a></sup></dd>
+<dt>SMAP</dt><dd><b>Simple words:</b> the CPU refuses kernel reads and writes of user pages, except inside an explicitly opened window. <b>Analogy:</b> staff hands do not work in student bags unless the copy procedure is opened. <b>Precise:</b> Supervisor Mode Access Prevention, CR4 bit 21: data accesses at CPL 0 to user pages fault unless RFLAGS.AC is set, which <code>stac</code> sets and <code>clac</code> clears. <sup class="src"><a href="#F3-29-src-D1">D1</a></sup></dd>
+<dt>User pointer validation</dt><dd><b>Simple words:</b> checking that an address and a length given by a user program describe only that program's memory. <b>Analogy:</b> checking that compartment 3 is in the student's own bag. <b>Precise:</b> here <code>user_range_ok(addr, len)</code>: <code>kUserBase ≤ addr ≤ kUserTop</code> and <code>len ≤ kUserTop − addr</code>, written so that no sum can wrap past 2<sup>64</sup>. <sup class="src"><a href="#F3-29-src-R3">R3</a></sup></dd>
+<dt>Exception table (fixup)</dt><dd><b>Simple words:</b> a list of instructions that are allowed to fault, and where to continue if they do. <b>Analogy:</b> the copy procedure's "if the compartment is empty, write 'missing' on the form". <b>Precise:</b> pairs (faulting RIP, fixup RIP) in the section <code>.uaccess_fixups</code>; the page-fault handler, on a kernel-mode fault, looks the RIP up and resumes at the fixup, which returns an error. <sup class="src"><a href="#F3-29-src-D5">D5</a></sup> <sup class="src"><a href="#F3-29-src-R2">R2</a></sup></dd>
+<dt>Canonical address</dt><dd><b>Simple words:</b> a 64-bit address whose top bits are all copies of bit 47. <b>Analogy:</b> a locker number in the valid format. <b>Precise:</b> with 4-level paging only 48 address bits are translated; bits 63–48 must equal bit 47, or any access raises a general-protection fault. <sup class="src"><a href="#F3-29-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F3-29-pictures">The idea in pictures</h2>
+<figure id="F3-29-fig1"><div class="svgbox">
+<svg viewBox="0 0 900 360" role="img" aria-labelledby="F3-29-f1t F3-29-f1d">
+<title id="F3-29-f1t">Figure 1: the path of write(1, buf, len) from ring 3 and back</title>
+<desc id="F3-29-f1d">Ring 3, top: the user program calls print, which calls sys_write in ulib.h; it puts 1 in RAX, the fd in RDI, the buffer in RSI, the length in RDX and executes syscall. The CPU saves RIP in RCX and RFLAGS in R11, clears IF, TF, DF and AC according to FMASK, loads kernel CS and SS from STAR and jumps to LSTAR. Ring 0, below: syscall_entry executes swapgs, parks the user RSP at gs:16, loads the thread's kernel stack from gs:8, pushes a SyscallFrame, enables interrupts and calls syscall_dispatch. sys_write checks the fd, checks the range with user_range_ok, then copies 256 bytes at a time with copy_from_user, which sets AC with stac, copies with rep movsb (an instruction listed in the exception table) and clears AC with clac, then writes to the console. Back in syscall_entry: interrupts off, pop the frame, restore the user RSP, swapgs, sysretq to RCX with RFLAGS from R11 in ring 3.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="360"/>
+<rect class="sv-b4" x="20" y="20" width="860" height="80" rx="6"/>
+<text class="sv-tb" x="35" y="44">ring 3: u_hello.elf</text>
+<text class="sv-ts" x="35" y="68">print("…") → sys_write(1, buf, len): RAX = 1, RDI = 1, RSI = buf, RDX = len; syscall</text>
+<text class="sv-ts" x="35" y="88">…continues after syscall with RAX = len, or −2 / −3</text>
+<rect class="sv-b3" x="20" y="130" width="420" height="200" rx="6"/>
+<text class="sv-tb" x="35" y="154">ring 0: syscall_entry (syscall.S)</text>
+<text class="sv-ts" x="35" y="178">swapgs → GS = this CPU's Cpu</text>
+<text class="sv-ts" x="35" y="198">user RSP → gs:16; RSP = gs:8 (kernel stack)</text>
+<text class="sv-ts" x="35" y="218">push SyscallFrame; sti; call syscall_dispatch</text>
+<text class="sv-ts" x="35" y="248">cli; pop frame; RSP = user RSP</text>
+<text class="sv-ts" x="35" y="268">swapgs; sysretq → RIP = RCX, RFLAGS = R11</text>
+<text class="sv-ts" x="35" y="300">CPU on entry: RCX = RIP, R11 = RFLAGS,</text><text class="sv-ts" x="35" y="318">RFLAGS &amp;= ~FMASK, CS/SS from STAR, RIP = LSTAR</text>
+<rect class="sv-b5" x="470" y="130" width="410" height="200" rx="6"/>
+<text class="sv-tb" x="485" y="154">sys_write (syscall.cc)</text>
+<text class="sv-ts" x="485" y="178">fd is 1 or 2? else −3</text>
+<text class="sv-ts" x="485" y="198">user_range_ok(buf, len)? else −2</text>
+<text class="sv-ts" x="485" y="218">copy_from_user(chunk, buf + done, ≤ 256):</text>
+<text class="sv-ts" x="500" y="238">stac; rep movsb (in exception table); clac</text>
+<text class="sv-ts" x="500" y="258">fault → fixup → bytes left ≠ 0 → −2</text>
+<text class="sv-ts" x="485" y="278">console_write_raw(chunk, n)</text>
+<text class="sv-ts" x="485" y="308">never dereferences buf directly</text>
+<line class="sv-line" x1="230" y1="100" x2="230" y2="124"/><polygon class="sv-head" points="230,130 224,120 236,120"/><text class="sv-ts" x="240" y="118">syscall</text>
+<line class="sv-line" x1="440" y1="218" x2="464" y2="218"/><polygon class="sv-head" points="470,218 460,212 460,224"/>
+<line class="sv-line" x1="470" y1="268" x2="446" y2="248"/><polygon class="sv-head" points="440,244 445,254 452,246"/>
+<line class="sv-line" x1="330" y1="130" x2="330" y2="106"/><polygon class="sv-head" points="330,100 324,110 336,110"/><text class="sv-ts" x="340" y="118">sysretq</text>
+</svg></div><figcaption><b>Figure 1.</b> A system call in the lab kernel (control flow). The kernel touches the user's buffer only inside <code>copy_from_user</code>, between <code>stac</code> and <code>clac</code>, after the range check. From <code>syscall.S</code> and <code>syscall.cc</code> <sup class="src"><a href="#F3-29-src-R2">R2</a></sup>; the instruction behaviour after D1 and D2.</figcaption></figure>
+
+<figure id="F3-29-fig2"><div class="svgbox">
+<svg viewBox="0 0 900 300" role="img" aria-labelledby="F3-29-f2t F3-29-f2d">
+<title id="F3-29-f2t">Figure 2: one process's address space in the lab kernel</title>
+<desc id="F3-29-f2d">A vertical bar of virtual addresses, low at the bottom. PML4 entry 0, 0 to 512 GiB, is shared by every address space and is supervisor-only: it contains the identity map of the first 4 GiB (the kernel at 1 MiB, the trampoline at 0x8000, device memory in the top GiB) and the kernel stack area at 4 GiB with guard pages, and the shootdown probe page at 5 GiB. PML4 entry 1, 512 GiB to 1 TiB (0x80_0000_0000 to 0x100_0000_0000), is the user half and has the user bit: the program's segments start at 0x80_0040_0000 (read-only headers, read-execute text, read-only data), and the user stack ends one page below 1 TiB, at 0xFF_FFFF_F000, growing down for at most 64 KiB. Everything above 1 TiB is unused, and addresses from 0x0000_8000_0000_0000 to 0xFFFF_7FFF_FFFF_FFFF are non-canonical.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="300"/>
+<rect class="sv-b3" x="60" y="190" width="300" height="90"/><text class="sv-tb" x="72" y="214">PML4 entry 0: kernel (supervisor)</text><text class="sv-ts" x="72" y="236">0–4 GiB identity map: kernel at 1 MiB</text><text class="sv-ts" x="72" y="256">4 GiB: kernel stacks + guard pages</text><text class="sv-ts" x="72" y="274">5 GiB: shootdown probe page</text>
+<rect class="sv-b4" x="60" y="60" width="300" height="130"/><text class="sv-tb" x="72" y="84">PML4 entry 1: user half (U = 1)</text><text class="sv-ts" x="72" y="108">top: user stack, 64 KiB, below</text><text class="sv-ts" x="72" y="126">0xFF_FFFF_F000 (one unmapped page above)</text><text class="sv-ts" x="72" y="156">0x80_0040_0000: ELF segments</text><text class="sv-ts" x="72" y="176">base 0x80_0000_0000 (512 GiB)</text>
+<rect class="sv-box" x="60" y="20" width="300" height="40"/><text class="sv-ts" x="72" y="45">above 1 TiB: unused</text>
+<text class="sv-ts" x="400" y="80">user_range_ok accepts only [0x80_0000_0000, 0x100_0000_0000)</text>
+<text class="sv-ts" x="400" y="110">u_peek reads 0x100000 → page fault (U/S), killed</text>
+<text class="sv-ts" x="400" y="140">u_badptr passes 0x90_0000_0000 → in range, unmapped → copy faults → −2</text>
+<text class="sv-ts" x="400" y="170">u_badptr passes 0x100000 → out of range → −2 at once</text>
+<text class="sv-ts" x="400" y="230">kernel half is the same in every process: PML4[0] is copied</text>
+<text class="sv-ts" x="400" y="260">not to scale</text>
+</svg></div><figcaption><b>Figure 2.</b> The two halves of every address space in the OS303 kernel (addresses grow upwards; not to scale). Layout from <code>uaccess.h</code>, <code>process.h</code> and <code>boot.S</code> <sup class="src"><a href="#F3-29-src-R2">R2</a></sup>; the user/supervisor bit after D1.</figcaption></figure>
+
+<h2 id="F3-29-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Students stay in student areas; staff-only rooms are locked, and the building itself enforces it. To get something done, a student asks at the office window. A good clerk never trusts what a form says about where things are: they check it, and they copy carefully, so that a wrong address on a form gets a polite "no" instead of an accident.</p></div>
+<p>A user program runs with less power than the kernel. It cannot touch the kernel's memory or run special instructions. When it needs something, it asks the kernel with a system call. The kernel must treat every address in that request as a possible mistake or trick.</p>
+
+<h2 id="F3-29-layer2">Layer 2 — the student explanation</h2>
+<p><b>Ring 3.</b> The GDT of F3-28 already contains user code and data descriptors (selectors 0x20 and 0x18, used with privilege bits 3, so 0x23 and 0x1B). The first entry into ring 3 uses <code>iretq</code>: <code>enter_user</code> pushes the frame an interrupt from ring 3 would have pushed (SS, RSP, RFLAGS with IF set, CS, RIP), clears every general register so that no kernel value leaks, swaps GS and "returns" into user code. The test program prints its own CS: 0x23, privilege level 3 <sup class="src"><a href="#F3-29-src-R2">R2</a></sup>.</p>
+<p><b>Memory.</b> Every process has its own page tables (F3-30 builds them). Their entry 0 at the top level is copied from the kernel's and has no user bit, so the kernel is mapped but inaccessible from ring 3; entry 1 holds the user half, with the user bit on every level (Figure 2). A user program that reads the kernel's address 0x100000 takes a page fault with "protection" in the error code: <code>u_peek</code> is killed, the kernel carries on.</p>
+<p><b>Entering the kernel.</b> Interrupts and exceptions from ring 3 already work (F3-19's IDT): the CPU loads RSP from the TSS's <code>rsp0</code>, which F3-26's scheduler sets to the current thread's stack top at every switch. For system calls the lab uses the faster <code>syscall</code> instruction. It does much less than an interrupt: it saves RIP in RCX and RFLAGS in R11, clears the RFLAGS bits named in the FMASK MSR, loads fixed kernel selectors from STAR and jumps to LSTAR. It does <i>not</i> change RSP. The first instructions of <code>syscall_entry</code> therefore have to find a kernel stack without using the user's: <code>swapgs</code> makes <code>%gs</code> point at this CPU's <code>Cpu</code>, the user RSP is parked at <code>%gs:16</code>, and RSP is loaded from <code>%gs:8</code>, the current thread's kernel stack top (also set by the scheduler). Then the registers are pushed as a <code>SyscallFrame</code> and <code>syscall_dispatch</code> runs as ordinary C++.</p>
+<p><b>The ABI.</b> B12 asks for "a system-call table with a stable numbering documented in the design note" <sup class="src"><a href="#F3-29-src-C1">C1</a></sup>. This is the OS303 kernel's, defined in <code>process.h</code>. It is this kernel's own ABI, not Linux's numbering.</p>
+<div class="tw"><table>
+<thead><tr><th>RAX</th><th>Call</th><th>Arguments (RDI, RSI, RDX)</th><th>Returns in RAX</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>exit</td><td>status (low 8 bits)</td><td>does not return</td></tr>
+<tr><td>1</td><td>write</td><td>fd (1 or 2), buffer, length</td><td>length, or −2 bad address, −3 bad fd</td></tr>
+<tr><td>2</td><td>getpid</td><td>—</td><td>process id</td></tr>
+<tr><td>3</td><td>spawn (F3-30)</td><td>module name, argv (NULL-terminated)</td><td>child pid, or −2, −5 no such module, −6 not executable, −8 invalid</td></tr>
+<tr><td>4</td><td>wait (F3-30)</td><td>pointer to an int for the status, or 0</td><td>child pid, or −7 no children, −2</td></tr>
+<tr><td>5</td><td>yield</td><td>—</td><td>0</td></tr>
+<tr><td>other</td><td>—</td><td>—</td><td>−4 no such call</td></tr>
+</tbody></table></div>
+<p>RCX and R11 are destroyed by <code>syscall</code> itself, so the wrapper in <code>ulib.h</code> lists them as clobbered, and a fourth argument would travel in R10 instead of RCX.</p>
+<p><b>Never trust a user pointer.</b> <code>sys_write</code> receives a buffer address and a length chosen by the user program. Before touching anything it checks that the whole range lies in the user half (<code>user_range_ok</code>). Even a range that passes can contain unmapped pages, so the copy itself must be able to fault safely: <code>copy_from_user</code> calls <code>uaccess_copy</code>, whose single copying instruction is listed in an <b>exception table</b>. If it faults, the page-fault handler finds the instruction in the table, moves RIP to the fixup code, and the copy returns "bytes not copied"; <code>sys_write</code> returns −2. The B12 test program <code>u_badptr</code> tries a kernel address, an unmapped user address, a length that runs past its stack into unmapped memory, a length that wraps around 2<sup>64</sup>, and a bad file descriptor; each got its error code and the kernel kept running <sup class="src"><a href="#F3-29-src-R2">R2</a></sup>.</p>
+<p><b>Privileged instructions.</b> <code>u_priv</code> executes <code>hlt</code> in ring 3. The CPU raises a general-protection fault; the trap handler sees that it came from ring 3 (<code>from_user</code>), prints a report and ends the process with status 0x100 | 13 = 0x10D, and the kernel continues.</p>
+<p><b>SMEP and SMAP.</b> Two CR4 bits make the hardware help. SMEP makes the CPU refuse to execute user pages in ring 0, which defeats the classic exploit of making the kernel jump to user-supplied code. SMAP makes it refuse to read or write user pages in ring 0 unless RFLAGS.AC is set; the copy routines set it with <code>stac</code> just before copying and clear it with <code>clac</code> right after, so every other kernel access to user memory faults. The lab enables both when CPUID reports them; QEMU's default CPU model does not, so the user tests run with <code>-cpu max</code>, and the log says "SMEP on, SMAP on" <sup class="src"><a href="#F3-29-src-R2">R2</a></sup>.</p>
+
+<h2 id="F3-29-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-29-l3-entry">Every instruction of the entry path is load-bearing</h3>
+<p><b>FMASK clears IF.</b> Between <code>syscall</code> and the stack switch the CPU runs on the <i>user's</i> stack pointer. An interrupt there would push its frame onto user memory (or fault on it). FMASK therefore clears IF, and <code>syscall_entry</code> enables interrupts only after the frame is on the kernel stack (line 23). It also clears TF (no single-step trap on the first kernel instruction), DF (the ABI requires it clear; <code>rep movsb</code> would otherwise copy backwards) and AC (a user who sets AC would otherwise switch SMAP off for the kernel) (<code>syscall.cc</code> line 30).</p>
+<p><b>swapgs must be balanced.</b> Every path from ring 3 into the kernel must execute <code>swapgs</code> exactly once, and every path back exactly once. <code>trap.S</code> decides by looking at the saved CS: only if the interrupted code was in ring 3 does it swap (F3-26's <code>trap.S</code> lines 22–24 and 61–63). An interrupt that arrives while the kernel is handling a system call comes from ring 0 and must not swap again. Getting this wrong gives a kernel whose <code>this_cpu()</code> points into user memory: a classic source of security bugs <sup class="src"><a href="#F3-29-src-D4">D4</a></sup>.</p>
+<p><b>SYSRET has a sharp edge.</b> SYSRET loads RIP from RCX. If a kernel ever returns with a non-canonical RCX, Intel CPUs raise the general-protection fault <i>in ring 0 with the user's stack pointer already loaded</i> <sup class="src"><a href="#F3-29-src-D1">D1</a></sup>. This kernel never changes the saved RIP, so RCX is always the address after the user's own <code>syscall</code> instruction; a kernel that implements signals or <code>ptrace</code> must check it or return with <code>iretq</code>. The claim itself is from memory and listed in the unverified box.</p>
+<p><b>Preemption inside a system call.</b> Interrupts are enabled during <code>syscall_dispatch</code>, so a system call can be preempted like any kernel code. That is safe because everything the return path needs is on the thread's own kernel stack, and <code>%gs</code> already holds the kernel value; when the thread runs again, perhaps on another CPU, it reads <code>this_cpu()</code> afresh.</p>
+<h3 id="F3-29-l3-range">The range check that does not overflow</h3>
+<p>The tempting check is <code>addr ≥ base &amp;&amp; addr + len ≤ top</code>. With <code>len</code> chosen by an attacker, <code>addr + len</code> can wrap past 2<sup>64</sup> and become small, and the check passes for a range that covers the whole kernel. <code>user_range_ok</code> never forms the sum: it checks <code>addr ≤ top</code> and then <code>len ≤ top − addr</code>, which cannot wrap. The host test (Listing 6) runs both versions on the same nine cases under UBSan: the naive check accepts two malicious ranges, the real one rejects them <sup class="src"><a href="#F3-29-src-R3">R3</a></sup>. The same pattern guards every sum in F3-30's ELF checker.</p>
+<h3 id="F3-29-l3-order">The order of decisions in the page-fault handler</h3>
+<p>A page fault now has four possible meanings, tried in order in <code>trap.cc</code> lines 65–80: (1) a user page that exists in the program but is not mapped yet: map it and retry (demand paging, F3-30); (2) a fault in kernel mode at an instruction listed in the exception table: resume at its fixup; (3) a fault in user mode: kill the process; (4) anything else is a kernel bug: crash with a dump. The order matters: a copy from a not-yet-mapped page of a valid buffer must be satisfied by demand paging (1) before it is treated as a bad pointer (2). Note what SMAP does to case 2: under SMAP, a direct kernel read of a user page outside <code>stac</code>/<code>clac</code> is a protection fault at an instruction that is <i>not</i> in the table, so it ends in case 4 — loudly.</p>
+<h3 id="F3-29-l3-toctou">Copy first, then check what you copied</h3>
+<p><code>sys_spawn</code> copies the path and every argument string into kernel buffers before using them, and <code>sys_write</code> copies into a 256-byte kernel chunk before printing. Reading user memory twice (once to check, once to use) invites a "time of check to time of use" attack: another thread of the same process can change the memory in between. With one thread per process (F3-30) that cannot happen here yet, but the habit costs nothing.</p>
+<h3 id="F3-29-l3-limits">Deviations from B12 and simplifications</h3>
+<ul>
+<li>B12's second test names "a misaligned length". This kernel has no alignment requirement for <code>write</code>, so the test uses the two length errors that do matter: a length that runs past mapped memory and one that wraps around 2<sup>64</sup>. The owner may want a different reading (NOTES).</li>
+<li><code>nosmap=1</code> on the command line switches off both SMEP and SMAP; it exists only for the forensic lab.</li>
+<li>No floating-point state is saved for user programs; they are compiled with <code>-mgeneral-regs-only</code> (F3-26).</li>
+</ul>
+
+<h2 id="F3-29-hardware">How the hardware actually does it</h2>
+<p>On <code>syscall</code> the CPU performs, in one instruction: RCX ← RIP of the next instruction; R11 ← RFLAGS; RFLAGS ← RFLAGS AND NOT FMASK; CS ← STAR[47:32], SS ← STAR[47:32] + 8 (with fixed flat descriptors loaded internally); RIP ← LSTAR. <code>sysretq</code> does RIP ← RCX; RFLAGS ← R11; CS ← STAR[63:48] + 16 | 3, SS ← STAR[63:48] + 8 | 3. That fixed "+8" and "+16" is why the GDT places user data (0x18) right before user code (0x20) and STAR[63:48] holds 0x10 <sup class="src"><a href="#F3-29-src-D2">D2</a></sup>. The page walk checks the user/supervisor bit at every level: a ring-3 access needs U = 1 on all of them, which is why <code>user_pte</code> in F3-30 sets it on every level it creates. A page fault pushes an error code whose bits say present/protection (bit 0), write (bit 1), user (bit 2), reserved bit (bit 3) and instruction fetch (bit 4) — the decoding <code>print_pf_error</code> prints.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Written from memory and not checked in this build: the MSR numbers EFER 0xC0000080 (SCE bit 0), STAR 0xC0000081, LSTAR 0xC0000082, FMASK 0xC0000084, KERNEL_GS_BASE 0xC0000102; the STAR field layout and the +8/+16 selector rule for SYSRET; RFLAGS bits TF 8, IF 9, DF 10, AC 18; CPUID leaf 7 subleaf 0 EBX bit 7 (SMEP) and bit 20 (SMAP); CR4 bits 20 (SMEP) and 21 (SMAP); the page-fault error-code bits; the selector values 0x1B/0x23; the SYSRET non-canonical-RCX behaviour on Intel CPUs; the exact behaviour of <code>rep movsb</code> when it faults (RCX holding the bytes left, which <code>uaccess_copy</code> relies on). The runs below show that this configuration works on QEMU 8.2.2's TCG model with <code>-cpu max</code>; they prove nothing about real CPUs. Check against Intel SDM Vol. 2 (SYSCALL, SYSRET, SWAPGS, STAC, CLAC, MOVS), Vol. 3 ("Paging": access rights, SMEP, SMAP, page-fault error code) and Vol. 4 (MSRs), and AMD64 APM Vol. 2 "SYSCALL and SYSRET" (D1, D2, D3).</p></div>
+<div class="co note"><span class="lbl">Note</span><p>Untested on hardware. QEMU's default CPU model in this build (<code>qemu64</code>) reports neither SMEP nor SMAP (the other chapters' logs say "SMEP off, SMAP off"), so this chapter's runs use <code>-cpu max</code>. Whether a given real CPU has them is a CPUID question for that CPU.</p></div>
+
+<h2 id="F3-29-worked">Worked example</h2>
+<p><b>STAR, by hand.</b> STAR[47:32] must give the kernel's CS on <code>syscall</code>: 0x08, so the kernel's SS is 0x08 + 8 = 0x10. STAR[63:48] must give, on <code>sysretq</code>, SS = value + 8 = 0x18 and CS = value + 16 = 0x20, so the value is 0x10; the CPU adds RPL 3, giving 0x1B and 0x23. The 64-bit MSR value is therefore <code>(0x10 &lt;&lt; 48) | (0x08 &lt;&lt; 32)</code> = <code>0x0010_0008_0000_0000</code>, exactly line 26 of <code>syscall.cc</code>. And indeed <code>u_hello</code> printed CS = 0x23.</p>
+<p><b>FMASK, by hand.</b> Bits 8, 9, 10 and 18: 0x100 + 0x200 + 0x400 + 0x40000 = <code>0x40700</code>.</p>
+<p><b>The wrapping length of <code>u_badptr</code>.</b> The program passes its stack buffer <code>top</code> (near 0xFF_FFFF_Exxx) with length 2<sup>64</sup> − 16. <code>user_range_ok</code>: the address is inside the user half, but <code>len ≤ kUserTop − addr</code> is false (about 4 KiB versus almost 2<sup>64</sup>), so −2 is returned without touching memory. The naive check would compute <code>addr + len</code> = addr − 16 (mod 2<sup>64</sup>), which is inside the user half, and accept.</p>
+<p><b>The length that runs into unmapped memory.</b> <code>sys_write(1, top, 8192)</code>: <code>top</code> is in the stack's top page, and the 8 KiB range ends above <code>kUserTop − 4096</code>, in the unmapped page above the stack (Figure 2). The range check passes (it is all in the user half). The copy faults when <code>rep movsb</code> reaches the unmapped page; demand paging declines (the page does not belong to the process); the exception table sends RIP to the fixup; <code>uaccess_copy</code> returns the bytes left; <code>sys_write</code> returns −2. The first chunks may already have been printed; a real kernel's <code>write</code> would return the count written so far, which is an ABI choice this kernel makes differently.</p>
+
+<h2 id="F3-29-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F3-29/</code>. The trap entry with its <code>swapgs</code> decision is F3-26's <code>trap.S</code>; the page-fault decision order is in F3-26's <code>trap.cc</code>.</p>
+<p><b>Listing 1</b> — <code>syscall.S</code></p>
+<pre class="listing" data-src="F3-29/syscall.S"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–11</td><td><code>swapgs</code>, park, load</td><td>Kernel GS; user RSP to <code>%gs:16</code>; kernel stack from <code>%gs:8</code>.</td><td>No instruction may use the stack before line 11.</td></tr>
+<tr><td>12–21</td><td>pushes</td><td>User RSP, RFLAGS, RIP, the number, six arguments: the <code>SyscallFrame</code>.</td><td>C++ reads the arguments from this frame.</td></tr>
+<tr><td>23–25</td><td><code>sti</code> … <code>cli</code></td><td>Interrupts on during the call, off for the return path.</td><td>The return path switches back to the user stack.</td></tr>
+<tr><td>26–37</td><td>pops, <code>swapgs</code>, <code>sysretq</code></td><td>Restore, user GS, return to ring 3.</td><td>RAX (the result) is not popped.</td></tr>
+<tr><td>42–65</td><td><code>enter_user</code></td><td>Builds an <code>iretq</code> frame for ring 3, clears registers, swaps GS.</td><td>First entry of every process (F3-30).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>uaccess.h</code> and <code>uaccess.S</code></p>
+<pre class="listing" data-src="F3-29/uaccess.h"></pre>
+<pre class="listing" data-src="F3-29/uaccess.S"></pre>
+<div class="tw"><table>
+<thead><tr><th>File, lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>uaccess.h 9–11</td><td>constants</td><td>User half = PML4 entry 1.</td><td>One place defines "user memory".</td></tr>
+<tr><td>uaccess.h 15–21</td><td><code>user_range_ok</code></td><td>Range check with no sum.</td><td>Cannot be fooled by wrap-around.</td></tr>
+<tr><td>uaccess.h 24–27</td><td><code>user_range_naive</code></td><td>The wrong version.</td><td>Kept only for the host test.</td></tr>
+<tr><td>uaccess.S 10–18</td><td><code>uaccess_copy</code></td><td><code>rep movsb</code>; on a fault, return RCX (bytes left).</td><td>One table entry covers the whole copy.</td></tr>
+<tr><td>uaccess.S 23–32</td><td><code>probe_read</code></td><td>One load that may fault; returns false on fault.</td><td>Used by F3-28's shootdown test.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>syscall.cc</code></p>
+<pre class="listing" data-src="F3-29/syscall.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>21–43</td><td><code>syscall_init_cpu</code></td><td>EFER.SCE, STAR, LSTAR, FMASK; SMEP/SMAP from CPUID unless <code>nosmap</code>.</td><td>Runs on every CPU (F3-28's <code>ap_entry</code> calls it).</td></tr>
+<tr><td>47–67</td><td><code>copy_from_user</code>, <code>copy_to_user</code></td><td>Range check, <code>stac</code>, copy, <code>clac</code>.</td><td>The only doors to user memory.</td></tr>
+<tr><td>83–92</td><td><code>uaccess_fixup</code></td><td>Looks the faulting RIP up in <code>.uaccess_fixups</code>.</td><td>The linker script collects the table (F3-26's <code>kernel.ld</code>, lines 15–17).</td></tr>
+<tr><td>96–122</td><td><code>sys_write</code></td><td>fd check; the forensic bug under <code>#ifdef</code>; the safe chunked copy.</td><td>Compare lines 101–104 with 106–120.</td></tr>
+<tr><td>160–176</td><td><code>syscall_dispatch</code></td><td>The table of Layer 2; a pending kill ends the process.</td><td>Kill requests are acted on at the boundary (F3-30).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — the user side: <code>ulib.h</code>, <code>crt0.S</code>, <code>ulib.cc</code>, and the test programs</p>
+<pre class="listing" data-src="F3-29/ulib.h"></pre>
+<pre class="listing" data-src="F3-29/crt0.S"></pre>
+<pre class="listing" data-src="F3-29/ulib.cc"></pre>
+<pre class="listing" data-src="F3-29/u_hello.cc"></pre>
+<pre class="listing" data-src="F3-29/u_badptr.cc"></pre>
+<pre class="listing" data-src="F3-29/u_priv.cc"></pre>
+<pre class="listing" data-src="F3-29/u_peek.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>File, lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>ulib.h 7–12</td><td><code>sys3</code></td><td>Number in RAX, arguments in RDI, RSI, RDX; RCX, R11 clobbered.</td><td>The user half of the ABI.</td></tr>
+<tr><td>crt0.S 5–11</td><td><code>_start</code></td><td>argc and argv from the stack, <code>main</code>, then system call 0.</td><td>F3-30 builds that stack.</td></tr>
+<tr><td>ulib.cc</td><td><code>memset</code>, <code>memcpy</code></td><td>The two functions g++ may call on its own.</td><td>A freestanding program must provide them.</td></tr>
+<tr><td>u_badptr.cc 21–27</td><td>six calls</td><td>Valid, unmapped, kernel, past mapped memory, wrapping, bad fd.</td><td>B12 acceptance test 2.</td></tr>
+</tbody></table></div>
+<p>The user programs are linked at 0x80_0040_0000 with <code>-mcmodel=large</code> (the default small model assumes code and data below 2 GiB). Their program headers:</p>
+<pre class="output" data-run="F3-29/readelf_hello"></pre>
+
+<p><b>Listing 5</b> — <code>test_user.cc</code> and <code>run.sh</code></p>
+<pre class="listing" data-src="F3-29/test_user.cc"></pre>
+<pre class="listing" data-src="F3-29/run.sh"></pre>
+<div class="tw"><table>
+<thead><tr><th>File, lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>test_user.cc 32–35</td><td>expected statuses</td><td>42; 0 failures; 0x100 | 13; 0x100 | 14.</td><td>The kernel reports every exit status.</td></tr>
+<tr><td>test_user.cc 36–39</td><td>frames before and after</td><td>Four processes, two of them killed, leave no frames behind.</td><td>Killing must clean up like exiting.</td></tr>
+<tr><td>run.sh 14–17</td><td>three boots</td><td>The tests with <code>-cpu max</code>; the bug kernel with SMAP; and with <code>nosmap=1</code>.</td><td>Two crashes are expected (exit 3).</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-29/user"></pre>
+
+<p><b>Listing 6</b> — <code>uaccess_test.cpp</code>, the range check under the sanitizers</p>
+<pre class="listing" data-src="F3-29/uaccess_test.cpp"></pre>
+<pre class="output" data-run="F3-29/uaccess_test"></pre>
+
+<h2 id="F3-29-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The window is not polite.</b> A system call is not a request that waits for a clerk to look up: the CPU switches privilege level and jumps to a fixed kernel address in one instruction, and the "clerk" is the same CPU now running kernel code.</li>
+<li><b>Staff rooms are visible from student areas.</b> The kernel is mapped in every process; it is only marked "supervisor". The protection is a bit in the page tables checked on every access, not a wall.</li>
+<li><b>SMAP is not about trust in students.</b> It protects against the kernel's own bugs: it makes accidental direct accesses fault, so they are found in testing instead of exploited later.</li>
+<li><b>Bags can change while the clerk reads them.</b> Another thread of the same program can modify the buffer during the copy; real clerks do not face shape-shifting bags.</li>
+</ul>
+
+<h2 id="F3-29-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Using the user stack in the entry path.</b> Any <code>push</code> or <code>call</code> before RSP is switched writes to user memory. Read the first three instructions of <code>syscall_entry</code> again.</li>
+<li><b>Unbalanced <code>swapgs</code>.</b> Symptom: <code>this_cpu()</code> returns garbage after the first interrupt that arrives during a system call, or user programs crash on the first <code>%gs</code> access. Check every entry and exit path.</li>
+<li><b>Dereferencing a user pointer in the kernel.</b> Works in all tests with valid pointers; crashes or leaks with malicious ones. With SMAP on it faults on the first test with a valid pointer — which is the point.</li>
+<li><b><code>addr + len</code> in a range check.</b> Wraps. Write the subtraction form.</li>
+<li><b>Forgetting the U bit on intermediate page-table levels.</b> The user page faults although its own entry has U = 1. Decode the error code: "protection, user mode" on an address you mapped means a missing permission somewhere up the walk.</li>
+<li><b>Debugging method.</b> For a crash in a system call: CR2 and the error code tell you who accessed what (bit 2 clear = the kernel did it); RIP and the backtrace through <code>syscall_dispatch</code> tell you which call; the argument registers in the dump (RDI, RSI, RDX at entry; here often RBX or RDI by the time of the crash) tell you which user value it was.</li>
+</ul>
+
+<div class="co transition" id="F3-29-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F3-26 to F3-28: threads, locks and all CPUs, all in ring 0. <b>What carries over:</b> the per-CPU area and GS base (now swapped with <code>swapgs</code>), each thread's kernel stack top (now loaded on every entry from ring 3), F3-19's trap handling, F3-21's page tables. <b>What changes:</b> code runs in ring 3 in its own address-space half; it reaches the kernel only through SYSCALL and a numbered ABI; the kernel copies user memory only through checked, fault-tolerant routines, and SMEP/SMAP make mistakes fault. <b>What comes next:</b> F3-30 turns "a user program" into processes: an ELF loader that refuses malformed files, demand paging, an initial stack with argv and the auxiliary vector, spawn, exit and wait, and an init that starts ten children.</p></div>
+
+<h2 id="F3-29-check">Check yourself</h2>
+<ol>
+<li>Why does the GDT put user data at 0x18 and user code at 0x20, and not the other way round?</li>
+<li>What does <code>syscall</code> do with RSP, and what are the first three instructions of <code>syscall_entry</code> for?</li>
+<li>Explain in your own words why the kernel must not dereference a pointer it received from a system call, even after checking that it lies in the user half.</li>
+<li>Why does FMASK clear AC? What could a user program do if it did not?</li>
+<li>Compute <code>user_range_ok(0xFF_FFFF_F000, 4096)</code> and <code>user_range_ok(0xFF_FFFF_F000, 4097)</code>.</li>
+<li>A page fault occurs at the <code>rep movsb</code> in <code>uaccess_copy</code>, from a valid buffer whose page has simply not been mapped yet. Walk through what the handler does.</li>
+<li>Which status does a process killed by a general-protection fault get, and why that encoding?</li>
+<li>Apply to a new case: you add a system call <code>read(fd, buf, len)</code> that fills a user buffer from the keyboard. Which copy routine, which checks, and what if the buffer's second page is unmapped?</li>
+<li>With SMAP on, the forensic kernel crashed on the <i>first</i> valid call. Is SMAP making the kernel less reliable?</li>
+</ol>
+
+<h2 id="F3-29-lab">Lab</h2>
+<div class="co safety"><span class="lbl">Safety</span><p>QEMU only; real hardware only on a designated spare machine with a recovery path (guide section 5.8). Nothing here was run on hardware.</p></div>
+<p><b>Goal (milestone B12, verbatim):</b> "Run code at ring 3 in its own address space; system calls through SYSCALL/SYSRET; safe copying of user memory." <sup class="src"><a href="#F3-29-src-C1">C1</a></sup></p>
+<p><b>Acceptance tests (verbatim):</b></p>
+<ol>
+<li>"A user program prints through a write system call and exits with a status the kernel reports." — <code>u_hello</code>, status 0x2a.</li>
+<li>"A user program that passes a kernel address, an unmapped address and a misaligned length to the write call gets error codes; the kernel does not crash." — <code>u_badptr</code> (see Layer 3 for the reading of "misaligned length").</li>
+<li>"A user program that executes a privileged instruction is terminated with a general-protection report; the kernel keeps running." — <code>u_priv</code>, status 0x10d.</li>
+</ol>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F3-29</code>. Expected: <code>user</code> exit 1; <code>forensic_smap</code> and <code>forensic_nosmap</code> exit 3; <code>uaccess_test</code> exit 0.</li>
+<li>Boot the normal kernel with <code>-cpu qemu64</code> instead of <code>max</code>: the log says "SMEP off, SMAP off" and the tests still pass. Explain why they still pass.</li>
+<li>Add a system call 6, <code>getcpu</code>, that returns <code>this_cpu().id</code>; call it from a new user program on 4 CPUs in a loop with <code>yield</code> and print the values. Update the ABI table.</li>
+<li>Remove <code>AC</code> from FMASK and write a user program that sets AC (with <code>pushf</code>/<code>popf</code>) before calling the forensic kernel's <code>write</code> with SMAP on. Predict the result, run it, explain.</li>
+</ol>
+
+<h2 id="F3-29-forensic">Forensic lab</h2>
+<p><b>Scenario: "the kernel trusted a user pointer".</b> A colleague "optimised" <code>sys_write</code>: "the buffer comes from our own C library, so the copy is a waste" (the code under <code>BUG_TRUST_USER_POINTER</code>, lines 101–104). The kernel was booted twice: on a CPU with SMAP, and on one without (simulated with <code>nosmap=1</code>). Both crashed. Find out why, from the dumps alone.</p>
+<p><b>Evidence 1</b> — with SMAP:</p>
+<pre class="output" data-run="F3-29/forensic_smap"></pre>
+<p><b>Evidence 2</b> — without SMAP and SMEP:</p>
+<pre class="output" data-run="F3-29/forensic_nosmap"></pre>
+<p><b>Evidence 3</b> — <code>addr2line</code> on Evidence 2's backtrace:</p>
+<pre class="output" data-run="F3-29/forensic_addr2line"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>In each dump: which address faulted, who accessed it (decode the error code), and in which thread?</li>
+<li>In Evidence 1 the faulting address belongs to <code>u_hello</code> and the page is present. Which segment of the program is it in (use the program headers in the Code walk-through)? Why did a valid pointer crash the kernel?</li>
+<li>In Evidence 2 <code>u_hello</code> printed correctly. Which of <code>u_badptr</code>'s calls crashed the kernel, and how do you know from the registers?</li>
+<li>Follow the backtrace: which kernel function made the access, and through which path was it called?</li>
+<li>RCX is 0x3fd in both dumps. What might that be? (Hint: F3-18's serial port.)</li>
+<li>Give the fix and two preventions, one in code review and one in the hardware configuration.</li>
+</ol>
+<p><b>Method hints.</b> Start with CR2 and the error code; compare CR2 with the argument registers; only then read the backtrace.</p>
+
+<h2 id="F3-29-project">Mini-project</h2>
+<p><b>A system-call fuzzer in ring 3.</b> Write <code>u_fuzz.cc</code>: a user program with an xorshift generator that makes 100,000 system calls with random numbers (0–15) and random arguments biased towards interesting values (0, −1, kernel addresses, the user stack, <code>kUserTop − 1</code>, huge lengths), skipping <code>exit</code>, and limiting <code>spawn</code>. It prints a histogram of return values. The kernel must not crash, and frames must return to the baseline after the program exits.</p>
+<p><b>Rubric (10 points).</b> Generator and interesting values documented (2); run recorded with <code>qemu_step</code> under <code>-cpu max</code>, no kernel crash (3); histogram explained (2); frames back to baseline (2); one paragraph on what the fuzzer cannot find (logic errors that return a wrong success value) (1).</p>
+
+<h2 id="F3-29-summary">Summary</h2>
+<ul>
+<li>Ring 3 code runs with user segments (CS 0x23) in the user half of its address space; the kernel half is mapped but supervisor-only.</li>
+<li>SYSCALL saves RIP/RFLAGS in RCX/R11, masks RFLAGS, loads kernel selectors and jumps to LSTAR without switching stacks; <code>syscall_entry</code> uses <code>swapgs</code> and the per-CPU area to find the kernel stack.</li>
+<li>A small numbered ABI (exit, write, getpid, spawn, wait, yield) with negative error codes; RCX and R11 are destroyed by the instruction.</li>
+<li>User pointers are checked without sums that can wrap, and copied only by routines in an exception table, which turns faults into −2.</li>
+<li>SMEP and SMAP make kernel execution and accidental access of user pages fault; <code>stac</code>/<code>clac</code> open a narrow window for the copy routines.</li>
+<li>The three B12 tests passed in QEMU with <code>-cpu max</code>; the forensic kernel crashed on a valid pointer under SMAP and on an unmapped one without it. Nothing was tested on hardware.</li>
+</ul>
+
+<h2 id="F3-29-sources">Sources</h2>
+<ol>
+<li id="F3-29-src-D1">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual" (tier 1; curriculum item 10; named in B12): Vol. 3 "Fast System Calls in 64-Bit Mode", "Paging" (access rights, SMEP, SMAP, page-fault error code), "Protection" (privilege levels, canonical addresses); Vol. 2 instruction reference for SYSCALL, SYSRET, SWAPGS, STAC, CLAC. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-29-src-D2">AMD, "AMD64 Architecture Programmer's Manual, Volume 2: System Programming" (tier 1; curriculum item 11; named in B12), "SYSCALL and SYSRET". <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-29-src-D3">Intel, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 4 "Model-Specific Registers" (tier 1; named in B12): STAR, LSTAR, FMASK, EFER, KERNEL_GS_BASE. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-29-src-D4">Russ Cox, Frans Kaashoek, Robert Morris, "xv6: a simple, Unix-like teaching operating system" (tier 3; curriculum item 9): "Traps and system calls" (user/kernel transitions, argument fetching with <code>copyin</code>). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-29-src-D5">The Linux kernel source (tier 4; curriculum item 40): the exception-table mechanism behind <code>copy_from_user</code>. Cited as "what that implementation does". <i>Not opened during this build (dossier gate G1 open).</i></li>
+<li id="F3-29-src-D6">H. J. Lu et al. (eds.), "System V Application Binary Interface, AMD64 Architecture Processor Supplement" (tier 1): the code models (<code>-mcmodel=large</code>) and the kernel-call convention (R10 for the fourth argument). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-29-src-C1">C1 — "Systems Curriculum", Track B, milestone B12 (goal, reading list and acceptance tests quoted verbatim). A map, not a technical source (AH-4).</li>
+<li id="F3-29-src-R1">R1 — lab runs <code>F3-29/build.log</code> and <code>build_bug.log</code>: the kernel and user programs built with g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0 and GNU ld 2.42, the second with <code>-DBUG_TRUST_USER_POINTER</code>; exit code 0; <code>readelf_hello.log</code> (GNU readelf 2.42).</li>
+<li id="F3-29-src-R2">R2 — lab run <code>user.log</code>: the B12 tests in QEMU emulator version 8.2.2 (TCG, <code>-cpu max</code>, one CPU), exit code 1 = pass; sources <code>syscall.S</code>, <code>syscall.cc</code>, <code>uaccess.S</code>, <code>test_user.cc</code>, the user programs, F3-26's <code>trap.S</code> and <code>trap.cc</code>. Untested on hardware.</li>
+<li id="F3-29-src-R3">R3 — lab run <code>uaccess_test.log</code>: g++ 13.3.0 with AddressSanitizer and UBSan, exit code 0.</li>
+<li id="F3-29-src-R4">R4 — forensic runs <code>forensic_smap.log</code> and <code>forensic_nosmap.log</code> (exit code 3, expected) and <code>forensic_addr2line.log</code> (GNU addr2line 2.42). Untested on hardware.</li>
+</ol>
+
+<h2 id="F3-29-glossary">Glossary links</h2>
+<p><a href="#gl-privilege-level-ring">Privilege level (ring)</a> · <a href="#gl-user-mode-and-kernel-mode">User mode and kernel mode</a> · <a href="#gl-system-call">System call</a> · <a href="#gl-syscall-and-sysret">SYSCALL and SYSRET</a> · <a href="#gl-model-specific-register-msr">Model-specific register (MSR)</a> · <a href="#gl-swapgs">SWAPGS</a> · <a href="#gl-smep">SMEP</a> · <a href="#gl-smap">SMAP</a> · <a href="#gl-user-pointer-validation">User pointer validation</a> · <a href="#gl-exception-table-fixup">Exception table (fixup)</a> · <a href="#gl-canonical-address">Canonical address</a> · <a href="#gl-system-call-table">System-call table</a> · <a href="#gl-privileged-instruction">Privileged instruction</a></p>
+
+<h2 id="F3-29-next">Next chapter</h2>
+<p>Next: <a href="#F3-30">F3-30 Processes and the ELF program loader</a>. Previous: <a href="#F3-28">F3-28 SMP bring-up and per-CPU data</a>. Back to the course: <a href="#OS303">OS303</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (milestone B12).</p>
+
+<h2 id="F3-29-answers">Answers to Check yourself</h2>
+<ol>
+<li>SYSRET computes the user selectors from one STAR field: SS = field + 8 and CS = field + 16. With the field 0x10, data must be at 0x18 and code at 0x20 (worked example). Reversing them would load a code descriptor into SS.</li>
+<li>Nothing: RSP still holds the user stack pointer. <code>swapgs</code> gives access to this CPU's <code>Cpu</code>; the user RSP is saved there (<code>%gs:16</code>); RSP is loaded with the current thread's kernel stack top (<code>%gs:8</code>). Only then may the code push.</li>
+<li>Good answers mention: the page may be unmapped (a fault inside the kernel at an arbitrary instruction crashes it); another thread may unmap or change it at any moment; with SMAP the access faults by design; the checked copy routines handle all of these and return an error code, while a direct access has no such path.</li>
+<li>With AC set, SMAP allows kernel accesses to user pages. A user program could set AC before <code>syscall</code> and so disable SMAP for the whole system call, turning any kernel bug that dereferences a user pointer back into an exploitable one. Clearing it on entry closes that door.</li>
+<li><code>kUserTop − 0xFF_FFFF_F000 = 0x1000</code>: 4096 ≤ 4096 → true; 4097 ≤ 4096 → false. (The first range is valid for the check, even though that page is deliberately unmapped; the copy would then fault and return −2.)</li>
+<li>The page-fault handler first calls <code>vm_handle_fault</code>: the current process exists, the error code says "not present", CR2 is in the user half and the page belongs to a segment or the stack, so the page is mapped and the instruction is restarted; <code>rep movsb</code> continues with RCX bytes left. The exception table is never consulted.</li>
+<li>0x100 | 13 = 0x10D. The 0x100 bit cannot be produced by <code>exit</code> (which keeps 8 bits), so a parent can distinguish "killed by vector 13" from "exited with 13".</li>
+<li><code>copy_to_user</code>, after checking fd and <code>user_range_ok(buf, len)</code>; fill a kernel buffer first, then copy. If the second page is unmapped and does not belong to the process, the copy faults, the fixup returns bytes left, and the call returns −2 (or, in a Unix-like ABI, the number of bytes copied before the fault).</li>
+<li>No: it makes the kernel fail <i>predictably</i> at the first wrong access, during testing, instead of working with valid pointers and failing (or leaking kernel memory) only with malicious ones. The bug was in the kernel all along.</li>
+</ol>
+<h3 id="F3-29-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation, Evidence 1.</b> Page fault in thread 2 'u_hello.elf', CR2 = <code>0x80_0040_2000</code>, error code 0x1: protection violation, read, <i>supervisor</i> mode. RBX and RDI hold the same value as CR2, and RDX = 0x17 (23, the length of "hello from ring 3: pid "). The address is the start of <code>u_hello</code>'s third LOAD segment (0x80_0040_2000, read-only data, <code>.rodata</code>): the string being printed. The page is present (the user's <code>ulen</code> already read it), and the kernel read it directly: SMAP refused, and the RIP was not in the exception table, so the kernel crashed.</p>
+<p><b>Observation, Evidence 2.</b> <code>u_hello</code> printed normally (without SMAP the direct read of a valid, mapped page "works"). <code>u_badptr</code>'s first call (valid buffer) also worked. The crash is in thread 3 'u_badptr.elf': CR2 = <code>0x90_0000_0000</code>, error code 0x0: not present, read, supervisor. RBX = RDI = <code>0x90_0000_0000</code> and RDX = 0x10: the second call, "unmapped user address", length 16. <code>addr2line</code>: <code>console_write_raw</code> (<code>console.cc:79</code>) ← <code>sys_write</code> (<code>syscall.cc:104</code>, the bug branch) ← <code>syscall_dispatch</code> (line 165) ← <code>syscall_entry</code> (<code>syscall.S:25</code>, the instruction after the call). RCX = 0x3fd is probably the port number of COM1's line status register (base 0x3F8 + 5), which <code>console_write_raw</code> polls; it confirms the console code was running (register-level detail from memory).</p>
+<p><b>Root cause.</b> <code>sys_write</code> under <code>BUG_TRUST_USER_POINTER</code> passes the user's address straight to the console: no range check, no exception-table copy. Any fault there is a kernel-mode fault at an unlisted instruction, i.e. a crash. With a kernel address the same code would have printed kernel memory to the user (an information leak) instead of crashing.</p>
+<p><b>Fix.</b> Use the safe branch: <code>user_range_ok</code>, then <code>copy_from_user</code> into a kernel buffer (lines 106–120).</p>
+<p><b>Prevention.</b> Code review rule: a value that came from a system-call argument is an integer, never a pointer, until a <code>copy_*_user</code> routine has used it (Linux marks such pointers with an annotation checked by a static analyser; the idea is easy to copy with a distinct C++ type). Hardware configuration: keep SMAP (and SMEP) enabled in every test configuration, so that the very first direct access faults during testing, as Evidence 1 shows. And fuzz the system-call interface (mini-project).</p>

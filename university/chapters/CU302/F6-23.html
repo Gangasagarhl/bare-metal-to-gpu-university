@@ -1,0 +1,315 @@
+<!--meta
+id: F6-23
+title: Register tiling and vectorised loads
+course: CU302
+level: L3
+prereqs: F6-22; F6-20; F6-08 (coalescing); F6-11 (bank conflicts); F6-03 (local memory)
+time: 10–14 hours including the lab and the forensic lab
+hardware: none for the CPU-emulator correctness test, the occupancy calculation, the compiler reports and the forensic lab (g++ 13.3, nvcc 12.0 in the build container); timing against cuBLAS needs an NVIDIA GPU, untested on hardware in this build
+maps: Curriculum E6 (steps 3–4: 1-D then 2-D register tiling; vectorized loads; register usage and occupancy per step); 13.2 topics 2 (alignment and vectorized loads), 3 (when higher occupancy does not help) and 6; course forensic "Register spills"
+analogy: F6 — the great kitchen hall (registered: registers = each helper's hands; using more per helper means fewer helpers fit in the hall; shared memory = the table; coalescing = fetching neighbouring jars in one trip)
+-->
+
+<h2 id="F6-23-hook">Story hook</h2>
+<p>After <a href="#F6-22">F6-22</a>, Amara's table group carries each jar from the pantry only once. Now the table is the crowded place: for every single multiplication, each helper reaches to the table twice, once for an amount and once for a weight. Hands are moving between table and stove all evening.</p>
+<p>Kwame, a new helper, holds four amounts in one hand and four weights in the other. With those eight jars in his hands he can make sixteen dishes — every amount with every weight — before he reaches to the table again. His neighbour does the same with the next four weights. The table traffic drops by a factor of eight.</p>
+<p>The catch is that hands are limited. If every helper holds sixty-four bowls of results and sixteen jars, fewer helpers fit in the hall, because the hall has only so many hands in total. And if a helper is told to hold more than his hands can carry, he puts some bowls on the floor behind him and picks them up again later — which is slow, and which nobody sees unless they look at the floor. This chapter is about holding the right number of jars, carrying four at a time, and checking the floor.</p>
+
+<h2 id="F6-23-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> register tiling as an outer product per k, and compute shared-memory loads per multiply-add for a TM × TN thread tile.</li>
+<li><b>Write</b> 1-D and 2-D register-tiled SGEMM kernels with 16-byte vectorised loads that stay correct on shapes that are not multiples of 4.</li>
+<li><b>Read</b> the compiler report and SASS for registers, <code>LDS.128</code>, <code>LDG.E.128</code> and spills, and connect them to occupancy.</li>
+<li><b>Diagnose</b> register spills caused by <code>__launch_bounds__</code> from a <code>ptxas</code> report and a SASS listing.</li>
+<li><b>Argue</b> from counted evidence why a kernel with 25 % theoretical occupancy can be the best step so far.</li>
+</ul>
+
+<div class="co jargon" id="F6-23-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Register tiling</dt><dd><b>Simple words:</b> each thread computes a small block of outputs and keeps them in its registers. <b>Analogy:</b> Kwame's sixteen dishes made from eight jars in his hands. <b>Precise:</b> each thread owns a TM × TN sub-tile of the block's C tile in an accumulator array that the compiler maps to registers; per k it loads TM values of A and TN values of B and performs TM·TN multiply-adds, an outer product. <sup class="src"><a href="#F6-23-src-D2">D2</a></sup> <sup class="src"><a href="#F6-23-src-D5">D5</a></sup></dd>
+<dt>Thread tile (TM × TN)</dt><dd><b>Simple words:</b> the outputs one thread is responsible for. <b>Analogy:</b> the bowls one helper fills. <b>Precise:</b> the TM rows × TN columns of C computed by one thread; 1-D register tiling has TN = 1, 2-D has both above 1. <sup class="src"><a href="#F6-23-src-D5">D5</a></sup></dd>
+<dt>Outer product</dt><dd><b>Simple words:</b> multiplying every value of one short list with every value of another. <b>Analogy:</b> every amount in one hand with every weight in the other. <b>Precise:</b> for column vector a (TM) and row vector b (TN), the TM × TN matrix a·b with elements a<sub>i</sub>b<sub>j</sub>; GEMM is a sum over k of outer products of a column of A and a row of B (MA201). <sup class="src"><a href="#F6-23-src-D2">D2</a></sup></dd>
+<dt>Vectorised load</dt><dd><b>Simple words:</b> one instruction that loads several neighbouring numbers at once. <b>Analogy:</b> carrying four jars in one trip. <b>Precise:</b> a load of a 16-byte aligned <code>float4</code>, compiled to <code>LDG.E.128</code> (global) or <code>LDS.128</code> (shared) in this build; the address must be a multiple of 16 bytes. <sup class="src"><a href="#F6-23-src-D1">D1</a></sup> <sup class="src"><a href="#F6-23-src-R4">R4</a></sup></dd>
+<dt>Register spill</dt><dd><b>Simple words:</b> values that do not fit in registers are stored in slow memory and loaded back. <b>Analogy:</b> bowls put on the floor behind the helper. <b>Precise:</b> when the register allocator cannot keep all live values in the available registers, it stores some to local memory (per-thread memory in device DRAM, cached) with <code>STL</code> and reloads them with <code>LDL</code>; <code>ptxas -v</code> reports "spill stores" and "spill loads" in bytes. <sup class="src"><a href="#F6-23-src-D1">D1</a></sup> <sup class="src"><a href="#F6-23-src-R5">R5</a></sup></dd>
+<dt>Launch bounds</dt><dd><b>Simple words:</b> a promise to the compiler about block size, and a request for how many blocks should fit. <b>Analogy:</b> telling the hall manager in advance how big your table group is and how many groups you want seated. <b>Precise:</b> <code>__launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor)</code>; the second argument makes the compiler limit registers per thread so that that many blocks can be resident, spilling if necessary. <sup class="src"><a href="#F6-23-src-D1">D1</a></sup> <sup class="src"><a href="#F6-23-src-R5">R5</a></sup></dd>
+</dl></div>
+<p>Terms from earlier chapters: <a href="#gl-occupancy">occupancy</a> and <a href="#gl-instruction-level-parallelism-ilp">instruction-level parallelism</a> (F6-20); <a href="#gl-spill-local-memory">spill (local memory)</a>, first met in F6-20; local memory here is GPU per-thread memory, unrelated to "local" variables in the C++ sense.</p>
+
+<h2 id="F6-23-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the three levels now in play. The block tile (BM × BN) lives in shared memory as BK-wide strips of A and B; each thread owns a TM × TN thread tile of C in registers; at each k a thread reads a column piece of TM values of A and a row piece of TN values of B and updates all TM·TN accumulators.</p>
+<figure id="F6-23-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 320" role="img" aria-labelledby="F6-23-f1t F6-23-f1d">
+<title id="F6-23-f1t">Figure 1: register tiling as an outer product per k</title>
+<desc id="F6-23-f1d">Left: shared memory holds As, a BK by BM strip of A stored transposed (rows are k, columns are m), and Bs, a BK by BN strip of B. In row k of As, a segment of TM values belonging to one thread is highlighted; in row k of Bs, a segment of TN values is highlighted. Arrows go to the right, to the registers of one thread: a column a of TM values and a row b of TN values, and a TM by TN grid of accumulators acc. A label says acc[i][j] += a[i] × b[j]: TM·TN multiply-adds for TM + TN shared loads; 4 × 4 gives 16 for 8, 8 × 8 gives 64 for 16. Below, the block tile of C, BM by BN, is drawn with a grid of thread tiles; one thread tile is highlighted. Not to scale.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="320"/>
+<text class="sv-tb" x="20" y="22">shared memory: one BK step</text>
+<rect class="sv-box" x="20" y="40" width="260" height="70"/><text class="sv-ts" x="24" y="34">As[k][m] (A strip, transposed)</text>
+<rect class="sv-b1" x="20" y="70" width="260" height="10"/><rect class="sv-b2" x="100" y="70" width="40" height="10"/>
+<text class="sv-ts" x="290" y="80">row k; TM values</text>
+<rect class="sv-box" x="20" y="140" width="260" height="70"/><text class="sv-ts" x="24" y="134">Bs[k][n] (B strip)</text>
+<rect class="sv-b1" x="20" y="170" width="260" height="10"/><rect class="sv-b2" x="180" y="170" width="40" height="10"/>
+<text class="sv-ts" x="290" y="180">row k; TN values</text>
+<line class="sv-dash" x1="400" y1="20" x2="400" y2="230"/>
+<text class="sv-tb" x="420" y="22">registers of one thread</text>
+<rect class="sv-b2" x="430" y="60" width="18" height="100"/><text class="sv-t" x="432" y="176">a</text>
+<rect class="sv-b2" x="470" y="36" width="100" height="18"/><text class="sv-t" x="580" y="50">b</text>
+<rect class="sv-b3" x="470" y="60" width="100" height="100"/>
+<line class="sv-line" x1="495" y1="60" x2="495" y2="160"/><line class="sv-line" x1="520" y1="60" x2="520" y2="160"/><line class="sv-line" x1="545" y1="60" x2="545" y2="160"/>
+<line class="sv-line" x1="470" y1="85" x2="570" y2="85"/><line class="sv-line" x1="470" y1="110" x2="570" y2="110"/><line class="sv-line" x1="470" y1="135" x2="570" y2="135"/>
+<text class="sv-t" x="590" y="100">acc (TM × TN)</text>
+<text class="sv-ts" x="420" y="196">acc[i][j] += a[i] × b[j]</text>
+<text class="sv-ts" x="420" y="212">TM·TN multiply-adds per TM + TN shared loads</text>
+<text class="sv-ts" x="420" y="228">4 × 4: 16 per 8;  8 × 8: 64 per 16</text>
+<line class="sv-line" x1="140" y1="75" x2="424" y2="100"/><polygon class="sv-head" points="422,95 431,101 421,105"/>
+<line class="sv-line" x1="220" y1="175" x2="464" y2="50"/><polygon class="sv-head" points="459,47 469,46 464,56"/>
+<text class="sv-tb" x="20" y="250">C block tile (BM × BN), split into thread tiles</text>
+<rect class="sv-box" x="20" y="258" width="260" height="56"/>
+<line class="sv-dash" x1="85" y1="258" x2="85" y2="314"/><line class="sv-dash" x1="150" y1="258" x2="150" y2="314"/><line class="sv-dash" x1="215" y1="258" x2="215" y2="314"/>
+<line class="sv-dash" x1="20" y1="286" x2="280" y2="286"/>
+<rect class="sv-b6" x="150" y="258" width="65" height="28"/><text class="sv-ts" x="300" y="290">one thread's TM × TN outputs; written to C once, at the end</text>
+</svg></div><figcaption><b>Figure 1.</b> Register tiling. The A strip is stored transposed in shared memory so that a thread's TM values are contiguous and can be read with 16-byte loads. Arrows show data flow. Not to scale. <sup class="src"><a href="#F6-23-src-D2">D2</a></sup> <sup class="src"><a href="#F6-23-src-D5">D5</a></sup></figcaption></figure>
+<p>Figure 2 is the course's step table so far as the compiler and the occupancy calculator see it. It is the first time a step that will run faster has lower theoretical occupancy; F6-20's forensic lab explained why that can happen.</p>
+<figure id="F6-23-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F6-23-f2t F6-23-f2d">
+<title id="F6-23-f2t">Figure 2: shared-memory loads per multiply-add versus theoretical occupancy for the E6 steps</title>
+<desc id="F6-23-f2d">Two horizontal bar groups for five kernels: tiled32, reg2d 64x64/4x4 scalar, vec 64x64/4x4, vec 128x128/8x8, and vec 128x128/8x8 with MINB=4. Left group: shared-memory load instructions per FFMA from the SASS: 1.25, 0.125, 0.125, 0.0625, and 0.0625. Right group: theoretical occupancy on the F6-20 example device from Listing 4: 100 %, 37.5 %, 37.5 %, 25 %, 50 %. The last kernel is marked "spills: 301 LDL, 334 STL". A note says lower bars on the left mean less shared-memory traffic per unit of work; occupancy falls as registers per thread rise.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<text class="sv-tb" x="160" y="20">shared loads per FFMA (SASS)</text>
+<text class="sv-tb" x="480" y="20">theoretical occupancy (example device)</text>
+<text class="sv-ts" x="10" y="52">tiled32</text>
+<text class="sv-ts" x="10" y="92">reg2d 4x4</text>
+<text class="sv-ts" x="10" y="132">vec 4x4</text>
+<text class="sv-ts" x="10" y="172">vec 8x8</text>
+<text class="sv-ts" x="10" y="212">vec 8x8 MINB=4</text>
+<rect class="sv-b1" x="120" y="40" width="250" height="18"/><text class="sv-ts" x="300" y="70">1.25</text>
+<rect class="sv-b2" x="120" y="80" width="25" height="18"/><text class="sv-ts" x="150" y="94">0.125</text>
+<rect class="sv-b2" x="120" y="120" width="25" height="18"/><text class="sv-ts" x="150" y="134">0.125</text>
+<rect class="sv-b3" x="120" y="160" width="12.5" height="18"/><text class="sv-ts" x="138" y="174">0.0625</text>
+<rect class="sv-b3" x="120" y="200" width="12.5" height="18"/><text class="sv-ts" x="138" y="214">0.0625 (+ spills: 301 LDL, 334 STL)</text>
+<rect class="sv-b1" x="480" y="40" width="250" height="18"/><text class="sv-ts" x="690" y="70">100 %</text>
+<rect class="sv-b2" x="480" y="80" width="93.75" height="18"/><text class="sv-ts" x="580" y="94">37.5 %</text>
+<rect class="sv-b2" x="480" y="120" width="93.75" height="18"/><text class="sv-ts" x="580" y="134">37.5 %</text>
+<rect class="sv-b3" x="480" y="160" width="62.5" height="18"/><text class="sv-ts" x="550" y="174">25 %</text>
+<rect class="sv-b3" x="480" y="200" width="125" height="18"/><text class="sv-ts" x="612" y="214">50 %</text>
+<text class="sv-ts" x="120" y="242">Lengths proportional to the printed values; no times are shown because none were measured.</text>
+</svg></div><figcaption><b>Figure 2.</b> Evidence from Listing 4 (occupancy, F6-20's example device, not a product) and from <code>sass_mix.out</code> and <code>spill_sass.out</code> (instruction counts, <code>sm_80</code>). <sup class="src"><a href="#F6-23-src-R3">R3</a></sup> <sup class="src"><a href="#F6-23-src-R4">R4</a></sup> <sup class="src"><a href="#F6-23-src-R5">R5</a></sup></figcaption></figure>
+
+<h2 id="F6-23-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Registers = each helper's hands; thread tile = the bowls one helper fills; outer product = every amount in one hand with every weight in the other; vectorised load = four neighbouring jars in one trip; spill = bowls put on the floor.</p></div>
+<p>In F6-22 each helper made one dish and reached to the table twice for every step. Now each helper makes a small square of dishes. With four amounts and four weights in hand, she can make sixteen dishes before reaching to the table again.</p>
+<p>Holding more is faster, up to a point. The hall has a fixed number of hands. If each helper holds a lot, fewer helpers fit. That is fine as long as each helper always has work ready: a helper with sixteen independent dishes rarely stands idle.</p>
+<p>If you force more helpers into the hall than their bowls allow, they put bowls on the floor. Picking them up again is slow. The compiler tells you exactly how many bowls went to the floor, and this chapter shows you where to read it.</p>
+
+<h2 id="F6-23-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-23-l2-outer">From dot products to outer products</h3>
+<p>C = AB can be written as C = Σ<sub>k</sub> A[:, k] B[k, :], a sum over k of outer products of a column of A and a row of B. <sup class="src"><a href="#F6-23-src-D2">D2</a></sup> A thread that owns the TM × TN sub-tile of C at rows <i>r</i>…<i>r</i>+TM−1 and columns <i>c</i>…<i>c</i>+TN−1 needs, at each k, only A[<i>r</i>…<i>r</i>+TM−1, k] and B[k, <i>c</i>…<i>c</i>+TN−1]: TM + TN values for TM·TN multiply-adds. For 4 × 4 that is 16 multiply-adds per 8 shared-memory values; for 8 × 8, 64 per 16. In F6-22 it was one multiply-add per 2 values.</p>
+<p>Listing 1 implements this with templates: BM × BN is the block tile, BK the depth of one shared-memory step, TM × TN the thread tile. A block has (BM ÷ TM)·(BN ÷ TN) threads: 256 for 64 × 64 with 4 × 4 and for 128 × 128 with 8 × 8. Thread <code>tid</code> owns thread-tile row <code>tRow = tid / (BN/TN)</code> and column <code>tCol = tid % (BN/TN)</code>. Loading the BM × BK and BK × BN strips is done cooperatively by all threads in a strided loop, since there are now more elements than threads.</p>
+
+<h3 id="F6-23-l2-transpose">Why A is stored transposed</h3>
+<p>Per k, a thread reads TM consecutive <i>rows</i> of A at one k. In a row-major <code>As[m][k]</code> those are BK floats apart; in a transposed <code>As[k][m]</code> they are contiguous, so a thread can fetch four of them with one 16-byte shared load. The price is paid once per tile, at the store: the kernel writes A into <code>As[k][m]</code> element by element. B needs no transpose: its TN values per k are already contiguous in <code>Bs[k][n]</code>. <sup class="src"><a href="#F6-23-src-D5">D5</a></sup></p>
+
+<h3 id="F6-23-l2-vector">Vectorised global loads</h3>
+<p>With <code>VEC = true</code>, each thread reads four consecutive floats of A (along k) or of B (along n) with one <code>float4</code> load. A warp's 32 <code>float4</code> loads cover 512 consecutive bytes for B, so they stay coalesced (F6-08) while issuing a quarter of the instructions. <sup class="src"><a href="#F6-23-src-D3">D3</a></sup> A <code>float4</code> access must be 16-byte aligned. <sup class="src"><a href="#F6-23-src-D1">D1</a></sup> Row starts are aligned only if the row length (K for A, N for B) is a multiple of 4, given that <code>cudaMalloc</code> returns suitably aligned base pointers (unverified box in Layer 3). The launcher in <code>launchers.cuh</code> therefore checks <code>K % 4</code> and <code>N % 4</code> and falls back to the scalar kernel otherwise; within a row, column offsets are multiples of 4, so with N a multiple of 4 a <code>float4</code> is either wholly inside the row or wholly outside, and the zero-fill test needs only its first element.</p>
+
+<h3 id="F6-23-l2-registers">What it costs in registers</h3>
+<p>The accumulators alone are TM·TN floats: 16 for 4 × 4, 64 for 8 × 8, plus TM + TN operand values, addresses and loop counters. The compiler report for <code>sm_80</code>: 75 registers for 64 × 64 / 4 × 4 scalar, 78 with <code>float4</code>, 77 for the 1-D kernel (8 × 1), 121 and 124 for 128 × 128 / 8 × 8 scalar and vector, all with 0 bytes of spills. <sup class="src"><a href="#F6-23-src-R3">R3</a></sup> Listing 4 feeds these numbers to NVIDIA's occupancy calculator header with F6-20's example device: 37.5 % for the 64 × 64 kernels, 25 % for 128 × 128, against 100 % for the naive and tiled kernels. <sup class="src"><a href="#F6-23-src-R6">R6</a></sup></p>
+
+<h2 id="F6-23-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F6-23-l3-ilp">Lower occupancy, more work in flight</h3>
+<p>F6-20 established, with Little's law and Volkov's argument, that latency is hidden by independent work in flight, which can come from more warps (thread-level parallelism) or from more independent instructions per warp (instruction-level parallelism). <sup class="src"><a href="#F6-23-src-D4">D4</a></sup> A thread with an 8 × 8 tile issues 64 independent FFMAs per k: the scheduler can issue one after another from the same warp without waiting for any of them, because none depends on another. A thread with one output issues one FFMA per k, and the next one depends on it through the accumulator. So 25 % occupancy with 64 independent accumulators per thread offers far more independent arithmetic than 100 % occupancy with one. What it does not offer is many warps to cover global-memory latency during the tile loads; that is what <a href="#F6-24">F6-24</a> fixes by overlapping the loads with computation.</p>
+
+<h3 id="F6-23-l3-sass">The SASS confirms the counts</h3>
+<p>For one BK = 8 step, the 2-D 64 × 64 / 4 × 4 kernel contains 128 <code>FFMA</code> (4·4·8) and 16 <code>LDS.128</code>: per k, one 16-byte load for the four A values and one for the four B values. That is 0.125 shared-memory load instructions per FFMA, ten times fewer than <code>sgemmTiled</code>'s 1.25. The 128 × 128 / 8 × 8 kernel has 512 <code>FFMA</code> and 32 <code>LDS.128</code>: 0.0625. <sup class="src"><a href="#F6-23-src-R4">R4</a></sup> Note that even the "scalar" 2-D kernel uses <code>LDS.128</code>: the compiler vectorised the shared loads itself because the transposed layout made them contiguous and the array is declared 16-byte aligned. What <code>VEC</code> changes is the global side: 14 <code>LDG.E</code> become 14 <code>LDG.E.128</code>, each moving four times the data, and the B tile is stored with <code>STS.128</code>. <sup class="src"><a href="#F6-23-src-R4">R4</a></sup> <sup class="src"><a href="#F6-23-src-D6">D6</a></sup></p>
+
+<h3 id="F6-23-l3-banks">Banks again</h3>
+<p>Two shared-memory patterns deserve a check in F6-11's model. The reads are fine: in a warp of the 64 × 64 / 4 × 4 kernel, 16 threads share a <code>tRow</code> and 16 consecutive <code>tCol</code>; their B reads <code>Bs[k][4·tCol]</code> as 16-byte loads cover 64 consecutive words, and their A reads are two distinct addresses, each broadcast. The transposed stores are not perfect: in the vector path, thread <code>i</code> stores four values to <code>As[k..k+3][m]</code> with <code>m = i/2</code> and <code>k ∈ {0, 4}</code>, so in one store instruction the threads with k = 0 and k = 4 hit word addresses <i>m</i> and 256 + <i>m</i>, which are the same bank: a two-way conflict, once per tile. <sup class="src"><a href="#F6-23-src-D3">D3</a></sup> It costs far less than the inner loop gains; a profiler will show it, and swizzled layouts (F6-27) remove it.</p>
+
+<h3 id="F6-23-l3-bounds">Launch bounds and spills</h3>
+<p><code>__launch_bounds__(256, MINB)</code> tells the compiler the block size and asks for at least MINB resident blocks per SM. <sup class="src"><a href="#F6-23-src-D1">D1</a></sup> With MINB = 1, <code>ptxas</code> used 124 registers for the 128 × 128 kernel; with MINB = 4 it limited itself to 64 registers, which needs 408 bytes of stack and produces 1,336 bytes of spill stores and 1,204 bytes of spill loads per thread. <sup class="src"><a href="#F6-23-src-R5">R5</a></sup> The SASS counts confirm it: 0 <code>LDL</code> / 0 <code>STL</code> without the bound, 301 <code>LDL</code> / 334 <code>STL</code> with it, around the same 512 <code>FFMA</code>. Local memory is per-thread memory in device memory, cached in L1 and L2; every <code>LDL</code> in the inner loop adds a load with cache or DRAM latency in front of an FFMA that needs its value. <sup class="src"><a href="#F6-23-src-D1">D1</a></sup> Listing 4 shows what the bound bought: 50 % theoretical occupancy instead of 25 %. Whether that trade wins is a measurement, and the course forensic lab below asks you to predict it from evidence. Volkov's talk is the classic warning against chasing occupancy at the cost of registers. <sup class="src"><a href="#F6-23-src-D4">D4</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Three platform facts used above were not read in a document during this build: (1) the alignment that <code>cudaMalloc</code> guarantees for returned pointers (the kernels need 16 bytes; check the CUDA Runtime API reference for <code>cudaMalloc</code> and the Programming Guide's device-memory section); (2) whether local memory is cached in L1 on your GPU generation (check the Programming Guide's "Local Memory" section and the tuning guide for your architecture); (3) the size of the register file per SM of your GPU (read <code>regsPerMultiprocessor</code> from <code>cudaGetDeviceProperties</code>). The register and spill numbers in this chapter are the compiler's own reports for <code>sm_80</code> and are not affected.</p></div>
+
+<h2 id="F6-23-hardware">How the hardware actually does it</h2>
+<p>Registers are the fastest storage on the GPU; each thread's registers are allocated from the SM's register file when its block becomes resident, for the block's lifetime. <sup class="src"><a href="#F6-23-src-D1">D1</a></sup> An <code>FFMA</code> reads its three operands from registers; an <code>LDS.128</code> moves 16 bytes from shared memory into four consecutive registers in one instruction, and <code>LDG.E.128</code> does the same from global memory. <sup class="src"><a href="#F6-23-src-D6">D6</a></sup> Fewer, wider load instructions mean fewer issue slots spent on loads, which matters once the FMA pipeline is the target. The register file is shared by all resident warps, which is the exact mechanism behind "using more per helper means fewer helpers fit in the hall": the occupancy calculator in Listing 4 divides the register file by registers per warp, rounded to the allocation unit that the header uses for compute capability 8.x (F6-20). <sup class="src"><a href="#F6-23-src-R6">R6</a></sup> When the compiler is told to use fewer registers than the code needs, the overflow goes to local memory, which lives in device memory and is reached through the caches like any other load. <sup class="src"><a href="#F6-23-src-D1">D1</a></sup></p>
+
+<h2 id="F6-23-worked">Worked example</h2>
+<p><b>Task.</b> For the 128 × 128 / 8 × 8 kernel with BK = 8 at <i>n</i> = 4,096: count FFMAs and shared-memory loads per thread per BK step, the global intensity, the minimum registers for the data alone, and the theoretical occupancy on the example device.</p>
+<ol>
+<li>Threads per block: (128 ÷ 8)·(128 ÷ 8) = 256. Per BK step per thread: 8 × 8 × 8 = 512 FFMA. Shared loads: per k, 8 A values (two <code>LDS.128</code>) and 8 B values (two <code>LDS.128</code>) = 4 instructions, × 8 = 32 <code>LDS.128</code>. Ratio 32 ÷ 512 = 0.0625, as the SASS shows. <sup class="src"><a href="#F6-23-src-R4">R4</a></sup></li>
+<li>Global intensity: the 128 × 128 block tile of F6-21's Listing 4: 31.5 FLOP/byte at <i>n</i> = 4,096 (it does not depend on the thread tile). <sup class="src"><a href="#F6-23-src-R2">R2</a></sup></li>
+<li>Registers for data: 64 accumulators + 8 + 8 operand values = 80. The compiler used 124: the rest holds addresses, indices and loop state. <sup class="src"><a href="#F6-23-src-R3">R3</a></sup></li>
+<li>Registers per block: 124 × 256 = 31,744. With the example device's 65,536 registers per SM, two blocks fit (63,488) and a third does not: 2 × 8 warps = 16 of 64 warps = 25 %, as Listing 4 prints. <sup class="src"><a href="#F6-23-src-R6">R6</a></sup></li>
+<li>To fit four blocks, a thread may use at most 65,536 ÷ (4 × 256) = 64 registers (Listing 4's sweep agrees: 64): exactly the 64 that <code>ptxas</code> chose for MINB = 4, at the price of the spills. <sup class="src"><a href="#F6-23-src-R5">R5</a></sup> <sup class="src"><a href="#F6-23-src-R6">R6</a></sup></li>
+</ol>
+
+<h2 id="F6-23-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>gemm_regtile.cuh</code>: one template for the 1-D and 2-D register-tiled kernels, with or without <code>float4</code>.</p>
+<pre class="listing" data-src="F6-23/gemm_regtile.cuh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–12</td><td><code>template &lt;BM, BN, BK, TM, TN, VEC, MINB&gt;</code>, <code>__launch_bounds__</code></td><td>All tile sizes are compile-time constants; the block size and MINB are promised to the compiler.</td><td>Constant sizes let <code>acc</code>, <code>a</code>, <code>b</code> live in registers; MINB is the forensic lab's knob.</td></tr>
+<tr><td>14–16</td><td><code>THREADS</code>, <code>As[BK][BM]</code>, <code>Bs[BK][BN]</code>, <code>alignas(16)</code></td><td>Shared strips; A transposed.</td><td>Alignment allows 16-byte shared loads and stores.</td></tr>
+<tr><td>17–21</td><td><code>tRow</code>, <code>tCol</code>, bases</td><td>Which thread tile this thread owns.</td><td>Consecutive <code>tid</code> take consecutive column groups: a warp's B reads are contiguous.</td></tr>
+<tr><td>22–24</td><td><code>float acc[TM][TN] = {}</code>, <code>a[TM]</code>, <code>b[TN]</code></td><td>Accumulators and operands.</td><td>Only fully unrolled constant indexing keeps them in registers; a variable index would force local memory.</td></tr>
+<tr><td>26–47</td><td><code>if constexpr (VEC)</code> loads</td><td>Strided loop over <code>float4</code> elements of the A and B strips; zero-fill at edges.</td><td>One 16-byte global load per four floats; A is split into four scalar stores to transpose it.</td></tr>
+<tr><td>48–59</td><td>scalar loads</td><td>The same with one float per iteration.</td><td>Used when K or N is not a multiple of 4.</td></tr>
+<tr><td>60</td><td><code>__syncthreads()</code></td><td>Strips complete.</td><td>Read after write, as in F6-22.</td></tr>
+<tr><td>61–91</td><td>the k loop</td><td>Load TM values of A and TN of B into registers, then TM·TN FMAs.</td><td>The outer product: 0.125 or 0.0625 shared loads per FFMA in the SASS.</td></tr>
+<tr><td>92</td><td><code>__syncthreads()</code></td><td>All reads done.</td><td>Write after read.</td></tr>
+<tr><td>94–102</td><td>guarded stores</td><td>Each thread writes its TM·TN outputs.</td><td>Edge tiles skip elements outside C; every element is written once.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>launchers.cuh</code> (shared by the GPU harness and the emulator) and <code>sgemm_regtile.cu</code> (E6 steps 1–4 in the harness).</p>
+<pre class="listing" data-src="F6-23/launchers.cuh"></pre>
+<pre class="listing" data-src="F6-23/sgemm_regtile.cu"></pre>
+<div class="tw"><table>
+<thead><tr><th>Part</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td><code>LAUNCH</code> macro</td><td><code>kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(...)</code> or <code>launch(grid, block, kernel, ...)</code></td><td>One launcher source for GPU and emulator.</td><td>The emulator tests exactly the launch logic the GPU uses, including the fallback.</td></tr>
+<tr><td>line 10 of <code>launchers.cuh</code></td><td><code>if (VEC &amp;&amp; (K % 4 != 0 || N % 4 != 0))</code></td><td>Falls back to the scalar kernel.</td><td>A misaligned <code>float4</code> load is an error on the GPU (misaligned address).</td></tr>
+<tr><td><code>runE6({...})</code></td><td>six variants</td><td>Naive to vec 128 × 128.</td><td>The speed table grows one line per step.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F6-23/sgemm_regtile"></pre>
+<pre class="output" data-run="F6-23/build_sm80"></pre>
+<p><b>Listing 3</b> — <code>check_regtile.cpp</code>: four variants on the CPU emulator. The shape 96 × 132 × 36 has K and N divisible by 4, so the vector path runs; 127 × 129 × 65 exercises the fallback.</p>
+<pre class="listing" data-src="F6-23/check_regtile.cpp"></pre>
+<pre class="output" data-run="F6-23/check_regtile"></pre>
+<p><b>Listing 4</b> — <code>occupancy_steps.cpp</code>: the theoretical occupancy of every step, from the compiler's register and shared-memory reports and NVIDIA's calculator header.</p>
+<pre class="listing" data-src="F6-23/occupancy_steps.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–29</td><td><code>cudaOccDeviceProp p</code></td><td>F6-20's example device.</td><td>Inputs, not a product: replace with your GPU's values.</td></tr>
+<tr><td>30–41</td><td><code>steps[]</code></td><td>Threads, registers, shared bytes per step.</td><td>Copied from the <code>resources.out</code> files of F6-21 to F6-24.</td></tr>
+<tr><td>54</td><td><code>cudaOccMaxActiveBlocksPerMultiprocessor</code></td><td>NVIDIA's own calculation.</td><td>Cross-checked against F6-20's model in F6-20.</td></tr>
+<tr><td>60–64</td><td><code>limitingFactors</code></td><td>Names every limit that is reached.</td><td>Registers limit every register-tiled step.</td></tr>
+<tr><td>69–86</td><td>the sweep over <code>regs</code></td><td>Largest register count that still fits 2, 3 or 4 blocks of 256 threads.</td><td>The budget a designer works to: 128, 80 and 64 on the example device.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F6-23/occupancy_steps"></pre>
+<p>The compiler's view (<code>sm_80</code>, compiled only): registers and spills of all variants, then the instruction mix of the 2-D scalar, 2-D vector and 128 × 128 kernels. <sup class="src"><a href="#F6-23-src-R3">R3</a></sup> <sup class="src"><a href="#F6-23-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F6-23/resources"></pre>
+<pre class="output" data-run="F6-23/sass_mix"></pre>
+
+<h2 id="F6-23-breaks">Where the analogy breaks</h2>
+<ul>
+<li>Helpers' hands in the story hold any number of jars a little less comfortably. Registers are all-or-nothing per block: one register more per thread can drop a whole block from the SM (Listing 4: 124 registers allow two blocks, 128 would still allow two, but the allocation is rounded per warp, so the steps are discrete).</li>
+<li>A helper who puts bowls on the floor knows where they are and picks them up herself. Spilled values go to local memory, which is device memory behind the caches: the "floor" is shared with every other thread's traffic and may be far away.</li>
+<li>In the story, more helpers always keep the hall busier. On a GPU, independent instructions inside one warp hide latency as well as more warps do, so fewer helpers with more independent dishes each can be faster (F6-20).</li>
+</ul>
+
+<h2 id="F6-23-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Accumulator array in local memory without any bound.</b> Symptom: <code>ptxas -v</code> shows a stack frame and <code>LDL</code>/<code>STL</code> in the SASS even with MINB = 1. Cause: an index into <code>acc</code> that is not a compile-time constant after unrolling (a loop without <code>#pragma unroll</code> or with a runtime trip count). Fix: constant trip counts and full unrolling; check the report after every change.</li>
+<li><b><code>float4</code> on unaligned rows.</b> Symptom: works for 64³, fails with a misaligned-address error (GPU) or wrong values for K = 65. Fix: the launcher's fallback, or pad rows to a multiple of 4.</li>
+<li><b>Forgetting the transposed store.</b> Symptom: the emulator reports most elements outside the bound. Cause: <code>As[m][k]</code> written, <code>As[k][m]</code> read. Find it: the emulator on 17 × 13 × 9 fails immediately.</li>
+<li><b>Using MINB to "fix" low occupancy.</b> Symptom: occupancy up, time worse (to be measured). Evidence: spill bytes in the report. Fix: remove the bound, or reduce the thread tile and compare in the step table.</li>
+<li><b>Too few threads to load the strips.</b> Symptom: wrong results for some configurations. Cause: assuming one element per thread when BM·BK exceeds THREADS. Fix: the strided loading loops of lines 27 and 49.</li>
+</ul>
+
+<div class="co transition" id="F6-23-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-22">F6-22</a> tiled the block in shared memory, cutting global loads per FFMA by TILE but leaving 1.25 shared loads per FFMA; <a href="#F6-20">F6-20</a> explained latency hiding by warps and by independent instructions. <b>What carries over:</b> block tiles in shared memory with two barriers per step, zero-fill at edges, the harness, the emulator test and the step table. <sup class="src"><a href="#F6-23-src-R1">R1</a></sup> <b>What changes:</b> each thread now owns many outputs, so registers become the limiting resource and occupancy drops; spills are the new silent failure; vectorised loads add an alignment condition that some shapes do not meet. <sup class="src"><a href="#F6-23-src-R3">R3</a></sup> <b>What comes next:</b> <a href="#F6-24">F6-24</a> keeps these kernels and overlaps the next tile's global loads with the current tile's arithmetic, using two shared-memory stages and asynchronous copies.</p></div>
+
+<h2 id="F6-23-check">Check yourself</h2>
+<ol>
+<li>How many shared-memory values does a thread with a 4 × 8 thread tile read per k, and how many multiply-adds does it do?</li>
+<li>Explain in your own words why the A strip is stored transposed in shared memory, and what it costs.</li>
+<li>Which statement is correct? (a) Register tiling raises occupancy. (b) Register tiling reduces shared-memory loads per FFMA and raises register use. (c) Vectorised loads change the arithmetic intensity against DRAM. (d) <code>__launch_bounds__</code> with a large MINB never changes the generated code.</li>
+<li>Predict, then check in <code>sass_mix.out</code>: how many <code>FFMA</code> and <code>LDS.128</code> does the 64 × 64 / 4 × 4 kernel contain per BK step, and why does the scalar variant also use <code>LDS.128</code>?</li>
+<li>Apply it to a new case: a 128 × 64 block tile with an 8 × 4 thread tile and BK = 8. How many threads per block, how much shared memory, and how many shared loads per FFMA (with 16-byte loads)?</li>
+<li>Why does the launcher fall back to the scalar kernel when N = 70, even though the vector kernel would compute correct values for most elements?</li>
+<li>Using Listing 4's method, what registers per thread would allow three 256-thread blocks on the example device?</li>
+<li>Work out the two-way bank conflict of the transposed vector store in F6-11's model: which threads of warp 0 collide?</li>
+</ol>
+
+<h2 id="F6-23-lab">Lab</h2>
+<p><b>Goal.</b> Add the 1-D and 2-D register-tiled steps and the vectorised-load step to your E6 table, with registers, spills and occupancy recorded per step. E6: "Steps logged with a speed table: naive; shared-memory tiling; 1-D then 2-D register tiling; vectorized loads; …" and "register usage and occupancy are recorded per step". <sup class="src"><a href="#F6-23-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–4: none (this build: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>Cuda compilation tools, release 12.0, V12.0.140</code>). Steps 5–6: an NVIDIA GPU with the CUDA Toolkit and cuBLAS recorded in your dossier. <b>Safety:</b> none beyond normal computer use.</p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-23</code>; check "all shapes ok" and 0 spill bytes for every variant in <code>resources.out</code>.</li>
+<li>Add a 128 × 64 / 8 × 4 variant (Check question 5) to <code>check_regtile.cpp</code> and <code>sgemm_regtile.cu</code>; record its registers and instruction mix with the <code>run.sh</code> commands.</li>
+<li>Remove <code>#pragma unroll</code> from the FMA loops in a copy of Listing 1 and record what happens to registers, stack frame and <code>LDL</code>/<code>STL</code>.</li>
+<li>Replace the example device in Listing 4 with your GPU's values (from <code>deviceQuery</code> or <code>cudaGetDeviceProperties</code>) and rerun.</li>
+<li>On a GPU: build and run Listing 2 with <code>-arch</code> set to your GPU and <code>-DUSE_CUBLAS -lcublas</code>; add the lines to your E6 table.</li>
+<li>Profile <code>vec 128x128/8x8</code> and the MINB = 4 variant: record achieved occupancy, local-memory traffic and the main stall reasons.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: all variants pass on the emulator; 0 spills with MINB = 1; the instruction counts above; 25–37.5 % theoretical occupancy on the example device. On a GPU (untested here): the register-tiled steps are faster than the tiled ones despite lower occupancy; the profiler shows few shared-memory instructions per FFMA.</p>
+<p><b>Verification.</b> Harness: "ALL CHECKS PASSED" with "matches cuBLAS". Compiler: <code>0 bytes spill stores, 0 bytes spill loads</code> for every kernel in your table, unless the step is the deliberate spill experiment.</p>
+<p><b>Troubleshooting.</b> Emulator test of a new variant takes very long → its block has many threads; use smaller blocks for the emulator (it runs one OS thread per GPU thread). Build error about a type in <code>__launch_bounds__</code> → the macro arguments must be constant expressions. Results wrong only for the vector variant → check the alignment fallback and the transposed store.</p>
+<p><b>Extension.</b> Let each thread own two 4 × 4 sub-tiles 32 columns apart instead of one contiguous 4 × 8 tile, so that a warp's B reads are 128 contiguous bytes per sub-tile; compare bank behaviour in the profiler.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 2 was built twice (default target; <code>sm_80</code> with cuBLAS); both runs stop with <code>cudaErrorNoDevice</code>. Correctness comes from the emulator; occupancy is the calculator's theoretical value for an example device; no time or speed in this chapter was measured.</p></div>
+
+<h2 id="F6-23-forensic">Forensic lab</h2>
+<p><b>Scenario: "Register spills".</b> Lindiwe's profiler showed 25 % achieved occupancy for the 128 × 128 / 8 × 8 kernel. Her colleague Arjun added <code>__launch_bounds__(256, 4)</code> "to double the occupancy" and opened a pull request titled "free speed-up". Before anyone has measured, the reviewer asks for an assessment from the compiler evidence alone.</p>
+<p><b>Evidence pack.</b> (1) The test translation unit <code>spill.cu</code>, which instantiates the kernel with MINB = 1 and MINB = 4:</p>
+<pre class="listing" data-src="F6-23/spill.cu"></pre>
+<p>(2) The compiler report for both instantiations <sup class="src"><a href="#F6-23-src-R5">R5</a></sup>:</p>
+<pre class="output" data-run="F6-23/spill_report"></pre>
+<p>(3) Local-memory and FMA instruction counts in the SASS, and the first local-memory instructions of the MINB = 4 version <sup class="src"><a href="#F6-23-src-R5">R5</a></sup>:</p>
+<pre class="output" data-run="F6-23/spill_sass"></pre>
+<p>(4) The theoretical occupancy of both (Listing 4's last two "vec 128x128" lines) <sup class="src"><a href="#F6-23-src-R6">R6</a></sup>.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: registers, stack frame, spill stores and spill loads for each version; <code>LDL</code>, <code>STL</code> and <code>FFMA</code> counts.</li>
+<li>Why did the compiler choose exactly 64 registers? Show the arithmetic.</li>
+<li>State two hypotheses for the effect on speed (faster because of more warps; slower because of local-memory traffic) and say which measurement would decide between them.</li>
+<li>The first <code>STL</code> instructions store <code>RZ</code>. What are they doing, and where in Listing 1 does that come from?</li>
+<li>Recommend: merge, reject, or change? Give a better way to reach higher occupancy if the measurement says it matters, and a CI check that would flag spills automatically.</li>
+</ol>
+<p><b>Method hints.</b> Read the <code>ptxas</code> lines first, then count instructions, then do the register arithmetic. Remember F6-20: more warps help only if there is not already enough independent work per warp.</p>
+
+<h2 id="F6-23-project">Mini-project</h2>
+<p><b>Resource ledger.</b> For the GEMM part of MP3, write a script that builds every variant for your GPU's architecture, extracts registers, shared memory and spill bytes from <code>ptxas -v</code>, counts <code>FFMA</code>, <code>LDS*</code>, <code>LDG*</code>, <code>LDL</code> and <code>STL</code> from <code>cuobjdump -sass</code>, computes theoretical occupancy with <code>cuda_occupancy.h</code>, and writes one table row per step next to the measured time. Fail CI when any variant outside the spill experiment has non-zero spill bytes. <sup class="src"><a href="#F6-23-src-C1">C1</a></sup></p>
+<p><b>Rubric.</b> Table generated, not hand-written (3). Spill check in CI (2). Occupancy uses your GPU's real limits with their source noted (2). One paragraph per step explaining the time change from the ledger's columns (3).</p>
+
+<h2 id="F6-23-summary">Summary</h2>
+<ul>
+<li>Register tiling makes each thread compute a TM × TN outer product per k: TM·TN multiply-adds for TM + TN shared values.</li>
+<li>The SASS shows 0.125 shared loads per FFMA for 4 × 4 and 0.0625 for 8 × 8, against 1.25 for the shared-memory-tiled kernel.</li>
+<li>Storing A transposed in shared memory makes a thread's A values contiguous, so they load as <code>LDS.128</code>.</li>
+<li><code>float4</code> global loads need 16-byte alignment; the launcher falls back to scalar loads when K or N is not a multiple of 4.</li>
+<li>Registers rise to 75–124 per thread and theoretical occupancy falls to 25–37.5 % on the example device; the independent FMAs per thread hide latency instead.</li>
+<li><code>__launch_bounds__(256, 4)</code> forces 64 registers and produces 1,336 bytes of spill stores and 301 <code>LDL</code>: read the compiler report before trusting an occupancy "fix".</li>
+</ul>
+
+<h2 id="F6-23-sources">Sources</h2>
+<ol>
+<li id="F6-23-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): vector types and alignment, launch bounds, local memory, registers and the register file, device memory accesses. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F6-23-src-D2">D2 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): matrix multiplication, thread coarsening. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-23-src-D3">D3 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): coalesced access, shared memory and bank conflicts. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-23-src-D4">D4 — Vasily Volkov, "Better Performance at Lower Occupancy", GPU Technology Conference 2010 talk (tier 5; named in curriculum E6). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-23-src-D5">D5 — NVIDIA, CUTLASS documentation, "Efficient GEMM in CUDA" (tier 2; named in curriculum E6): thread-level tiling, outer products. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-23-src-D6">D6 — NVIDIA, "CUDA Binary Utilities" (tier 1): SASS instructions <code>LDS</code>, <code>LDG</code>, <code>STS</code>, <code>LDL</code>, <code>STL</code>, <code>FFMA</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-23-src-C1">C1 — Systems Curriculum (this project), milestone E6 (goal, build steps, acceptance tests quoted), local file <code>SYSTEMS_CURRICULUM.html</code>. A map, not a source (AH-4).</li>
+<li id="F6-23-src-R1">R1 — run of Listing 3 (<code>university/labs/F6-23/check_regtile.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with ASan and UBSan, exit code 0.</li>
+<li id="F6-23-src-R2">R2 — run of F6-21 Listing 4 (<code>university/labs/F6-21/intensity.log</code>), exit code 0.</li>
+<li id="F6-23-src-R3">R3 — <code>ptxas -v</code> report for <code>sm_80</code> (<code>resources.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>, compiled only.</li>
+<li id="F6-23-src-R4">R4 — SASS instruction mix for <code>sm_80</code> (<code>sass_mix.log</code>), same toolkit, compiled only.</li>
+<li id="F6-23-src-R5">R5 — forensic compiler report and SASS counts (<code>spill_report.log</code>, <code>spill_sass.log</code>), same toolkit, compiled only.</li>
+<li id="F6-23-src-R6">R6 — run of Listing 4 (<code>occupancy_steps.log</code>), g++ with the toolkit's <code>cuda_occupancy.h</code>, exit code 0; device values are F6-20's example inputs.</li>
+<li id="F6-23-src-R7">R7 — builds and runs of Listing 2 (<code>sgemm_regtile.log</code>, <code>build_sm80.log</code>); untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+</ol>
+
+<h2 id="F6-23-glossary">Glossary links</h2>
+<p><a href="#gl-register-tiling">Register tiling</a> · <a href="#gl-thread-tile-tm-tn">Thread tile (TM × TN)</a> · <a href="#gl-outer-product">Outer product</a> · <a href="#gl-vectorised-load">Vectorised load</a> · <a href="#gl-register-spill">Register spill</a> · <a href="#gl-launch-bounds">Launch bounds</a> · <a href="#gl-occupancy">Occupancy</a> · <a href="#gl-instruction-level-parallelism-ilp">Instruction-level parallelism (ILP)</a> · <a href="#gl-spill-local-memory">Spill (local memory)</a></p>
+
+<h2 id="F6-23-next">Next chapter</h2>
+<p><a href="#F6-24">F6-24 Double buffering and asynchronous copies to shared memory</a>. Previous: <a href="#F6-22">F6-22</a>. Back to the course: <a href="#CU302">CU302</a>.</p>
+
+<h2 id="F6-23-answers">Answers to Check yourself</h2>
+<ol>
+<li>4 + 8 = 12 values; 4 × 8 = 32 multiply-adds.</li>
+<li>A thread needs TM consecutive rows of A at one k. Row-major in shared memory they are BK floats apart; transposed they are contiguous and load with 16-byte instructions. The cost is that the tile store must write A element by element in transposed positions, with a two-way bank conflict in the vector path.</li>
+<li>(b). (a) is false: it raises registers per thread and lowers occupancy (Listing 4). (c) is false: DRAM intensity depends on the block tile, not on instruction width. (d) is false: the forensic lab shows 64 registers and spills.</li>
+<li>4 × 4 × 8 = 128 <code>FFMA</code> and 16 <code>LDS.128</code> (two per k). The A values are contiguous in the transposed layout and the array is 16-byte aligned, so <code>ptxas</code> combined four scalar loads into one 128-bit load by itself.</li>
+<li>(128 ÷ 8)·(64 ÷ 4) = 256 threads; shared memory (128 + 64) × 8 × 4 = 6,144 bytes; per k, 8 A values (2 <code>LDS.128</code>) and 4 B values (1 <code>LDS.128</code>) for 32 FFMA: 3 ÷ 32 ≈ 0.094.</li>
+<li>N = 70 is not a multiple of 4, so row starts of B are not all 16-byte aligned: row 1 starts at byte 280, and 280 is not a multiple of 16. A misaligned <code>float4</code> load is an error on the GPU, so correctness for most elements is irrelevant.</li>
+<li>Listing 4's sweep prints 80. Plain division would suggest 65,536 ÷ (3 × 256) ≈ 85, but registers are allocated per warp in units of 256 and per sub-partition (F6-20's model): 80 × 32 = 2,560 registers per warp fits six warps in each quarter of 16,384, giving 24 warps = 3 blocks, while 81–85 registers round up to 2,816 per warp and fit only five.</li>
+<li>Thread <i>i</i> has m = i ÷ 2 and k = 4·(i mod 2). Threads 2<i>j</i> (k = 0) and 2<i>j</i> + 1 (k = 4) write word addresses <i>j</i> and 256 + <i>j</i> in the same store instruction; 256 is a multiple of 32, so both are in bank <i>j</i>: 16 pairs, two-way conflict.</li>
+</ol>
+<h3 id="F6-23-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>MINB = 1: 124 registers, 0-byte stack, 0 spills; 0 <code>LDL</code>, 0 <code>STL</code>, 512 <code>FFMA</code>. MINB = 4: 64 registers, 408-byte stack frame, 1,336 bytes spill stores, 1,204 bytes spill loads; 301 <code>LDL</code>, 334 <code>STL</code>, 512 <code>FFMA</code>.</li>
+<li>Four blocks of 256 threads must fit in the register file: on the example device, 65,536 ÷ 1,024 = 64 registers per thread. (On your GPU: <code>regsPerMultiprocessor</code> ÷ (4 × 256).)</li>
+<li>Hypothesis 1: twice the resident warps hide more latency → faster. Hypothesis 2: hundreds of local-memory loads per thread, many in the inner loop, add latency and memory traffic → slower. Decide with the harness time of both variants and the profiler's local-memory traffic and stall reasons. The evidence already favours hypothesis 2: the kernel had 64 independent FMAs per k, so latency was not the problem that more warps solve.</li>
+<li>They store zeros: the initialisation <code>float acc[TM][TN] = {}</code> of accumulators that no longer fit in registers (line 22). Accumulators living in local memory are the worst case: every FMA on them needs a load and a store.</li>
+<li>Reject as is. If more occupancy is needed, use a smaller thread tile (for example 8 × 4) or a smaller block tile and measure; never reach it by forcing spills. CI: parse <code>ptxas -v</code> and fail on non-zero "spill stores" for any kernel not marked as an experiment.</li>
+</ol>
+<p>How the evidence was produced: <code>run.sh</code> steps <code>spill_report</code> and <code>spill_sass</code> compile <code>spill.cu</code> for <code>sm_80</code> (compiled only; no GPU); the fault was injected by adding MINB = 4 to the launch bounds. Wrong answers: "spills only affect the start of the kernel" (the first <code>STL</code> are initialisation, but 334 stores and 301 loads are far more than the 64 accumulators need to be zeroed once); "64 registers is what the hardware gives each thread" (the same kernel used 124 without the bound).</p>

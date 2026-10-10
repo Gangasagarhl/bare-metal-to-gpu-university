@@ -1,0 +1,313 @@
+<!--meta
+id: F6-14
+title: Reductions from naive to warp shuffles
+course: CU301
+level: L3
+prereqs: F6-10 to F6-13; MA302 (F0-75 floating-point error and Kahan summation); CU201 (F6-06 timing, F6-08 coalescing, F6-09 bandwidth); HW301 (F1-57 SIMT and divergence)
+time: 10–14 hours including the lab and milestone E3
+hardware: Milestone E3 needs an NVIDIA GPU (and an AMD GPU for the wave64 criterion). The models, the CPU acceptance test, the forensic replay and all compiler evidence run on any computer with g++ and nvcc (this build: no GPU)
+maps: Curriculum Track E 13.2 topic 5 (parallel primitives: reductions, tree, warp shuffles, atomics); milestone E3 (reduction); exam P (tune a reduction to a target percentage of CUB DeviceReduce set beforehand)
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-14-hook">Story hook</h2>
+<p>At closing time every helper in the hall has a small pile of coins, the tips of the evening, and the head of the hall wants one number. The first idea is a queue: everyone walks to the cashier, who adds one pile at a time. That is a loop on one core, and in this hall of thousands it takes all night.</p>
+<p>Then Ravi's row tries pairs. Helper 0 adds helper 1's coins to his own, helper 2 adds helper 3's, and so on. Half the helpers are done after one round. In the next round the survivors pair up again. After eight rounds a row of 256 has one pile. But Ravi's way of choosing who adds (only helpers whose number is divisible by 2, then by 4, then by 8) leaves gaps everywhere in the row, and helpers keep reaching into the same drawer. Mira changes who adds, then who reads from where, then lets helpers pass coins hand to hand along the row without the table at all. Same total, a fraction of the time.</p>
+<p>This chapter follows Mira, step by step, through the six versions of a parallel reduction that milestone E3 asks for, measures what each step changes, and then finds the bug that only bites when the pile of coins is larger than two billion.</p>
+
+<h2 id="F6-14-able">What you will be able to do</h2>
+<ul>
+<li><b>Build</b> a sequence of reduction kernels, each a single documented change: divergence removed, bank conflicts removed, first add during the load, warp shuffles, a grid-stride loop with one launch.</li>
+<li><b>Predict</b> for each version how many warp-steps and bank passes its shared-memory phase needs, and check the prediction with a model.</li>
+<li><b>Set</b> an acceptance tolerance for a float sum and explain why the result differs from a sequential CPU loop.</li>
+<li><b>Measure</b> against <code>cub::DeviceReduce::Sum</code> with a target percentage set before you start (exam P).</li>
+<li><b>Find</b> a 32-bit index overflow that only appears above 2^31 elements, from PTX and a replay.</li>
+</ul>
+
+<div class="co jargon" id="F6-14-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Reduction</dt><dd><b>Simple words:</b> combining many values into one, such as a sum, maximum or count. <b>Analogy:</b> turning everyone's pile of coins into one total. <b>Precise:</b> applying an associative binary operator ⊕ to <i>n</i> values; a tree evaluation takes <i>n</i> − 1 operations in ⌈log₂ <i>n</i>⌉ steps; the result equals the sequential one exactly only when ⊕ is truly associative (integer addition), not for floating-point addition. <sup class="src"><a href="#F6-14-src-D3">D3</a></sup></dd>
+<dt>Tree reduction</dt><dd><b>Simple words:</b> add in pairs, then pairs of pairs. <b>Analogy:</b> rounds of pairing up in the row. <b>Precise:</b> step <i>k</i> combines elements 2<sup><i>k</i></sup> apart; in shared memory each step needs a barrier (<a href="#F6-12">F6-12</a>). <sup class="src"><a href="#F6-14-src-D3">D3</a></sup></dd>
+<dt>Warp shuffle</dt><dd><b>Simple words:</b> a lane reads a register of another lane in its warp directly. <b>Analogy:</b> passing coins hand to hand along the row, no table needed. <b>Precise:</b> <code>__shfl_down_sync(mask, v, delta)</code> returns <code>v</code> of lane <i>self</i> + <i>delta</i>; no shared memory and no block barrier; see <a href="#F6-15">F6-15</a>. <sup class="src"><a href="#F6-14-src-H1">H1</a></sup></dd>
+<dt>Grid-stride loop</dt><dd><b>Simple words:</b> each thread handles element <i>i</i>, then <i>i</i> + (all threads of the grid), and so on. <b>Analogy:</b> each helper takes every N-th plate from the long counter. <b>Precise:</b> <code>for (i = global id; i &lt; n; i += gridDim.x * blockDim.x)</code>; decouples the grid size from <i>n</i>, so a fixed, occupancy-sized grid covers any input. <sup class="src"><a href="#F6-14-src-D2">D2</a></sup></dd>
+<dt>Pairwise summation</dt><dd><b>Simple words:</b> summing in a tree instead of a line, which keeps rounding errors small. <b>Analogy:</b> adding small piles to small piles, never a coin to a mountain. <b>Precise:</b> the error bound grows with log₂ <i>n</i> instead of <i>n</i>; a GPU tree reduction is a pairwise sum in a particular order. Compare Kahan's compensated sum (<a href="#F0-75">F0-75</a>). <sup class="src"><a href="#F6-14-src-R4">R4</a></sup></dd>
+<dt>Index overflow</dt><dd><b>Simple words:</b> an index that does not fit in its integer type wraps around. <b>Analogy:</b> a plate numbering that goes from 2,147,483,647 back to a negative number. <b>Precise:</b> <code>blockIdx.x * blockDim.x + threadIdx.x</code> is computed in 32-bit unsigned arithmetic and wraps at 2^32; stored in an <code>int</code>, it is negative from 2^31 on. <sup class="src"><a href="#F6-14-src-R7">R7</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-14-pictures">The idea in pictures</h2>
+<figure id="F6-14-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-14-f1t F6-14-f1d">
+<title id="F6-14-f1t">Figure 1: interleaved versus sequential addressing in a tree reduction of 8 values</title>
+<desc id="F6-14-f1d">Two trees side by side, each reducing 8 boxes s0 to s7 in three steps. Left, version 1, interleaved: in step 1 boxes 0, 2, 4, 6 receive the values of 1, 3, 5, 7; in step 2 boxes 0 and 4 receive 2 and 6; in step 3 box 0 receives 4. The active threads are 0, 2, 4, 6 then 0, 4 then 0, spread out across the row. Right, version 3, sequential: in step 1 boxes 0 to 3 receive 4 to 7; in step 2 boxes 0 and 1 receive 2 and 3; in step 3 box 0 receives 1. The active threads are always the first ones, contiguous. A note says: in a block of 256, version 1 issues 47 warp-steps with every warp divergent, version 3 issues 12, from Listing 3.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="20" y="22">v1 interleaved: s[t] += s[t + stride], t % (2·stride) == 0</text>
+<text class="sv-tb" x="400" y="22">v3 sequential: s[t] += s[t + stride], t &lt; stride</text>
+<g>
+<rect class="sv-b1" x="20" y="40" width="36" height="28"/><text class="sv-ts" x="30" y="59">s0</text>
+<rect class="sv-b1" x="62" y="40" width="36" height="28"/><text class="sv-ts" x="72" y="59">s1</text>
+<rect class="sv-b1" x="104" y="40" width="36" height="28"/><text class="sv-ts" x="114" y="59">s2</text>
+<rect class="sv-b1" x="146" y="40" width="36" height="28"/><text class="sv-ts" x="156" y="59">s3</text>
+<rect class="sv-b1" x="188" y="40" width="36" height="28"/><text class="sv-ts" x="198" y="59">s4</text>
+<rect class="sv-b1" x="230" y="40" width="36" height="28"/><text class="sv-ts" x="240" y="59">s5</text>
+<rect class="sv-b1" x="272" y="40" width="36" height="28"/><text class="sv-ts" x="282" y="59">s6</text>
+<rect class="sv-b1" x="314" y="40" width="36" height="28"/><text class="sv-ts" x="324" y="59">s7</text>
+</g>
+<rect class="sv-b6" x="20" y="100" width="36" height="28"/><rect class="sv-b6" x="104" y="100" width="36" height="28"/><rect class="sv-b6" x="188" y="100" width="36" height="28"/><rect class="sv-b6" x="272" y="100" width="36" height="28"/>
+<line class="sv-line" x1="80" y1="68" x2="44" y2="98"/><line class="sv-line" x1="164" y1="68" x2="128" y2="98"/><line class="sv-line" x1="248" y1="68" x2="212" y2="98"/><line class="sv-line" x1="332" y1="68" x2="296" y2="98"/>
+<text class="sv-ts" x="320" y="118">step 1</text>
+<rect class="sv-b6" x="20" y="160" width="36" height="28"/><rect class="sv-b6" x="188" y="160" width="36" height="28"/>
+<line class="sv-line" x1="122" y1="128" x2="44" y2="158"/><line class="sv-line" x1="290" y1="128" x2="212" y2="158"/>
+<text class="sv-ts" x="320" y="178">step 2</text>
+<rect class="sv-b6" x="20" y="220" width="36" height="28"/>
+<line class="sv-line" x1="206" y1="188" x2="44" y2="218"/>
+<text class="sv-ts" x="320" y="238">step 3</text>
+<text class="sv-ts" x="20" y="272">active threads: 0,2,4,6 | 0,4 | 0 (spread out)</text>
+<line class="sv-line" x1="380" y1="10" x2="380" y2="290"/>
+<g>
+<rect class="sv-b1" x="400" y="40" width="36" height="28"/><text class="sv-ts" x="410" y="59">s0</text>
+<rect class="sv-b1" x="442" y="40" width="36" height="28"/><text class="sv-ts" x="452" y="59">s1</text>
+<rect class="sv-b1" x="484" y="40" width="36" height="28"/><text class="sv-ts" x="494" y="59">s2</text>
+<rect class="sv-b1" x="526" y="40" width="36" height="28"/><text class="sv-ts" x="536" y="59">s3</text>
+<rect class="sv-b1" x="568" y="40" width="36" height="28"/><text class="sv-ts" x="578" y="59">s4</text>
+<rect class="sv-b1" x="610" y="40" width="36" height="28"/><text class="sv-ts" x="620" y="59">s5</text>
+<rect class="sv-b1" x="652" y="40" width="36" height="28"/><text class="sv-ts" x="662" y="59">s6</text>
+<rect class="sv-b1" x="694" y="40" width="36" height="28"/><text class="sv-ts" x="704" y="59">s7</text>
+</g>
+<rect class="sv-b2" x="400" y="100" width="36" height="28"/><rect class="sv-b2" x="442" y="100" width="36" height="28"/><rect class="sv-b2" x="484" y="100" width="36" height="28"/><rect class="sv-b2" x="526" y="100" width="36" height="28"/>
+<line class="sv-line" x1="586" y1="68" x2="418" y2="98"/><line class="sv-line" x1="628" y1="68" x2="460" y2="98"/><line class="sv-line" x1="670" y1="68" x2="502" y2="98"/><line class="sv-line" x1="712" y1="68" x2="544" y2="98"/>
+<rect class="sv-b2" x="400" y="160" width="36" height="28"/><rect class="sv-b2" x="442" y="160" width="36" height="28"/>
+<line class="sv-line" x1="502" y1="128" x2="418" y2="158"/><line class="sv-line" x1="544" y1="128" x2="460" y2="158"/>
+<rect class="sv-b2" x="400" y="220" width="36" height="28"/>
+<line class="sv-line" x1="460" y1="188" x2="418" y2="218"/>
+<text class="sv-ts" x="400" y="272">active threads: 0..3 | 0,1 | 0 (contiguous)</text>
+<text class="sv-ts" x="20" y="306">Block of 256 (Listing 3): v1 issues 47 warp-steps, every warp divergent; v3 issues 12, one bank pass each.</text>
+</svg></div><figcaption><b>Figure 1.</b> The same tree, two ways of numbering the workers. Lines show which value is added into which box. Interleaved addressing (left) keeps active lanes spread over every warp; sequential addressing (right) packs them into the first warps, which finish together and leave whole warps idle. Counts from Listing 3 (R3). <sup class="src"><a href="#F6-14-src-R3">R3</a></sup> <sup class="src"><a href="#F6-14-src-S1">S1</a></sup></figcaption></figure>
+
+<h2 id="F6-14-layer1">Layer 1 — the kid explanation</h2>
+<p>To add up everyone's coins quickly, pair up: each pair makes one pile, then pairs of piles make one pile, and so on. With a thousand helpers that is only ten rounds. The tricks are about who works in each round (keep the workers next to each other, so whole groups can rest) and where they put the coins (do not all reach into the same drawer). The fastest helpers do not even use the table: they pass the coins straight from hand to hand.</p>
+
+<h2 id="F6-14-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-14-l2-shape">The shape of a GPU reduction</h3>
+<p>Each block reduces its part of the input to one value; that leaves one partial per block, which is reduced again, by another launch or by an atomic. <sup class="src"><a href="#F6-14-src-D3">D3</a></sup> Inside a block, each thread first puts one value in shared memory, then a loop halves the number of active threads per step, with a barrier between steps (<a href="#F6-12">F6-12</a>). Listing 1 contains six versions; versions 1–5 are finished by repeated launches until one value is left (the host loop of lines 149–161), version 6 finishes in one launch.</p>
+<h3 id="F6-14-l2-v1v2">v1 → v2: remove divergence</h3>
+<p><b>v1</b> (lines 13–27) picks the active threads with <code>tid % (2 * stride) == 0</code>. In step 1 every even thread works: every warp has some lanes working and some idle, so every warp is <em>divergent</em> (<a href="#F1-57">F1-57</a>) and must issue the step. Listing 3 counts, for one block of 256 threads: in v1, all 8 warps issue each of the first five steps, and every warp that issues is divergent; 47 warp-steps in total. <sup class="src"><a href="#F6-14-src-R3">R3</a></sup> <b>v2</b> (lines 29–44) keeps the same pairs but lets <em>consecutive</em> threads do the work: thread <i>t</i> handles index <code>2 * stride * t</code>. Now the active threads are the first ones, warps are either fully active or fully idle until fewer than 32 threads remain, and the count falls to 12 warp-steps. <sup class="src"><a href="#F6-14-src-R3">R3</a></sup></p>
+<h3 id="F6-14-l2-v3">v2 → v3: remove bank conflicts</h3>
+<p>v2's index <code>2 * stride * t</code> makes lanes of one warp read words 2, 4, 8, … apart: the bank model of <a href="#F6-11">F6-11</a> gives 2, 4, 8, 8, 8, 4, 2, 1 passes in the eight steps. <b>v3</b> (lines 46–60) reverses the loop: the stride starts at half the block and halves; thread <i>t</i> adds <code>s[t + stride]</code>. Consecutive lanes read consecutive words: 1 pass in every step, still 12 warp-steps. <sup class="src"><a href="#F6-14-src-R3">R3</a></sup> This is "sequential addressing" (Figure 1).</p>
+<h3 id="F6-14-l2-v4">v3 → v4: first add during the load</h3>
+<p>In v3 half the threads are idle from the first step. <b>v4</b> (lines 62–78) lets each thread load <em>two</em> elements and add them before writing to shared memory; each block covers 2 × 256 elements, and half as many blocks are launched. <sup class="src"><a href="#F6-14-src-S1">S1</a></sup></p>
+<h3 id="F6-14-l2-v5">v4 → v5: shuffles</h3>
+<p>The last five steps of v3 and v4 involve at most one warp and still pay a barrier each. <b>v5</b> (lines 104–113) uses <code>warpSum</code> (lines 80–87): five <code>__shfl_down_sync</code> steps reduce a warp's 32 values in registers, with no shared memory and no block barrier. <code>blockSum</code> (lines 89–102) reduces each warp, writes one value per warp to shared memory, one barrier, and lets warp 0 reduce those. <sup class="src"><a href="#F6-14-src-H1">H1</a></sup> The loop counts from <code>warpSize / 2</code>, not 16, so the same source is correct on 64-wide wavefronts (<a href="#F6-15">F6-15</a>), as E3 requires.</p>
+<h3 id="F6-14-l2-v6">v5 → v6: one launch</h3>
+<p><b>v6</b> (lines 115–127) launches a fixed grid (here 8 blocks per SM, line 221, a starting point to tune) and lets each thread accumulate many elements in a grid-stride loop before <code>blockSum</code>; thread 0 of each block then does one <code>atomicAdd</code> on the total (<a href="#F6-13">F6-13</a>). One launch, and almost all of the work is sequential adds in registers. The price: float atomics add the block results in an order that can change between runs.</p>
+<p>The E3 list also mentions "unrolling". In v5/v6 the warp step is already a five-iteration loop; the classic unrolled last-warp trick of the Harris slides relied on implicit warp-synchronous execution, which is no longer safe without <code>__syncwarp</code> (<a href="#F6-15">F6-15</a>). <sup class="src"><a href="#F6-14-src-S1">S1</a></sup> <sup class="src"><a href="#F6-14-src-D1">D1</a></sup></p>
+
+<h2 id="F6-14-layer3">Layer 3 — the engineer's depth</h2>
+<p>In the hall: the row's coins are added in a different order than the cashier would, so a float total can differ in the last coins. The precise version follows.</p>
+<h3 id="F6-14-l3-float">Why float sums need a tolerance</h3>
+<p>Floating-point addition is not associative; different orders give different roundings. Listing 4 sums E3's input, 2^28 floats with values in thousandths from 0 to 0.999, four ways on the CPU, against an exact integer total of 134,083,486.704: <sup class="src"><a href="#F6-14-src-R4">R4</a></sup></p>
+<ul>
+<li>a plain float loop gives 16,777,216.000, a relative error of 0.875: once the running sum reaches 2^24, adding a value below 1 no longer changes it;</li>
+<li>a pairwise (tree) float sum gives 134,083,488.000, relative error 9.666 × 10⁻⁹;</li>
+<li>Kahan's compensated float sum gives the same value;</li>
+<li>a double loop gives 134,083,486.707, relative error 2.395 × 10⁻¹¹.</li>
+</ul>
+<p>So the GPU's tree is <em>more</em> accurate than the naive CPU loop, and comparing against that loop would reject a correct kernel. E3 asks for a Kahan-summed CPU reference and a stated tolerance; Listing 1 computes the reference in double with Kahan's correction (lines 196–209) and the tolerance as (elements per thread + 2 log₂ <i>n</i>) × ε × Σ|<i>x</i>| (lines 222–224), a bound for sums of non-negative data whose derivation is in MA302 (<a href="#F0-75">F0-75</a>). Integer sums must be exact.</p>
+<h3 id="F6-14-l3-cub">Measuring against CUB, honestly</h3>
+<p>Listing 2 calls <code>cub::DeviceReduce::Sum</code> twice, the first time with a null temporary buffer to learn its size, as CUB requires; it times the median of 20 calls. <sup class="src"><a href="#F6-14-src-H2">H2</a></sup> The installed CUB 2.0.1 declares <code>int num_items</code> for <code>Sum</code> (Evidence R6), so this version handles at most 2^31 − 1 items per call. Its documentation states that it "provides 'run-to-run' determinism for pseudo-associative reduction (e.g., addition of floating point types) on the same GPU device", but results "may be inconsistent" between devices of different compute capability. <sup class="src"><a href="#F6-14-src-H2">H2</a></sup> Your v6 with float atomics does not have that property. A reduction reads each byte once, so the achievable rate is bounded by memory bandwidth (<a href="#F6-09">F6-09</a>); both listings print GB/s for that comparison.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>No throughput was measured.</b> The six versions and the CUB reference were built but not run (no GPU). This chapter therefore states no speedup between versions and no percentage of CUB. The ordering "each version is at least as fast as the previous one" is the expectation of S1 and D3 (title only), not an observation; v2 in particular can be slower than v1 on some GPUs because of its bank conflicts. Also an interpretation: the SASS of v5 (R8) shows each shuffle loop as a loop with one <code>SHFL.DOWN</code>, not unrolled, presumably because <code>warpSize</code> is not a compile-time constant; this was not confirmed. Check: run Listings 1 and 2 on your GPU and fill in the table of the lab.</p></div>
+<h3 id="F6-14-l3-x">The target percentage X</h3>
+<p>E3 and exam P require "X % of CUB DeviceReduce throughput", with X set <em>before</em> tuning. This course does not set X: it depends on the GPU and is an owner decision recorded in the course notes. Setting it in advance prevents the common error of declaring whatever you reached a success.</p>
+<h3 id="F6-14-l3-overflow">Large inputs and 32-bit indices</h3>
+<p><code>blockIdx.x * blockDim.x + threadIdx.x</code> has type <code>unsigned int</code> and wraps at 2^32; assigned to an <code>int</code>, it is negative from 2^31. Inputs above 2^31 elements are now ordinary (2 GiB of bytes). v4–v6 compute their index in <code>size_t</code> (line 68). The forensic lab is about a kernel that does not.</p>
+
+<h2 id="F6-14-hardware">How the hardware actually does it</h2>
+<p>The shuffle step is a register-to-register exchange inside the SM; in Evidence R8 it is <code>SHFL.DOWN PT, R9, R0, R7, 0x1f</code> followed by <code>FADD</code>, with no shared-memory instruction and no <code>BAR.SYNC</code> between the steps; one <code>STS</code>, one <code>BAR.SYNC</code> and one <code>LDS</code> connect the two warp-level phases of <code>blockSum</code>. <sup class="src"><a href="#F6-14-src-R8">R8</a></sup> Newer GPUs also have a warp-wide integer reduction instruction (<code>REDUX.SUM</code>, exposed as <code>__reduce_add_sync</code> for compute capability 8.0 in the CUDA 12.0 header <code>crt/sm_80_rt.h</code>); the SASS of <a href="#F6-13">F6-13</a> and <a href="#F6-15">F6-15</a> shows it. <sup class="src"><a href="#F6-14-src-H1">H1</a></sup> It covers integers only; floats still use shuffles.</p>
+
+<h2 id="F6-14-worked">Worked example</h2>
+<p><b>Task.</b> For 2^28 elements and blocks of 256, how many launches does v3 need, and how many does v4? How many elements does each thread of v6 add on a GPU with 100 SMs (an invented number)?</p>
+<ol>
+<li>v3: each launch divides the count by 256 (rounded up): 2^28 → 2^20 → 2^12 → 2^4 → 1: four launches.</li>
+<li>v4: each launch divides by 512: 2^28 → 2^19 → 2^10 → 2 → 1: four launches, the first with half as many blocks.</li>
+<li>v6: grid = 100 × 8 = 800 blocks of 256 = 204,800 threads. 2^28 / 204,800 = 1,310.72, so each thread adds 1,310 or 1,311 elements in its loop.</li>
+<li>Tolerance for v6 (lines 222–224): (1,311 + 2 × 28) × 1.19 × 10⁻⁷ × Σ|<i>x</i>|, with Σ|<i>x</i>| ≈ 1.34 × 10⁸: about 2.2 × 10⁴, a relative tolerance of about 1.6 × 10⁻⁴. The pairwise result of R4 is far inside it.</li>
+</ol>
+
+<h2 id="F6-14-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>reduce.cu</code>: six versions with checks and timing (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-14/reduce.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings reduce.cu -o reduce</code>.</p>
+<pre class="output" data-run="F6-14/reduce"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Built for real; the run stopped at <code>cudaGetDevice</code> (no GPU in the container, R1). On a GPU it prints, per version, the integer sum, whether it is exact, the float sum, whether it is within tolerance, the median time and GB/s; none of these have been observed. What would be needed: an NVIDIA GPU with 2 GiB of free memory, and a rerun; for E3's wave64 criterion, a HIP port run on an AMD GPU.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–27</td><td>v1</td><td>Interleaved, modulo test.</td><td>Divergent warps in every step.</td></tr>
+<tr><td>29–44</td><td>v2</td><td>Consecutive threads, index <code>2·stride·t</code>.</td><td>No divergence; strided shared reads.</td></tr>
+<tr><td>46–60</td><td>v3</td><td>Sequential addressing, stride halves.</td><td>No divergence, no bank conflicts.</td></tr>
+<tr><td>62–78</td><td>v4</td><td>Two loads and an add before the tree; 64-bit index.</td><td>No thread idle in step 1.</td></tr>
+<tr><td>80–102</td><td><code>warpSum</code>, <code>blockSum</code></td><td>Shuffles inside each warp; one barrier between warps.</td><td>No hard-coded 32 in the loop.</td></tr>
+<tr><td>104–127</td><td>v5, v6</td><td>Shuffles; then grid-stride and one atomic per block.</td><td>One launch for the whole sum.</td></tr>
+<tr><td>137–167</td><td><code>runVersion</code></td><td>Repeated launches ping-ponging between two buffers until one value remains.</td><td>Finishes v1–v5 without a grid barrier (<a href="#F6-12">F6-12</a>).</td></tr>
+<tr><td>196–209</td><td>references</td><td>Kahan sum in double for floats; exact sum for ints.</td><td>E3's acceptance references.</td></tr>
+<tr><td>222–224</td><td>tolerance</td><td>A bound from the summation order.</td><td>Stated before the run.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>cub_reduce.cu</code>: the CUB reference (complete program; untested on hardware).</p>
+<pre class="listing" data-src="F6-14/cub_reduce.cu"></pre>
+<p><b>Build command</b>: <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings cub_reduce.cu -o cub_reduce</code>.</p>
+<pre class="output" data-run="F6-14/cub_reduce"></pre>
+<p>Lines 35–36: the size query and the allocation of temporary storage; line 41: a warm-up call; lines 42–48: 20 timed calls; line 52: the median. Untested on hardware (R2); the header excerpt below is what the build actually read.</p>
+<pre class="output" data-run="F6-14/cub_header"></pre>
+
+<p><b>Listing 3</b> — <code>reduce_model.cpp</code>: warp-steps and bank passes of v1–v3 in one block.</p>
+<pre class="listing" data-src="F6-14/reduce_model.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined reduce_model.cpp -o reduce_model</code>.</p>
+<pre class="output" data-run="F6-14/reduce_model"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–22</td><td><code>bankPasses</code></td><td>Distinct words per bank; the worst bank is the number of passes.</td><td>The model of <a href="#F6-11">F6-11</a>.</td></tr>
+<tr><td>40–42</td><td>the three rules</td><td>Who is active and which word it reads, per version.</td><td>Copied from the kernels.</td></tr>
+<tr><td>45–47</td><td>counts</td><td>Active threads, issuing warps, divergent warps.</td><td>Columns of the output.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>sum_check.cpp</code>: the CPU side of E3's acceptance for 2^28 floats.</p>
+<pre class="listing" data-src="F6-14/sum_check.cpp"></pre>
+<p><b>Build command</b>: the same g++ command; it runs for about half a minute under the sanitizers (the lab gives it 60 s).</p>
+<pre class="output" data-run="F6-14/sum_check"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>19–21</td><td>data</td><td>Same values as Listing 1; exact total in thousandths.</td><td>A reference without rounding.</td></tr>
+<tr><td>22–27</td><td>three sums</td><td>Plain float, Kahan float, double.</td><td>Compare orders and precisions.</td></tr>
+<tr><td>28–35</td><td>pairwise</td><td>A streamed tree: merge equal-sized partial sums.</td><td>The order a GPU tree uses, roughly.</td></tr>
+</tbody></table></div>
+<p><b>Compiler evidence.</b> The SASS of <code>reduceV5&lt;float&gt;</code> (<code>sm_80</code>), filtered to shuffles, shared accesses, barriers and float adds:</p>
+<pre class="output" data-run="F6-14/sass_shfl"></pre>
+
+<h2 id="F6-14-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Coins are exact; floats are not.</b> Adding coins in any order gives the same total; adding floats does not (Listing 4). The analogy hides the most important correctness issue of this chapter.</li>
+<li><b>Idle helpers in a busy row still cost.</b> In the hall, an idle helper is free. On the GPU, a warp with one active lane issues the whole instruction; that is why v1 is slow even though it does no more additions than v3.</li>
+<li><b>Passing hand to hand is limited to one row.</b> Shuffles only work inside a warp; across warps the table (shared memory) and a barrier are still needed.</li>
+</ul>
+
+<h2 id="F6-14-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> float sum "wrong" compared with a CPU loop. <b>Cause:</b> the CPU loop is the inaccurate one (R4). <b>Fix:</b> compare with a Kahan or double reference and a stated tolerance.</li>
+<li><b>Symptom:</b> correct for powers of two, wrong otherwise. <b>Cause:</b> threads past the end load garbage, or skip the barrier. <b>Fix:</b> load the identity (0 for sums) past the end; keep all threads in the loop.</li>
+<li><b>Symptom:</b> wrong on AMD, correct on NVIDIA. <b>Cause:</b> a hard-coded 32 (offset 16, mask <code>0xffffffff</code>, lane = <code>tid &amp; 31</code>). <b>Fix:</b> <code>warpSize</code> everywhere (<a href="#F6-15">F6-15</a>).</li>
+<li><b>Symptom:</b> wrong only above 2^31 elements (the forensic lab). <b>Cause:</b> a 32-bit index. <b>Fix:</b> compute indices in <code>size_t</code>.</li>
+<li><b>Symptom:</b> the last-warp unrolled code from an old tutorial gives wrong sums on new GPUs. <b>Cause:</b> it assumes lanes run in lockstep without <code>__syncwarp</code>. <b>Fix:</b> shuffles, or <code>__syncwarp()</code> between steps (<a href="#F6-15">F6-15</a>).</li>
+</ul>
+
+<div class="co transition" id="F6-14-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> MA302 <a href="#F0-75">F0-75</a> (rounding error, Kahan summation), SP203 parallel reductions on the CPU with threads, and <a href="#F6-10">F6-10</a> to <a href="#F6-13">F6-13</a> (shared memory, banks, barriers, atomics). <b>What carries over:</b> associativity decides whether parallel order matters; a tree has log₂ <i>n</i> depth; error bounds depend on the summation order. <sup class="src"><a href="#F6-14-src-D3">D3</a></sup> <b>What changes:</b> the tree must be mapped to warps (divergence), to banks (conflicts) and to blocks (one partial per block, then another launch or an atomic); the GPU's order is fixed by the kernel, not by the programmer's loop. <b>What comes next:</b> <a href="#F6-15">F6-15</a> looks at the warp-level primitives v5 used, and how they differ on 64-wide wavefronts.</p></div>
+
+<h2 id="F6-14-check">Check yourself</h2>
+<ol>
+<li>Name the single change from each version to the next, v1 to v6.</li>
+<li>Why does v2 have bank conflicts that v3 does not, although both have no divergence?</li>
+<li>Why does a plain float loop over 2^28 values of about 0.5 stall at 16,777,216?</li>
+<li>Why does v6 need no second launch, and what does it give up for that?</li>
+<li>Apply: for 2^20 elements and blocks of 512, how many launches does v3 need?</li>
+<li>What must the tolerance of a float sum depend on?</li>
+<li>Predict: in Listing 3, what does v1's first step look like with blocks of 64 threads?</li>
+<li>Explain in your own words why the forensic reduction is correct for every input up to 2^31 bytes and wrong above it.</li>
+</ol>
+
+<h2 id="F6-14-lab">Lab</h2>
+<p><b>Goal.</b> Milestone E3: at least five documented reduction versions, correct by E3's rule, measured against CUB with a target set beforehand.</p>
+<p><b>Hardware and software needed.</b> Steps 1–3: g++ 13.3 and CUDA 12.0 (no GPU). Steps 4–7: an NVIDIA GPU with at least 2 GiB free memory. Step 8: an AMD GPU with ROCm. Folder <code>university/labs/F6-14</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-14</code>. Read <code>reduce_model.out</code> and <code>sum_check.out</code>.</li>
+<li>Before any GPU run, write your target X (percentage of CUB throughput) in your lab notes, with one sentence of reasoning.</li>
+<li>In Listing 3, add v4's rule (same as v3 after the load). Is anything different in the shared-memory phase?</li>
+<li>On a GPU: run Listing 1 and Listing 2; fill in a table: version, change, exact (int), within tolerance (float), median ms, GB/s, % of CUB.</li>
+<li>Vary the grid of v6 (line 221): 1, 2, 4, 8, 16 blocks per SM. Plot GB/s.</li>
+<li>Profile v1, v3 and v5 with Nsight Compute; record the shared-memory bank conflicts and warp-execution efficiency metrics your version offers.</li>
+<li>Run v6 ten times and record the float results. Are they identical? Compare with CUB's statement in R6.</li>
+<li>Port <code>warpSum</code>/<code>blockSum</code> to HIP and run on wave64 (<a href="#F6-15">F6-15</a> has the AMD listing).</li>
+</ol>
+<p><b>Expected observations.</b> Step 3: identical counts to v3. Steps 4–8: your measurements; this build observed none.</p>
+<p><b>Verification.</b> Integer sums exact; float sums within the printed tolerance for every version; the percentage of CUB compared with your X.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Out of memory → Listing 1 allocates about 2 GiB for float and int inputs; reduce <code>n</code> to 2^27 and say so in your table.</li>
+<li>v2 slower than v1 → possible; see the unverified box; check bank conflicts in the profiler.</li>
+<li>Times vary a lot → lock clocks if you are allowed to, or use the median of more runs, and report the spread.</li>
+</ul>
+<p><b>Extension.</b> Add a version that loads <code>float4</code> (vectorised loads, <a href="#F6-08">F6-08</a>) in v6's loop; handle the tail.</p>
+
+<h2 id="F6-14-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "The reduction that is wrong only for large inputs." A service sums byte counts with <code>sumBytes32</code> (forensic file <code>overflow.cu</code>). Unit tests up to 1 GiB pass. A customer with a 3 GiB file reports a total of 2,684,354,560 instead of 3,221,225,472. A 2 GiB file is correct.</p>
+<p><b>Evidence pack.</b> The kernel; its PTX from the special-register read to the first load (R7); the replay of the index arithmetic for six sizes (<code>overflow_emu.cpp</code>, R9). Both are below.</p>
+<pre class="listing" data-src="F6-14/overflow.cu"></pre>
+<pre class="output" data-run="F6-14/ptx_index"></pre>
+<pre class="listing" data-src="F6-14/overflow_emu.cpp"></pre>
+<pre class="output" data-run="F6-14/overflow_emu"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: from which size on is the sum wrong, how much is missing at 3 GiB, and what is the first wrong block?</li>
+<li>Hypotheses: a 32-bit accumulator overflow; a lost update; an index overflow. Which evidence supports or rules out each?</li>
+<li>Root cause: explain, with the PTX, why the first load is skipped and the second is not.</li>
+<li>Fix: give the one-line fix and the PTX instruction that shows it.</li>
+<li>Prevention: which test sizes and which compiler or review habit would have caught it?</li>
+</ol>
+<p><b>Method hints.</b> 2,684,354,560 = 2.5 × 2^30. Divide 2^31 by the elements per block.</p>
+
+<h2 id="F6-14-project">Mini-project</h2>
+<p><b>The reduce module of the primitives library.</b> Package your best version as <code>reduce(in, n, op, identity)</code> for <code>int</code>, <code>unsigned long long</code> and <code>float</code>, with 64-bit sizes, no hard-coded warp size, tests on the E4 sizes plus 2^31 + 1 (bytes), and a row in the comparison table against CUB.</p>
+<p><b>Rubric.</b> Correct on all sizes and types (4). Correct above 2^31 elements (2). Warp-size independent (1). Measured against CUB with the X set beforehand (3).</p>
+
+<h2 id="F6-14-summary">Summary</h2>
+<ul>
+<li>A reduction is a tree: per-block partials, then another launch or an atomic.</li>
+<li>v1 → v2 removes divergence; v2 → v3 removes bank conflicts; v4 adds during the load; v5 uses shuffles; v6 uses a grid-stride loop and one launch.</li>
+<li>Float sums depend on order: a tree is more accurate than a long loop; test against a Kahan reference with a stated tolerance.</li>
+<li>Set the target percentage of CUB before you tune.</li>
+<li>Indices for large inputs must be 64-bit; <code>int i = blockIdx.x * blockDim.x + threadIdx.x</code> fails from 2^31.</li>
+</ul>
+
+<h2 id="F6-14-sources">Sources</h2>
+<ol>
+<li id="F6-14-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): warp shuffle functions, independent thread scheduling, atomic functions. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-14-src-D2">D2 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-14-src-D3">D3 — Hwu, Kirk, El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): the reduction chapter. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-14-src-S1">S1 — Mark Harris, "Optimizing Parallel Reduction in CUDA" (NVIDIA presentation; tier 5): the classic sequence of reduction kernels this chapter's v1–v4 follow. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-14-src-H1">H1 — CUDA 12.0 headers as installed (nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>sm_30_intrinsics.h</code> (<code>__shfl_down_sync</code>), <code>crt/sm_80_rt.h</code> (<code>__reduce_add_sync</code>). Tier 1.</li>
+<li id="F6-14-src-H2">H2 — CUB 2.0.1 headers as installed (libcub-dev 2.0.1-2), read in this build: <code>cub/device/device_reduce.cuh</code> (<code>Sum</code> signature with <code>int num_items</code>; the determinism note, quoted). Tier 1.</li>
+<li id="F6-14-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-14/reduce.log</code>), CUDA 12.0; untested on hardware, exit code 1.</li>
+<li id="F6-14-src-R2">R2 — build and run of Listing 2 (<code>cub_reduce.log</code>); untested on hardware, exit code 1.</li>
+<li id="F6-14-src-R3">R3 — run of Listing 3 (<code>reduce_model.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-14-src-R4">R4 — run of Listing 4 (<code>sum_check.log</code>), g++ 13.3.0, exit code 0.</li>
+<li id="F6-14-src-R6">R6 — CUB header excerpt (<code>cub_header.log</code>).</li>
+<li id="F6-14-src-R7">R7 — PTX of <code>sumBytes32</code> and <code>sumBytes64</code>, <code>sm_80</code> (<code>ptx_index.log</code>), compiled only.</li>
+<li id="F6-14-src-R8">R8 — SASS of <code>reduceV5&lt;float&gt;</code>, <code>sm_80</code> (<code>sass_shfl.log</code>), compiled only.</li>
+<li id="F6-14-src-R9">R9 — run of <code>overflow_emu.cpp</code> (<code>overflow_emu.log</code>), g++ 13.3.0, exit code 0; and the build of <code>overflow.cu</code> (<code>overflow.log</code>), untested on hardware.</li>
+</ol>
+
+<h2 id="F6-14-glossary">Glossary links</h2>
+<p><a href="#gl-reduction">Reduction</a> · <a href="#gl-tree-reduction">Tree reduction</a> · <a href="#gl-warp-shuffle">Warp shuffle</a> · <a href="#gl-grid-stride-loop">Grid-stride loop</a> · <a href="#gl-pairwise-summation">Pairwise summation</a> · <a href="#gl-index-overflow">Index overflow</a> · <a href="#gl-bank-conflict">Bank conflict</a></p>
+
+<h2 id="F6-14-next">Next chapter</h2>
+<p>Next: <a href="#F6-15">F6-15 Warp-level primitives: shuffles and votes</a>. Previous: <a href="#F6-13">F6-13 Atomics</a>. Back to the course: <a href="#CU301">CU301</a>.</p>
+
+<h2 id="F6-14-answers">Answers to Check yourself</h2>
+<ol>
+<li>v2: consecutive threads do the work (no divergence). v3: sequential addressing (no bank conflicts). v4: first add during the load. v5: warp shuffles for the in-warp steps. v6: grid-stride loop and one atomic per block, one launch.</li>
+<li>v2's lanes read words <code>2·stride</code> apart, so several lanes map to the same bank (2 to 8 passes in R3); v3's active lanes read consecutive words.</li>
+<li>From 2^24 = 16,777,216 the spacing of floats is 2; adding about 0.5 rounds back to the same value every time.</li>
+<li>Each block adds its result to the total with an atomic, so no second pass is needed; the order of the float additions then varies between runs, and the result is not bit-reproducible.</li>
+<li>2^20 → 2^11 → 4 → 1: three launches.</li>
+<li>On the number and order of additions (terms added in sequence per thread, tree depth), the unit roundoff ε, and Σ|<i>x</i>|.</li>
+<li>Two warps, both issuing, both divergent (32 active of 64 threads, alternating lanes).</li>
+<li>The element index is computed in 32-bit signed arithmetic. Below 2^31 it fits, so every element is loaded. From block 4,194,304 on the product exceeds the largest <code>int</code>, the index becomes negative, the bounds test (done on the sign-extended 64-bit value) fails, and the first load of each pair is skipped. Small tests never reach that block, so they cannot see the bug.</li>
+</ol>
+<h3 id="F6-14-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Correct up to and including <i>n</i> = 2^31; at 2^31 + 512, 256 bytes are missing; at 3 × 2^30, 536,870,912 (= 2^29) are missing, total 2,684,354,560 as reported. The first wrong block is 4,194,304 = 2^31 / 512 (R9).</p>
+<p><b>Hypotheses.</b> The total is accumulated in <code>unsigned long long</code> with <code>atomicAdd</code>, and per-block sums are at most 512: no accumulator overflow. The kernel uses atomics, so no lost update; and the loss is exactly reproducible. The index overflow matches: everything from element 2^31 on is affected, and exactly half of it is missing.</p>
+<p><b>Root cause.</b> <code>int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x</code>: the PTX computes it with <code>mad.lo.s32</code> and sign-extends it with <code>cvt.s64.s32</code> before the unsigned compare <code>setp.ge.u64</code> (R7). From block 4,194,304 on, <i>i</i> is negative, the extended value is huge, and the first load is skipped. The second index, <code>i + blockDim.x</code>, is computed in <code>unsigned</code> arithmetic (int + unsigned), wraps back to the right value, and still loads. Half of each block's bytes are lost.</p>
+<p><b>Fix.</b> <code>size_t i = static_cast&lt;size_t&gt;(blockIdx.x) * (blockDim.x * 2) + threadIdx.x;</code> (<code>sumBytes64</code>); the PTX shows <code>mul.wide.u32</code>, a 32 × 32 → 64-bit multiply (R7). <b>Prevention:</b> test sizes just below and above 2^31 and 2^32 elements (of bytes, cheap); compile with <code>-Wconversion</code> or a linter for narrowing assignments; a review rule "indices into arrays that can exceed 2^31 elements are 64-bit".</p>
+<p><b>How the evidence was produced:</b> <code>overflow_emu.cpp</code> replays the kernel's arithmetic on the CPU (no data stored); <code>run.sh</code> produced the PTX. The kernel itself was built but not run (no GPU).</p>

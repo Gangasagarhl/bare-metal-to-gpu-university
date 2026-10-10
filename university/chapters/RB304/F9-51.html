@@ -1,0 +1,277 @@
+<!--meta
+id: F9-51
+title: micro-ROS on a microcontroller
+course: RB304
+level: L3–L4
+prereqs: F9-49 (real-time node structure, lock-free ring); OS305 (F3-39 uRTOS, F3-40 RTOS services); HW204 (UART); RB303 (ROS 2 topics, DDS)
+time: 10–14 hours including the lab
+hardware: none in this build: the firmware runs on QEMU's emulated Cortex-M3 board (mps2-an385) with repeatable virtual time, and the IMU is simulated; micro-ROS itself is NOT installed in the build container; the course lab on a real microcontroller with a real IMU and micro-ROS is untested on hardware in this build
+maps: Course RB304 goal "run micro-ROS on a microcontroller with an RTOS"; course lab "micro-ROS publishing IMU data from an MCU" (structure built and run in emulation; micro-ROS part untested); micro-ROS documentation; prepares RB403 (F9-66)
+analogy: F9 — a bicycle as a control loop (registered); the "reflex near the muscle" mapping for a microcontroller node is this chapter's proposal, listed in NOTES.md
+-->
+
+<h2 id="F9-51-hook">Story hook</h2>
+<p>Touch a hot pan and your hand pulls back before you feel the pain. The signal does not travel up to the brain and back: a short circuit in the spinal cord, close to the muscle, reacts first, and tells the brain afterwards. The brain still decides what to do next; it is not part of the fastest loop.</p>
+<p>Robots are built the same way. A small microcontroller next to the motors and sensors runs the fastest, most time-critical loops with an RTOS, and reports to the big Linux computer, which runs ROS 2 and makes the plans. micro-ROS is a way of making that microcontroller a member of the ROS 2 system: its tasks publish and subscribe to topics as if they were ROS 2 nodes, through a small agent on the Linux side. This chapter builds the shape of such a microcontroller node for an IMU, on the course's own RTOS, runs it on an emulated chip, and decodes its data on the host. Then it shows what happens when the node's buffer and publishing rate are chosen without arithmetic: data disappears, quietly, unless you count it.</p>
+
+<h2 id="F9-51-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> why a robot puts its fastest loops on a microcontroller and how micro-ROS connects it to ROS 2 through an agent.</li>
+<li><b>Structure</b> a microcontroller node with RTOS tasks: an on-time sampling task, a publishing task, and a lock-free ring between them, all in static memory.</li>
+<li><b>Frame</b> messages on a serial link with a length, a sequence number and a checksum, and decode them on the host.</li>
+<li><b>Budget</b> ring size, publishing rate and link bandwidth from the sample rate, and detect losses from sequence numbers.</li>
+<li><b>Decide</b> which parts of a design to check against the micro-ROS documentation before building on a real board.</li>
+</ul>
+
+<div class="co jargon" id="F9-51-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>micro-ROS</dt><dd><b>Simple words:</b> a version of ROS 2 small enough for a microcontroller. <b>Analogy:</b> the reflex circuit that also reports to the brain. <b>Precise:</b> a framework that runs a reduced ROS 2 client library on a microcontroller with an RTOS, with static memory and a fixed number of entities, and connects to a ROS 2 system through an agent on a larger computer, over a serial, UDP or similar transport (names and details: unverified box in Layer 2). <sup class="src"><a href="#F9-51-src-D1">D1</a></sup></dd>
+<dt>micro-ROS agent</dt><dd><b>Simple words:</b> a program on the big computer that speaks for the microcontroller in the ROS 2 world. <b>Analogy:</b> an interpreter at the border. <b>Precise:</b> a process on the host that receives the microcontroller's compact protocol messages over the transport and creates and operates the corresponding DDS entities (publishers, subscribers) on the client's behalf, so that other ROS 2 nodes see ordinary topics. Listing 2 plays this role for this chapter's own frame format. <sup class="src"><a href="#F9-51-src-D1">D1</a></sup></dd>
+<dt>Sequence number</dt><dd><b>Simple words:</b> a counter put into every message, so that the receiver can see if one is missing. <b>Analogy:</b> page numbers in a book: a missing page is visible at once. <b>Precise:</b> a monotonically increasing number assigned by the producer to each sample when it is produced (not when it is sent), so that losses anywhere between production and reception show as gaps at the receiver. <sup class="src"><a href="#F9-51-src-D2">D2</a></sup></dd>
+<dt>Frame (serial link)</dt><dd><b>Simple words:</b> one packaged message on a stream of bytes, with a start marker, a length and a check value. <b>Analogy:</b> an envelope with the number of pages written on it and a seal. <b>Precise:</b> a delimited unit on a byte stream: a start byte, a length, a payload and a checksum (here CRC-16 with polynomial 0x1021 and initial value 0xFFFF over length and payload), so that the receiver can find message boundaries and reject corrupted messages. <sup class="src"><a href="#F9-51-src-D3">D3</a></sup></dd>
+<dt>Static allocation</dt><dd><b>Simple words:</b> deciding all memory when the program is built, not while it runs. <b>Analogy:</b> a toolbox with a fixed slot for each tool. <b>Precise:</b> every buffer, stack and object has a size fixed at build time and lives in the image's data or zero-initialised (.bss) sections; nothing is allocated at run time, so memory use is known from the linker output (<a href="#OS305">OS305</a>). <sup class="src"><a href="#F9-51-src-R5">R5</a></sup></dd>
+</dl></div>
+<p>Terms from earlier chapters: <a href="#gl-rtos-real-time-operating-system">RTOS</a>, <a href="#gl-task-rtos-thread">task (RTOS thread)</a>, <a href="#gl-fixed-priority-preemptive-scheduling">fixed-priority preemptive scheduling</a>, <a href="#gl-ring-buffer-spsc">ring buffer (SPSC)</a>, <a href="#gl-semihosting">semihosting</a> (<a href="#OS305">OS305</a>); <a href="#gl-lock-free-ring-buffer">lock-free ring buffer</a> (<a href="#F9-49">F9-49</a>); <a href="#gl-hardware-interface">hardware interface</a> (<a href="#F9-50">F9-50</a>).</p>
+
+<h2 id="F9-51-pictures">The idea in pictures</h2>
+<figure id="F9-51-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 290" role="img" aria-labelledby="F9-51-f1t F9-51-f1d">
+<title id="F9-51-f1t">Figure 1: a microcontroller node and its host, this chapter's version and the micro-ROS version</title>
+<desc id="F9-51-f1d">Left, the microcontroller running uRTOS: an IMU task at priority 3 every 2 ticks reads the sensor and pushes samples into a 16-slot ring; a publisher task at priority 2 every 10 ticks pops all samples and sends frames over the UART. Middle: the serial link. Right, the Linux host: an agent program decodes frames, checks CRC and sequence numbers, and in the micro-ROS version would create a ROS 2 publisher so other nodes see an IMU topic. Labels show which parts were built and run in this chapter (firmware on QEMU, host decoder) and which are untested (micro-ROS client library, micro-ROS agent, ROS 2 topic).</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="290"/>
+<rect class="sv-b6" x="16" y="20" width="330" height="200" rx="8"/>
+<text class="sv-tb" x="28" y="42">microcontroller (uRTOS, static memory)</text>
+<rect class="sv-b1" x="28" y="58" width="130" height="58" rx="5"/><text class="sv-t" x="38" y="78">IMU task</text><text class="sv-ts" x="38" y="96">prio 3, every 2 ticks</text><text class="sv-ts" x="38" y="110">never waits</text>
+<rect class="sv-b8" x="178" y="62" width="70" height="50" rx="25"/><text class="sv-ts" x="196" y="84">ring</text><text class="sv-ts" x="188" y="100">16 slots</text>
+<line class="sv-line" x1="158" y1="87" x2="170" y2="87"/><polygon class="sv-head" points="178,87 168,82 168,92"/>
+<rect class="sv-b3" x="28" y="136" width="220" height="58" rx="5"/><text class="sv-t" x="38" y="156">publisher task</text><text class="sv-ts" x="38" y="174">prio 2, every 10 ticks: pop all,</text><text class="sv-ts" x="38" y="188">frame (seq, CRC), send</text>
+<line class="sv-line" x1="213" y1="112" x2="213" y2="128"/><polygon class="sv-head" points="213,136 208,126 218,126"/>
+<rect class="sv-b4" x="262" y="136" width="70" height="58" rx="5"/><text class="sv-t" x="272" y="168">UART</text>
+<line class="sv-line" x1="248" y1="165" x2="256" y2="165"/><polygon class="sv-head" points="262,165 254,160 254,170"/>
+<line class="sv-line2" x1="332" y1="165" x2="452" y2="165"/><polygon class="sv-head" points="460,165 450,160 450,170"/>
+<text class="sv-ts" x="352" y="155">serial link</text>
+<rect class="sv-b7" x="460" y="20" width="284" height="200" rx="8"/>
+<text class="sv-tb" x="472" y="42">Linux host</text>
+<rect class="sv-b2" x="472" y="136" width="260" height="58" rx="5"/><text class="sv-t" x="482" y="156">agent (Listing 2)</text><text class="sv-ts" x="482" y="174">find frames, check CRC,</text><text class="sv-ts" x="482" y="188">check sequence, decode</text>
+<rect class="sv-b5" x="472" y="58" width="260" height="58" rx="5"/><text class="sv-t" x="482" y="78">ROS 2 topic (micro-ROS agent)</text><text class="sv-ts" x="482" y="96">other nodes subscribe</text><text class="sv-ts" x="482" y="110">untested in this build</text>
+<line class="sv-dash" x1="602" y1="136" x2="602" y2="124"/><polygon class="sv-head" points="602,116 597,126 607,126"/>
+<text class="sv-ts" x="16" y="246">built and run here: firmware on QEMU mps2-an385 (virtual time), host decoder with sanitizers.</text>
+<text class="sv-ts" x="16" y="264">not run here: the micro-ROS client library on the board, the micro-ROS agent, the ROS 2 topic.</text>
+</svg></div><figcaption><b>Figure 1.</b> The structure of this chapter's IMU node (Listings 1 and 2), and where micro-ROS would replace the course's own frame format (unverified box in Layer 2). <sup class="src"><a href="#F9-51-src-D1">D1</a></sup> <sup class="src"><a href="#F9-51-src-R1">R1</a></sup></figcaption></figure>
+
+<figure id="F9-51-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 220" role="img" aria-labelledby="F9-51-f2t F9-51-f2d">
+<title id="F9-51-f2t">Figure 2: the uframe layout</title>
+<desc id="F9-51-f2d">A row of boxes for the 23 bytes of a frame: start byte 0x7E; length 19; topic 1; sequence number 2 bytes; tick 4 bytes; accelerometer x, y, z 2 bytes each; gyroscope x, y, z 2 bytes each; CRC-16 2 bytes. A bracket shows that the CRC covers the length and the 19-byte payload. Multi-byte fields are little-endian. Below, the first frame of the run as hex: 7e 13 01 0000 00000000 0000 0000 e803 0000 0000 18fc 090f.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="220"/>
+<rect class="sv-b4" x="20" y="40" width="50" height="40"/><text class="sv-ts" x="26" y="64">0x7E</text>
+<rect class="sv-b8" x="70" y="40" width="40" height="40"/><text class="sv-ts" x="76" y="64">len</text>
+<rect class="sv-b8" x="110" y="40" width="50" height="40"/><text class="sv-ts" x="114" y="64">topic</text>
+<rect class="sv-b1" x="160" y="40" width="70" height="40"/><text class="sv-ts" x="168" y="64">seq (2)</text>
+<rect class="sv-b3" x="230" y="40" width="100" height="40"/><text class="sv-ts" x="240" y="64">tick (4)</text>
+<rect class="sv-b2" x="330" y="40" width="160" height="40"/><text class="sv-ts" x="340" y="64">accel x,y,z (2 each)</text>
+<rect class="sv-b6" x="490" y="40" width="160" height="40"/><text class="sv-ts" x="500" y="64">gyro x,y,z (2 each)</text>
+<rect class="sv-b5" x="650" y="40" width="80" height="40"/><text class="sv-ts" x="660" y="64">CRC-16</text>
+<line class="sv-line2" x1="70" y1="92" x2="650" y2="92"/><text class="sv-ts" x="250" y="108">CRC covers length + 19-byte payload; little-endian fields</text>
+<text class="sv-ts" x="20" y="30">23 bytes = 1 start + 1 length + 19 payload + 2 check (this course's own format, not a micro-ROS format)</text>
+<text class="sv-tm" x="20" y="150">7e 13 01 0000 00000000 0000 0000 e803 0000 0000 18fc 090f</text>
+<text class="sv-ts" x="20" y="172">first frame of firmware.out: seq 0, tick 0, accel z = 0x03e8 = 1000 mg, gyro z = 0xfc18 = −1000 (0.01 °/s)</text>
+<text class="sv-ts" x="20" y="194">sent as hexadecimal text so that the logs are readable: 46 characters + "F " + newline per frame</text>
+</svg></div><figcaption><b>Figure 2.</b> The frame format of Listing 1, with the first frame from the run decoded by hand. <sup class="src"><a href="#F9-51-src-R1">R1</a></sup></figcaption></figure>
+
+<h2 id="F9-51-layer1">Layer 1 — the kid explanation</h2>
+<p>A robot has a big brain (a computer running ROS 2) and small helpers (little chips next to the motors and sensors). The small helpers are fast and never get distracted, so they do the jobs that must happen exactly on time, like reading the tilt sensor many times a second.</p>
+<p>The helper writes each reading on a numbered card and puts the card in a small box. Every now and then it sends all the cards in the box down a wire to the big brain. The big brain checks the numbers on the cards: if card 12 comes right after card 4, it knows cards 5 to 11 got lost. If the box is too small for the number of cards between two sendings, cards get lost, and the numbers are how you find out.</p>
+
+<h2 id="F9-51-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F9-51-l2-why">Why a microcontroller, and why micro-ROS</h3>
+<p>F9-47 to F9-50 made Linux behave well enough for a 1 kHz loop with care, and the build container still missed the jitter requirement. A microcontroller with an RTOS has a small, analysable timing: a few tasks, fixed priorities, interrupt latency in the order of microseconds, no virtual memory, no page faults (<a href="#OS305">OS305</a>, <a href="#F3-39">F3-39</a>). So the fastest, hardest loops (motor current, IMU sampling, emergency stop) go there, and Linux receives their results. <sup class="src"><a href="#F9-51-src-D1">D1</a></sup> micro-ROS lets the microcontroller's tasks take part in ROS 2 directly: the board publishes and subscribes to topics through a client library, and an agent on the host bridges to DDS. <sup class="src"><a href="#F9-51-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>micro-ROS facts from the author's memory, none built or run in this build (micro-ROS is not installed in the build container): that micro-ROS uses the rcl layer of ROS 2 plus a C convenience library <code>rclc</code> (with its own executor, <code>rclc_executor</code>) on the microcontroller; that the client talks to the agent with the DDS-XRCE protocol (an OMG standard for resource-constrained devices) as implemented by Micro XRCE-DDS; that the agent is started on the host with a transport argument such as <code>serial</code> or <code>udp4</code>; that supported RTOSes include FreeRTOS, Zephyr and NuttX; that the maximum numbers of nodes, publishers, subscriptions and buffer sizes are fixed at build time in the middleware's configuration; that publishers may use reliable or best-effort streams; and the memory figures quoted for typical boards. Check the micro-ROS documentation (architecture, supported hardware, tutorials for your RTOS and board) and the OMG DDS-XRCE specification. This chapter's Listings show the structure with the course's own RTOS and frame format instead.</p></div>
+
+<h3 id="F9-51-l2-node">The node, on uRTOS</h3>
+<p>Listing 1 is the firmware: the course's teaching RTOS uRTOS (copied unchanged from <a href="#F3-39">F3-39</a>) with two tasks and a static ring:</p>
+<ul>
+<li>The <b>IMU task</b> (priority 3) reads the simulated IMU every 2 ticks, gives each sample a sequence number, and pushes it into the ring. If the ring is full, it counts a drop and goes on; it never waits.</li>
+<li>The <b>publisher task</b> (priority 2) wakes every 10 ticks, pops every sample in the ring, and sends each as a frame (Figure 2) over the UART as hexadecimal text.</li>
+<li>The ring has 16 slots in static memory and uses the same release/acquire protocol as F9-49's (here with the compiler's atomic built-ins, because the freestanding build has no C++ library).</li>
+</ul>
+<p>Built with clang for an Armv7-M target and run in QEMU's emulation of the mps2-an385 board with repeatable virtual time (F3-39's set-up): <sup class="src"><a href="#F9-51-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F9-51/firmware"></pre>
+<p>61 samples produced (ticks 0 to 120), 61 published, 0 dropped; the ring never held more than 5 samples (one publishing period's worth). The header line checks the CRC routine with the standard check string "123456789": 0x29B1. <sup class="src"><a href="#F9-51-src-R1">R1</a></sup> A second run printed identical output, 64 lines: with virtual time, the firmware's behaviour repeats exactly. <sup class="src"><a href="#F9-51-src-R3">R3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That 0x29B1 is the published check value of the CRC-16 variant with polynomial 0x1021, initial value 0xFFFF, no reflection and no final XOR (often called CRC-16/CCITT-FALSE or CRC-16/IBM-3740) is from the author's memory; the firmware and the host compute the same value, which proves they agree with each other, not with the standard. Check a CRC catalogue before using this frame format with other software.</p></div>
+
+<h3 id="F9-51-l2-agent">The host side</h3>
+<p>Listing 2 reads the firmware's output, finds frames, checks length and CRC, decodes the sample, and checks sequence numbers and the tick spacing. It plays the role a micro-ROS agent plays (receive, check, hand on), without creating a ROS 2 topic. Result: <sup class="src"><a href="#F9-51-src-R2">R2</a></sup></p>
+<pre class="output" data-run="F9-51/agent"></pre>
+<p>61 frames, none bad, no gaps, every received sample exactly 2 ticks after the previous one. The gyroscope's z value is the simulated triangle wave (−1,000, −900, −800 …), the accelerometer shows 1,000 mg on z: a level, slowly turning board.</p>
+
+<h3 id="F9-51-l2-budget">The arithmetic that keeps data</h3>
+<p>Three numbers must agree. With samples every <i>s</i> ticks and publishing every <i>P</i> ticks, the ring receives <i>P</i>/<i>s</i> samples between two publisher runs, plus whatever accumulates while the publisher is late. A ring of <i>N</i> slots of this design holds <i>N</i> − 1. Here: 10 / 2 = 5 per period, 15 usable slots: margin for a publisher up to 20 ticks late. Third, the link: each frame is 49 characters as text (46 hexadecimal digits, "F ", newline); on a real UART at 115,200 baud with 10 bits per character, that is about 4.3 ms per frame, so at most about 235 samples per second. Hexadecimal text doubles the size; a binary frame (23 bytes) would allow about 500. The micro-ROS protocol has its own overhead per message; check it for your configuration.</p>
+
+<h2 id="F9-51-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F9-51-l3-prio">Priorities on the microcontroller</h3>
+<p>The sampling task has the higher priority because its timing matters (sample spacing is part of the data's meaning: an IMU integrated with irregular spacing drifts); the publisher's timing only needs to keep the ring from filling. This is rate-monotonic in spirit (<a href="#F9-46">F9-46</a>): the shorter period gets the higher priority. The UART output in Listing 1 waits while the transmit buffer is full (busy-waiting in <code>board::putChar</code>); that is acceptable only because the publisher has the lower priority, so the IMU task preempts it. On a real board, the UART would be driven by an interrupt or DMA, and the publisher would block on a semaphore instead of spinning (<a href="#F3-40">F3-40</a>).</p>
+
+<h3 id="F9-51-l3-time">Time across two computers</h3>
+<p>The tick in each frame is the microcontroller's own clock. The host has a different clock. ROS 2 messages carry timestamps; to give an IMU message a host timestamp, the agent can stamp it on arrival (adding the link's variable delay) or the two clocks can be related by a synchronisation protocol (micro-ROS offers a time synchronisation with the agent; unverified). For the course robot, record both: the microcontroller tick for spacing, the host time for fusion with other sensors (<a href="#RB401">RB401</a> uses them).</p>
+
+<h3 id="F9-51-l3-memory">Memory and size</h3>
+<p>The image is small: <sup class="src"><a href="#F9-51-src-R5">R5</a></sup></p>
+<pre class="output" data-run="F9-51/size"></pre>
+<p>2,816 bytes of code; 5,380 bytes of zero-initialised data, of which 2 × 256 words = 2,048 bytes are the two task stacks and 16 × 20 = 320 bytes the ring (a sample is 20 bytes with padding; F3-39's kernel and logs take most of the rest). All of it is known at link time. A micro-ROS client is larger (its middleware buffers, the entity tables); its documentation gives typical figures per board, which this build could not check.</p>
+
+<h3 id="F9-51-l3-reliable">Losing data on purpose</h3>
+<p>Sensor streams are usually sent best-effort: a lost IMU sample is less harmful than a stalled stream waiting for a retransmission, and the next sample comes in 2 ticks. Commands to the board (a target velocity, an emergency stop) are different: they need to arrive or the board must notice they did not (a command timeout that stops the motors). Whatever the transport promises, sequence numbers and timeouts in your own data make losses visible end to end, including the losses inside the board that no transport can see: the forensic lab.</p>
+
+<h2 id="F9-51-hardware">How the hardware actually does it</h2>
+<p>On the emulated board, the UART is the CMSDK APB UART model at address 0x40004000 (<a href="#OS305">OS305</a>'s board support); writing a byte to its data register sends it, and QEMU forwards it to its standard output, which the lab saves. On a real microcontroller, the UART shifts each byte out bit by bit at the configured baud rate, with a start and a stop bit; a USB-to-serial adapter or a USB device class on the microcontroller itself (<a href="#HW205">HW205</a>) carries it to the host. The IMU on a real board sits on an I2C or SPI bus (<a href="#HW204">HW204</a>); the sampling task would start a bus transfer (ideally with DMA), and the sample would be ready a few hundred microseconds later, a delay the sampling task must not wait for while holding up other work. Ticks in this build are virtual: QEMU's <code>-icount shift=0</code> advances virtual time one nanosecond per instruction (F3-39's unverified box), so the 25,000-clock tick is not the timing of any real chip. <sup class="src"><a href="#F9-51-src-R1">R1</a></sup></p>
+
+<h2 id="F9-51-worked">Worked example</h2>
+<p><b>Task.</b> A design review proposes: IMU at 1 kHz, publishing at 50 Hz to save processor time, ring of 16 slots, binary frames of 23 bytes on a 115,200-baud UART. Check it.</p>
+<ol>
+<li>Samples per publishing period: 1,000 / 50 = 20. Usable slots: 15. <b>Fails</b>: at least 5 samples lost every period, 250 per second, even with a perfectly punctual publisher.</li>
+<li>Fix A: ring of 32 (31 usable; 11 slots of margin, 11 ms of publisher lateness). Fix B: publish at 100 Hz (10 per period; 5 slots of margin).</li>
+<li>Link: 1,000 frames/s × 23 bytes × 10 bits = 230,000 bit/s, twice the link's 115,200. <b>Fails</b> regardless of the ring. Options: a faster link (a higher baud rate the hardware supports, or USB), fewer samples (average on the board and send 250 Hz), or smaller frames (several samples per frame sharing one header and checksum).</li>
+<li>Lesson: three budgets (ring, publisher rate, link), each checked with a line of arithmetic before any code.</li>
+</ol>
+
+<h2 id="F9-51-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>imu_node.cc</code>, the firmware (with <code>board.h</code>, <code>startup.cc</code>, <code>urtos.h</code>, <code>urtos.cc</code> and <code>os305.ld</code> copied unchanged from F3-39).</p>
+<pre class="listing" data-src="F9-51/imu_node.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–18</td><td><code>RING_SIZE</code>, <code>PUB_PERIOD</code></td><td>Build-time parameters with defaults 16 and 10.</td><td>The forensic variant changes only these.</td></tr>
+<tr><td>35–38</td><td>ring and counters</td><td>Static array, head, tail, and the counts reported at the end.</td><td>Static allocation; drops are counted.</td></tr>
+<tr><td>40–59</td><td><code>ringPush</code>, <code>ringPop</code></td><td>SPSC ring with release/acquire atomics; push fails when full.</td><td>The IMU task never waits.</td></tr>
+<tr><td>62–67</td><td><code>readImu</code></td><td>Simulated sensor: triangle wave on gyro z.</td><td>Deterministic data that is easy to check.</td></tr>
+<tr><td>70–81</td><td><code>crc16</code></td><td>Bitwise CRC-16, polynomial 0x1021, initial 0xFFFF.</td><td>Detects corrupted frames.</td></tr>
+<tr><td>86–104</td><td><code>sendFrame</code></td><td>Builds the 23-byte frame and prints it as hexadecimal text.</td><td>Figure 2 in code.</td></tr>
+<tr><td>107–118</td><td><code>imuTask</code></td><td>Sample, number, push, sleep until the next absolute tick.</td><td>Sequence numbers are given at production.</td></tr>
+<tr><td>120–132</td><td><code>publishTask</code></td><td>Drain the ring, send, sleep until the next publishing tick.</td><td>Its period and the ring size must agree.</td></tr>
+<tr><td>136–146</td><td><code>report</code></td><td>Prints the counts and ends the emulation.</td><td>The firmware reports its own losses.</td></tr>
+<tr><td>150–159</td><td><code>main</code></td><td>UART, CRC self-check, two tasks, start.</td><td>Priorities 3 and 2: sampling first.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>agent.cc</code>, the host decoder (built with sanitizers).</p>
+<pre class="listing" data-src="F9-51/agent.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>14–25</td><td><code>crc16</code></td><td>Same algorithm as the firmware.</td><td>Both ends must agree exactly.</td></tr>
+<tr><td>40–52</td><td>framing</td><td>Passes non-frame lines through; rejects wrong length, start byte or CRC.</td><td>Bad frames are counted, not decoded.</td></tr>
+<tr><td>54–61</td><td>decode</td><td>Sequence, tick and six signed values, little-endian.</td><td>Figure 2 in reverse.</td></tr>
+<tr><td>62–73</td><td>gap and spacing checks</td><td>Counts gaps and missing samples; minimum and maximum tick spacing.</td><td>Losses become visible at the receiver.</td></tr>
+</tbody></table></div>
+<p>The lab script (build, emulation, decoding, repeat check, forensic variant, size):</p>
+<pre class="listing" data-src="F9-51/run.sh"></pre>
+
+<h2 id="F9-51-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A reflex acts without the brain; this chapter's node only reports.</b> A real board that controls motors must also act on its own when the host is silent: a command timeout that stops the motors is the reflex that matters.</li>
+<li><b>Nerves do not lose signals in a queue; a microcontroller node can</b>, if the arithmetic of Layer 2 is wrong.</li>
+<li><b>The spinal cord and the brain share one body clock; the microcontroller and the host have separate clocks</b> that must be related explicitly.</li>
+</ul>
+
+<h2 id="F9-51-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> periodic gaps in the received sequence. <b>Cause:</b> the ring is too small for the publishing period, or the publisher is starved. <b>Check:</b> the board's drop counter and maximum fill. <b>Fix:</b> Layer 2's arithmetic.</li>
+<li><b>Symptom:</b> gaps without drops on the board. <b>Cause:</b> loss on the link (corrupted frames rejected by CRC, or a host that reads too slowly). <b>Check:</b> the host's bad-frame counter and its input buffer.</li>
+<li><b>Symptom:</b> irregular sample spacing. <b>Cause:</b> the sampling task waits (on the bus, on the UART, on a lock) or has a lower priority than slow work. <b>Fix:</b> sampling never waits; highest priority among the data tasks.</li>
+<li><b>Symptom:</b> the board resets after a while. <b>Cause:</b> a task stack too small (the frame building uses stack). <b>Check:</b> stack painting and high-water marks (F3-39's techniques).</li>
+<li><b>Symptom:</b> micro-ROS client cannot create a publisher. <b>Cause</b> (from memory, unverified): the build-time limit on entities is too small. <b>Check:</b> the micro-ROS configuration documentation.</li>
+</ul>
+
+<div class="co transition" id="F9-51-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F3-39">F3-39</a> built uRTOS with fixed-priority preemptive scheduling; <a href="#F9-49">F9-49</a> separated a real-time path from slow work with a lock-free ring; <a href="#F9-50">F9-50</a> put the control loop behind hardware interfaces. <b>What carries over:</b> priorities by urgency, never waiting on the real-time path, static memory, a counted drop instead of a block, and arithmetic before code. <b>What changes:</b> the system now spans two computers with separate clocks joined by a link of limited bandwidth, and data loss can happen in three places (the board's ring, the link, the host). <b>What comes next:</b> this course ends here. <a href="#RB401">RB401</a> uses timestamped sensor data for mapping and localisation, and <a href="#RB403">RB403</a> (<a href="#F9-66">F9-66</a>, <a href="#F9-67">F9-67</a>) decides for the course robot which loops run on the microcontroller and which on Linux, and builds the operating system image that meets the jitter requirement for real.</p></div>
+
+<h2 id="F9-51-check">Check yourself</h2>
+<ol>
+<li>Give three reasons for putting IMU sampling on a microcontroller rather than on the Linux computer.</li>
+<li>What does the micro-ROS agent do, and why does the microcontroller need one?</li>
+<li>Why is the sequence number assigned when the sample is produced, not when it is sent?</li>
+<li>Explain "max fill 5" in the normal run from the task periods.</li>
+<li>Apply to a new case: a wheel-encoder board samples at 2 kHz and publishes at 200 Hz over a 1 Mbit/s link with 23-byte binary frames. Check ring (16 slots) and link.</li>
+<li>Why is the sampling task's priority higher than the publisher's? What would change if they were swapped?</li>
+<li>What does "the firmware and the host compute the same CRC" prove, and what does it not?</li>
+<li>Predict, then run: build with <code>-DRING_SIZE=8 -DPUB_PERIOD=20</code>. How many samples per publishing period are dropped, and how many in total by tick 120?</li>
+</ol>
+
+<h2 id="F9-51-lab">Lab</h2>
+<p><b>Goal.</b> Run an IMU node on an emulated microcontroller with an RTOS, decode its data on the host, and (on real hardware) publish it to ROS 2 with micro-ROS.</p>
+<p><b>Hardware and software needed.</b> Steps 1–3: clang/lld 18, QEMU 8.2 with the mps2-an385 board, g++ (versions as in the logs); run <code>university/labs/run_lab.sh university/labs/F9-51</code>. Step 4: a microcontroller board supported by micro-ROS, an IMU breakout on I2C or SPI, a USB-to-serial link, ROS 2 and the micro-ROS tools; <b>untested on hardware in this build</b>.</p>
+<div class="co safety"><span class="lbl">Safety</span><p>Use the board's documented supply voltage for the IMU and the logic levels of both devices; a 5 V signal on a 3.3 V input can destroy a chip. Unplug before rewiring. Flashing a board can make it unresponsive until recovered through its debug port: know the recovery path first. See the course <a href="#safety">safety rules</a>.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Check <code>agent.out</code> (61 frames, 0 gaps), <code>repeat.out</code> (identical), <code>size.out</code>.</li>
+<li>Decode the first frame by hand with Figure 2 and compare with the agent's line.</li>
+<li>Do Check yourself 8 and the worked example's fixes as builds with <code>-D</code> options.</li>
+<li>(Real hardware, untested in this build) Port the structure to your board with micro-ROS: a sampling task at the highest data priority, a ring, a publishing task that publishes an IMU message through the micro-ROS client library instead of <code>sendFrame</code>; start the micro-ROS agent on the host over serial; check the topic's rate with ROS 2's command-line tools; add your own sequence number field or use the message header to detect gaps. Follow the micro-ROS tutorial for your board and RTOS for every name.</li>
+</ol>
+<p><b>Expected observations.</b> In emulation: as above. <sup class="src"><a href="#F9-51-src-R1">R1</a></sup> <sup class="src"><a href="#F9-51-src-R2">R2</a></sup> On hardware: a topic at the publishing rate with all samples; gaps if Layer 2's arithmetic is violated. No hardware numbers are given because none were measured in this build.</p>
+<p><b>Verification.</b> <code>run.sh</code> fails unless the normal run has "sequence gaps 0", the second run is identical and the forensic run shows a GAP line.</p>
+<p><b>Troubleshooting.</b> No output from QEMU → check the board name and that the image was linked with <code>os305.ld</code>. "bad frames" on real hardware → baud rate mismatch or noise; check both ends' settings.</p>
+<p><b>Extension.</b> Add a command path: the host sends a frame with a new sampling period; the board applies it at the next tick and acknowledges with a sequence number. Add a timeout on the board that falls back to a safe default when no host frame arrives for 1 s.</p>
+
+<h2 id="F9-51-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A team's balancing robot "loses its balance estimate every few hundred milliseconds" after a firmware change "to reduce CPU load": the publishing task now runs half as often, and the ring was shrunk "because the samples are sent faster anyway". The host's fusion code integrates the gyroscope using the number of received samples times the nominal sample spacing.</p>
+<p><b>Evidence pack.</b> The new firmware's data, decoded by the host program, and the firmware's own end-of-run report: <sup class="src"><a href="#F9-51-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F9-51/forensic_agent"></pre>
+<pre class="output" data-run="F9-51/forensic_report"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: how many samples were produced, published and dropped? What pattern do the gaps have?</li>
+<li>Hypotheses: (a) the link corrupts frames; (b) the board drops samples; (c) the IMU task misses its periods. Which counters decide between them?</li>
+<li>Root cause: compute the expected loss per publishing period from the two changed parameters.</li>
+<li>Explain why the balance estimate fails, given how the host integrates.</li>
+<li>Fix and prevention.</li>
+</ol>
+<p><b>Method hints.</b> Samples per period = publishing period / sampling period. Usable slots = ring size − 1.</p>
+
+<h2 id="F9-51-project">Mini-project</h2>
+<p><b>A two-way link with health reporting.</b> Extend Listings 1 and 2 into a link that carries IMU samples up and velocity commands down, with sequence numbers both ways, a command timeout on the board (motors to zero), and a health frame once per 100 ticks with the board's drop counter, maximum ring fill, bad frames received and the stack high-water marks. Test it in emulation, with deliberate faults injected (a corrupted byte, a stalled host).</p>
+<p><b>Rubric.</b> Both directions framed and checked (2). Command timeout tested (2). Health counters correct against injected faults (3). Ring and link budgets written down and checked (2). Clean builds, sanitizers on the host side (1).</p>
+
+<h2 id="F9-51-summary">Summary</h2>
+<ul>
+<li>Fast, hard loops go to a microcontroller with an RTOS; micro-ROS connects it to ROS 2 through an agent on the host (details unverified in this build).</li>
+<li>The node's shape: a high-priority sampling task that never waits, a static ring, a lower-priority publisher, framed and checksummed messages with sequence numbers.</li>
+<li>In emulation: 61 samples produced and received, 0 gaps, identical on a second run; 2,816 bytes of code.</li>
+<li>Budget the ring (samples per publishing period against usable slots), the publisher and the link before writing code.</li>
+<li>With a 4-slot ring and a 20-tick publisher, 42 of 61 samples were dropped on the board; the host saw 5 gaps; only counters made it visible.</li>
+</ul>
+
+<h2 id="F9-51-sources">Sources</h2>
+<ol>
+<li id="F9-51-src-D1">micro-ROS documentation (architecture, supported hardware and RTOSes, tutorials) (tier 2; listed in the guide's source registry for RB304). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F9-51-src-D2">OMG DDS-XRCE specification (DDS for eXtremely Resource Constrained Environments) (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F9-51-src-D3">A catalogue of parametrised CRC algorithms (for the CRC-16 variant and its check value) (tier 3). <i>Not opened during this build (dossier gate G1 open); see the unverified box.</i></li>
+<li id="F9-51-src-R1">R1 — <code>firmware.log</code>: clang 18.1.3, LLD 18.1.3, QEMU 8.2.2 mps2-an385 with <code>-icount shift=0,sleep=off</code>; exit code 0; untested on hardware.</li>
+<li id="F9-51-src-R2">R2 — <code>agent.log</code>: g++ 13.3.0 with address and undefined-behaviour sanitizers, fed with <code>firmware.out</code>; exit code 0.</li>
+<li id="F9-51-src-R3">R3 — <code>repeat.log</code>: second emulation run compared byte for byte with the first.</li>
+<li id="F9-51-src-R4">R4 — <code>forensic_agent.log</code> and <code>forensic_report.log</code>: the same source built with <code>-DRING_SIZE=4 -DPUB_PERIOD=20</code>, run in QEMU, decoded by Listing 2; exit code 0; untested on hardware.</li>
+<li id="F9-51-src-R5">R5 — <code>size.log</code>: <code>llvm-size -A</code> on the normal image.</li>
+</ol>
+
+<h2 id="F9-51-glossary">Glossary links</h2>
+<p><a href="#gl-micro-ros">micro-ROS</a> · <a href="#gl-micro-ros-agent">micro-ROS agent</a> · <a href="#gl-sequence-number">Sequence number</a> · <a href="#gl-frame-serial-link">Frame (serial link)</a> · <a href="#gl-static-allocation">Static allocation</a> · <a href="#gl-ring-buffer-spsc">Ring buffer (SPSC)</a> · <a href="#gl-rtos-real-time-operating-system">RTOS</a></p>
+
+<h2 id="F9-51-next">Next chapter</h2>
+<p>This is the last chapter of <a href="#RB304">RB304</a>. Previous: <a href="#F9-50">F9-50 ros2_control</a>. Later: <a href="#RB401">RB401</a> (mapping, SLAM and planning) and <a href="#RB403">RB403</a> (<a href="#F9-66">F9-66</a>). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackH">Track H</a>.</p>
+
+<h2 id="F9-51-answers">Answers to Check yourself</h2>
+<ol>
+<li>Small, analysable timing (few tasks, fixed priorities, microsecond interrupt latency); no virtual memory, page faults or general-purpose kernel work in the way; close to the sensor's bus, so sampling is not delayed by the host's load (and the host's failure does not stop it).</li>
+<li>It receives the microcontroller's compact protocol over the transport and creates and runs the corresponding DDS entities on the host, so the board's publishers appear as ordinary ROS 2 topics; the microcontroller cannot run a full DDS implementation itself.</li>
+<li>So that a sample lost anywhere after production (in the ring, on the link, on the host) leaves a gap; numbering at sending would hide the board's own drops.</li>
+<li>The IMU task pushes a sample every 2 ticks; the publisher empties the ring every 10 ticks: up to 10 / 2 = 5 samples accumulate.</li>
+<li>Ring: 2,000 / 200 = 10 per period against 15 usable slots: OK with 5 slots of margin (2.5 ms of publisher lateness). Link: 2,000 × 23 × 10 = 460,000 bit/s against 1,000,000: OK, 46 % used (check the real overhead of your transport).</li>
+<li>The sampling task's timing is part of the data; the publisher only needs to keep the ring from overflowing. Swapped, a slow UART output in the publisher would delay sampling, making the sample spacing irregular.</li>
+<li>That both ends implement the same algorithm with the same parameters; not that it is the standard variant other tools expect (the unverified box).</li>
+<li>10 samples per 20-tick period against 7 usable slots: 3 dropped per period. The publisher drains the ring at tick 0 (after the first sample) and then every 20 ticks up to tick 120: 6 full periods, so 6 × 3 = 18 drops. The same reasoning gives 6 × 7 = 42 for the forensic build, which matches its report; run your build to confirm 18.</li>
+</ol>
+<h3 id="F9-51-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Produced 61, published 19, dropped 42; the ring had 4 slots and a maximum fill of 3. The host saw 19 frames, 0 bad, 5 gaps, 35 samples missing; every gap shown is 7 samples (seq 3 → 11, 13 → 21, 23 → 31), and the spacing between received samples reaches 16 ticks. <sup class="src"><a href="#F9-51-src-R4">R4</a></sup></p>
+<p><b>Hypotheses.</b> (a) Link corruption would show as bad frames: 0. (b) The board's drop counter is 42: confirmed. (c) The IMU task produced 61 samples, as in the normal run: it kept its period.</p>
+<p><b>Root cause.</b> Publishing every 20 ticks with sampling every 2 ticks gives 10 samples per period; a 4-slot ring holds 3. 7 of every 10 samples are dropped: exactly the gap size. The difference between 42 dropped and 35 missing is the 7 samples dropped after the last received one (seq 54–60), which leave no gap because nothing follows them.</p>
+<p><b>Why the estimate fails.</b> The host integrates gyro rate × (number of samples × 2 ticks): with 7 of 10 samples missing, it integrates 30 % of the true rotation, and the angle estimate falls behind in steps every publishing period.</p>
+<p><b>Fix.</b> Restore a ring with more usable slots than samples per period plus margin (16 with a 10-tick publisher, as in the normal run; or 32 with 20 ticks). On the host, integrate with the tick differences carried in each frame, not with the sample count, and treat a gap as a fault for the estimator. <b>Prevention.</b> A build-time check (a <code>static_assert</code> that <code>RING_SIZE - 1</code> exceeds <code>PUB_PERIOD / kImuPeriod</code> with margin), the health counters of the mini-project, and an alarm on any sequence gap.</p>
+<p><b>How the evidence was made.</b> <code>imu_node.cc</code> unchanged, built with <code>-DRING_SIZE=4 -DPUB_PERIOD=20</code> (step 4 of <code>run.sh</code>), run in QEMU and decoded by Listing 2.</p>

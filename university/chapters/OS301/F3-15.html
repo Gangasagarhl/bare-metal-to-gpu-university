@@ -1,0 +1,294 @@
+<!--meta
+id: F3-15
+title: ExitBootServices and the handoff
+course: OS301
+level: L3
+prereqs: F3-10 (the UEFI application, memory map), F3-12 (configuration tables), F3-13 (the disk image), F3-14 (ELF, the OS301 boot protocol); OS201 (paging)
+time: 8–10 hours including the lab (the course project)
+hardware: a Linux computer with clang 18 and lld (UEFI target), g++ 13, Python 3, QEMU 8.2 with OVMF; no real PC
+maps: Curriculum milestone A3 (all acceptance tests); section 2.7 "The ExitBootServices rule"
+analogy: F3 — the school (registered mappings used: bootloader = the person who unlocks the classroom; operating system = the principal; firmware = the caretaker who opens the building); proposal in NOTES.md: "map key = the stamp on the room plan; the caretaker only leaves if the plan you show him carries today's stamp"
+-->
+
+<h2 id="F3-15-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>At the end of the caretaker's shift, he hands the building to the new principal. He will only leave if she shows him the latest room plan, the one with today's stamp on it, because he will never be back to tell her what changed. If, between printing the plan and showing it, someone books one more room, the stamp is out of date: the caretaker refuses and stays. A principal who does not look at his answer waits in the corridor for ever, and the visitors see only the school's logo on the door.</p>
+</div>
+<p>This chapter is the course project. Your loader, written in C++, reads the kernel of F3-14 from the disk of F3-13, maps it at its higher-half address with the right permissions, collects the boot information, and performs the most delicate step of the whole boot: it asks the firmware to leave (ExitBootServices), with a key that proves it has seen the final memory map, and jumps. A test then reads the running machine from the outside, through QEMU's monitor, and checks every acceptance item of milestone A3. In the forensic lab, a loader with one extra line hangs "after the logo"; you find out why from its serial output and a time line.</p>
+
+<h2 id="F3-15-able">What you will be able to do</h2>
+<ul>
+<li><b>Implement</b> a UEFI loader that loads an ELF64 kernel from the ESP, builds four-level page tables and jumps to the kernel with the OS301 protocol.</li>
+<li><b>Apply</b> the ExitBootServices rule: get the final map, call with its key, retry on failure, and use no boot service after success.</li>
+<li><b>Build</b> page tables with an identity map, a direct map of physical memory and a higher-half kernel mapping whose W and NX bits follow the ELF flags.</li>
+<li><b>Verify</b> a running machine from outside: walk its page tables through the QEMU monitor and compare the framebuffer with a screen dump.</li>
+<li><b>Diagnose</b> a hang at the handoff from serial output and time stamps, and tell a stale map key from other causes.</li>
+</ul>
+
+<div class="co jargon" id="F3-15-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>ExitBootServices</dt><dd><b>Simple words:</b> the call in which the loader tells the firmware "I take over now; stop your services". <b>Analogy:</b> the caretaker's handover at the end of the shift. <b>Precise:</b> the UEFI boot service <code>ExitBootServices(ImageHandle, MapKey)</code>; if <code>MapKey</code> is the key of the current memory map, the firmware ends boot services and returns success, after which only runtime services may be used; otherwise it returns an error and boot services remain partly available. <sup class="src"><a href="#F3-15-src-D1">D1</a></sup> <sup class="src"><a href="#F3-15-src-S1">S1</a></sup></dd>
+<dt>Memory map key</dt><dd><b>Simple words:</b> a number the firmware gives with each memory map; it changes whenever memory is allocated or freed. <b>Analogy:</b> today's stamp on the room plan. <b>Precise:</b> the <code>MapKey</code> output of <code>GetMemoryMap</code>, identifying the state of the memory map at that moment; ExitBootServices accepts only the key of the current map. <sup class="src"><a href="#F3-15-src-D1">D1</a></sup></dd>
+<dt>Page-table entry (PTE) bits</dt><dd><b>Simple words:</b> the switches in each page-table entry that say whether the page exists, may be written, and may hold code. <b>Analogy:</b> the signs on a classroom door: "open", "staff may rearrange", "no lessons held here". <b>Precise:</b> in x86-64 four-level paging, bit 0 Present, bit 1 Read/Write, bit 7 Page Size (2 MiB or 1 GiB page at levels 2 and 3), bit 63 Execute-Disable (honoured when EFER.NXE = 1); the physical address of the next table or the page is in bits 12 to 51. <sup class="src"><a href="#F3-15-src-D3">D3</a></sup></dd>
+<dt>Identity map</dt><dd><b>Simple words:</b> a mapping where every virtual address equals the physical address. <b>Analogy:</b> the room numbers on the plan are the numbers on the doors. <b>Precise:</b> page-table entries mapping virtual address <i>v</i> to physical address <i>v</i>; the loader needs it because the instruction after <code>mov cr3</code> is fetched at the same (identity-mapped, under the firmware) address. <sup class="src"><a href="#F3-15-src-D3">D3</a></sup></dd>
+<dt>Graphics Output Protocol (GOP)</dt><dd><b>Simple words:</b> the firmware's description of the screen: where its memory is and how big it is. <b>Analogy:</b> the caretaker's note about the notice board: where it hangs and how many rows it has. <b>Precise:</b> the UEFI protocol giving the current mode's resolution, pixel format, pixels per scan line, and the framebuffer's physical base and size; the framebuffer stays valid after ExitBootServices. <sup class="src"><a href="#F3-15-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F3-15-pictures">The idea in pictures</h2>
+<p>Figure 1 is the loader's sequence, with the TSC readings it recorded in the lab run. Figure 2 shows the address space the kernel finds at entry: three regions in one set of page tables.</p>
+<figure id="F3-15-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F3-15-f1t F3-15-f1d">
+<title id="F3-15-f1t">The loader's sequence and its time line</title>
+<desc id="F3-15-f1d">A horizontal time line in time-stamp counter ticks since the loader started, from the lab run. Steps: open the boot volume and read kernel.elf, done at 2,094,150 ticks; check the ELF; allocate and copy the kernel; fill the boot information; build page tables; get the memory map; before ExitBootServices at 14,995,966; ExitBootServices succeeded at 17,173,164 on the first attempt; kernel entered at 17,812,228. A loop arrow from ExitBootServices back to GetMemoryMap is labelled: on failure, get the map again and retry. A vertical dashed line at ExitBootServices separates "boot services available" from "no boot services: serial port only".</desc>
+<line class="sv-line" x1="20" y1="160" x2="740" y2="160"/>
+<rect class="sv-b1" x="20" y="60" width="90" height="70"/><text class="sv-ts" x="26" y="82">open volume,</text><text class="sv-ts" x="26" y="100">read kernel</text><text class="sv-tm" x="26" y="120">+2,094,150</text>
+<rect class="sv-b2" x="120" y="60" width="100" height="70"/><text class="sv-ts" x="126" y="82">check ELF,</text><text class="sv-ts" x="126" y="100">copy kernel,</text><text class="sv-ts" x="126" y="120">boot info</text>
+<rect class="sv-b4" x="230" y="60" width="150" height="70"/><text class="sv-ts" x="236" y="82">page tables,</text><text class="sv-ts" x="236" y="100">GetMemoryMap</text><text class="sv-tm" x="236" y="120">+14,995,966</text>
+<rect class="sv-b6" x="390" y="60" width="150" height="70"/><text class="sv-ts" x="396" y="82">GetMemoryMap +</text><text class="sv-ts" x="396" y="100">ExitBootServices</text><text class="sv-tm" x="396" y="120">+17,173,164</text>
+<rect class="sv-b3" x="560" y="60" width="180" height="70"/><text class="sv-ts" x="566" y="82">copy map, switch CR3,</text><text class="sv-ts" x="566" y="100">jump; kernel entered</text><text class="sv-tm" x="566" y="120">+17,812,228</text>
+<line class="sv-dash" x1="550" y1="30" x2="550" y2="240"/>
+<text class="sv-ts" x="300" y="44">boot services available</text>
+<text class="sv-ts" x="560" y="44">no boot services: serial only</text>
+<path class="sv-line2" d="M 470 130 C 470 200 410 200 410 135"/><polygon class="sv-head" points="410,131 405,143 415,143"/>
+<text class="sv-ts" x="300" y="215">on failure: get the map again, retry (at most 4 attempts)</text>
+<text class="sv-ts" x="20" y="268">TSC ticks since the loader's entry, lab run R2 (about 2.0 to 2.1 × 10^9 ticks per host second, F3-12). Widths not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> The loader of Listing 1 from entry to the jump, with the four time stamps it stored in the boot information (R2). The rule on the dashed line is the curriculum's (S1) and the UEFI Specification's (D1, title only). Sources: <sup class="src"><a href="#F3-15-src-S1">S1</a></sup> <sup class="src"><a href="#F3-15-src-R2">R2</a></sup></figcaption></figure>
+<figure id="F3-15-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 290" role="img" aria-labelledby="F3-15-f2t F3-15-f2d">
+<title id="F3-15-f2t">The kernel's address space at entry</title>
+<desc id="F3-15-f2d">Left, the PML4 with three used entries: entry 0 and entry 256 both point to the same PDPT, which has four entries each pointing to a page directory of 512 two-megabyte pages, covering physical 0 to 4 GiB; entry 511 points to a PDPT whose entry 510 points to a page directory whose entry 0 points to a page table with three 4 KiB entries for the kernel. Right, the resulting virtual regions: 0 to 4 GiB identity map; 0xffff800000000000 plus 0 to 4 GiB direct map; 0xffffffff80000000 the kernel, three pages, R-X, R--, RW-, backed by physical 0xe753000.</desc>
+<rect class="sv-b1" x="20" y="30" width="110" height="220"/><text class="sv-tb" x="30" y="50">PML4</text>
+<text class="sv-tm" x="30" y="80">[0]</text><text class="sv-tm" x="30" y="140">[256]</text><text class="sv-tm" x="30" y="220">[511]</text>
+<rect class="sv-b2" x="190" y="60" width="110" height="90"/><text class="sv-tb" x="200" y="80">PDPT</text><text class="sv-ts" x="200" y="100">[0..3] → 4 PDs</text><text class="sv-ts" x="200" y="118">2048 × 2 MiB</text><text class="sv-ts" x="200" y="136">pages</text>
+<line class="sv-line" x1="130" y1="76" x2="182" y2="90"/><polygon class="sv-head" points="189,92 177,85 176,96"/>
+<line class="sv-line" x1="130" y1="136" x2="182" y2="120"/><polygon class="sv-head" points="189,118 176,115 179,126"/>
+<rect class="sv-b4" x="190" y="180" width="110" height="70"/><text class="sv-tb" x="200" y="200">PDPT → PD</text><text class="sv-ts" x="200" y="218">[510] → [0] → PT</text><text class="sv-ts" x="200" y="236">3 × 4 KiB PTEs</text>
+<line class="sv-line" x1="130" y1="216" x2="182" y2="216"/><polygon class="sv-head" points="189,216 177,211 177,221"/>
+<rect class="sv-b3" x="380" y="40" width="360" height="56"/><text class="sv-tm" x="390" y="62">0x0 .. 0x100000000</text><text class="sv-ts" x="390" y="84">identity map (for the CR3 switch), RW, executable</text>
+<rect class="sv-b3" x="380" y="110" width="360" height="56"/><text class="sv-tm" x="390" y="132">0xffff800000000000 + 0 .. 4 GiB</text><text class="sv-ts" x="390" y="154">direct map: BootInfo, memory map, stack, framebuffer</text>
+<rect class="sv-b6" x="380" y="186" width="360" height="64"/><text class="sv-tm" x="390" y="208">0xffffffff80000000: kernel, 3 pages</text><text class="sv-ts" x="390" y="226">R-X | R-- (NX) | RW- (NX)</text><text class="sv-ts" x="390" y="244">physical 0xe753000 .. 0xe756000</text>
+<line class="sv-dash" x1="300" y1="100" x2="372" y2="70"/><line class="sv-dash" x1="300" y1="110" x2="372" y2="138"/><line class="sv-dash" x1="300" y1="216" x2="372" y2="216"/>
+<text class="sv-ts" x="20" y="280">PML4 entries 0 and 256 share one PDPT: the identity map and the direct map are the same tables seen at two addresses.</text>
+</svg></div><figcaption><b>Figure 2.</b> The page tables built by Listing 1 (lines 218–267) on the 256 MiB lab machine: the direct map covers 4 GiB because the loader always covers at least 4 GiB (the framebuffer is at 2 GiB). Kernel address from R2. Sources: <sup class="src"><a href="#F3-15-src-D3">D3</a></sup> <sup class="src"><a href="#F3-15-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F3-15-layer1">Layer 1 — the kid explanation</h2>
+<p>The loader carries the kernel into memory, writes its note (F3-14), and builds a new map of addresses for the kernel. Then comes the handover. The firmware will only stop and leave if the loader shows it the newest list of who uses which memory. The loader asks for the list, and immediately, without changing anything, says "here is your list, you can go now". If the firmware says "that list is old", the loader asks again and tries again. When the firmware has gone, the loader cannot ask it for anything any more; it switches to the new map and jumps into the kernel.</p>
+
+<h2 id="F3-15-layer2">Layer 2 — the student explanation</h2>
+<p>The loader is an ordinary UEFI application (F3-10) with seven steps, numbered in the comments of Listing 1:</p>
+<ol>
+<li><b>Find the volume.</b> The Loaded Image protocol says which device the loader was loaded from; that device's Simple File System protocol opens its root directory.</li>
+<li><b>Read and check the kernel.</b> The whole <code>\kernel.elf</code> is read into memory and checked with F3-14's <code>elf::check</code> before anything else happens. A bad file ends here with a message and a return to the firmware: the A3 rule "print a clear error and return to firmware instead of jumping".<sup class="src"><a href="#F3-15-src-S1">S1</a></sup></li>
+<li><b>Place the kernel.</b> One physically contiguous block of zeroed pages for the kernel's whole span; each segment's file bytes are copied in. The zero-fill of .bss is free because the pages were zeroed.</li>
+<li><b>Fill the boot information</b> (all of F3-14's fields except the memory map, which must be the final one): RSDP and SMBIOS 3 addresses from the configuration table (F3-12), the framebuffer from GOP, the command line from <code>\cmdline.txt</code>.</li>
+<li><b>Build page tables</b>: the kernel's pages with W and NX from the ELF flags; a direct map and an identity map of physical memory with 2 MiB pages; a stack.</li>
+<li><b>Hand over</b>: get the memory map, call ExitBootServices with its key, retry on failure. After success, convert the map into the OS301 format.</li>
+<li><b>Jump</b>: enable NX in EFER, disable interrupts, load CR3, load the stack pointer, put the BootInfo address in RDI, jump to the entry point.</li>
+</ol>
+<p>The <b>ExitBootServices rule</b> in the curriculum's words: "The memory map key changes whenever memory is allocated. The loader must get the memory map, call ExitBootServices with that key, and retry by getting the map again if the call fails; after success no boot service may be used (no printing through the console protocol, no allocation). This is the most common first bug."<sup class="src"><a href="#F3-15-src-S1">S1</a></sup> Listing 1 obeys it in three ways: every allocation the loader needs (including space for the final map, with room for 16 more entries) happens before the loop; the loop contains only GetMemoryMap and ExitBootServices; and after the loop, output goes to the serial port by direct port I/O, not through the console protocol.</p>
+
+<h2 id="F3-15-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-15-l3-key">Why the key exists</h3>
+<p>The firmware owns memory until ExitBootServices. Its own drivers allocate and free memory while the loader runs (timers fire, a USB or network driver may react), and every allocation by the loader changes the map too. The memory map the kernel receives must describe memory exactly as the firmware leaves it, because the kernel will treat every range marked "boot services data" or "conventional" as free. If the map were one allocation out of date, a page the kernel thinks is free might hold the firmware's last data structure or, worse, a page the firmware still uses for a runtime service. The map key turns "is this map current?" into one comparison inside the firmware.<sup class="src"><a href="#F3-15-src-D1">D1</a></sup></p>
+<p>Three consequences shape the code. First, the buffer for the final map must exist before the final GetMemoryMap: allocating it afterwards changes the map you received a moment earlier. Listing 1 asks for the size first, adds room for 16 descriptors, and allocates both the raw buffer and the OS301 range array (lines 232–242). Second, the descriptor size is whatever GetMemoryMap says, never <code>sizeof</code> (F3-10). Third, the conversion of the raw descriptors into <code>MemoryRange</code> entries happens after ExitBootServices (lines 321–327), because it writes into memory already allocated and calls nothing.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory of the UEFI Specification (D1), not opened: after a <i>failed</i> ExitBootServices, the firmware may already have shut down part of its services, and the loader should call nothing but GetMemoryMap and ExitBootServices (some editions also allow the memory-allocation services) before trying again. Listing 1 follows the stricter reading in its normal build, except on its give-up path after four failures (line 315), which prints through the console. The forensic build prints through the console after a failure, which is a second rule violation; it worked on this OVMF build (R6). The status values 0x8000000000000001 (EFI_LOAD_ERROR) and 0x8000000000000002 (EFI_INVALID_PARAMETER, returned for a stale key) are also from memory of D1.</p></div>
+<h3 id="F3-15-l3-pt">Building the page tables</h3>
+<p>The loader runs under the firmware's page tables: on x86-64 UEFI, long mode with an identity map.<sup class="src"><a href="#F3-15-src-S1">S1</a></sup> It builds its own in pages it allocates as LoaderData, so they appear in the final memory map as loader memory, which the kernel must keep until it builds its own tables.</p>
+<ul>
+<li><b>Kernel</b> (lines 221–231): for each page of each segment, <code>pte_slot</code> walks PML4 → PDPT → PD → PT, creating missing tables with Present and Writable set, and the leaf entry gets Present, Writable only if the segment has W, and NX unless it has X. Permissions are decided at the last level, because the processor combines all levels: a page is writable only if every level allows writing, and executable only if no level sets NX.<sup class="src"><a href="#F3-15-src-D3">D3</a></sup></li>
+<li><b>Direct map</b> (lines 243–267): the loader scans the map for the highest address of any RAM range, takes at least 4 GiB (the framebuffer and PCI windows live below 4 GiB), and builds one PDPT plus one page directory per GiB, each with 512 entries of 2 MiB pages (bit 7). The same PDPT is placed in PML4 entry 0 (identity map) and entry 256 (0xffff800000000000, the direct map).</li>
+<li><b>Stack</b>: 16 pages, used through the direct map.</li>
+</ul>
+<p>The switch (lines 333–347) has an ordering constraint. After <code>mov cr3</code>, the next instruction is fetched through the new tables at the same virtual address as before, a low identity-mapped firmware address; without PML4 entry 0 the processor would fault on the next fetch, and with no interrupt handler of ours that ends in a triple fault and a reset. EFER.NXE is set before the switch, because with NXE off, bit 63 of an entry is a reserved bit and a page-table walk that meets it faults.<sup class="src"><a href="#F3-15-src-D3">D3</a></sup> The stack pointer is set to the top minus 8, as if a <code>call</code> had pushed a return address, because the System V ABI expects RSP + 8 to be a multiple of 16 at a function's first instruction.<sup class="src"><a href="#F3-15-src-D4">D4</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The PTE bit positions (0, 1, 7, 63), the address mask, the EFER MSR number 0xC0000080 and NXE as bit 11, the reserved-bit behaviour with NXE off and the permission-combining rule are from memory of the Intel SDM (D3), not opened. Evidence that the bits we wrote mean what we think: QEMU's monitor reports these entries, and a3_test.py decodes them with the same positions and finds what the ELF flags require (R2); this is consistent, not independent, because both sides use our reading of D3. The ABI stack-alignment rule is from memory of D4.</p></div>
+<h3 id="F3-15-l3-test">Testing from outside the machine</h3>
+<p>A kernel that prints "my pages are correct" proves little: the claim and the check would both be ours. <code>a3_test.py</code> (Listing 2) instead pauses the machine and asks QEMU, which implements the hardware, what is there. It reads CR3 from <code>info registers</code>, walks the four levels with <code>xp</code> (read physical memory) for every page of every PT_LOAD segment listed in the ELF file itself, and compares the W and NX bits with the segment flags. It compares the framebuffer base the kernel printed with the VGA device's BAR0 from <code>info pci</code>, and the reported size and pattern with a <code>screendump</code> image. All ten checks passed (R2).<sup class="src"><a href="#F3-15-src-R2">R2</a></sup></p>
+<p>One acceptance sentence was implemented with a difference worth stating. A3 says the kernel "as its first act, writes a known pattern to the framebuffer". The kernel stub prints "kernel entered" first and paints the framebuffer last (F3-14, Listing 1, lines 171–176); the test checks the painted pattern, not its order. The order was chosen so that the serial port shows how far the kernel got even if the framebuffer address were wrong; NOTES.md records this as a decision for the course owner.</p>
+
+<h2 id="F3-15-hardware">How the hardware actually does it</h2>
+<p>ExitBootServices is not a hardware event: no signal changes on any pin. The firmware stops its timer interrupts and its drivers' activity, marks its boot-services memory as no longer its own, and returns; the processor continues in the same mode with the same page tables.<sup class="src"><a href="#F3-15-src-D1">D1</a></sup> The hardware events in this chapter are the three instructions at the end. <code>wrmsr</code> to EFER turns on the interpretation of bit 63. <code>mov cr3</code> makes the processor use a new top-level table and flushes the translations it cached (except global ones, which we do not use). <code>jmp</code> to a higher-half address is the first instruction fetch through the kernel mapping; if any level of that walk were wrong, this would be the faulting instruction.<sup class="src"><a href="#F3-15-src-D3">D3</a></sup></p>
+<p>The kernel's physical address in the run, 0xe753000 (about 231 MiB on a 256 MiB machine), is an observation about this OVMF: <code>AllocatePages</code> with <i>AllocateAnyPages</i> returned memory near the top of RAM. The loader does not depend on it; the kernel is position-independent in physical memory because the page tables decide where its virtual addresses point.<sup class="src"><a href="#F3-15-src-R2">R2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Untested on hardware: every run in this chapter used QEMU 8.2.2 (q35, std VGA, AHCI) with the distribution's OVMF (2024.02). Real firmware differs in how often its drivers allocate memory (more chances for a stale key), in the framebuffer format and pitch, and in memory above 4 GiB; the "at least 4 GiB" direct map would need to cover the real top of RAM, which the loop at lines 244–250 computes but which was only exercised with 256 MiB.</p></div>
+
+<h2 id="F3-15-worked">Worked example</h2>
+<p><b>Problem.</b> For the lab machine (256 MiB of RAM, kernel of 3 pages at 0xffffffff80000000), compute (a) the PML4, PDPT, PD and PT indices of the kernel's first address and of the BootInfo's direct-map address if it is at physical 0xe756000; (b) how many 4 KiB pages of page tables the loader allocates; (c) the time spent in the handoff, from the TSC readings.</p>
+<p><b>Solution.</b> (a) An index is 9 bits: PML4 = bits 47–39, PDPT = 38–30, PD = 29–21, PT = 20–12. For 0xffffffff80000000: bits 47–39 are all ones → 511; bits 38–30 = 0b111111110 → 510; bits 29–21 = 0; bits 20–12 = 0. For 0xffff800000000000 + 0xe756000: PML4 = 256 (bit 47 set, the others zero); PDPT = 0 (below 1 GiB); PD = 0xe756000 &gt;&gt; 21 = 0x73 = 115; it is a 2 MiB page, so there is no PT level, and the offset in the page is 0xe756000 − 0x73 × 0x200000 = 0x156000.</p>
+<p>(b) PML4: 1. Kernel path: a new PDPT, PD and PT (PML4 entry 511 was empty): 3. Direct map: 4 GiB → 1 PDPT and 4 PDs: 5. Total 9 pages = 36 KiB. The identity map costs nothing extra: it reuses the direct map's PDPT.</p>
+<p>(c) From R2: before ExitBootServices +14,995,966, after +17,173,164: 2,177,198 ticks, which at the rate measured in F3-12 (about 2.0 to 2.1 × 10^9 ticks per host second) is about 1.0 to 1.1 ms, including one GetMemoryMap. From then to "kernel entered", +17,812,228: 639,064 ticks, about 0.3 ms, almost all of it the two serial lines printed at polling speed. The second healthy run (R7) gives 1,718,670 and 396,548 ticks: same order, different values. Treat these as observations of one emulator on one host, not as properties of UEFI.<sup class="src"><a href="#F3-15-src-R2">R2</a></sup> <sup class="src"><a href="#F3-15-src-R7">R7</a></sup></p>
+
+<h2 id="F3-15-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>loader.cc</code>: milestone A3's loader. It includes F3-10's <code>efi.hpp</code> and <code>console.hpp</code> and F3-14's <code>elf64.hpp</code> and <code>bootinfo.hpp</code>.</p>
+<pre class="listing" data-src="F3-15/loader.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">14–31</td><td><code>memset</code>, <code>memcpy</code></td><td>Byte loops through a <code>volatile</code> pointer.</td><td>The compiler emits calls to these for struct copies and zeroing; without <code>volatile</code> it may turn the loop back into a call to itself.</td></tr>
+<tr><td class="n">49–58</td><td><code>serial</code></td><td>Polls COM1's line-status bit 5 and writes a byte.</td><td>The only output allowed after ExitBootServices.</td></tr>
+<tr><td class="n">60–68</td><td><code>pages</code></td><td>AllocatePages (any address, LoaderData) and zeroes them.</td><td>Zeroed pages give .bss and empty page tables for free.</td></tr>
+<tr><td class="n">81–103</td><td><code>read_file</code></td><td>Open, GetInfo for the size, AllocatePool, Read, Close.</td><td>The File protocol pattern; size 0 means error.</td></tr>
+<tr><td class="n">106–121</td><td><code>pte_slot</code></td><td>Walks four levels, creating tables, returns the leaf slot.</td><td>Intermediate entries are permissive; the leaf decides.</td></tr>
+<tr><td class="n">170–175</td><td><code>elf::check</code></td><td>Rejects a bad kernel and returns <code>kLoadError</code>.</td><td>A3: "print a clear error and return to firmware".</td></tr>
+<tr><td class="n">178–187</td><td>kernel copy</td><td>One block for the span; copies <code>filesz</code> bytes per segment.</td><td>Physical layout mirrors the virtual one; offsets are <code>vaddr − lowest</code>.</td></tr>
+<tr><td class="n">199–200</td><td><code>find_table</code></td><td>RSDP (ACPI 2.0 GUID) and SMBIOS 3 entry point.</td><td>F3-12's configuration table.</td></tr>
+<tr><td class="n">207</td><td><code>pixels_per_scan_line * 4</code></td><td>Pitch in bytes for 32-bit pixels.</td><td>Pitch, not width: they can differ.</td></tr>
+<tr><td class="n">228–229</td><td>leaf entry</td><td>Physical page | P | (W if flag W) | (NX unless flag X).</td><td>The acceptance test reads exactly these bits.</td></tr>
+<tr><td class="n">234–237</td><td>map buffers</td><td>Size query, then buffers with room for 16 more descriptors.</td><td>No allocation inside the exit loop.</td></tr>
+<tr><td class="n">243–251</td><td>top of RAM</td><td>Highest end of non-MMIO, non-reserved ranges, at least 4 GiB.</td><td>Size of the direct map.</td></tr>
+<tr><td class="n">266–267</td><td>PML4[0], PML4[256]</td><td>The same PDPT twice.</td><td>Identity and direct map from one set of tables.</td></tr>
+<tr><td class="n">285–317</td><td>exit loop</td><td>GetMemoryMap, ExitBootServices(key), retry up to 4 attempts.</td><td>The ExitBootServices rule.</td></tr>
+<tr><td class="n">292–298, 304–313</td><td><code>PLANT_STALE_KEY</code></td><td>Forensic build only: an allocation inside the loop, then no retry.</td><td>The evidence of the forensic lab.</td></tr>
+<tr><td class="n">321–327</td><td>map conversion</td><td>Raw descriptors → <code>MemoryRange</code>; pointer via the direct map.</td><td>Done after exit: no calls, no allocations.</td></tr>
+<tr><td class="n">333–347</td><td>the jump</td><td>EFER.NXE, <code>cli</code>, CR3, RSP, RBP = 0, RDI = BootInfo, <code>jmp</code>.</td><td>The OS301 entry state (F3-14, Figure 2).</td></tr>
+</tbody></table></div>
+<p><b>Build</b> (in <code>run.sh</code>): <code>clang++ --target=x86_64-unknown-windows -std=c++20 -ffreestanding -fno-exceptions -fno-rtti -mno-red-zone -fno-stack-protector -O2 -Wall -Wextra -Wpedantic -Werror -I ../F3-10 -I ../F3-14 -c loader.cc</code> and <code>lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /out:loader.efi loader.o</code>; the kernel as in F3-14; the disk with F3-13's <code>mkimage.sh</code>.</p>
+<pre class="output" data-run="F3-15/build"></pre>
+<p><b>Listing 2</b> — <code>a3_test.py</code>: the acceptance test, run against the live machine.</p>
+<pre class="listing" data-src="F3-15/a3_test.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">30–36</td><td><code>ask</code></td><td>Sends a monitor command and reads until the <code>(qemu)</code> prompt.</td><td>The monitor is a text interface; escape sequences are removed.</td></tr>
+<tr><td class="n">39–48</td><td><code>segments</code></td><td>Reads the PT_LOAD headers from kernel.elf.</td><td>The expected permissions come from the file, not from the kernel's own report.</td></tr>
+<tr><td class="n">51–61</td><td><code>pte</code></td><td>Four-level walk with <code>xp /1gx</code>; stops at a large page.</td><td>Reads the tables the processor uses (CR3).</td></tr>
+<tr><td class="n">69–76</td><td>serial loop</td><td>Reads until "kernel: halting", at most 90 s.</td><td>A hang becomes a FAIL, not a stuck test.</td></tr>
+<tr><td class="n">103–112</td><td>permission check</td><td>Every page: W equals flag W, NX equals not flag X.</td><td>A3: "verified from the QEMU monitor's page-table view".</td></tr>
+<tr><td class="n">115–134</td><td>framebuffer checks</td><td>BAR0 from <code>info pci</code>; size and two pixels from a <code>screendump</code>.</td><td>A3: "the test compares them with QEMU's configuration".</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F3-15/a3"></pre>
+<p>The two damaged kernels (A3: "bad magic, overlapping segments"): <code>run.sh</code> changes byte 0 of the ELF, or copies the first segment's address into the second program header, and boots each.</p>
+<pre class="output" data-run="F3-15/bad_badmagic"></pre>
+<pre class="output" data-run="F3-15/bad_overlap"></pre>
+<p>In both, the loader names the problem and returns <code>EFI_LOAD_ERROR</code>; the firmware's boot manager reports "Load Error" and moves to the next boot option, the UEFI shell. No jump happened.<sup class="src"><a href="#F3-15-src-R3">R3</a></sup> <sup class="src"><a href="#F3-15-src-R4">R4</a></sup></p>
+
+<h2 id="F3-15-breaks">Where the analogy breaks</h2>
+<ol>
+<li><b>The stamp is not a date.</b> A map key is an opaque number; the firmware compares it for equality. Nothing about "older" or "newer" can be read from it.</li>
+<li><b>The caretaker does not entirely leave.</b> Runtime services (variables, time, reset) stay in memory and can still be called after the handover; the analogy's caretaker who "never comes back" overstates it.</li>
+<li><b>Refusing is the friendly outcome.</b> In the story the refusal is the problem; in UEFI, the refusal is the protection, and the bug is the loader that ignores it.</li>
+</ol>
+
+<h2 id="F3-15-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Printing between GetMemoryMap and ExitBootServices.</b> Console output can allocate. Print before, or after through the serial port.</li>
+<li><b>Allocating the final map's buffer after getting its size.</b> The allocation changes the map; allocate with spare room first.</li>
+<li><b>Ignoring ExitBootServices' status.</b> The machine continues with firmware still running and the jump may even "work", until a firmware timer fires into memory the kernel has reused.</li>
+<li><b>Using boot services after success.</b> Console, allocation and file calls are gone; on some firmware they appear to work, on others they hang.</li>
+<li><b>No identity map at the CR3 switch.</b> Triple fault and reset immediately after <code>mov cr3</code>; QEMU with <code>-no-reboot</code> exits instead, and <code>-d int</code> shows the faults.</li>
+<li><b>NX bits with EFER.NXE off.</b> Reserved-bit page fault on the first fetch through the kernel mapping.</li>
+<li><b>Passing the BootInfo in RCX.</b> The loader is compiled with the Microsoft convention, the kernel with System V: be explicit, as the <code>"D"</code> constraint at line 346 is.</li>
+</ul>
+
+<div class="co transition" id="F3-15-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F3-10 (the first UEFI application and the memory map), F3-12 (RSDP and SMBIOS), F3-13 (the disk), F3-14 (ELF, the protocol, the kernel stub). <b>What carries over:</b> all of them are now parts of one program; the map you printed in F3-10 is now the map you hand over. <b>What changes:</b> for the first time a program you wrote owns the machine with nobody underneath: no firmware services, no operating system, no debugger except the emulator's. <b>What comes next:</b> F3-16 asks whether the firmware should run your loader at all: Secure Boot checks a signature on <code>loader.efi</code>, and measured boot records a hash of it in the TPM.</p></div>
+
+<h2 id="F3-15-check">Check yourself</h2>
+<ol>
+<li>State the ExitBootServices rule in your own words.</li>
+<li>Why must the loader allocate the buffer for the final memory map before the final GetMemoryMap?</li>
+<li>Why does the loader need an identity map, if the kernel never uses low addresses?</li>
+<li>A segment has flags R and X. Which bits does its leaf entry get, and which bits do its intermediate entries get? Why the difference?</li>
+<li>Why does the acceptance test read permissions through the QEMU monitor instead of trusting the kernel's own printout?</li>
+<li>Which of these may the loader do after a successful ExitBootServices? (a) write to COM1 with <code>outb</code> (b) call AllocatePages (c) write into the BootInfo page (d) print through ConOut (e) read the TSC</li>
+<li>Apply to a new case: a loader built for a machine with 64 GiB of RAM. How many page-directory pages does Listing 1's direct map need, and would the loop at lines 244–250 reach that size?</li>
+<li>Predict: what would the serial output show if line 266 (PML4 entry 0) were removed?</li>
+</ol>
+
+<h2 id="F3-15-lab">Lab</h2>
+<h3 id="F3-15-lab-goal">Goal</h3>
+<p>Milestone A3, as written: "The loader reads the kernel ELF from the ESP, maps it at its higher-half virtual address, gathers boot information, exits boot services and jumps to the kernel." Acceptance: "The kernel, as its first act, writes a known pattern to the framebuffer and prints "kernel entered" plus the boot-info version on the serial port. The kernel prints the RSDP signature and revision, the memory-map entry count and the framebuffer geometry; the test compares them with QEMU's configuration. Writable and executable permissions match the ELF segment flags (verified from the QEMU monitor's page-table view). Loading a corrupted ELF (bad magic, overlapping segments) makes the loader print a clear error and return to firmware instead of jumping."<sup class="src"><a href="#F3-15-src-S1">S1</a></sup></p>
+<h3 id="F3-15-lab-hw">Hardware and software needed</h3>
+<p>clang 18.1.3 and lld-link (UEFI target), g++ 13.3 and ld.lld 18.1.3 (kernel), Python 3.13, QEMU 8.2.2 with OVMF 2024.02 (R1, R2); the F3-10, F3-13 and F3-14 lab folders. No real PC.</p>
+<h3 id="F3-15-lab-safety">Safety</h3>
+<p>Emulator only. Before trying the image on a real PC (optional, not part of this lab), read F3-13's safety box on writing USB sticks: <code>dd</code> to the wrong device destroys its data.</p>
+<h3 id="F3-15-lab-steps">Steps</h3>
+<ol>
+<li>Build the loader, the kernel and the disk image (<code>run.sh</code> step 1); boot it by hand with <code>-serial stdio</code> and read the serial output.</li>
+<li>Run <code>a3_test.py</code>. Then break one thing at a time and watch which check fails: make every kernel page writable; swap width and pitch in the BootInfo; skip the pattern.</li>
+<li>Run the two damaged kernels; add a third damage (entry point in the R-- segment) and check the message.</li>
+<li>Remove PML4 entry 0, boot with <code>-d int,cpu_reset -no-reboot</code>, and record what QEMU logs.</li>
+<li>Count the loader's ExitBootServices attempts over ten boots (<code>exit_attempts</code> in the BootInfo).</li>
+</ol>
+<h3 id="F3-15-lab-expect">Expected observations</h3>
+<p>"A3 acceptance: PASS (10 of 10 checks passed)" (R2); both damaged kernels rejected with a named reason and a return to the boot manager (R3, R4); in our runs ExitBootServices succeeded on the first attempt every time (R2, R5, R7).</p>
+<h3 id="F3-15-lab-verify">Verification</h3>
+<p>The acceptance script's verdict is the verification. Additionally, confirm that the page-table walk your script performs agrees with QEMU's <code>info tlb</code> or <code>info mem</code> for the kernel range.</p>
+<h3 id="F3-15-lab-trouble">Troubleshooting</h3>
+<ul>
+<li>The loader never prints → the firmware did not find <code>\EFI\BOOT\BOOTX64.EFI</code>; check the image with F3-13's verifier.</li>
+<li>"loader: ExitBootServices succeeded" and then nothing → a fault after the CR3 switch; use <code>-d int</code> and check NXE, PML4 entry 0 and the entry address.</li>
+<li>"kernel entered" and then a wrong magic → the BootInfo pointer arrived in the wrong register or as a physical address.</li>
+<li>The pattern is sheared diagonally in the screendump → you used width instead of pitch.</li>
+</ul>
+<h3 id="F3-15-lab-ext">Extension</h3>
+<p>Load an initial RAM disk (<code>\initrd.img</code>) into LoaderData pages, fill <code>initrd_physical</code> and <code>initrd_size</code>, and make the kernel print its first 16 bytes through the direct map.</p>
+
+<h2 id="F3-15-forensic">Forensic lab</h2>
+<p><b>Scenario: "Stuck after the logo".</b> Tomás added one line to his loader, which used to work: a small allocation for a log buffer right before ExitBootServices, "to record the boot". He tested with build 1 and it booted. He then changed it to allocate a page instead, build 2, and now the machine shows the firmware logo for ever. The serial port shows nothing new after a certain line. His teammate wants to roll back the firmware update installed the same week.</p>
+<p><b>Evidence pack.</b> Three boots with time stamps (host seconds since QEMU started): (1) the healthy loader; (2) build 1; (3) build 2, stopped by the harness after 25 s. And the loader source with the <code>PLANT_STALE_KEY</code> lines (Listing 1, lines 292–313).</p>
+<pre class="output" data-run="F3-15/forensic_healthy"></pre>
+<pre class="output" data-run="F3-15/forensic_stale1"></pre>
+<pre class="output" data-run="F3-15/forensic_stale2"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Where does each boot stop, and how long after "exiting boot services"?</li>
+<li>What does the status in build 2's last line mean, and which input of ExitBootServices was wrong?</li>
+<li>Explain why build 1 booted and build 2 did not, although both allocate memory in the same place. Which part of your explanation is a hypothesis?</li>
+<li>Evaluate the firmware-rollback idea.</li>
+<li>Give the fix and a rule that prevents the whole class of bug.</li>
+</ol>
+<p><b>Method hints.</b> Compare the last common line of the three boots. Read the loop in Listing 1 with the planted lines in place: what happens between the GetMemoryMap that produced the key and the ExitBootServices that used it? What does the code do after a failure?</p>
+
+<h2 id="F3-15-project">Mini-project</h2>
+<p>Turn the loader into a retry-proof handoff and prove it. Add a build option that allocates one page inside the exit loop on the first attempt only (so the first key is stale on purpose), keep the retry, and extend the test to assert "ExitBootServices succeeded after a retry" and <code>exit_attempts == 2</code> in the kernel's output. Rubric: the forced-failure build boots and passes all ten A3 checks (2); the attempt count is checked by the test (1); the loop makes no call other than GetMemoryMap and ExitBootServices after the first failure (1); a short note on what your firmware did after the failed call (1).</p>
+
+<h2 id="F3-15-summary">Summary</h2>
+<ul>
+<li>The A3 loader: find the volume, read and check the kernel, copy it, fill the boot information, build page tables, exit boot services with the map key, jump.</li>
+<li>The ExitBootServices rule: allocate everything first; in the loop, only GetMemoryMap and ExitBootServices; retry on failure; after success, no boot service at all.</li>
+<li>Page tables: leaf entries carry W and NX from the ELF flags; one PDPT serves as identity map (PML4[0]) and direct map (PML4[256]); EFER.NXE before CR3.</li>
+<li>Test from outside: QEMU's monitor (registers, physical memory, PCI, screen dump) gives evidence the kernel cannot fake.</li>
+<li>A stale map key gives EFI_INVALID_PARAMETER (from memory of D1); a loader that does not retry hangs "after the logo". Whether a given allocation changes the key depends on the firmware: a 64-byte pool allocation did not here, a page allocation did.</li>
+</ul>
+
+<h2 id="F3-15-sources">Sources</h2>
+<ol>
+<li id="F3-15-src-D1">D1 — UEFI Forum, "UEFI Specification" (curriculum item 12): boot services GetMemoryMap, AllocatePages, AllocatePool, ExitBootServices; Loaded Image, Simple File System, File and Graphics Output protocols; the configuration table. Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</li>
+<li id="F3-15-src-D2">D2 — Tool Interface Standard (TIS) Committee, "Executable and Linking Format (ELF) Specification": program headers, PT_LOAD. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-15-src-D3">D3 — Intel Corporation, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3, "Paging" chapter (4-level paging, entry formats, access rights) and the EFER description. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-15-src-D4">D4 — x86-64 psABI maintainers, "System V Application Binary Interface, AMD64 Architecture Processor Supplement": argument registers, stack alignment at function entry. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-15-src-D5">D5 — The Limine boot protocol documentation (curriculum item 17), named by milestone A3 as "a design reference". Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F3-15-src-S1">S1 — Systems Curriculum (this project), section 2.7 ("The ExitBootServices rule", quoted verbatim), section 2.2 (CPU mode at handoff) and milestone A3 (goal, build list, acceptance tests quoted verbatim). Opened in this build (local file); a map, not a source (AH-4).</li>
+<li id="F3-15-src-R1">R1 — Lab run <code>F3-15/build.log</code>: clang 18.1.3 and LLD 18.1.3 for the loader, g++ 13.3.0 and LLD 18.1.3 for the kernel; exit code 0; 2026-10-09.</li>
+<li id="F3-15-src-R2">R2 — Lab run <code>F3-15/a3.log</code>: a3_test.py with QEMU 8.2.2 (q35, 256 MiB) and OVMF 2024.02-2ubuntu0.10; exit code 0; untested on hardware.</li>
+<li id="F3-15-src-R3">R3 — Lab run <code>F3-15/bad_badmagic.log</code>; exit code 124 (stopped by the harness after the loader returned).</li>
+<li id="F3-15-src-R4">R4 — Lab run <code>F3-15/bad_overlap.log</code>; exit code 124 (as R3).</li>
+<li id="F3-15-src-R5">R5 — Lab run <code>F3-15/forensic_stale1.log</code>: loader built with <code>-DPLANT_STALE_KEY=1</code>; exit code 124.</li>
+<li id="F3-15-src-R6">R6 — Lab run <code>F3-15/forensic_stale2.log</code>: loader built with <code>-DPLANT_STALE_KEY=2</code>; exit code 124 (25 s time limit).</li>
+<li id="F3-15-src-R7">R7 — Lab run <code>F3-15/forensic_healthy.log</code>: the normal loader with time stamps; exit code 124 (stopped after the kernel halted).</li>
+</ol>
+
+<h2 id="F3-15-glossary">Glossary links</h2>
+<p><a href="#gl-exitbootservices">ExitBootServices</a> · <a href="#gl-memory-map-key">Memory map key</a> · <a href="#gl-page-table-entry-pte-bits">Page-table entry (PTE) bits</a> · <a href="#gl-identity-map">Identity map</a> · <a href="#gl-graphics-output-protocol-gop">Graphics Output Protocol (GOP)</a> · <a href="#gl-hhdm-direct-map">HHDM / direct map</a> · <a href="#gl-boot-information-structure">Boot information structure</a> · <a href="#gl-higher-half-kernel">Higher-half kernel</a></p>
+
+<h2 id="F3-15-next">Next chapter</h2>
+<p>Next: <a href="#F3-16">F3-16 Secure Boot and measured boot</a>. Previous: <a href="#F3-14">F3-14</a>. Back to the course: <a href="#OS301">OS301</a>.</p>
+
+<h2 id="F3-15-answers">Answers to Check yourself</h2>
+<ol>
+<li>Get the memory map, call ExitBootServices with the key that came with it, without allocating in between; if it fails, get the map again and retry; after success, use no boot service.</li>
+<li>Allocating changes the memory map and its key; the map you received would no longer be the final one.</li>
+<li>Right after <code>mov cr3</code>, the processor fetches the next loader instruction at its current low address through the new tables; that address must be mapped. The kernel can remove the identity map later.</li>
+<li>Leaf: Present, not Writable, NX clear. Intermediate: Present and Writable, NX clear. The processor combines the levels (writable only if all allow it, no-execute if any sets NX), so permissive intermediate entries let each leaf decide for its own page.</li>
+<li>A kernel with wrong page tables could also print wrong claims about them; QEMU reads the tables the processor actually uses (CR3 and physical memory), an independent observer.</li>
+<li>(a), (c), (e). AllocatePages (b) and ConOut (d) are boot services.</li>
+<li>64 GiB → <code>gib</code> = 64 → 64 page-directory pages (plus one PDPT), 256 KiB, within the 512 GiB limit at line 252. The loop takes the highest end of every RAM-type range, so it would reach 64 GiB if the map lists RAM up to there; device windows above 4 GiB are left out by type.</li>
+<li>The last line "loader: jumping to the kernel" and nothing more: the fetch after <code>mov cr3</code> faults, no handler exists, a triple fault follows; with <code>-no-reboot</code> QEMU exits.</li>
+</ol>
+<h3 id="F3-15-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Healthy: "kernel: halting" at 2.239 s, under 2 ms after "exiting boot services" (2.237 s). Build 1: the same, at 2.339 s. Build 2: the last line is at 2.559 s, 3 ms after "exiting boot services" (2.556 s), and then nothing until the harness stopped QEMU 25 s after start.</li>
+<li>0x8000000000000002 is an error (top bit) with code 2, EFI_INVALID_PARAMETER (from memory of D1); for ExitBootServices it means the map key was not the current one. The key 0x91a came from a GetMemoryMap that preceded the planted AllocatePages.</li>
+<li>Build 2's AllocatePages changes the memory map (a new LoaderData page), so the key is stale; the call fails, and the planted code prints and spins instead of retrying: "stuck after the logo". Build 1's 64-byte AllocatePool did not make ExitBootServices fail on this firmware. The hypothesis: OVMF served the pool request from a pool page it had already allocated, so the map (and the key) did not change. The rule is not "small allocations are safe": another firmware, or the same one with a fuller pool, may change the key for build 1 too.</li>
+<li>Rejected: the healthy loader on the same firmware boots (evidence 1), and the failure follows the code change, not the firmware. The status names the cause.</li>
+<li>Remove the allocation from the loop (allocate the log buffer before the final GetMemoryMap), and keep the retry so that any stale key, from the loader or from a firmware driver, is survived. Rule: between the final GetMemoryMap and ExitBootServices, call nothing; always handle ExitBootServices' status with a retry.</li>
+</ol>
+<p><b>How the evidence was produced:</b> <code>run.sh</code> step 4 built <code>loader.cc</code> with <code>-DPLANT_STALE_KEY=1</code> and <code>=2</code> (the bug was planted on purpose) and booted each with time stamps; build 1 was expected to fail and did not, which is why the scenario uses both.</p>

@@ -1,0 +1,272 @@
+<!--meta
+id: F8-06
+title: NCCL and RCCL in a data-parallel training step
+course: DG401
+level: L4
+prereqs: F8-01; F8-05; MA302 (gradients, SGD); CU302 (streams)
+time: 10–20 hours including the lab
+hardware: Lab: any Linux computer with g++ and Open MPI (this build: CPU workers and MPI processes on a shared container, no GPU, no NCCL or RCCL installed). GPU part: two or more GPUs in one machine with NCCL (NVIDIA) or RCCL (AMD), or a cloud multi-GPU instance
+maps: Curriculum Track F 14.1 (rows "Library use" and "Data parallelism"); milestone F3
+analogy: F8 — the great kitchen hall (every hall cooks the same recipe on its own share of the guests, and the tasting notes are pooled after every course)
+-->
+
+<h2 id="F8-06-hook">Story hook</h2>
+<p>The teaching campus is trying to perfect one soup recipe. Last month one hall tasted 64 bowls a night and adjusted the recipe a little after each night. Now four halls each taste 16 bowls a night, pool their tasting notes, and every hall adjusts its copy of the recipe in exactly the same way. If they do it right, the four halls together make the very same recipe changes as the one hall did, night after night, only faster.</p>
+<p>The first week goes wrong twice. On Monday, nobody handed out the starting recipe; each hall began from its own grandmother's version, and although they pooled their notes faithfully, the four recipes never became the same. On Thursday, each hall wrote "average of my 16 bowls" and then the four averages were <i>added</i>, not averaged: every change was four times too strong. Both mistakes are one line of code. This chapter is about writing that step correctly, first with a ring you built, then with a real communication library.</p>
+
+<h2 id="F8-06-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> a data-parallel training step: shard the batch, compute local gradients, all-reduce them, apply the same update on every replica.</li>
+<li><b>Implement</b> it with your own ring all-reduce and with a real library (MPI here; NCCL or RCCL on GPUs), using the correct scaling of the gradient.</li>
+<li><b>Verify</b> that <i>N</i> workers reproduce the 1-worker loss curve within a stated tolerance, and that replicas stay identical.</li>
+<li><b>Use</b> a GPU collective library's model correctly: communicators, one rank per GPU, collectives on streams, group calls, debug output (from the documentation, checked on your hardware).</li>
+<li><b>Diagnose</b> the two classic data-parallel bugs (no initial broadcast; summed instead of averaged gradients) from loss curves and replica differences.</li>
+</ul>
+
+<div class="co jargon" id="F8-06-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Data-parallel training</dt><dd><b>Simple words:</b> several workers train the same model, each on a different part of every batch, and combine their results after every step. <b>Analogy:</b> four halls tasting different bowls of the same recipe and pooling notes. <b>Precise:</b> each of <i>N</i> workers holds a full copy of the parameters, computes the gradient of the loss on its shard of the global batch, and an all-reduce combines the gradients so every worker applies the same update. <sup class="src"><a href="#F8-06-src-D8">D8</a></sup> <sup class="src"><a href="#F8-06-src-C1">C1</a></sup></dd>
+<dt>Replica (model)</dt><dd><b>Simple words:</b> one worker's copy of the model's parameters. <b>Analogy:</b> one hall's copy of the recipe. <b>Precise:</b> the parameters held by one data-parallel worker; correct data parallelism keeps all replicas identical after every step. <sup class="src"><a href="#F8-06-src-R1">R1</a></sup></dd>
+<dt>Global batch and shard</dt><dd><b>Simple words:</b> all the examples used for one step, and each worker's part of them. <b>Analogy:</b> the 64 bowls of a night, and each hall's 16. <b>Precise:</b> the global batch size <i>B</i> sets the effective batch of the update; with <i>N</i> workers each processes a shard of about <i>B</i>/<i>N</i> examples. <sup class="src"><a href="#F8-06-src-R1">R1</a></sup></dd>
+<dt>Gradient bucketing</dt><dd><b>Simple words:</b> sending gradients in a few large groups instead of one tensor at a time. <b>Analogy:</b> collecting notes into a few big envelopes before sending them round. <b>Precise:</b> packing many parameter gradients into buckets that are all-reduced as single messages, so the per-message start-up cost α is paid a few times per step, and starting each bucket's all-reduce as soon as its gradients are ready, overlapping it with the rest of the backward pass (as described in the PyTorch DDP paper, title only). <sup class="src"><a href="#F8-06-src-D8">D8</a></sup></dd>
+<dt>Scaling efficiency</dt><dd><b>Simple words:</b> how much of the ideal <i>N</i>-times speed-up you actually got. <b>Analogy:</b> four halls should do four nights' tasting in one night; did they? <b>Precise:</b> throughput with <i>N</i> workers divided by (<i>N</i> × throughput with 1 worker), for the same global batch per worker (weak scaling) or the same global batch (strong scaling); state which. <sup class="src"><a href="#F8-06-src-C1">C1</a></sup></dd>
+<dt>Group call (NCCL/RCCL)</dt><dd><b>Simple words:</b> telling the library "these several calls belong together; start them as one". <b>Analogy:</b> one bell for several carts. <b>Precise:</b> NCCL's <code>ncclGroupStart</code> / <code>ncclGroupEnd</code> bracket, used when one thread issues collectives for several GPUs or fuses several operations (from the NCCL documentation; not verified in this build). <sup class="src"><a href="#F8-06-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F8-06-pictures">The idea in pictures</h2>
+<figure id="F8-06-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 380" role="img" aria-labelledby="F8-06-f1t F8-06-f1d">
+<title id="F8-06-f1t">Figure 1: one data-parallel training step with four workers</title>
+<desc id="F8-06-f1d">At the top a box "rank 0's initial parameters" with arrows down to four columns labelled worker 0 to worker 3, marked "broadcast once, before step 0". Each column has the same four boxes from top to bottom: "replica of parameters", "forward and backward on shard w (16 of 64 samples)", "local gradient divided by global batch 64", then a wide box spanning all four columns, "all-reduce (sum) of gradients and loss sum", then in each column "same SGD update", with a dashed arrow from the bottom back to the replica box labelled "next step". To the right a note says: the all-reduce result is the gradient of the global batch, identical on every worker, so replicas stay identical.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="380"/>
+<rect class="sv-b2" x="200" y="12" width="260" height="30"/><text class="sv-t" x="216" y="32">rank 0's initial parameters</text>
+<text class="sv-ts" x="470" y="32">broadcast once, before step 0</text>
+<line class="sv-line" x1="330" y1="42" x2="80" y2="70"/><line class="sv-line" x1="330" y1="42" x2="230" y2="70"/>
+<line class="sv-line" x1="330" y1="42" x2="380" y2="70"/><line class="sv-line" x1="330" y1="42" x2="530" y2="70"/>
+<polygon class="sv-head" points="80,72 86,64 90,70"/><polygon class="sv-head" points="230,72 230,63 236,68"/>
+<polygon class="sv-head" points="380,72 374,66 382,64"/><polygon class="sv-head" points="530,72 522,68 526,63"/>
+<text class="sv-tb" x="40" y="88">worker 0</text><text class="sv-tb" x="190" y="88">worker 1</text><text class="sv-tb" x="340" y="88">worker 2</text><text class="sv-tb" x="490" y="88">worker 3</text>
+<rect class="sv-b1" x="20" y="96" width="130" height="30"/><text class="sv-ts" x="30" y="115">replica</text>
+<rect class="sv-b1" x="170" y="96" width="130" height="30"/><text class="sv-ts" x="180" y="115">replica</text>
+<rect class="sv-b1" x="320" y="96" width="130" height="30"/><text class="sv-ts" x="330" y="115">replica</text>
+<rect class="sv-b1" x="470" y="96" width="130" height="30"/><text class="sv-ts" x="480" y="115">replica</text>
+<rect class="sv-b3" x="20" y="140" width="130" height="40"/><text class="sv-ts" x="28" y="157">fwd+bwd, samples</text><text class="sv-ts" x="28" y="172">0–15 of the step</text>
+<rect class="sv-b3" x="170" y="140" width="130" height="40"/><text class="sv-ts" x="178" y="157">fwd+bwd, samples</text><text class="sv-ts" x="178" y="172">16–31</text>
+<rect class="sv-b3" x="320" y="140" width="130" height="40"/><text class="sv-ts" x="328" y="157">fwd+bwd, samples</text><text class="sv-ts" x="328" y="172">32–47</text>
+<rect class="sv-b3" x="470" y="140" width="130" height="40"/><text class="sv-ts" x="478" y="157">fwd+bwd, samples</text><text class="sv-ts" x="478" y="172">48–63</text>
+<rect class="sv-b5" x="20" y="194" width="130" height="30"/><text class="sv-ts" x="28" y="213">grad / 64 (global)</text>
+<rect class="sv-b5" x="170" y="194" width="130" height="30"/><text class="sv-ts" x="178" y="213">grad / 64 (global)</text>
+<rect class="sv-b5" x="320" y="194" width="130" height="30"/><text class="sv-ts" x="328" y="213">grad / 64 (global)</text>
+<rect class="sv-b5" x="470" y="194" width="130" height="30"/><text class="sv-ts" x="478" y="213">grad / 64 (global)</text>
+<rect class="sv-b6" x="20" y="240" width="580" height="34"/><text class="sv-tb" x="150" y="262">all-reduce (sum): gradients + loss sum</text>
+<rect class="sv-b4" x="20" y="290" width="130" height="30"/><text class="sv-ts" x="28" y="309">same SGD update</text>
+<rect class="sv-b4" x="170" y="290" width="130" height="30"/><text class="sv-ts" x="178" y="309">same SGD update</text>
+<rect class="sv-b4" x="320" y="290" width="130" height="30"/><text class="sv-ts" x="328" y="309">same SGD update</text>
+<rect class="sv-b4" x="470" y="290" width="130" height="30"/><text class="sv-ts" x="478" y="309">same SGD update</text>
+<polyline class="sv-dash" points="600,305 640,305 640,111 600,111"/><polygon class="sv-head" points="600,111 610,106 610,116"/>
+<text class="sv-ts" x="646" y="200">next</text><text class="sv-ts" x="646" y="214">step</text>
+<text class="sv-ts" x="20" y="346">The sum of the four "grad / 64" is the gradient of the mean loss over all 64 samples: the 1-worker gradient.</text>
+<text class="sv-ts" x="20" y="364">Shard sizes and the batch of 64 are those of Listing 1 (R1). Not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> One step of Listing 1 with four workers. The broadcast happens once; the all-reduce every step. Structure after the PyTorch DDP paper (title only) and the curriculum's milestone F3; numbers from R1. <sup class="src"><a href="#F8-06-src-R1">R1</a></sup> <sup class="src"><a href="#F8-06-src-D8">D8</a></sup> <sup class="src"><a href="#F8-06-src-C1">C1</a></sup></figcaption></figure>
+
+<h2 id="F8-06-layer1">Layer 1 — the kid explanation</h2>
+<p>If one person tastes 64 bowls and four people taste 16 each, they learn the same thing, as long as they pool their notes properly. Two rules: everyone starts from the same recipe, and the pooled note is the average of all 64 bowls, not the sum of four averages. Then everyone changes their copy in the same way, and the copies stay the same forever.</p>
+
+<h2 id="F8-06-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F8-06-l2-math">Why the sum of shard gradients is the batch gradient</h3>
+<p>The loss of a step is the mean over the global batch of <i>B</i> samples: <i>L</i> = (1/<i>B</i>) Σ<sub><i>i</i></sub> ℓ<sub><i>i</i></sub>. Its gradient is (1/<i>B</i>) Σ<sub><i>i</i></sub> ∇ℓ<sub><i>i</i></sub> (<a href="#MA302">MA302</a>). Split the sum over the workers' shards: worker <i>w</i> computes <i>g</i><sub><i>w</i></sub> = (1/<i>B</i>) Σ<sub><i>i</i> in shard <i>w</i></sub> ∇ℓ<sub><i>i</i></sub>, and the all-reduce sum Σ<sub><i>w</i></sub> <i>g</i><sub><i>w</i></sub> is exactly the 1-worker gradient. Every worker receives the same sum and applies the same update, so replicas that start equal stay equal. Dividing each shard by its own size and then summing (the Thursday bug) gives <i>N</i> times the gradient when shards are equal. Dividing by the global <i>B</i>, or summing and then dividing by <i>N</i>, are both correct. <sup class="src"><a href="#F8-06-src-R1">R1</a></sup></p>
+<h3 id="F8-06-l2-step">The step in code</h3>
+<p><code>train.hpp</code> is the whole step: initialise every replica from the same seed (the "broadcast"), and for every step compute each worker's loss sum and gradient on samples [<i>s</i>·64 + <i>w</i>·64/<i>N</i>, <i>s</i>·64 + (<i>w</i>+1)·64/<i>N</i>), divide by 64, put the loss sum in one extra element, run the F8-05 ring all-reduce over the 98 floats, and update. Listing 1 runs it for 1, 2, 4 and 8 workers. <sup class="src"><a href="#F8-06-src-R1">R1</a></sup></p>
+<h3 id="F8-06-l2-result">What "the same loss curve" means</h3>
+<p>The 1-worker loss fell from 1.42552 at step 0 to 0.04325 at step 299. With 2, 4 and 8 workers the loss differed from the 1-worker loss at most steps (240 to 255 of 300), but never by more than 2.38·10<sup>−7</sup>; the final parameters differed by at most 1.79·10<sup>−7</sup>; and the replicas were identical at every step. <sup class="src"><a href="#F8-06-src-R1">R1</a></sup> The tiny differences are rounding: the sum over 64 samples is added in a different order when it is split into shards and summed by a ring (<a href="#F8-05">F8-05</a>). That is why the milestone says "within a stated tolerance": Listing 1 states 10<sup>−4</sup> on the loss, and requires bit-identical replicas.</p>
+<h3 id="F8-06-l2-mpi">With a real library</h3>
+<p>Listing 2 does the same with Open MPI: one process per worker, <code>MPI_Bcast</code> of rank 0's parameters, then one in-place <code>MPI_Allreduce</code> per step. With 1, 2 and 4 processes the logged losses agree to six digits (the step 0 loss prints as 1.425524 with one process and 1.425525 with two and four), and no rank's parameters differ from rank 0's. <sup class="src"><a href="#F8-06-src-R2">R2</a></sup> The pattern is the one used with NCCL or RCCL on GPUs; the API names differ.</p>
+
+<h2 id="F8-06-layer3">Layer 3 — the engineer's depth</h2>
+<p>In one line of analogy: the halls now share one delivery company with its own rules: every hall must book the same deliveries in the same order, and the delivery runs on the hall's own kitchen schedule, not on the head chef's clock.</p>
+<h3 id="F8-06-l3-rules">The rules of a collective library</h3>
+<p>Every collective library has the rule MPI states for its collectives: all ranks of a communicator call the same collectives in the same order with matching arguments (<a href="#F8-01">F8-01</a>). <sup class="src"><a href="#F8-06-src-D3">D3</a></sup> In Listing 2 that is easy: one broadcast, then one all-reduce per step. In a real framework the gradients of many tensors are bucketed, and the order in which buckets become ready may differ between ranks unless the framework fixes it; the PyTorch DDP paper describes this problem and its bucketing design (title only). <sup class="src"><a href="#F8-06-src-D8">D8</a></sup> A rank that calls collectives in a different order hangs or, worse, adds the wrong tensors together.</p>
+<h3 id="F8-06-l3-nccl">The NCCL and RCCL model</h3>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>NCCL and RCCL are not installed in this build, and their documentation was not opened. From the NCCL documentation, as generally described: a communicator is created per GPU, either by one process for all its GPUs (<code>ncclCommInitAll</code>) or by one process or thread per GPU, where rank 0 creates an <code>ncclUniqueId</code> with <code>ncclGetUniqueId</code>, distributes it to all ranks by some other means (for example an <code>MPI_Bcast</code>), and every rank calls <code>ncclCommInitRank(&amp;comm, nranks, id, rank)</code> with its own GPU current. Collectives such as <code>ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum, comm, stream)</code> and <code>ncclBroadcast</code> take device pointers and a CUDA stream, return once the operation is enqueued, and complete in stream order, so the optimizer kernel queued after them on the same stream sees the result without a host synchronisation. When one thread issues collectives for several GPUs, or several collectives should be launched together, they are bracketed by <code>ncclGroupStart()</code> / <code>ncclGroupEnd()</code>. Communicators are released with <code>ncclCommDestroy</code> (or aborted with <code>ncclCommAbort</code> on errors). The <code>NCCL_DEBUG</code> environment variable (for example <code>INFO</code>) prints the version, the detected topology and the chosen rings or trees. RCCL keeps the same API names with HIP streams. Every name, signature and behaviour in this box must be checked against the NCCL and RCCL documentation and headers of your installed versions before use.</p></div>
+<p>Translating Listing 2 to that model changes three things. The buffers are on the GPU, so forward, backward, the division by <i>B</i> and the update are kernels (your E6/E7 GEMM kernels from <a href="#CU302">CU302</a> in the milestone). The all-reduce goes on the stream that produced the gradient, so it starts after the backward kernels without the host waiting. And the communicator needs a bootstrap: MPI is a common way to distribute the unique id. <sup class="src"><a href="#F8-06-src-C1">C1</a></sup></p>
+<h3 id="F8-06-l3-overlap">Bucketing and overlap</h3>
+<p>Listing 1 all-reduces 98 floats per step: 392 bytes, deep in the latency-bound region of <a href="#F8-03">F8-03</a>. A real model has millions of parameters in hundreds of tensors. All-reducing each tensor separately pays α hundreds of times; one giant all-reduce at the end of the backward pass waits for the last gradient and hides nothing. Bucketing does both jobs: buckets of a few megabytes each, launched as soon as their last gradient is computed, overlap communication with the rest of the backward pass. <sup class="src"><a href="#F8-06-src-D8">D8</a></sup> Overlap across nodes is milestone F6 in DG402.</p>
+<h3 id="F8-06-l3-scaling">Scaling efficiency</h3>
+<p>Milestone F3 also asks for the scaling efficiency from 1 to <i>N</i> GPUs. <sup class="src"><a href="#F8-06-src-C1">C1</a></sup> Its definition is simple (Jargon box); its measurement needs care: warm-up steps excluded, median step time over many steps, the same global batch or the same per-GPU batch stated, and the communication time per step measured separately so you can tell where efficiency is lost. This build does not report one: Listings 1 and 2 run on four shared CPU cores where a 97-parameter model's step is dominated by thread and process overheads, so a number would mean nothing. The lab does it on GPUs.</p>
+
+<h2 id="F8-06-hardware">How the hardware actually does it</h2>
+<p>On GPUs, one training step is a long sequence of kernels on a stream: forward layers, backward layers, the all-reduce, and the optimizer. The all-reduce is itself GPU work: a library kernel (or, in your F8-05 ring, copies and reduction kernels) that moves data over the links of <a href="#F8-04">F8-04</a>. Because it is queued on a stream, the host thread runs ahead and queues the next step's work while the GPUs are still busy. A second stream lets the all-reduce of one bucket run while backward kernels for earlier layers still compute; then compute units and links are busy at the same time, and the two compete for GPU memory bandwidth. <sup class="src"><a href="#F8-06-src-D7">D7</a></sup> In this build, MPI processes on one CPU take the place of GPUs; Open MPI's all-reduce goes through shared memory between the processes.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That Open MPI 4.1.6 on this container used its shared-memory transport for Listing 2 was not checked (no transport selection was logged). That library collective kernels compete with compute kernels for GPU resources, and by how much, depends on the library, its settings and the GPU, and was not measured.</p></div>
+
+<h2 id="F8-06-worked">Worked example</h2>
+<p><b>Task.</b> Global batch <i>B</i> = 64, <i>N</i> = 4 workers, learning rate 0.05. (a) What does each worker divide its gradient sum by? (b) If instead each worker divides by its shard size, what effective learning rate results? (c) The loss is reported by the extra element in the same all-reduce: what must each worker put there, and how is the reported loss computed? (d) What is the byte size of each step's all-reduce in Listing 1, and in which region of the alpha-beta model is it?</p>
+<ol>
+<li>(a) By 64, the global batch, so that the sum over workers is the mean gradient.</li>
+<li>(b) Shards are 16; dividing by 16 and summing four of them gives 4 × the mean gradient, so the update equals one with learning rate 0.2. The forensic run C shows the consequence: its loss falls faster than the 1-worker curve (0.0103 vs 0.0432 at step 299), which is not "the same curve". <sup class="src"><a href="#F8-06-src-R3">R3</a></sup></li>
+<li>(c) Its loss <i>sum</i> over its shard (not its mean); the all-reduce gives the global sum, and dividing by 64 gives the global mean loss (<code>train.hpp</code>, lines 45 and 48).</li>
+<li>(d) 97 parameters + 1 loss = 98 floats = 392 bytes, far below the half-performance size of <a href="#F8-03">F8-03</a>: latency-bound. That is why small models scale badly with data parallelism, and why buckets exist.</li>
+</ol>
+
+<h2 id="F8-06-code">Code walk-through</h2>
+<p><b>Shared code</b> — <code>train.hpp</code>, the step with the three modes used by the forensic lab. (<code>mlp.hpp</code>, the 4–16–1 model with its hand-written backward pass, and <code>ring.hpp</code>, the ring of <a href="#F8-05">F8-05</a> Listing 1, are in the lab folder.)</p>
+<pre class="listing" data-src="F8-06/train.hpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–16</td><td><code>Mode</code></td><td>Correct, and the two planted bugs.</td><td>One code path, three behaviours: the forensic runs differ only here.</td></tr>
+<tr><td>29–32</td><td>initialisation</td><td>Same seed on every worker (the in-process "broadcast"), or a different seed per worker in <code>NoBroadcast</code>.</td><td>Replicas must start equal.</td></tr>
+<tr><td>37–39</td><td>shard</td><td>Worker <i>w</i>'s samples of step <i>s</i>.</td><td>Data depend only on the sample index (<code>mlp.hpp</code>), so all worker counts see the same samples.</td></tr>
+<tr><td>40–44</td><td>scaling</td><td>Divide by the global batch, or (bug) by the shard size.</td><td>The Thursday bug is this one expression.</td></tr>
+<tr><td>45, 48</td><td>loss</td><td>Loss sum in an extra element; global mean after the all-reduce.</td><td>One collective per step, not two.</td></tr>
+<tr><td>47</td><td><code>ringAllReduce</code></td><td>F8-05's ring, chunks of 32 floats.</td><td>Your own collective inside a training loop.</td></tr>
+<tr><td>49–57</td><td>update and gap</td><td>SGD on every replica; largest difference from replica 0.</td><td>The replica gap is the cheapest bug detector there is.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 1</b> — <code>dp_train.cpp</code>: 1-worker reference and 2, 4, 8 workers, with the acceptance test.</p>
+<pre class="listing" data-src="F8-06/dp_train.cpp"></pre>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined dp_train.cpp -o dp_train</code>, then <code>./dp_train</code>.</p>
+<pre class="output" data-run="F8-06/dp_train"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12</td><td>tolerance</td><td>10<sup>−4</sup> on the loss.</td><td>The milestone's "stated tolerance", stated in code.</td></tr>
+<tr><td>13</td><td>reference</td><td>1-worker run.</td><td>Same global batch, so the same effective batch size.</td></tr>
+<tr><td>18–31</td><td>comparison</td><td>Per-step loss difference, steps that differ at all, final parameter difference, replica gap.</td><td>Reports both "how close" and "how often not identical".</td></tr>
+<tr><td>32–41</td><td>verdict</td><td>PASS if within tolerance and replicas identical.</td><td>Acceptance as a program exit code.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>dp_mpi.cc</code>: the same step with Open MPI, one process per worker.</p>
+<pre class="listing" data-src="F8-06/dp_mpi.cc"></pre>
+<p><b>Build command</b> (from <code>run.sh</code>): <code>mpic++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -DOMPI_SKIP_MPICXX dp_mpi.cc -o dp_mpi</code>, then <code>mpirun -np 1</code>, <code>-np 2</code> and <code>-np 4 ./dp_mpi</code>.</p>
+<pre class="output" data-run="F8-06/dp_mpi"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–17</td><td>setup</td><td>Rank and size of <code>MPI_COMM_WORLD</code>.</td><td>With NCCL: rank and size come from the launcher, and a communicator is built from a unique id.</td></tr>
+<tr><td>21–22</td><td>broadcast</td><td>Only rank 0's initial values survive.</td><td>Ranks 1… deliberately use a different seed: the broadcast is what makes them equal.</td></tr>
+<tr><td>25–30</td><td>local gradient</td><td>Shard of rank <i>r</i>; divide by the global batch.</td><td>Same as <code>train.hpp</code>.</td></tr>
+<tr><td>31</td><td><code>MPI_Allreduce(MPI_IN_PLACE, …)</code></td><td>Sum of 98 floats over all ranks, result in place.</td><td>The call that becomes <code>ncclAllReduce</code> (same buffer for send and receive) on GPUs.</td></tr>
+<tr><td>39–45</td><td>replica check</td><td>Broadcast rank 0's final parameters; each rank compares; reduce the count.</td><td>The replica gap, across processes.</td></tr>
+</tbody></table></div>
+
+<h2 id="F8-06-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Notes add up exactly; floats do not.</b> Pooled tasting notes are the same in any order; the summed gradient differs in the last bits with the order (R1), so "the same recipe changes" means "within a tolerance" across worker counts, and "exactly" only across the replicas of one run.</li>
+<li><b>Halls taste in parallel; GPUs also wait.</b> The story has no cost for pooling notes; on real hardware the all-reduce takes time that grows with the model size and shrinks the speed-up (scaling efficiency).</li>
+<li><b>Recipes do not drift on their own.</b> Replicas can: non-deterministic kernels or different library versions on different GPUs can make them differ; check the replica gap.</li>
+</ul>
+
+<h2 id="F8-06-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> loss curve with <i>N</i> workers different from the start, replicas never equal. <b>Cause:</b> no initial broadcast. <b>Fix:</b> broadcast parameters (and optimizer state) from rank 0 before step 0.</li>
+<li><b>Symptom:</b> <i>N</i>-worker run diverges or trains "too fast". <b>Cause:</b> gradients summed instead of averaged. <b>Fix:</b> divide by the global batch, or by <i>N</i> after a sum of means.</li>
+<li><b>Symptom:</b> a job hangs at step 0. <b>Cause:</b> one rank calls a collective the others do not (a rank with no data skipping it, <a href="#F8-01">F8-01</a>), or calls them in a different order. <b>Fix:</b> every rank calls every collective, in the same order.</li>
+<li><b>Symptom:</b> the optimizer sees half-reduced gradients on GPUs. <b>Cause:</b> the update kernel was queued on a different stream from the all-reduce without an event. <b>Fix:</b> same stream, or an event wait.</li>
+<li><b>Symptom:</b> replicas slowly drift apart. <b>Cause:</b> each rank re-computes a reduced value in a different order, or uses non-deterministic kernels. <b>Fix:</b> reduce once and distribute the bits (all-reduce does); log the replica gap periodically.</li>
+</ul>
+
+<div class="co transition" id="F8-06-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F8-05">F8-05</a> built a ring all-reduce and showed that its result is bit-identical on every rank; <a href="#F8-01">F8-01</a> gave the rule that all ranks call every collective. <b>What carries over:</b> the ring, now inside a training loop; the matching-call rule; busbw and the alpha-beta model to judge the communication cost. <sup class="src"><a href="#F8-06-src-R1">R1</a></sup> <b>What changes:</b> the all-reduce has a meaning (the mean gradient), so scaling and initial state matter; the library takes over the ring, and you must use its communicators, streams and group calls correctly. <sup class="src"><a href="#F8-06-src-C1">C1</a></sup> <b>What comes next:</b> DG402 leaves the single node: GPU-aware MPI, RDMA, multi-node all-reduce, overlap of communication with the backward pass, and fault handling.</p></div>
+
+<h2 id="F8-06-check">Check yourself</h2>
+<ol>
+<li>Show that dividing each worker's gradient sum by the global batch <i>B</i> and summing gives the 1-worker gradient.</li>
+<li>Why does Listing 1 put the loss sum, not the loss mean, into the all-reduce?</li>
+<li>Which is true? (a) With correct data parallelism, the <i>N</i>-worker loss is bit-identical to the 1-worker loss. (b) Replicas of one correct run are bit-identical. (c) Without a broadcast, the all-reduce eventually makes replicas equal. (d) Summing per-shard means over 4 equal shards multiplies the effective learning rate by 4.</li>
+<li>In your own words: what is gradient bucketing for?</li>
+<li>Apply: <i>B</i> = 60, <i>N</i> = 8. How are the shards of Listing 1's formula sized, and why is dividing each by its shard size wrong even after dividing the sum by 8?</li>
+<li>Predict, then check in the forensic output: in run B the replica gap is the same at every logged step. Why does it not shrink?</li>
+<li>What three things change when Listing 2 is moved to GPUs with NCCL or RCCL?</li>
+<li>Why does this build not report a scaling efficiency?</li>
+</ol>
+
+<h2 id="F8-06-lab">Lab</h2>
+<p><b>Goal.</b> Milestone F3: a data-parallel training step that reproduces the 1-worker loss curve, with your ring and with a real library, and its scaling efficiency on GPUs.</p>
+<p><b>Hardware and software needed.</b> Steps 1–4: any Linux computer with g++ and Open MPI (this build: g++ 13.3.0, Open MPI 4.1.6, 4 logical CPUs). Steps 5–8: two or more GPUs in one machine with NCCL (NVIDIA) or RCCL (AMD), an MPI for the bootstrap, or a cloud multi-GPU instance. Folder <code>university/labs/F8-06</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use. On shared GPU machines, use only the GPUs your job was given (the launcher's device list), not all visible ones.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F8-06</code>; read every <code>.out</code> and <code>.log</code>.</li>
+<li>Change the global batch in <code>train.hpp</code> to 60 and rerun Listing 1 with 8 workers (uneven shards). Does it still pass?</li>
+<li>Do the forensic lab.</li>
+<li>Time Listing 2 with 1, 2 and 4 processes and a model 100× larger (<code>HID</code>); compute a scaling efficiency and explain why it means little on this machine.</li>
+<li>On GPUs: port the step to the GPU: forward, backward and update as kernels (your E6/E7 GEMM kernels), one process per GPU.</li>
+<li>On GPUs: replace <code>MPI_Allreduce</code> by the library's all-reduce on the compute stream, bootstrapping the communicator over MPI as the documentation describes; check every return code.</li>
+<li>On GPUs: run with the library's debug output enabled and save the log; find the version and the chosen algorithm in it.</li>
+<li>On GPUs: run 1 and <i>N</i> GPUs with fixed seeds; compare loss curves with your stated tolerance; measure and report the scaling efficiency against your plan's target.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: PASS for 2, 4, 8 workers, loss differences of the order of 10<sup>−7</sup>; MPI losses equal to six digits. On GPUs: your own numbers and your own library log (AH-23, AH-17).</p>
+<p><b>Verification.</b> Milestone F3's acceptance tests verbatim: "With fixed seeds, N-GPU training produces the same loss curve as single-GPU training within a stated tolerance (taking the effective batch size into account)." "Scaling efficiency from 1 to N GPUs is reported; the target is set in your plan." <sup class="src"><a href="#F8-06-src-C1">C1</a></sup> In this build only the first was done, on CPU workers and MPI processes.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>MPI refuses to start as root in a container → <code>--allow-run-as-root</code>; more processes than cores → <code>--oversubscribe</code> (as <code>run.sh</code> does).</li>
+<li><code>mpic++</code> fails under <code>-Werror</code> with warnings from the MPI C++ header → <code>-DOMPI_SKIP_MPICXX</code>.</li>
+<li>GPU job hangs at communicator creation → not every rank received the same unique id, or ranks disagree on the number of ranks.</li>
+<li>Loss differs from step 0 → initial broadcast missing or done on the wrong stream before the parameters were initialised.</li>
+</ul>
+<p><b>Extension.</b> Split the 98-float gradient into two "buckets" (layer 2 first, then layer 1) and all-reduce each as soon as its gradient is complete; with MPI, use non-blocking <code>MPI_Iallreduce</code> and measure whether anything overlaps.</p>
+
+<h2 id="F8-06-forensic">Forensic lab</h2>
+<p><b>Scenario: "The 4-GPU curves do not match".</b> Three teams port the same model from 1 to 4 workers. All three say "it trains". Their logs, with the 1-worker reference, are below; you must say which ports are correct.</p>
+<p><b>Evidence.</b> The program that produced the logs (<code>dp_forensic.cpp</code>, using <code>train.hpp</code>) and its output (R3):</p>
+<pre class="listing" data-src="F8-06/dp_forensic.cpp"></pre>
+<pre class="output" data-run="F8-06/dp_forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: compare each run's loss at steps 0 and 299 with the reference, and its replica gap.</li>
+<li>Hypotheses for run B: (a) different data on each worker; (b) different initial parameters; (c) a broken all-reduce. Which does the constant gap support?</li>
+<li>Hypotheses for run C: (a) a larger learning rate; (b) gradients scaled by <i>N</i>; (c) a different batch. Which evidence separates them?</li>
+<li>Root cause and fix for each faulty run.</li>
+<li>Prevention: which two numbers would you log in every data-parallel job?</li>
+</ol>
+<p><b>Method hints.</b> At step 0 every run has seen the same samples. A loss at step 0 that differs from the reference cannot come from training; it comes from the starting point.</p>
+
+<h2 id="F8-06-project">Mini-project</h2>
+<p><b>Your all-reduce in a training loop (MP5 single-node part, continued).</b> Connect the library you started in <a href="#F8-05">F8-05</a> to the GPU training step of lab step 5: the same loop must run with your all-reduce or with NCCL/RCCL, chosen by a flag. Report the loss curves of 1 and <i>N</i> GPUs with both, the step time split into compute and communication, and the scaling efficiency with both. The comparison of your all-reduce's busbw with the library's (MP5's third milestone) belongs in the report. <sup class="src"><a href="#F8-06-src-C2">C2</a></sup></p>
+<p><b>Rubric.</b> Loss curves equal within the stated tolerance for both back-ends and replicas identical (4). Correct library use: communicator creation, stream semantics, error checks, cleanup (2). Step time breakdown with medians and method (2). Scaling efficiency with the target and an explanation of the gap using the alpha-beta model (2).</p>
+
+<h2 id="F8-06-summary">Summary</h2>
+<ul>
+<li>Data parallelism: same parameters everywhere, different shards, one all-reduce of gradients per step, the same update everywhere.</li>
+<li>Divide by the global batch (or average after summing); broadcast the initial state.</li>
+<li>Correct runs match the 1-worker loss within rounding (here ≤ 2.38·10<sup>−7</sup>) and keep replicas bit-identical.</li>
+<li>Library rules: same collectives in the same order on every rank; on GPUs, collectives are stream-ordered and need a communicator bootstrap.</li>
+<li>Bucketing reduces start-up costs and enables overlap; small models are latency-bound.</li>
+<li>Log the loss at step 0 and the replica gap: they catch both classic bugs.</li>
+</ul>
+
+<h2 id="F8-06-sources">Sources</h2>
+<ol>
+<li id="F8-06-src-D1">D1 — NVIDIA, NCCL documentation: communicator creation, group calls, CUDA stream semantics, environment variables (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F8-06-src-D2">D2 — AMD, RCCL documentation (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-06-src-D3">D3 — MPI Forum, "MPI: A Message-Passing Interface Standard", collective communication: matching calls on all processes of a communicator (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-06-src-D7">D7 — NVIDIA, "CUDA C++ Programming Guide", streams and concurrent execution (tier 1). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-06-src-D8">D8 — Shen Li et al., "PyTorch Distributed: Experiences on Accelerating Data Parallel Training", VLDB 2020 (tier 5): gradient bucketing and overlap. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F8-06-src-C1">C1 — Systems Curriculum, section 14.1 and milestone F3, whose goal and acceptance tests are quoted verbatim; a map, not a source (AH-4).</li>
+<li id="F8-06-src-C2">C2 — University authoring guide, MP5 "A multi-node all-reduce": milestones; a map, not a source.</li>
+<li id="F8-06-src-R1">R1 — run of Listing 1 (<code>university/labs/F8-06/dp_train.log</code>), g++ 13.3.0 with AddressSanitizer and UBSan, exit code 0.</li>
+<li id="F8-06-src-R2">R2 — <code>run.sh</code> step <code>dp_mpi</code>: Listing 2 with 1, 2 and 4 processes (<code>dp_mpi.log</code>), Open MPI 4.1.6, exit code 0.</li>
+<li id="F8-06-src-R3">R3 — run of the forensic program (<code>dp_forensic.log</code>), g++ 13.3.0, exit code 0.</li>
+</ol>
+
+<h2 id="F8-06-glossary">Glossary links</h2>
+<p><a href="#gl-data-parallel-training">Data-parallel training</a> · <a href="#gl-replica-model">Replica (model)</a> · <a href="#gl-global-batch-and-shard">Global batch and shard</a> · <a href="#gl-gradient-bucketing">Gradient bucketing</a> · <a href="#gl-scaling-efficiency">Scaling efficiency</a> · <a href="#gl-group-call-nccl-rccl">Group call (NCCL/RCCL)</a> · <a href="#gl-communicator">Communicator</a> · <a href="#gl-all-reduce">All-reduce</a></p>
+
+<h2 id="F8-06-next">Next chapter</h2>
+<p>This is the last chapter of <a href="#DG401">DG401</a>. Previous: <a href="#F8-05">F8-05</a>. The next course in Track F is DG402 (multi-node: GPU-aware MPI, RDMA, overlap and fault handling).</p>
+
+<h2 id="F8-06-answers">Answers to Check yourself</h2>
+<ol>
+<li>Σ<sub><i>w</i></sub> (1/<i>B</i>) Σ<sub><i>i</i>∈shard <i>w</i></sub> ∇ℓ<sub><i>i</i></sub> = (1/<i>B</i>) Σ<sub>all <i>i</i></sub> ∇ℓ<sub><i>i</i></sub>, because the shards partition the batch.</li>
+<li>Sums add; means of unequal shards do not. The all-reduce of sums gives the global sum, divided once by <i>B</i>.</li>
+<li>(b) and (d). (a) is false: differences of up to 2.38·10<sup>−7</sup> at most steps (R1). (c) is false: run B's gap stays 0.9722 (R3).</li>
+<li>To pay the per-message start-up cost a few times per step instead of once per tensor, and to start communication while the backward pass is still running.</li>
+<li>Shards [<i>w</i>·60/8, (<i>w</i>+1)·60/8): sizes 7 or 8. Dividing each by its own size gives each shard's mean; the mean of means weights the samples of small shards more, so it is not the batch mean even after dividing by 8.</li>
+<li>Every replica receives the same averaged gradient and applies the same update, so the differences between replicas, set at initialisation, are never touched: the gap stays exactly as it began.</li>
+<li>Buffers and computation move to the GPU; the all-reduce is enqueued on a stream and completes in stream order; a communicator must be created from a shared unique id (bootstrap, for example over MPI).</li>
+<li>The model is tiny and the workers are threads or processes on four shared CPU cores; the step time is dominated by overheads that have nothing to do with GPUs or links.</li>
+</ol>
+<h3 id="F8-06-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Run A matches the reference at every logged step (1.4255 … 0.0432) with gap 0. Run B starts at 1.1299 instead of 1.4255 and keeps a constant gap of 0.9722; its curve differs throughout (0.0461 at step 299). Run C starts at 1.4255, gap 0, but falls faster: 0.0519 at step 50 versus 0.0582, 0.0103 at step 299 versus 0.0432. (R3)</p>
+<p><b>Run B.</b> At step 0 no training has happened, so a different loss means a different starting point: (b). The data are the same (the shards are fixed by sample index), and a broken all-reduce would make the gap change, not stay constant. Root cause: every worker initialised its own parameters; there was no broadcast. The reported loss is a mixture of four different models' losses. Fix: broadcast rank 0's parameters before step 0 (<code>MPI_Bcast</code> in Listing 2; the library's broadcast on GPUs).</p>
+<p><b>Run C.</b> Same start and identical replicas, so the initial state and the all-reduce are fine; only the update size is wrong. A larger configured learning rate (a) and gradients scaled by <i>N</i> (b) look the same in the loss; the configuration file and the code separate them: the learning rate is 0.05 in all runs, and each worker divides by its shard size, 16, instead of 64, so the sum is 4× the mean gradient (b). Fix: divide by the global batch. Note that run C's lower loss is not a success: it is a different training run, and with a larger model or rate it can diverge.</p>
+<p><b>Prevention.</b> Log the loss at step 0 (must equal the 1-worker value) and the replica gap (must be 0), in every job. <b>How the evidence was produced:</b> <code>dp_forensic.cpp</code> with <code>train.hpp</code>'s three modes, run by <code>run_lab.sh</code>.</p>

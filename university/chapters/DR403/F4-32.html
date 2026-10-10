@@ -1,0 +1,385 @@
+<!--meta
+id: F4-32
+title: The common Arm boot chain
+course: DR403
+level: L4
+prereqs: F4-31; DR402 (D4); OS301 (the PC boot path and UEFI)
+time: 10–14 hours including the lab and the forensic lab
+hardware: none required (QEMU 8.2.2 machine virt with secure=on, aarch64-linux-gnu-g++ 13.3.0, Python 3.13.16 in the build container); Trusted Firmware-A, U-Boot and a real board are named but were not available in this build
+maps: Curriculum section 11.2 (the common Arm boot chain) and the "through the standard boot chain" part of milestone D10; prepares the chain-of-trust material of F11
+analogy: F4 — the school and its visitors; registered: firmware = the caretaker, bootloader = the person who unlocks the classroom; proposed: boot ROM = the fixed first caretaker at the gate, BL31 = the caretaker who lives in the office, an SMC = a note passed through the office hatch (see NOTES.md)
+-->
+
+<h2 id="F4-32-hook">Story hook</h2>
+<p>At six in the morning the school is dark. The first person to arrive is old Mr Pike at the gate. He has done the same thing every morning for forty years and will never change: he looks at the board by the gate that says which entrance to use today, walks to that entrance, picks up the envelope left there, checks that the seal is intact, and hands it to whoever the envelope names. He knows nothing else about the school.</p>
+<p>The envelope names Ms Ruiz, the facilities manager. She switches on the heating, the boilers and the water, checks two more envelopes, and hands them on: one to the caretaker who will live in the office all day, one to the teacher who will open the classrooms. The caretaker settles into the office and stays there. From then on, whenever a teacher needs something only the caretaker may do (turn off the building's power, open the locked wing), the teacher passes a note through the office hatch and waits for the answer.</p>
+<p>Your kernel is the teacher. By the time it runs, three people have been through the building before it, each one deciding something it cannot change: which entrance, which rooms are heated, which wing is locked. When the kernel does not start, the evidence is in what those three left behind. This chapter builds all four stages in QEMU, small enough to read in one sitting, and then breaks the hand-over between the last two.</p>
+
+<h2 id="F4-32-able">What you will be able to do</h2>
+<ul>
+<li><b>Describe</b> the common Arm boot chain of curriculum 11.2: boot ROM, first stage (U-Boot SPL or TPL, or TF-A BL2, or a vendor loader), TF-A BL31, optional BL32 (OP-TEE), BL33 (U-Boot proper or EDK II), your kernel; and <b>state</b> the job, exception level and lifetime of each.</li>
+<li><b>Build</b> a four-stage chain in QEMU (<code>-M virt,secure=on</code>) in which a "ROM" at EL3 loads and checks a second stage, the second stage loads a resident EL3 monitor and a kernel, and the monitor drops to EL1 with the DTB address in <code>x0</code>.</li>
+<li><b>Program</b> the EL3 hand-over registers (<code>SCR_EL3</code>, <code>SPSR_EL3</code>, <code>ELR_EL3</code>, <code>VBAR_EL3</code>) and <b>explain</b> each bit you set.</li>
+<li><b>Implement</b> two PSCI calls in the monitor and call them from the kernel through the SMC instruction, following the SMC Calling Convention.</li>
+<li><b>Diagnose</b> a failed hand-over from the monitor's exception report and QEMU's exception log.</li>
+</ul>
+
+<div class="co jargon" id="F4-32-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Boot chain (Arm)</dt><dd><b>Simple words:</b> the list of programs that run one after another from power-on until your kernel starts. <b>Analogy:</b> the people who open the school in the morning, each handing an envelope to the next. <b>Precise:</b> on Arm SoCs, a boot ROM, a first stage that initialises DRAM, an EL3 runtime (TF-A BL31), an optional secure-world OS (BL32), a normal-world loader (BL33) and the OS, each loaded and optionally verified by the one before. <sup class="src"><a href="#F4-32-src-C1">C1</a></sup> <sup class="src"><a href="#F4-32-src-D1">D1</a></sup></dd>
+<dt>Trusted Firmware-A (TF-A)</dt><dd><b>Simple words:</b> the open reference firmware for the secure parts of booting an Arm 64-bit chip. <b>Analogy:</b> the caretaker's rule book, used by many schools. <b>Precise:</b> the Trusted Firmware project's implementation of the Arm boot stages BL1 (ROM-like first stage), BL2 (trusted boot loader), BL31 (EL3 runtime with PSCI and the SMC dispatcher), with interfaces to BL32 (secure payload) and BL33 (non-secure firmware). <sup class="src"><a href="#F4-32-src-D1">D1</a></sup></dd>
+<dt>EL3 runtime (BL31)</dt><dd><b>Simple words:</b> firmware that stays in memory after the kernel starts, in the most privileged mode, to do the few things the kernel may not do itself. <b>Analogy:</b> the caretaker who lives in the office all day. <b>Precise:</b> the TF-A stage resident at exception level 3 in secure memory; it owns <code>VBAR_EL3</code>, handles SMC exceptions from lower levels (PSCI, SMCCC services, sometimes SCMI or vendor services) and switches between the secure and non-secure worlds. <sup class="src"><a href="#F4-32-src-D1">D1</a></sup> <sup class="src"><a href="#F4-32-src-R3">R3</a></sup></dd>
+<dt>SMC (Secure Monitor Call)</dt><dd><b>Simple words:</b> the instruction a kernel uses to ask the EL3 firmware for a service. <b>Analogy:</b> a note passed through the office hatch to the caretaker. <b>Precise:</b> an AArch64 instruction that, when permitted by <code>SCR_EL3</code>, takes a synchronous exception to EL3 with exception class 0x17; the SMC Calling Convention defines the function ID in <code>w0</code>, arguments in <code>x1</code> onwards and results in <code>x0</code> to <code>x3</code>. <sup class="src"><a href="#F4-32-src-D3">D3</a></sup> <sup class="src"><a href="#F4-32-src-R4">R4</a></sup></dd>
+<dt>PSCI (Power State Coordination Interface)</dt><dd><b>Simple words:</b> the standard list of power requests an OS can send to firmware: start a CPU, stop a CPU, power off, reset. <b>Analogy:</b> the printed form the teacher fills in for the caretaker. <b>Precise:</b> an Arm specification of firmware functions (PSCI_VERSION, CPU_ON, CPU_OFF, SYSTEM_OFF, SYSTEM_RESET and others) called through SMC or HVC with fixed function IDs, advertised to the OS by a <code>/psci</code> devicetree node or ACPI. <sup class="src"><a href="#F4-32-src-D2">D2</a></sup></dd>
+<dt>SPL and TPL (U-Boot)</dt><dd><b>Simple words:</b> small first versions of U-Boot that fit in the chip's on-chip memory and start the DRAM. <b>Analogy:</b> the facilities manager who switches on the heating before anyone else can work. <b>Precise:</b> U-Boot's Secondary and Tertiary Program Loaders: reduced builds that run from on-chip SRAM, initialise clocks and DRAM, and load the next stages (TF-A BL31, OP-TEE, U-Boot proper) into DRAM. <sup class="src"><a href="#F4-32-src-D5">D5</a></sup> <sup class="src"><a href="#F4-32-src-C1">C1</a></sup></dd>
+<dt>Secure and non-secure worlds</dt><dd><b>Simple words:</b> two separate sets of privileges inside one chip; the normal OS runs in one, trusted firmware in the other. <b>Analogy:</b> the locked wing of the school that teachers cannot enter. <b>Precise:</b> Arm's TrustZone security states; <code>SCR_EL3.NS</code> selects the state of the levels below EL3, and memory and devices can be made accessible only to the secure state. <sup class="src"><a href="#F4-32-src-D4">D4</a></sup></dd>
+<dt>Recovery mode (boot ROM)</dt><dd><b>Simple words:</b> a way to load a program into a board over USB when nothing on its storage works. <b>Analogy:</b> the side gate the old caretaker opens when no envelope is waiting. <b>Precise:</b> a boot ROM function, selected by pins, fuses or the absence of a valid image, that receives code over USB or serial (Allwinner FEL, NXP serial download, Rockchip mask-ROM mode). <sup class="src"><a href="#F4-32-src-C1">C1</a></sup> <sup class="src"><a href="#F4-32-src-D9">D9</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-32-pictures">The idea in pictures</h2>
+<p>Figure 1 is the timeline of this chapter's boot, from power-on to the kernel's request to power off, with the exception level of each stage and the memory it runs from. It has the same shape as the real chain of curriculum 11.2; the boxes below the line name the real components that occupy each slot.</p>
+<figure id="F4-32-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F4-32-f1t F4-32-f1d">
+<title id="F4-32-f1t">Figure 1: boot chain timeline from power-on to the kernel</title>
+<desc id="F4-32-f1d">A horizontal time axis from power-on on the left to the kernel on the right. Five stage boxes above the axis, in order: ROM at EL3, running from flash at 0x0, loads and checks BL2; BL2 at EL3 in secure RAM at 0x0e000000, would initialise DRAM, loads BL31 and BL33; BL31 at EL3 in secure RAM at 0x0e100000, stays resident; an optional BL32 slot drawn dashed, not built here; BL33, the kernel, at EL1 in DRAM at 0x40080000, with x0 holding the DTB address 0x40000000. Arrows join each stage to the next. A curved arrow labelled SMC goes from BL33 back to BL31 and another labelled ERET returns. Below the axis, matching slots name the real components: boot ROM or mask ROM; U-Boot SPL or TPL, TF-A BL2 or a vendor loader; TF-A BL31; OP-TEE; U-Boot proper or EDK II then your kernel.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<rect class="sv-b4" x="10" y="30" width="130" height="96" rx="6"/><text class="sv-tb" x="20" y="52">ROM</text><text class="sv-ts" x="20" y="72">EL3, flash 0x0</text><text class="sv-ts" x="20" y="90">load + CRC BL2</text><text class="sv-ts" x="20" y="108">exit 5 if bad</text>
+<rect class="sv-b1" x="160" y="30" width="130" height="96" rx="6"/><text class="sv-tb" x="170" y="52">BL2</text><text class="sv-ts" x="170" y="72">EL3, 0x0e000000</text><text class="sv-ts" x="170" y="90">(DRAM init)</text><text class="sv-ts" x="170" y="108">load BL31, BL33</text>
+<rect class="sv-b3" x="310" y="30" width="130" height="96" rx="6"/><text class="sv-tb" x="320" y="52">BL31</text><text class="sv-ts" x="320" y="72">EL3, 0x0e100000</text><text class="sv-ts" x="320" y="90">resident</text><text class="sv-ts" x="320" y="108">PSCI via SMC</text>
+<rect class="sv-dash" x="460" y="30" width="110" height="96" rx="6"/><text class="sv-tb" x="470" y="52">BL32</text><text class="sv-ts" x="470" y="72">S-EL1</text><text class="sv-ts" x="470" y="90">not built</text>
+<rect class="sv-b2" x="590" y="30" width="160" height="96" rx="6"/><text class="sv-tb" x="600" y="52">BL33 = kernel</text><text class="sv-ts" x="600" y="72">EL1, 0x40080000</text><text class="sv-ts" x="600" y="90">x0 = DTB</text><text class="sv-ts" x="600" y="108">0x40000000</text>
+<line class="sv-line" x1="140" y1="78" x2="154" y2="78"/><polygon class="sv-head" points="152,73 160,78 152,83"/>
+<line class="sv-line" x1="290" y1="78" x2="304" y2="78"/><polygon class="sv-head" points="302,73 310,78 302,83"/>
+<line class="sv-line" x1="440" y1="78" x2="584" y2="78"/><polygon class="sv-head" points="582,73 590,78 582,83"/>
+<text class="sv-ts" x="470" y="146">ERET to EL1</text>
+<path class="sv-line2" d="M 660 126 C 640 175, 420 175, 380 130"/><polygon class="sv-head" points="376,138 380,126 388,134"/>
+<text class="sv-ts" x="560" y="182">SMC (PSCI_VERSION, SYSTEM_OFF)</text>
+<line class="sv-line" x1="10" y1="200" x2="740" y2="200"/><polygon class="sv-head" points="738,195 748,200 738,205"/>
+<text class="sv-ts" x="10" y="218">power-on</text><text class="sv-ts" x="690" y="218">time</text>
+<rect class="sv-box" x="10" y="232" width="130" height="80" rx="4"/><text class="sv-ts" x="18" y="252">boot ROM</text><text class="sv-ts" x="18" y="270">(mask ROM,</text><text class="sv-ts" x="18" y="288">fixed at manufacture)</text>
+<rect class="sv-box" x="160" y="232" width="130" height="80" rx="4"/><text class="sv-ts" x="168" y="252">U-Boot SPL/TPL,</text><text class="sv-ts" x="168" y="270">TF-A BL2, or a</text><text class="sv-ts" x="168" y="288">vendor loader</text>
+<rect class="sv-box" x="310" y="232" width="130" height="80" rx="4"/><text class="sv-ts" x="318" y="252">TF-A BL31</text><text class="sv-ts" x="318" y="270">(PSCI, SMCCC,</text><text class="sv-ts" x="318" y="288">SCMI, vendor)</text>
+<rect class="sv-box" x="460" y="232" width="110" height="80" rx="4"/><text class="sv-ts" x="468" y="252">OP-TEE</text><text class="sv-ts" x="468" y="270">(optional)</text>
+<rect class="sv-box" x="590" y="232" width="160" height="80" rx="4"/><text class="sv-ts" x="598" y="252">U-Boot proper or</text><text class="sv-ts" x="598" y="270">EDK II, then</text><text class="sv-ts" x="598" y="288">your kernel</text>
+</svg></div><figcaption><b>Figure 1.</b> Above the axis: the chain built in this chapter's lab, with addresses from its run. Below: the real components of curriculum 11.2 for each slot. Straight arrows are hand-overs (control flow); the curved arrows are calls back into the resident monitor. Not to scale in time. <sup class="src"><a href="#F4-32-src-C1">C1</a></sup> <sup class="src"><a href="#F4-32-src-R3">R3</a></sup> <sup class="src"><a href="#F4-32-src-R4">R4</a></sup></figcaption></figure>
+<p>Figure 2 turns the same story by 90 degrees: the exception levels are rows, time runs to the right, and every arrow is a change of level that QEMU recorded in its exception log. Going down needs an <code>ERET</code> with the target level's state prepared in <code>SCR_EL3</code> and <code>SPSR_EL3</code>; going up needs an exception, here an SMC.</p>
+<figure id="F4-32-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F4-32-f2t F4-32-f2d">
+<title id="F4-32-f2t">Figure 2: exception levels during the boot, as QEMU logged them</title>
+<desc id="F4-32-f2d">Three horizontal bands labelled EL3 (secure), EL2 (unused here) and EL1 (non-secure). A thick bar in the EL3 band covers ROM, BL2 and BL31 set-up. An arrow labelled "ERET, PC 0x40080000" goes down from EL3 to EL1, where a bar labelled "kernel" begins. Two arrows go up from EL1 to EL3 labelled "SMC, ESR 0x5e000000, to 0xe101400 (VBAR_EL3 + 0x400)", each followed by a short EL3 bar and an arrow back down labelled "ERET". The second SMC, SYSTEM_OFF, ends in EL3 with a semihosting exit.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<text class="sv-tb" x="10" y="52">EL3 (secure)</text><text class="sv-tb" x="10" y="122">EL2 (unused)</text><text class="sv-tb" x="10" y="192">EL1 (non-secure)</text>
+<line class="sv-dash" x1="140" y1="80" x2="750" y2="80"/><line class="sv-dash" x1="140" y1="150" x2="750" y2="150"/>
+<rect class="sv-b4" x="140" y="34" width="210" height="28" rx="4"/><text class="sv-ts" x="148" y="53">ROM → BL2 → BL31 set-up</text>
+<line class="sv-line" x1="350" y1="62" x2="350" y2="170"/><polygon class="sv-head" points="345,168 350,176 355,168"/>
+<text class="sv-ts" x="356" y="112">ERET, PC 0x40080000</text>
+<rect class="sv-b2" x="350" y="178" width="400" height="28" rx="4"/><text class="sv-ts" x="358" y="197">kernel (BL33)</text>
+<line class="sv-line" x1="500" y1="178" x2="500" y2="70"/><polygon class="sv-head" points="495,72 500,64 505,72"/>
+<rect class="sv-b3" x="500" y="34" width="40" height="28" rx="4"/>
+<line class="sv-line" x1="540" y1="62" x2="540" y2="170"/><polygon class="sv-head" points="535,168 540,176 545,168"/>
+<text class="sv-ts" x="420" y="236">SMC: ESR 0x5e000000, to 0xe101400</text>
+<line class="sv-line" x1="640" y1="178" x2="640" y2="70"/><polygon class="sv-head" points="635,72 640,64 645,72"/>
+<rect class="sv-b3" x="640" y="34" width="100" height="28" rx="4"/><text class="sv-ts" x="646" y="53">SYSTEM_OFF</text>
+<text class="sv-ts" x="560" y="112">ERET</text>
+</svg></div><figcaption><b>Figure 2.</b> Exception-level changes of the lab's boot, drawn from QEMU's <code>-d int</code> log (Layer 3 shows the log itself). Up arrows are exceptions; down arrows are exception returns. <sup class="src"><a href="#F4-32-src-R4">R4</a></sup> <sup class="src"><a href="#F4-32-src-D4">D4</a></sup></figcaption></figure>
+
+<h2 id="F4-32-layer1">Layer 1 — the kid explanation</h2>
+<p>When a small computer board switches on, it does not start your program straight away. First a tiny program that was built into the chip in the factory wakes up. It knows only one thing: where to find the next program. That one wakes up the memory and finds two more: a guard who stays awake all the time in a locked room, and your program. Your program can ask the guard for help, for example "please switch everything off", by passing a note. If any of these helpers makes a mistake, your program never starts, and you have to work out which helper it was.</p>
+
+<h2 id="F4-32-layer2">Layer 2 — the student explanation</h2>
+<p>An Arm SoC starts executing in a boot ROM inside the chip. The ROM reads boot-mode pins or fuses to pick a boot medium (SD, eMMC, SPI flash, UFS, NAND or USB), loads the first stage from that medium into on-chip SRAM, because DRAM does not work yet, optionally verifies its signature, and jumps to it. Many ROMs also offer a USB recovery mode when no valid image is found. <sup class="src"><a href="#F4-32-src-C1">C1</a></sup></p>
+<p>The first stage (U-Boot SPL or TPL, TF-A BL2, or a vendor's loader) initialises clocks and DRAM, then loads the rest into DRAM: TF-A's BL31, optionally OP-TEE as BL32, and the normal-world loader as BL33, which is U-Boot proper or EDK II. BL31 stays resident at EL3. BL33 runs in the non-secure world, loads your kernel, a devicetree and perhaps an initial RAM disk, and starts the kernel with the DTB address in <code>x0</code>, or runs it as a UEFI application (F4-33). <sup class="src"><a href="#F4-32-src-C1">C1</a></sup> <sup class="src"><a href="#F4-32-src-D1">D1</a></sup> <sup class="src"><a href="#F4-32-src-D5">D5</a></sup></p>
+<p>After the kernel is running, BL31 is still there. The kernel cannot switch CPUs on and off, reset or power off the system by itself on most Arm platforms, because those controls are reserved for the secure world. It asks BL31 through the <code>smc</code> instruction, using function numbers defined by the PSCI specification. The <code>/psci</code> node of the devicetree tells the kernel that PSCI exists and whether to use <code>smc</code> or <code>hvc</code>. <sup class="src"><a href="#F4-32-src-D2">D2</a></sup> <sup class="src"><a href="#F4-32-src-D3">D3</a></sup></p>
+<p>The lab builds a miniature of this chain: four programs on a 64 MiB flash image in QEMU's virt machine with its EL3 extension switched on. The "ROM" checks BL2 with a CRC-32 and copies it to secure RAM; BL2 loads BL31 and the kernel; BL31 programs the EL3 registers and drops to EL1; the kernel calls PSCI_VERSION and SYSTEM_OFF. Breaking one bit of the kernel image stops the chain in BL2; breaking one bit of a register value in BL31 stops it at the very first instruction of the kernel, which is the forensic lab. <sup class="src"><a href="#F4-32-src-R3">R3</a></sup> <sup class="src"><a href="#F4-32-src-R6">R6</a></sup> <sup class="src"><a href="#F4-32-src-R8">R8</a></sup></p>
+
+<h2 id="F4-32-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F4-32-l3-stages">The stages, their levels and their lifetimes</h3>
+<p>The TF-A documentation names five image slots. BL1 is a ROM-like first stage for platforms where TF-A itself provides the first code (on most SoCs the vendor's mask ROM fills this role, and TF-A starts at BL2 or BL31). BL2 is the trusted boot loader: it runs at EL3 or S-EL1, loads the other images, and on platforms with trusted boot verifies them against a chain of certificates. BL31 is the EL3 runtime and stays resident. BL32 is a secure payload at S-EL1, OP-TEE being the common open one <sup class="src"><a href="#F4-32-src-D6">D6</a></sup>. BL33 is the non-secure firmware: U-Boot proper or EDK II. <sup class="src"><a href="#F4-32-src-D1">D1</a></sup> <sup class="src"><a href="#F4-32-src-C1">C1</a></sup></p>
+<div class="tw"><table>
+<thead><tr><th>Slot</th><th>This lab</th><th>Real chain (examples)</th><th>Level</th><th>Runs from</th><th>Lifetime</th></tr></thead>
+<tbody>
+<tr><td>Boot ROM / BL1</td><td><code>rom.cc</code></td><td>Vendor mask ROM; TF-A BL1 on some platforms</td><td>EL3</td><td>ROM (here: QEMU flash at 0x0)</td><td>Until it jumps</td></tr>
+<tr><td>First stage / BL2</td><td><code>bl2.cc</code></td><td>U-Boot SPL or TPL, TF-A BL2, vendor loader</td><td>EL3 (or S-EL1)</td><td>On-chip SRAM (here: secure RAM at 0x0e000000)</td><td>Until it hands over</td></tr>
+<tr><td>BL31</td><td><code>bl31.cc</code>, <code>bl31_vec.S</code></td><td>TF-A BL31</td><td>EL3</td><td>Secure SRAM or reserved DRAM (here: 0x0e100000)</td><td>Resident until power-off</td></tr>
+<tr><td>BL32</td><td>not built</td><td>OP-TEE</td><td>S-EL1</td><td>Secure DRAM</td><td>Resident</td></tr>
+<tr><td>BL33</td><td><code>bl33.cc</code> (the kernel itself)</td><td>U-Boot proper or EDK II, which then loads the OS</td><td>EL2 or EL1, non-secure</td><td>DRAM (here: 0x40080000)</td><td>Until the OS takes over (except UEFI runtime services)</td></tr>
+</tbody></table></div>
+<p>The run records each stage reporting where it is and what it did, from the ROM at EL3 to the kernel's last SMC. <sup class="src"><a href="#F4-32-src-R3">R3</a></sup></p>
+<pre class="output" data-run="F4-32/boot_ok"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The stage names, levels and roles in the table come from curriculum 11.2 and the author's memory of the Trusted Firmware-A documentation ("Firmware Design"), the U-Boot documentation (SPL, TPL, falcon mode) and the OP-TEE documentation; none was opened in this build, and TF-A, U-Boot and OP-TEE were not built or run. Real platforms differ: some run BL2 at S-EL1, some skip BL2 because SPL loads BL31 directly, some vendors replace TF-A with their own monitor. Read your platform's TF-A port and U-Boot board documentation.</p></div>
+
+<h3 id="F4-32-l3-rom">What a boot ROM does, and what this lab's ROM leaves out</h3>
+<p>A real boot ROM decides the boot medium from pins or fuses, initialises enough of that medium's controller to read from it, parses a vendor-specific header (offsets, sizes, load addresses, sometimes several copies for redundancy), loads the image into on-chip SRAM, verifies a signature against a key hash fused into the SoC if secure boot is enabled, and jumps. If none of that works, it may fall back to a USB recovery protocol. Each vendor documents its own format, or does not; U-Boot's tools generate the formats of many vendors. <sup class="src"><a href="#F4-32-src-C1">C1</a></sup> <sup class="src"><a href="#F4-32-src-D9">D9</a></sup></p>
+<p>The lab's ROM reads a fixed offset (0x10000) of one fixed medium (QEMU's first flash device, mapped at 0), checks a 32-byte header of the course's own format ("DR4I", load address, size, CRC-32, name), copies the payload to the load address and jumps. A CRC-32 detects accidental damage. It does not detect tampering: anyone who can write the flash can recompute it. Real secure boot replaces it with a signature check against a key the attacker cannot change, which is the subject of F11-01's chain of trust. <sup class="src"><a href="#F4-32-src-R2">R2</a></sup></p>
+<pre class="output" data-run="F4-32/mkflash"></pre>
+<p>The damaged-image test flips one bit in the middle of the kernel's payload after its CRC-32 was computed. BL2 finds the mismatch and stops with exit code 6, before anything is copied over the kernel's load address. That is the behaviour you want from every stage: refuse loudly, early, and with the offset of the bad image. <sup class="src"><a href="#F4-32-src-R5">R5</a></sup> <sup class="src"><a href="#F4-32-src-R6">R6</a></sup></p>
+<pre class="output" data-run="F4-32/corrupt_mkflash"></pre>
+<pre class="output" data-run="F4-32/corrupt"></pre>
+
+<h3 id="F4-32-l3-dram">DRAM initialisation: the step this lab cannot show</h3>
+<p>BL2 prints "DRAM init would happen here". On real hardware this step is the biggest piece of the first stage: programming the memory controller and the DRAM PHY with the timings of the chips soldered on the board, then running training sequences that tune delays per data line. It runs from on-chip SRAM because DRAM is not usable until it finishes. Whether it is open code or a vendor binary decides whether a fully open boot chain exists for a board: curriculum 11.4 records open DRAM initialisation for RK3399 and many Allwinner parts, a Rockchip binary for RK3588, and a DDR PHY training firmware blob on i.MX8M. F4-34 uses those facts to choose boards. <sup class="src"><a href="#F4-32-src-C1">C1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> QEMU's RAM needs no initialisation, so this build has no evidence about DRAM training. The description above is from curriculum 11.2 and 11.4 and the author's general knowledge; the open or closed status of each family's DRAM code changes over time and must be checked in the current U-Boot and TF-A sources for your board.</p></div>
+
+<h3 id="F4-32-l3-handover">The EL3 hand-over: three registers and an ERET</h3>
+<p>Leaving EL3 for the kernel is one instruction, <code>eret</code>, which restores the processor state from <code>SPSR_EL3</code> and jumps to <code>ELR_EL3</code>. What the lower level will be, and in which execution state, is decided by those two registers and by <code>SCR_EL3</code>. The lab's <code>enter_bl33</code> writes all three and puts the DTB address in <code>x0</code>, so the kernel sees exactly the arm64 boot contract of F4-31. <sup class="src"><a href="#F4-32-src-D4">D4</a></sup> <sup class="src"><a href="#F4-32-src-D8">D8</a></sup></p>
+<ul>
+<li><b><code>SCR_EL3</code> = 0x431.</b> Bit 0 (NS) = 1: the levels below EL3 are non-secure. Bits 5:4 are reserved-as-one in this architecture version and are set. Bit 10 (RW) = 1: the next lower level, EL2 or EL1, runs in AArch64. The SMC instruction is enabled because bit 7 (SMD, "SMC disable") is 0. <sup class="src"><a href="#F4-32-src-D4">D4</a></sup> <sup class="src"><a href="#F4-32-src-R3">R3</a></sup></li>
+<li><b><code>SPSR_EL3</code> = 0x3c5.</b> Mode field 0b0101 = EL1 using <code>SP_EL1</code> ("EL1h"); bits 9:6 (D, A, I, F) = 1: debug, SError, IRQ and FIQ masked. The kernel unmasks what it is ready for.</li>
+<li><b><code>ELR_EL3</code></b> = the kernel's entry, 0x40080000, and <b><code>x0</code></b> = the DTB, 0x40000000; <code>x1</code> to <code>x3</code> = 0.</li>
+</ul>
+<p>QEMU's exception log confirms the hand-over in its own words: "Exception return from AArch64 EL3 to AArch64 EL1 PC 0x40080000". <sup class="src"><a href="#F4-32-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F4-32/boot_trace"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The bit positions of <code>SCR_EL3</code> (NS bit 0, RES1 bits 5:4, SMD bit 7, RW bit 10) and the <code>SPSR</code> mode encoding are the author's memory of the Arm Architecture Reference Manual, which was not opened in this build. The runs show only that QEMU 8.2.2 accepts 0x431 and 0x3c5 as an entry to AArch64 EL1, and rejects 0x31 (the forensic lab). Later architecture versions add more <code>SCR_EL3</code> bits that enable features for lower levels (for example pointer authentication or the memory tagging extension); a real BL31 sets them per platform, and a kernel that uses such a feature traps to EL3 when they are clear.</p></div>
+<p>Two things BL31 leaves alone deserve a note. The counter frequency register <code>CNTFRQ_EL0</code> is writable only at the highest implemented level, so firmware must program it; QEMU's reset value (62500000 Hz) was kept here, and BL31 prints it. And EL2 is skipped: the kernel is entered at EL1. A real BL31 enters BL33 at EL2 when EL2 exists, so that a hypervisor (or the kernel's EL2 code) can use it; our kernel's <code>start.S</code> handles both, as F4-37's Raspberry Pi run shows. <sup class="src"><a href="#F4-32-src-R3">R3</a></sup> <sup class="src"><a href="#F4-32-src-D4">D4</a></sup></p>
+
+<h3 id="F4-32-l3-smc">SMC, the calling convention and PSCI</h3>
+<p>The SMC Calling Convention (SMCCC) gives every firmware service a 32-bit function ID in <code>w0</code>: bit 31 says "fast call", bit 30 says "SMC64" (64-bit arguments) or "SMC32", bits 29:24 name the owning service range (standard secure services include PSCI), and the low bits number the function. Arguments go in <code>x1</code> to <code>x7</code> (or <code>w1</code>..), results come back in <code>x0</code> to <code>x3</code>, and the callee preserves the other registers. An unknown function returns −1, NOT_SUPPORTED. <sup class="src"><a href="#F4-32-src-D3">D3</a></sup></p>
+<p>The lab's kernel calls two PSCI functions: PSCI_VERSION (0x84000000) and SYSTEM_OFF (0x84000008). The <code>smc #0</code> traps to EL3 with exception class 0x17 (the log shows <code>ESR 0x17/0x5e000000</code>), through the vector at <code>VBAR_EL3</code> + 0x400 ("synchronous exception from a lower level using AArch64"): 0xe101000 + 0x400 = 0xe101400, the address in the log. The handler saves the registers C++ may clobber, calls <code>smc_dispatch</code>, restores them and returns with <code>eret</code>; <code>ELR_EL3</code> already points at the instruction after the SMC. <sup class="src"><a href="#F4-32-src-R4">R4</a></sup> <sup class="src"><a href="#F4-32-src-D3">D3</a></sup> <sup class="src"><a href="#F4-32-src-D4">D4</a></sup></p>
+<p>PSCI_VERSION returns 0x10000, major 1 minor 0, because our BL31 says so. On QEMU's virt machine without <code>secure=on</code>, QEMU itself implements PSCI behind <code>hvc</code>, and F4-37's kernel reads "1.1" from it. The number is a property of the firmware, not of the chip. <sup class="src"><a href="#F4-32-src-R3">R3</a></sup> <sup class="src"><a href="#F4-32-src-R10">R10</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The function IDs 0x84000000 (PSCI_VERSION) and 0x84000008 (SYSTEM_OFF), the return value −1 for NOT_SUPPORTED, the SMCCC bit layout and the register usage are from the author's memory of Arm's "Power State Coordination Interface" (DEN0022) and "SMC Calling Convention" (DEN0028); neither was opened in this build. The lab's BL31 and kernel agree with each other because both were written from the same memory; that proves nothing about the specification. The PSCI function IDs listed in QEMU's own <code>/psci</code> node (F4-31's dump: <code>cpu_on = 0xc4000003</code>, <code>cpu_off = 0x84000002</code>) are consistent with the layout described.</p></div>
+<p>One observation from the run needs explaining: the kernel reports "devicetree has a /psci node: no". When QEMU is given firmware with <code>-bios</code> and <code>secure=on</code>, it does not emulate PSCI itself and leaves the <code>/psci</code> node out, expecting the firmware to provide both. A real chain does: TF-A implements PSCI, and U-Boot or the board's devicetree source adds the node with <code>method = "smc"</code>. Our chain adds nothing, so a Linux kernel booted by it would not know PSCI exists and could not start secondary CPUs. Adding the node is one of the lab steps. <sup class="src"><a href="#F4-32-src-R3">R3</a></sup> <sup class="src"><a href="#F4-32-src-D7">D7</a></sup></p>
+
+<h3 id="F4-32-l3-secure">The secure world leaves marks in the devicetree</h3>
+<p>QEMU's virt machine with <code>secure=on</code> has a second PL011, reserved for the secure world, at 0x9040000. Its devicetree node is present with <code>status = "disabled"</code> and a <code>secure-status = "okay"</code> property, so that secure firmware may use it and the normal world must not. A kernel that takes "the first PL011" without checking <code>status</code> picks it. The normal-world access to secure-only hardware is refused with a data abort (fault address 0x9040018, the flag register), the exception handler tries to print through the same UART and faults again, and the run never produces a byte of output. The run shows the first abort and the count of exceptions QEMU logged before the 8-second timeout. <sup class="src"><a href="#F4-32-src-R7">R7</a></sup></p>
+<pre class="output" data-run="F4-32/nostatus"></pre>
+<p>The exact path from the first abort to the long run of "Undefined Instruction" exceptions was not investigated; what matters is the first line and its fault address. Two lessons follow. <code>status</code> is not a hint; it is the board's statement of ownership. And an exception handler whose only output is the device that has faulted reports nothing.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The <code>secure-status</code> property and the existence of the secure UART at 0x9040000 were seen in QEMU's generated tree in this build (the kernel picked it, and the abort's fault address is inside its window); the meaning of <code>secure-status</code> is from the author's memory of the Devicetree Specification and QEMU's documentation. On real SoCs, which blocks are secure-only is set by the TrustZone controllers' configuration in firmware, and differs per board.</p></div>
+
+<h3 id="F4-32-l3-standard">Standard boot, UEFI and where your kernel fits</h3>
+<p>In the real chain, BL33 is a full loader. U-Boot proper reads a boot script or its "standard boot" configuration, loads the kernel, the devicetree and an initial RAM disk from a partition or the network, applies devicetree fix-ups (memory size, MAC addresses, <code>/chosen</code> with the command line, the <code>/psci</code> node), and starts the kernel with <code>booti</code> (the arm64 contract) or as a UEFI application through its UEFI implementation. EDK II provides UEFI on platforms that use it. Curriculum 11.3 explains why the UEFI path matters: it is the one that lets a single image boot on many boards (F4-33), and it is the path milestone D10 asks for. <sup class="src"><a href="#F4-32-src-D5">D5</a></sup> <sup class="src"><a href="#F4-32-src-C1">C1</a></sup></p>
+
+<h2 id="F4-32-hardware">How the hardware actually does it</h2>
+<p>At reset an Armv8-A core starts at its highest implemented exception level, at an address given by a reset-vector configuration (an implementation-defined input or register, <code>RVBAR_EL3</code>), with the MMU and caches off. On an SoC that address points into the mask ROM. The other cores are held in reset or parked by the ROM until firmware releases them; on QEMU virt all cores start at the same entry, which is why every stage checks <code>MPIDR_EL1</code> and parks the others. <sup class="src"><a href="#F4-32-src-D4">D4</a></sup></p>
+<p>TrustZone is implemented by the interconnect and by security controllers in front of memories and peripherals: every bus transaction carries a non-secure bit taken from the issuing world, and a controller configured by secure firmware rejects non-secure accesses to secure regions. That rejection is what the normal-world kernel saw as a data abort on the secure UART in QEMU. <sup class="src"><a href="#F4-32-src-D4">D4</a></sup> <sup class="src"><a href="#F4-32-src-R7">R7</a></sup></p>
+<p>Boot-medium selection is electrical. Boot-mode pins (straps) are sampled at reset, sometimes with fuses that override them; boards wire some straps to buttons ("hold this button to enter recovery mode"), which is how you reach a ROM's USB recovery protocol on a board whose storage holds a broken image. <sup class="src"><a href="#F4-32-src-C1">C1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The chain ran only in QEMU 8.2.2's virt machine with <code>secure=on</code>; QEMU's model of TrustZone is not a security boundary, and its reset behaviour (all cores at the flash entry) is QEMU's. <code>RVBAR_EL3</code>, the reset state and the TrustZone controller description are from the author's memory of the Arm ARM and of Arm's TrustZone documentation. Boot pins, fuses and recovery buttons are board-specific: read your board's schematic and the SoC TRM's boot chapter.</p></div>
+<div class="co safety"><span class="lbl">Safety</span><p>Replacing boot stages on a real board can make it unbootable. Before writing any boot medium, know the board's recovery path (a removable SD card, USB recovery mode through the ROM, an external SPI programmer with a backup image) and test it once while the board still works. Never write fuses: secure-boot and boot-mode fuses are one-time programmable, and a wrong value is permanent. Never flash firmware on a machine you depend on. Develop in QEMU first, as this lab does. See the university <a href="#safety">safety rules</a>.</p></div>
+
+<h2 id="F4-32-worked">Worked example</h2>
+<p><b>Question.</b> Using only the boot trace, show that the kernel's two SMCs went to the right vector, and work out which instruction issued each one.</p>
+<p><b>Step 1: the vector.</b> BL31 printed <code>VBAR_EL3 = 0xe101000</code>. The AArch64 vector table has four groups of four 128-byte entries: current level with <code>SP_EL0</code> (offset 0x000), current level with <code>SP_ELx</code> (0x200), lower level in AArch64 (0x400), lower level in AArch32 (0x600); within each group, synchronous is the first entry. An SMC from EL1 in AArch64 is a synchronous exception from a lower level in AArch64: 0xe101000 + 0x400 = 0xe101400. The log says "to EL3 PC 0xe101400". <sup class="src"><a href="#F4-32-src-R3">R3</a></sup> <sup class="src"><a href="#F4-32-src-R4">R4</a></sup></p>
+<p><b>Step 2: the syndrome.</b> <code>ESR 0x17/0x5e000000</code>: QEMU prints the exception class and then the full register. 0x5e000000 = 0b0101_1110_0000…; bits 31:26 = 0b010111 = 0x17, "SMC instruction executed in AArch64 state". Bit 25 (IL) = 1, a 32-bit instruction; the low 16 bits hold the SMC's immediate, 0. <sup class="src"><a href="#F4-32-src-D4">D4</a></sup></p>
+<p><b>Step 3: the callers.</b> The first SMC has <code>ELR 0x400820a8</code>, the second <code>0x400820d8</code>. For an SMC, <code>ELR_EL3</code> holds the address of the <i>next</i> instruction, so the SMCs are at 0x400820a4 and 0x400820d4. Subtract the load address 0x40080000: offsets 0x20a4 and 0x20d4 in the image, which is linked at 0. Running <code>aarch64-linux-gnu-addr2line -f -i -e bl33.elf 0x20a4</code> on the lab's build points into the inlined <code>smc()</code> helper called from <code>kmain</code>, the first for PSCI_VERSION and the second for SYSTEM_OFF (this step was not recorded as a run; do it in the lab).</p>
+<p><b>Step 4: the return.</b> After the first SMC the log shows "Exception return from AArch64 EL3 to AArch64 EL1 PC 0x400820a8": the instruction after the SMC, as expected. After the second there is no return: BL31 ended the run with semihosting (the log's "Semihosting call ... from EL3 to EL3"). <sup class="src"><a href="#F4-32-src-R4">R4</a></sup></p>
+<p><b>Step 5: cross-check with the serial log.</b> Between the two SMCs the kernel printed "PSCI_VERSION returned 0x10000 (major 1, minor 0)", and BL31 printed its two "SMC ... from the normal world" lines in the same order. Two independent records (the serial output of our code and QEMU's own log) agree on the sequence. <sup class="src"><a href="#F4-32-src-R3">R3</a></sup></p>
+
+<h2 id="F4-32-code">Code walk-through</h2>
+<p>Three firmware stages are linked at fixed addresses (they know their SoC), and the kernel is the position-independent image of F4-31. All share <code>kbase.cc</code> for <code>printf</code> and the semihosting exit.</p>
+<p><b>Listing 1</b> — <code>bootimg.h</code>: the image format and the check every stage applies.</p>
+<pre class="listing" data-src="F4-32/bootimg.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>7–13</td><td><code>struct BootImage</code></td><td>32-byte header: magic, load address, size, CRC-32, name.</td><td>Real ROM headers carry the same ideas plus signatures and redundancy.</td></tr>
+<tr><td>15–25</td><td><code>crc32</code></td><td>Bitwise CRC-32 with the reflected polynomial 0xedb88320.</td><td>Matches Python's <code>zlib.crc32</code>, so the host tool and the ROM agree.</td></tr>
+<tr><td>29–43</td><td><code>load_image</code></td><td>Checks magic, then CRC, then copies.</td><td>Check before copy: a bad image never overwrites memory.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>mkflash.py</code>: lays out the flash image.</p>
+<pre class="listing" data-src="F4-32/mkflash.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>16–17</td><td><code>OFFSETS</code>, <code>FLASH_SIZE</code></td><td>Fixed offsets agreed with the ROM and BL2; 64 MiB.</td><td>The boot ROM's layout is a contract; your image tool must produce it exactly.</td></tr>
+<tr><td>35–36</td><td>header</td><td>Packs magic, load, size, CRC of the intact payload, name.</td><td>The CRC is computed before any corruption.</td></tr>
+<tr><td>37–38</td><td><code>--corrupt</code></td><td>Flips one bit in the middle of the payload.</td><td>A controlled fault for the refusal test.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>stage_start.S</code> and <code>stage.ld</code>: entry and layout of a fixed-address stage.</p>
+<pre class="listing" data-src="F4-32/stage_start.S"></pre>
+<pre class="listing" data-src="F4-32/stage.ld"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>S 7–9</td><td><code>mpidr_el1</code> check</td><td>Only CPU 0 continues.</td><td>QEMU starts every core at the flash entry.</td></tr>
+<tr><td>S 10–17</td><td>stack, <code>.bss</code></td><td>Absolute addresses through literal pools (<code>ldr x9, =sym</code>).</td><td>Correct only at the link address: these stages are not relocatable, by design.</td></tr>
+<tr><td>S 18</td><td><code>bl stage_main</code></td><td>Passes <code>x0</code>–<code>x3</code> from the previous stage unchanged.</td><td>BL2 hands BL31 the kernel entry and DTB this way.</td></tr>
+<tr><td>L 7–11</td><td><code>TEXT_BASE</code>, <code>RAM_BASE</code></td><td>Code at one address, writable data at another.</td><td>The ROM's code is in flash (read-only); its stack and variables must be in RAM.</td></tr>
+</tbody></table></div>
+<p><b>Listing 4</b> — <code>rom.cc</code>: stage 0.</p>
+<pre class="listing" data-src="F4-32/rom.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>8–9</td><td><code>kUart</code>, <code>kBl2Offset</code></td><td>Fixed addresses.</td><td>A ROM is built for one chip; no devicetree exists yet.</td></tr>
+<tr><td>28–33</td><td>load or stop</td><td>Exit 5 if BL2 is bad; a real ROM would try another medium or recovery mode.</td><td>The comment marks what this ROM leaves out.</td></tr>
+<tr><td>36–37</td><td>jump</td><td>Calls BL2's entry.</td><td>Still at EL3: the ROM gives its full privilege to BL2.</td></tr>
+</tbody></table></div>
+<p><b>Listing 5</b> — <code>bl2.cc</code>: stage 1.</p>
+<pre class="listing" data-src="F4-32/bl2.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11</td><td><code>kDtb</code></td><td>The DTB address where QEMU places it for firmware.</td><td>On a real board BL2 or BL33 loads the DTB from storage.</td></tr>
+<tr><td>18–28</td><td><code>load_or_stop</code></td><td>Loads one image or exits 6 with the flash offset.</td><td>The message names the image: the corrupt test points straight at BL33.</td></tr>
+<tr><td>37–39</td><td>DTB check</td><td>Reads the magic (byte-swapped: DTB is big-endian).</td><td>Fails early instead of handing the kernel garbage in <code>x0</code>.</td></tr>
+<tr><td>41–42</td><td>start BL31</td><td>Passes the kernel entry and DTB in <code>x0</code>, <code>x1</code>.</td><td>TF-A passes similar information in a structured list of entry-point descriptions.</td></tr>
+</tbody></table></div>
+<p><b>Listing 6</b> — <code>bl31.cc</code> and <code>bl31_vec.S</code>: the resident monitor.</p>
+<pre class="listing" data-src="F4-32/bl31.cc"></pre>
+<pre class="listing" data-src="F4-32/bl31_vec.S"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>C 19–21</td><td>PSCI constants</td><td>Two function IDs and NOT_SUPPORTED.</td><td>The interface the kernel depends on.</td></tr>
+<tr><td>C 23–27</td><td><code>SCR_VALUE</code></td><td>NS, RES1 bits, RW; overridable from the build.</td><td>The forensic lab builds it with a different value.</td></tr>
+<tr><td>C 31–44</td><td><code>smc_dispatch</code></td><td>Switch on the function ID; unknown IDs return −1.</td><td>Never ignore an unknown call: the caller must learn it is unsupported.</td></tr>
+<tr><td>C 46–50</td><td><code>el3_report</code></td><td>Any other exception: report and exit 7.</td><td>Produced the forensic evidence.</td></tr>
+<tr><td>C 55</td><td><code>msr vbar_el3</code></td><td>Installs the EL3 vectors before leaving EL3.</td><td>Without it, the first SMC jumps to whatever <code>VBAR_EL3</code> held at reset.</td></tr>
+<tr><td>V 3–17</td><td>vector table</td><td>16 entries; entry 8 (offset 0x400) goes to the SMC handler.</td><td>The lower-level AArch64 synchronous slot, as the worked example computed.</td></tr>
+<tr><td>V 19–42</td><td><code>el3_sync_lower</code></td><td>Saves x4–x18, x29, x30; passes ESR in x4; restores; <code>eret</code>.</td><td>SMCCC requires the callee to preserve registers other than the results.</td></tr>
+<tr><td>V 50–60</td><td><code>enter_bl33</code></td><td>Writes SCR, SPSR, ELR; DTB to x0; zeroes x1–x3; <code>eret</code>.</td><td>The whole hand-over in nine instructions.</td></tr>
+</tbody></table></div>
+<div class="co warning"><span class="lbl">Watch out</span><p>This monitor shares its stack with nothing and saves only general-purpose registers. A real BL31 keeps a separate context per world and per CPU, saves system registers when it switches worlds, and must not trust any pointer the normal world passes. Do not copy this monitor into a real product: it exists to show the shape of the hand-over.</p></div>
+<p><b>Listing 7</b> — <code>bl33.cc</code>: the kernel as BL33.</p>
+<pre class="listing" data-src="F4-32/bl33.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–20</td><td><code>smc</code></td><td>Function ID in <code>x0</code>, <code>smc #0</code>, result in <code>x0</code>; x1–x3 marked clobbered.</td><td>SMCCC may return values in x1–x3; the compiler must not keep data there.</td></tr>
+<tr><td>29–34</td><td>console search</td><td>First PL011 that is compatible, <i>available</i>, and translatable.</td><td>Removing <code>t.available(n)</code> is the "Common mistakes" run.</td></tr>
+<tr><td>41</td><td><code>/psci</code> check</td><td>Reports whether the tree advertises PSCI.</td><td>It does not here; Layer 3 explains why.</td></tr>
+<tr><td>42–47</td><td>two SMCs</td><td>PSCI_VERSION, then SYSTEM_OFF; exit 8 if the firmware returns.</td><td>A kernel must handle firmware that does not do what it asked.</td></tr>
+</tbody></table></div>
+<p>The build record lists the size of each stage. <sup class="src"><a href="#F4-32-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F4-32/build"></pre>
+
+<h2 id="F4-32-breaks">Where the analogy breaks</h2>
+<ul>
+<li>Mr Pike at the gate can be replaced when he retires. A mask ROM cannot be changed after manufacture; its bugs are permanent, and a vulnerable ROM stays vulnerable on every chip made with it.</li>
+<li>A caretaker who lives in the office is a person you can see. BL31 is invisible to the kernel: it occupies memory the kernel must not touch (the devicetree's reserved-memory or memory reservation map should say where), and it can run at any SMC, interrupt or power event, taking time the kernel cannot account for.</li>
+<li>Passing a note through the hatch is voluntary. On real platforms some events go to EL3 without the kernel asking: secure interrupts routed to EL3, and on some platforms errors that firmware handles first.</li>
+<li>In the school, every envelope is checked by a person who can notice an odd seal. A boot stage checks exactly what its code checks: a CRC detects damage, not forgery; a signature check with a leaked key accepts forgeries.</li>
+</ul>
+
+<h2 id="F4-32-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Ignoring <code>status</code> and picking a secure-world device.</b> The kernel aborts on its first access and its own exception report faults on the same UART: no output at all. Debug with QEMU's <code>-d int</code> log, which does not depend on your console. <sup class="src"><a href="#F4-32-src-R7">R7</a></sup></li>
+<li><b>Missing <code>RW</code> in <code>SCR_EL3</code>.</b> The exception return is illegal and the first instruction of the kernel raises an Illegal Execution State exception at EL3. This is the forensic lab.</li>
+<li><b>Not installing <code>VBAR_EL3</code> before the first SMC.</b> The SMC lands at an address left over from reset. Symptom: a hang or a random crash at the first PSCI call, never at boot.</li>
+<li><b>Expecting a <code>/psci</code> node that your firmware never added.</b> A Linux kernel then runs on one CPU and cannot power off. Check the tree the kernel actually received (dump it from the kernel or with QEMU's <code>dumpdtb</code>), not the source file.</li>
+<li><b>Overlapping images.</b> A BL33 load address inside BL31's memory overwrites the monitor; the symptom appears at the first SMC. A good BL2 checks load ranges against each other (a lab step).</li>
+<li><b>Debugging with the console only.</b> Before the console works, use the exit code (this course's semihosting exit), QEMU's <code>-d int,guest_errors</code> log, or a debugger attached to QEMU's gdb stub (<code>-s -S</code>); on hardware, a JTAG probe.</li>
+</ul>
+
+<div class="co transition" id="F4-32-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F4-31">F4-31</a> showed that an SoC kernel receives its machine description in <code>x0</code>; <a href="#OS301">OS301</a> showed the PC's path from reset vector through UEFI. <b>What carries over:</b> the arm64 boot contract, the exception model of AArch64 from DR402, the idea that firmware leaves the machine in a state you must read rather than assume. <b>What changes:</b> several programs run before you, at higher privilege, and one of them stays resident; power and CPU control are requests to it, not register writes of your own; image formats and boot media are vendor contracts. <sup class="src"><a href="#F4-32-src-C1">C1</a></sup> <b>What comes next:</b> <a href="#F4-33">F4-33</a> looks at the standard that lets BL33 present the same interface on every board: UEFI as required by Arm SystemReady and EBBR.</p></div>
+
+<h2 id="F4-32-check">Check yourself</h2>
+<ol>
+<li>Explain in your own words why the first stage after the boot ROM runs from on-chip SRAM and not from DRAM.</li>
+<li>Which stages of the chain are still in memory, and able to run, after your kernel has started? (a) none; (b) only BL31 (and BL32 if present); (c) all of them; (d) BL33 only.</li>
+<li>In the lab, which exit code does a damaged BL2 image produce, which a damaged BL33 image, and why are they different?</li>
+<li>What would QEMU's log show if <code>VBAR_EL3</code> were 0xe102000 instead of 0xe101000? Compute the address of the SMC vector.</li>
+<li>Predict, then check in the lab: if <code>bl33.cc</code> called <code>smc(0x84000009)</code> (SYSTEM_RESET) before SYSTEM_OFF, what would BL31 print and what would the kernel receive?</li>
+<li>Apply it to a new case: a board's kernel boots, prints its banner, and hangs when Linux tries to bring up the second CPU. The kernel's tree has no <code>/psci</code> node. Name two places in the chain where the node could have been added, and how you would check which one failed.</li>
+<li>Why is a CRC-32 in the boot image header no protection against an attacker, and what replaces it in a secure boot chain?</li>
+<li>What does <code>SPSR_EL3</code> = 0x3c5 say about the state the kernel starts in?</li>
+<li>A colleague says: "PSCI version 1.0 means this chip implements PSCI 1.0." Correct the statement using the two runs of this course (this chapter and F4-37).</li>
+</ol>
+
+<h2 id="F4-32-lab">Lab</h2>
+<p><b>Goal.</b> Build and boot a four-stage Arm boot chain in QEMU, watch every change of exception level, make it refuse a damaged image, and extend the resident monitor. This lab prepares the boot-chain half of milestone D10, whose goal is: "The same AArch64 kernel binary boots on QEMU virt and on a board from a second SoC family (for example Rockchip RK3399, NXP i.MX8M, TI AM62x or an Allwinner A64 or H6 board) through TF-A and U-Boot's UEFI implementation, discovering everything at run time." <sup class="src"><a href="#F4-32-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> No hardware. The build used <code>QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)</code>, <code>aarch64-linux-gnu-g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>GNU ld (GNU Binutils for Ubuntu) 2.42</code> and Python 3.13.16, as printed in the logs. Run <code>university/labs/run_lab.sh university/labs/F4-32</code> from the repository root. TF-A, U-Boot and OP-TEE were not available in the build container; the extension names how to use them.</p>
+<p><b>Safety.</b> None beyond normal computer use for the emulator steps. Any step on a real board follows the safety box above: recovery path first, never write fuses.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. <code>boot_ok.out</code> should show all four stages and end with SYSTEM_OFF (exit code 0); <code>corrupt.out</code> should stop in BL2 at flash offset 0x40000 (exit code 6).</li>
+<li>Run the chain yourself with QEMU's exception log: <code>qemu-system-aarch64 -M virt,secure=on -cpu cortex-a53 -m 256M -nographic -semihosting -bios flash.bin -d int -D int.txt</code> (build <code>flash.bin</code> with the commands in <code>run.sh</code>). Find the ERET to EL1 and both SMCs, and redo the worked example with <code>addr2line</code>.</li>
+<li>Add PSCI_FEATURES and SYSTEM_RESET to <code>smc_dispatch</code> (look the function IDs up in the PSCI specification, do not guess), and make the kernel ask PSCI_FEATURES about SYSTEM_RESET before calling it.</li>
+<li>Make BL2 refuse images whose load ranges overlap each other or BL2 itself, and test it with a deliberately wrong load address in <code>mkflash.py</code>.</li>
+<li>Give the ROM a fallback: if BL2 at 0x10000 is bad, try a second copy at 0x30000 (change <code>mkflash.py</code> to write both). Test with <code>--corrupt BL2</code>. This is how real ROMs survive a bad update.</li>
+<li>Make BL2 tell the kernel about PSCI: since editing a DTB in place is the job of a loader, start by checking in the kernel for a <code>/psci</code> node, and if it is missing, print a warning that names the stage which should have added it.</li>
+</ol>
+<p><b>Expected observations.</b> Measured on the build container: the ROM runs at EL3; BL31 reports <code>VBAR_EL3 = 0xe101000</code> and <code>SCR_EL3 = 0x431</code>; the kernel is entered at EL1 at 0x40080000 with the DTB at 0x40000000; PSCI_VERSION returns 0x10000. Your step-3 run prints the features answer and ends with a reset (QEMU restarts the ROM unless run with <code>-no-reboot</code>).</p>
+<p><b>Verification.</b> Exit code 0 for the good chain, 6 for a damaged BL33, 5 for a damaged BL2 without the fallback and 0 with it; in the <code>-d int</code> log, exactly one ERET from EL3 to EL1 before the first SMC, and every SMC entering at <code>VBAR_EL3</code> + 0x400.</p>
+<p><b>Troubleshooting.</b></p>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Likely cause</th><th>Check</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>No output at all, exit 124</td><td>QEMU started without <code>secure=on</code>, so there is no EL3 and no flash code at 0 runs as expected; or the kernel picked the secure UART</td><td>The command line; <code>-d int</code> for a data abort at 0x9040018</td><td>Use the lab's <code>QM</code> line; keep the <code>status</code> check</td></tr>
+<tr><td>"unexpected exception, vector 4" right after "entering BL33"</td><td>A bad <code>SCR_EL3</code> or <code>SPSR_EL3</code></td><td>ESR_EL3 exception class</td><td>See the forensic lab</td></tr>
+<tr><td>Hang at the first SMC</td><td><code>VBAR_EL3</code> not set, or the vector entry at 0x400 misplaced</td><td><code>-d int</code>: "to EL3 PC" address</td><td>Install vectors first; keep <code>.balign 2048</code> and 128-byte entries</td></tr>
+<tr><td>Exit 6 although nothing was corrupted</td><td>A stage grew past its flash slot and overlapped the next image</td><td>Sizes in <code>mkflash.out</code> against the offsets</td><td>Move the offsets, or assert sizes in <code>mkflash.py</code></td></tr>
+</tbody></table></div>
+<p><b>Extension.</b> On a machine with network access, build TF-A for QEMU (its <code>qemu</code> platform) and U-Boot's <code>qemu_arm64</code> configuration, boot your F4-31 kernel from U-Boot with <code>booti</code>, and compare what U-Boot changes in the devicetree. Record every version and command in your log; nothing of this was run in this build.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Every run used QEMU 8.2.2. The real components named in the lab (TF-A's QEMU platform, U-Boot's <code>qemu_arm64</code> configuration and <code>booti</code>) are from the author's memory of their documentation; they were not built or run, and their names and options must be checked in the current releases. Steps 3 to 6 have no reference run: they are for you to do and record.</p></div>
+
+<h2 id="F4-32-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> A firmware engineer tidies up BL31: "the SCR value had magic numbers in it, so I rewrote it from the field list". The new build prints every stage's banner, then one more line, and stops. The kernel never prints anything. The kernel image has not changed since yesterday, when the same chain booted.</p>
+<p><b>Evidence pack.</b> The serial log of the failing boot <sup class="src"><a href="#F4-32-src-R8">R8</a></sup>:</p>
+<pre class="output" data-run="F4-32/forensic_serial"></pre>
+<p>QEMU's exception log of the same run, with repeated lines counted <sup class="src"><a href="#F4-32-src-R9">R9</a></sup>:</p>
+<pre class="output" data-run="F4-32/forensic_int"></pre>
+<p>Yesterday's good boot and its exception log are in <code>boot_ok.out</code> and <code>boot_trace.out</code> (Layer 3).</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which values differ between the good and the failing serial logs before the failure? Where did the failing run end up after the ERET: which level, which PC?</li>
+<li>Decode <code>ESR_EL3 = 0x3a000000</code>. What kind of exception is it, and why is it reported at EL3 although BL31 tried to enter EL1?</li>
+<li>State at least two hypotheses (for example: a damaged kernel image; a wrong entry address; a bad <code>SPSR_EL3</code>; a bad <code>SCR_EL3</code>) and the evidence for or against each.</li>
+<li>Which bit is missing from the new <code>SCR_EL3</code> value, and what does that bit control?</li>
+<li>Give the fix and a check that would catch this class of mistake at build time or in BL31 itself.</li>
+</ol>
+<p><b>Method hints.</b> Compare the two logs line by line before reading any code. In <code>ESR_ELx</code>, bits 31:26 are the exception class. An exception return that the architecture considers illegal does not change the exception level; it sets <code>PSTATE.IL</code>, and the next instruction then raises an exception at the current level. Which vector offset does a synchronous exception "from the current level, using <code>SP_ELx</code>" use?</p>
+
+<h2 id="F4-32-project">Mini-project</h2>
+<p><b>A measured hash chain.</b> Replace the CRC-32 with SHA-256 (write it, and test it on the host against Python's <code>hashlib</code> with at least 1000 random inputs). Each stage's header carries the hash of the next stage's image; the ROM carries the expected hash of BL2 as a constant (your stand-in for a key hash in fuses). Each stage also appends what it loaded (name, hash) to a log in a reserved memory area, and the kernel prints that log. Write one page explaining why this gives integrity against accidental damage and a record of what ran, but not authenticity, and what a signature scheme would add (this prepares F11-01). <sup class="src"><a href="#F4-32-src-C1">C1</a></sup></p>
+<p><b>Rubric.</b> SHA-256 implementation correct on the host test, with the number of cases stated (2). The chain refuses any single-bit change in any stage, shown by a script that tries one flip per stage (3). The kernel prints the measurement log, and the log's hashes match <code>sha256sum</code> of the images (2). Memory for the log is reserved so the kernel will not overwrite it, and the reservation is described in the devicetree or explained (1). The one-page explanation is correct and names what remains unprotected (2).</p>
+
+<h2 id="F4-32-summary">Summary</h2>
+<ul>
+<li>An Arm SoC boots through a boot ROM, a first stage that brings up DRAM (SPL, TPL, BL2 or a vendor loader), a resident EL3 runtime (BL31), an optional secure OS (BL32) and a normal-world loader (BL33) before your kernel.</li>
+<li>Each stage should check the next before copying it and refuse loudly; a CRC detects damage, only a signature detects tampering.</li>
+<li>Leaving EL3 is <code>SCR_EL3</code> (security state, AArch64 or AArch32 below), <code>SPSR_EL3</code> (target level, masks), <code>ELR_EL3</code> (entry), then <code>ERET</code>; the kernel gets the DTB in <code>x0</code>.</li>
+<li>After boot the kernel asks BL31 for power and CPU control with SMC and PSCI function IDs under the SMC Calling Convention; the <code>/psci</code> node says that, and how, PSCI is available.</li>
+<li>The secure world's ownership shows in the devicetree as <code>status = "disabled"</code>; ignoring it crashes the kernel without a word.</li>
+<li>When the console is silent, QEMU's exception log and exit codes are your evidence.</li>
+</ul>
+
+<h2 id="F4-32-sources">Sources</h2>
+<ol>
+<li id="F4-32-src-D1">Trusted Firmware project, "Trusted Firmware-A documentation" (tier 2), especially "Firmware Design" (boot stages BL1, BL2, BL31, BL32, BL33; image loading; entry-point information) and the QEMU platform port. <i>Title only — not opened during this build; the Source Researcher must confirm the release and sections (dossier gate G1 open).</i></li>
+<li id="F4-32-src-D2">Arm, "Arm Power State Coordination Interface Platform Design Document" (DEN0022) (tier 1): function IDs, PSCI_VERSION, SYSTEM_OFF, SYSTEM_RESET, PSCI_FEATURES, return codes. <i>Title only — not opened during this build; the Source Researcher must confirm the issue and sections (dossier gate G1 open).</i></li>
+<li id="F4-32-src-D3">Arm, "SMC Calling Convention" (DEN0028) (tier 1): function ID layout, register usage, NOT_SUPPORTED. <i>Title only — not opened during this build; the Source Researcher must confirm the issue and sections (dossier gate G1 open).</i></li>
+<li id="F4-32-src-D4">Arm, "Arm Architecture Reference Manual for A-profile architecture" (tier 1): <code>SCR_EL3</code>, <code>SPSR_EL3</code>, <code>ELR_EL3</code>, <code>VBAR_EL3</code> and the vector table offsets, exception return and illegal exception returns, <code>ESR_ELx</code> exception classes 0x0E and 0x17, <code>RVBAR_EL3</code>, <code>CNTFRQ_EL0</code>, the Security states. <i>Title only — not opened during this build; the Source Researcher must confirm the issue and sections (dossier gate G1 open).</i></li>
+<li id="F4-32-src-D5">U-Boot project, "The U-Boot Documentation" (tier 2): SPL and TPL, standard boot, <code>booti</code>, the UEFI implementation, devicetree fix-ups. <i>Title only — not opened during this build; the Source Researcher must confirm the release and sections (dossier gate G1 open).</i></li>
+<li id="F4-32-src-D6">OP-TEE project, "OP-TEE documentation" (tier 2): the secure OS as BL32. <i>Title only — not opened during this build; the Source Researcher must confirm the release and section (dossier gate G1 open).</i></li>
+<li id="F4-32-src-D7">QEMU project, "QEMU System Emulation User's Guide" (tier 2): the Arm virt machine's <code>secure</code> option, firmware loading with <code>-bios</code>, PSCI emulation and when QEMU provides it, the <code>-d int</code> log. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F4-32-src-D8">The Linux kernel documentation (tier 2), "Booting AArch64 Linux": the register state the kernel expects from its loader. <i>Title only — not opened during this build; the Source Researcher must confirm the kernel version and section (dossier gate G1 open).</i></li>
+<li id="F4-32-src-D9">Vendor and community boot ROM documentation named in curriculum 11.2 and 11.4 (tier 3): the linux-sunxi community wiki on FEL, NXP's serial download protocol and Universal Update Utility (uuu), Rockchip's mask-ROM mode documentation. <i>Title only — not opened during this build; the Source Researcher must confirm editions and sections (dossier gate G1 open).</i></li>
+<li id="F4-32-src-C1">Systems Curriculum (this project), sections 11.2 "The common Arm boot chain", 11.3, 11.4 and milestone D10 in 11.6 (local file <code>SYSTEMS_CURRICULUM.html</code>): the chain, the stage names, the reading list and the D10 goal quoted verbatim. A map, not a source (AH-4).</li>
+<li id="F4-32-src-R1">R1 — build of the four stages: <code>build.log</code>; aarch64-linux-gnu-g++ 13.3.0, GNU ld 2.42; exit code 0.</li>
+<li id="F4-32-src-R2">R2 — flash image: <code>mkflash.log</code>; Python 3.13.16; exit code 0.</li>
+<li id="F4-32-src-R3">R3 — the whole chain: <code>boot_ok.log</code>; QEMU 8.2.2 (<code>-M virt,secure=on</code>); exit code 0; untested on hardware.</li>
+<li id="F4-32-src-R4">R4 — QEMU exception log of the same boot: <code>boot_trace.log</code>; QEMU 8.2.2; exit code 0; untested on hardware.</li>
+<li id="F4-32-src-R5">R5 — damaged flash image: <code>corrupt_mkflash.log</code>; Python 3.13.16; exit code 0.</li>
+<li id="F4-32-src-R6">R6 — chain with the damaged BL33: <code>corrupt.log</code>; QEMU 8.2.2; exit code 6 (expected refusal); untested on hardware.</li>
+<li id="F4-32-src-R7">R7 — kernel without the <code>status</code> check: <code>nostatus.log</code>; QEMU 8.2.2; exit code 124 (expected: no output within 8 s); untested on hardware.</li>
+<li id="F4-32-src-R8">R8 — forensic boot, serial log: <code>forensic_serial.log</code>; QEMU 8.2.2; exit code 7 (expected); untested on hardware.</li>
+<li id="F4-32-src-R9">R9 — forensic boot, exception log: <code>forensic_int.log</code>; QEMU 8.2.2; exit code 0.</li>
+<li id="F4-32-src-R10">R10 — PSCI version reported by QEMU's own PSCI on virt without <code>secure=on</code>: F4-37 lab, <code>two_virt.log</code>; QEMU 8.2.2; exit code 0.</li>
+</ol>
+
+<h2 id="F4-32-glossary">Glossary links</h2>
+<p><a href="#gl-boot-chain-arm">Boot chain (Arm)</a> · <a href="#gl-trusted-firmware-a-tf-a">Trusted Firmware-A (TF-A)</a> · <a href="#gl-el3-runtime-bl31">EL3 runtime (BL31)</a> · <a href="#gl-smc-secure-monitor-call">SMC (Secure Monitor Call)</a> · <a href="#gl-psci-power-state-coordination-interface">PSCI (Power State Coordination Interface)</a> · <a href="#gl-spl-and-tpl-u-boot">SPL and TPL (U-Boot)</a> · <a href="#gl-secure-and-non-secure-worlds">Secure and non-secure worlds</a> · <a href="#gl-recovery-mode-boot-rom">Recovery mode (boot ROM)</a> · <a href="#gl-boot-rom-mask-rom">Boot ROM (mask ROM)</a> · <a href="#gl-reset-vector">Reset vector</a> · <a href="#gl-semihosting">Semihosting</a></p>
+
+<h2 id="F4-32-next">Next chapter</h2>
+<p><a href="#F4-33">F4-33 SystemReady and EBBR</a> runs a UEFI application of your own on QEMU's AArch64 UEFI firmware and reads, from the UEFI configuration table, either ACPI tables or a devicetree: the interface that makes "one image, many boards" possible. Back to the course: <a href="#DR403">DR403</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#socs">section 11, platforms and SoCs</a>.</p>
+
+<h2 id="F4-32-answers">Answers to Check yourself</h2>
+<ol>
+<li>Good answers say: DRAM is not usable until its controller and PHY have been programmed and trained, which is the first stage's own job; the only RAM available before that is the SoC's on-chip SRAM, which the ROM can load into directly.</li>
+<li>(b). BL31 stays resident at EL3 (and BL32 in the secure world if present). (a) forgets that the kernel's SMCs go somewhere; the run shows BL31 answering after the kernel started. (c) is wrong because the ROM's and BL2's work is done and their memory may be reused. (d) confuses BL33 with the kernel: in a real chain BL33 (U-Boot) is gone once the kernel runs, except UEFI runtime services if the kernel was started through UEFI.</li>
+<li>A bad BL2 stops in the ROM with exit code 5; a bad BL33 stops in BL2 with exit code 6. Each stage reports its own refusal; the exit code (or message) tells you which stage refused, and hence which image to look at.</li>
+<li>The SMC would enter at 0xe102000 + 0x400 = 0xe102400, and since the vector table is actually at 0xe101000, the code there would be whatever lies at that address: the log's "to EL3 PC 0xe102400" would show it, followed by a crash or hang.</li>
+<li>BL31 prints "unknown SMC 0x84000009 (ESR_EL3 0x5e000000) -&gt; NOT_SUPPORTED" and the kernel receives −1 in <code>x0</code> (0xffffffffffffffff printed as unsigned), then continues to SYSTEM_OFF. Check by editing <code>bl33.cc</code> and rerunning.</li>
+<li>The node can come from the board's devicetree source (built into the DTB that BL33 loads) or be added by U-Boot as a fix-up before starting the kernel (and on some platforms TF-A passes information that U-Boot uses). Check the source DTS for a <code>psci</code> node, then dump the tree the kernel actually received (from the kernel, or U-Boot's <code>fdt print /psci</code> before booting) to see whether the fix-up ran.</li>
+<li>Anyone who can modify the image can recompute the CRC: it is a public function with no secret. A secure chain verifies a digital signature with a public key whose hash is fused into the SoC (or a certificate chain rooted there), so a modified image fails unless the attacker has the private key.</li>
+<li>Mode EL1h (EL1 using its own stack pointer), AArch64 (the mode field's encoding; the execution state also depends on <code>SCR_EL3.RW</code>), with debug, SError, IRQ and FIQ masked.</li>
+<li>PSCI_VERSION reports the version of the firmware that answers, not a property of the chip. In this chapter our own BL31 answered 1.0; in F4-37, QEMU's built-in PSCI on the same emulated CPU answered 1.1. On a real board, TF-A's version decides it.</li>
+</ol>
+<h3 id="F4-32-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>The only difference before the failure is BL31's line "SCR_EL3 = 0x31" (failing) versus "SCR_EL3 = 0x431" (good). After the ERET, the failing run is still at EL3: QEMU's log shows an exception "from EL3 to EL3" with ELR 0x40080000, the kernel's entry, and the target "EL3 PC 0xe101200".</li>
+<li>Bits 31:26 of 0x3a000000 are 0b001110 = 0x0E: Illegal Execution State. The exception return was illegal (it asked for an AArch64 EL1 while <code>SCR_EL3</code> declared the lower levels AArch32), so the ERET did not change the level: it set <code>PSTATE.IL</code> and branched to <code>ELR_EL3</code>. The first instruction at 0x40080000 then raised the exception at EL3, through the "current level, <code>SP_ELx</code>, synchronous" vector: <code>VBAR_EL3</code> + 0x200 = 0xe101200, vector number 4 in BL31's report. QEMU names the exception "Undefined Instruction" in its log while the syndrome says 0x0E.</li>
+<li>Damaged kernel: ruled out, BL2 checked its CRC-32 ("CRC-32 ok") and the image was unchanged. Wrong entry: ruled out, ELR is 0x40080000 as in the good run. Bad <code>SPSR_EL3</code>: not printed, but the code path is unchanged and the value is a constant; possible, ruled out by the source diff. Bad <code>SCR_EL3</code>: supported, it is the only printed difference.</li>
+<li>0x431 − 0x31 = 0x400: bit 10, RW. With RW = 0 the levels below EL3 are AArch32, so an exception return to an AArch64 EL1 is illegal. The engineer's field list included NS and the RES1 bits but forgot RW.</li>
+<li>Fix: set bit 10 (build with the default <code>SCR_VALUE</code>, 0x431). Prevention: define each field by name and add a <code>static_assert</code> that RW is set whenever the BL33 entry state is AArch64; in BL31, read <code>SCR_EL3</code> back before the ERET and refuse to continue if RW does not match the requested <code>SPSR</code> mode; keep the good boot log as a reference and diff each new build's log against it in CI. How the fault was injected: <code>run.sh</code> builds BL31 with <code>-DSCR_VALUE=0x31</code>.</li>
+</ol>

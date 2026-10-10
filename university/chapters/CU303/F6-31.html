@@ -1,0 +1,328 @@
+<!--meta
+id: F6-31
+title: Unified (managed) memory, page migration and prefetching
+course: CU303
+level: L4
+prereqs: F6-29 (pinned memory and overlap); F6-30 (graphs); F1-38 (virtual memory and TLBs); F3-21 (paging); F6-09 (bandwidth)
+time: 10–14 hours including the lab
+hardware: Lab steps 1–3: an NVIDIA GPU whose device attributes managedMemory and concurrentManagedAccess you record (prefetching to the GPU needs concurrentManagedAccess = 1), on Linux, with a CUDA Toolkit and driver (record both versions), or a cloud GPU instance. The CPU demand-paging measurement, the cost model and the forensic lab need no GPU (this build had none: the GPU run below shows the runtime's real "no device" error)
+maps: Track E 13.2 topic 9 (unified / managed memory: page migration, prefetching and its costs); prepares the profiling of E8 and E10
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-31-hook">Story hook</h2>
+<p>The great kitchen hall has two stores. The head chef keeps a larder next to her office; the hall has its own pantry beside the cooks. Until now, Amara wrote a delivery order every time something had to go from her larder to the pantry or back. It works, but she must remember every crate.</p>
+<p>Ravi, the new store manager, proposes a different system. "Every crate gets one number, valid in both stores. Nobody writes delivery orders. If a cook reaches for crate 812 and it is in the larder, a runner fetches it, and the cook waits a moment. If you want the cooks never to wait, tell the runners in advance which crates will be needed, and they bring them over before the cooks start."</p>
+<p>It feels like magic at first. Then the evening of the tasting comes. After every single course, Amara walks to the pantry and tastes from every crate. The runners carry the crates to her larder, then back to the pantry for the next course, then back again. The kitchen spends the evening carrying crates.</p>
+<p>In CUDA, the shared crate number is a <b>managed pointer</b>, the runners are <b>page migration</b>, the advance notice is <b>prefetching</b>, and Amara's tasting is the most common way to make managed memory slow.</p>
+
+<h2 id="F6-31-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> what managed memory is, what one pointer valid on both processors means, and what the device attributes <code>managedMemory</code>, <code>concurrentManagedAccess</code> and <code>pageableMemoryAccess</code> tell you.</li>
+<li><b>Connect</b> GPU page migration to the demand paging you know from the CPU, using a real fault count measured in this build.</li>
+<li><b>Write</b> a managed-memory program with <code>cudaMallocManaged</code>, <code>cudaMemPrefetchAsync</code> and <code>cudaMemAdvise</code>, synchronising correctly before the CPU touches the data.</li>
+<li><b>Predict</b> with a cost model when on-demand migration is close to explicit copies and when it is many times slower (fault granularity, ping-pong access).</li>
+<li><b>Diagnose</b> a measurement whose fault count does not match the plan, separating the program's own page faults from those of a tool.</li>
+</ul>
+
+<div class="co jargon" id="F6-31-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Managed memory (unified memory)</dt><dd><b>Simple words:</b> memory with one address that both the CPU and the GPU can use; the system moves the data to whoever uses it. <b>Analogy:</b> crates with one number valid in both stores, moved by runners. <b>Precise:</b> memory allocated with <code>cudaMallocManaged</code> or declared <code>__managed__</code>; the header says the pointer "is valid on the CPU and on all GPUs in the system that support managed memory" and "all accesses to this pointer must obey the Unified Memory programming model". It is released with <code>cudaFree</code>. <sup class="src"><a href="#F6-31-src-H1">H1</a></sup> <sup class="src"><a href="#F6-31-src-D1">D1</a></sup></dd>
+<dt>Page migration</dt><dd><b>Simple words:</b> moving a page of data to the memory of the processor that uses it. <b>Analogy:</b> a runner carrying a crate from one store to the other. <b>Precise:</b> on systems where devices report <code>concurrentManagedAccess</code>, "managed memory can migrate to any processor's memory at any time", and "the Unified Memory driver will employ heuristics to maintain data locality and prevent excessive page faults". <sup class="src"><a href="#F6-31-src-H1">H1</a></sup></dd>
+<dt>Page fault (GPU, managed memory)</dt><dd><b>Simple words:</b> the moment a processor reaches for data that is not where it can use it, and must wait for it. <b>Analogy:</b> the cook reaches for crate 812, it is not there, and the cook waits for the runner. <b>Precise:</b> an access to a virtual page that has no valid mapping for the accessing processor, resolved by the operating system (CPU, <a href="#F1-38">F1-38</a>, <a href="#F3-21">F3-21</a>) or by the Unified Memory driver (GPU) before the access is retried. <sup class="src"><a href="#F6-31-src-D1">D1</a></sup> <sup class="src"><a href="#F6-31-src-D4">D4</a></sup></dd>
+<dt>Prefetch (managed memory)</dt><dd><b>Simple words:</b> moving data to where it will be needed before anyone asks for it. <b>Analogy:</b> telling the runners in advance which crates to bring. <b>Precise:</b> <code>cudaMemPrefetchAsync(ptr, bytes, dstDevice, stream)</code> migrates a managed range to a GPU or, with <code>cudaCpuDeviceId</code>, to host memory, as an operation in a stream; the header calls it "not required for functionality" and says it "only serves to improve performance". <sup class="src"><a href="#F6-31-src-H1">H1</a></sup></dd>
+<dt>Memory advice</dt><dd><b>Simple words:</b> hints that tell the system how you will use a range of memory. <b>Analogy:</b> notes on a crate: "mostly for tasting", "keep in the pantry", "the larder will look at this too". <b>Precise:</b> <code>cudaMemAdvise</code> with <code>cudaMemAdviseSetReadMostly</code>, <code>cudaMemAdviseSetPreferredLocation</code> or <code>cudaMemAdviseSetAccessedBy</code> (and their unset forms), each with documented effects on duplication, migration and mapping. <sup class="src"><a href="#F6-31-src-H1">H1</a></sup></dd>
+<dt>Thrashing (ping-pong migration)</dt><dd><b>Simple words:</b> data moving back and forth between two processors again and again. <b>Analogy:</b> crates carried to the larder after every course and back again. <b>Precise:</b> repeated migration of the same pages because two processors take turns accessing them; the header mentions the driver's "page thrash detection and resolution logic", which may eventually pin a constantly thrashing page to host memory. <sup class="src"><a href="#F6-31-src-H1">H1</a></sup></dd>
+<dt>Minor page fault</dt><dd><b>Simple words:</b> a page fault the operating system fixes without reading the disk. <b>Analogy:</b> the crate is in the building; it only needs to be put on the right shelf. <b>Precise:</b> the count Linux reports in <code>ru_minflt</code> of <code>getrusage</code>; Listing 2 uses it to count first-touch faults on the CPU. <sup class="src"><a href="#F6-31-src-D5">D5</a></sup> <sup class="src"><a href="#F6-31-src-R2">R2</a></sup></dd>
+</dl></div>
+
+<h2 id="F6-31-pictures">The idea in pictures</h2>
+<p>Figure 1 is the mechanism, in the order things happen when a GPU thread touches a managed page that currently lives in host memory. Each step names who acts. The CPU part of the story (steps 1–3 on the left) is the demand paging of <a href="#F1-38">F1-38</a>; the GPU part is the same idea between two processors.</p>
+<figure id="F6-31-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-31-f1t F6-31-f1d">
+<title id="F6-31-f1t">Figure 1: what an on-demand migration does</title>
+<desc id="F6-31-f1d">Two memories side by side: host memory on the left with a page labelled P, and GPU memory on the right. Above them, two page tables: the CPU page table maps virtual page V to P in host memory; the GPU page table has no valid entry for V. Numbered steps: 1, a GPU thread reads virtual page V; 2, the GPU page table has no mapping, so a GPU page fault occurs and the warp waits; 3, the Unified Memory driver unmaps V from the CPU page table; 4, it copies the page (or a group of pages) over the link to GPU memory; 5, it maps V in the GPU page table to the new copy; 6, the GPU retries the access, which now hits GPU memory. A dashed arrow shows the reverse direction: a later CPU access to V faults on the CPU and moves the page back. A note says prefetching does steps 3 to 5 in advance, as one operation in a stream.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<rect class="sv-b1" x="20" y="20" width="250" height="70" rx="6"/><text class="sv-tb" x="30" y="40">CPU page table</text>
+<text class="sv-ts" x="30" y="62">V → P (host memory)</text><text class="sv-ts" x="30" y="80">step 3: unmapped</text>
+<rect class="sv-b2" x="490" y="20" width="250" height="70" rx="6"/><text class="sv-tb" x="500" y="40">GPU page table</text>
+<text class="sv-ts" x="500" y="62">V → (none)  step 2: fault</text><text class="sv-ts" x="500" y="80">step 5: V → P′ (GPU memory)</text>
+<rect class="sv-b3" x="20" y="150" width="250" height="90" rx="6"/><text class="sv-tb" x="30" y="170">Host memory</text>
+<rect class="sv-b6" x="40" y="186" width="70" height="36"/><text class="sv-ts" x="50" y="208">page P</text>
+<rect class="sv-b5" x="490" y="150" width="250" height="90" rx="6"/><text class="sv-tb" x="500" y="170">GPU memory</text>
+<rect class="sv-b6" x="510" y="186" width="70" height="36"/><text class="sv-ts" x="520" y="208">page P′</text>
+<line class="sv-line" x1="110" y1="204" x2="506" y2="204"/><polygon class="sv-head" points="508,204 500,200 500,208"/>
+<text class="sv-ts" x="250" y="196">step 4: copy over the link</text>
+<line class="sv-dash" x1="506" y1="226" x2="112" y2="226"/><polygon class="sv-head" points="110,226 118,222 118,230"/>
+<text class="sv-ts" x="220" y="244">later CPU access: fault on the CPU, page moves back</text>
+<rect class="sv-b4" x="300" y="20" width="160" height="70" rx="6"/><text class="sv-tb" x="310" y="40">GPU thread</text>
+<text class="sv-ts" x="310" y="60">step 1: reads V</text><text class="sv-ts" x="310" y="78">step 6: retry hits</text>
+<line class="sv-line" x1="460" y1="55" x2="488" y2="55"/><polygon class="sv-head" points="490,55 482,51 482,59"/>
+<text class="sv-ts" x="20" y="276">Steps 3–5 are done by the Unified Memory driver while the faulting warp waits. Granularity (one page or a group) is not specified here.</text>
+<text class="sv-ts" x="20" y="296">cudaMemPrefetchAsync does steps 3–5 ahead of time, as one stream operation, so step 2 never happens.</text>
+<text class="sv-ts" x="20" y="316">Not to scale. Simplified; the real fault path on a given GPU is not documented in the sources of this build.</text>
+</svg></div><figcaption><b>Figure 1.</b> On-demand migration of a managed page and what prefetching saves. The behaviour of prefetch (migrate, remove old mappings by default, map on the destination) is quoted from the installed header; the fault steps follow the Programming Guide's unified-memory description (title only in this build). <sup class="src"><a href="#F6-31-src-H1">H1</a></sup> <sup class="src"><a href="#F6-31-src-D1">D1</a></sup></figcaption></figure>
+
+<p>Figure 2 shows the costs side by side for the same work, as the cost model of Listing 3 computes them with invented TG-1 numbers: explicit copies, on-demand migration with small and large fault groups, and the ping-pong pattern of the story.</p>
+<figure id="F6-31-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 270" role="img" aria-labelledby="F6-31-f2t F6-31-f2d">
+<title id="F6-31-f2t">Figure 2: modelled time for ten kernel passes over 256 MiB</title>
+<desc id="F6-31-f2d">A horizontal bar chart with four bars, in model milliseconds on a logarithmic-free linear scale truncated at 420 ms. Explicit copies or prefetch: 53.6 ms. On-demand with 2048 KiB fault groups: 58.7 ms. On-demand with 64 KiB fault groups: 217.4 ms. Ping-pong with 2048 KiB groups: 406.7 ms. A fifth row says ping-pong with 64 KiB groups is 1993.9 ms, off the chart, drawn as a bar that runs to the edge with a break mark. All values from the real output of Listing 3 with invented TG-1 parameters.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="270"/>
+<text class="sv-tb" x="20" y="22">Ten passes over 256 MiB, kernel 2 ms per pass (Listing 3, invented TG-1 numbers)</text>
+<text class="sv-ts" x="20" y="54">explicit / prefetch</text><rect class="sv-b3" x="210" y="42" width="64" height="18"/><text class="sv-ts" x="280" y="55">53.6 ms</text>
+<text class="sv-ts" x="20" y="86">on-demand, 2 MiB groups</text><rect class="sv-b4" x="210" y="74" width="70" height="18"/><text class="sv-ts" x="286" y="87">58.7 ms</text>
+<text class="sv-ts" x="20" y="118">on-demand, 64 KiB groups</text><rect class="sv-b5" x="210" y="106" width="261" height="18"/><text class="sv-ts" x="477" y="119">217.4 ms</text>
+<text class="sv-ts" x="20" y="150">ping-pong, 2 MiB groups</text><rect class="sv-b6" x="210" y="138" width="488" height="18"/><text class="sv-ts" x="704" y="151">406.7</text>
+<text class="sv-ts" x="20" y="182">ping-pong, 64 KiB groups</text><rect class="sv-b7" x="210" y="170" width="520" height="18"/>
+<line class="sv-line2" x1="700" y1="166" x2="712" y2="192"/><line class="sv-line2" x1="708" y1="166" x2="720" y2="192"/>
+<text class="sv-ts" x="420" y="210">1993.9 ms — off the chart (bar broken)</text>
+<line class="sv-line" x1="210" y1="226" x2="730" y2="226"/>
+<text class="sv-ts" x="206" y="242">0</text><text class="sv-ts" x="440" y="242">200</text><text class="sv-ts" x="680" y="242">400 ms</text>
+<text class="sv-ts" x="20" y="262">Scale 1.2 px per model ms. Same work in every row; only where and how often the data moves differs.</text>
+</svg></div><figcaption><b>Figure 2.</b> Where the time goes, according to the model (R3): bulk transfers cost about the same whether they are explicit copies or prefetches; on-demand migration adds a fault cost per group; ping-pong multiplies the transfers by the number of passes. Every number is a model output with invented parameters, not a measurement. <sup class="src"><a href="#F6-31-src-R3">R3</a></sup></figcaption></figure>
+
+<h2 id="F6-31-layer1">Layer 1 — the kid explanation</h2>
+<p>The CPU and the GPU each have their own memory. Until now you copied data from one to the other yourself. With managed memory, you get one address that works on both. You stop writing copies.</p>
+<p>The data still has to travel. When the GPU touches data that is in the CPU's memory, it stops and waits. The system carries a piece of memory, a page, across. Then the GPU goes on. This waiting is called a page fault.</p>
+<p>If you know which data the GPU will need, you can say so first. That is a prefetch. The pages travel in one big trip before the work starts, and nobody waits.</p>
+<p>The worst case is two processors taking turns. The CPU looks at the data, then the GPU, then the CPU again. Each turn, the pages travel. Managed memory makes that easy to write and slow to run.</p>
+
+<h2 id="F6-31-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-31-l2-alloc">Allocating and using managed memory</h3>
+<p>Analogy first: one crate number, valid in both stores. <code>cudaMallocManaged(&amp;p, bytes)</code> returns a pointer that "is valid on the CPU and on all GPUs in the system that support managed memory". The memory "is not cleared"; a size of 0 returns <code>cudaErrorInvalidValue</code>; if the device does not support managed memory the call returns <code>cudaErrorNotSupported</code>, and support "can be queried using the device attribute cudaDevAttrManagedMemory". The memory is released with <code>cudaFree</code>. <sup class="src"><a href="#F6-31-src-H1">H1</a></sup> The optional flags argument sets the default stream association (<code>cudaMemAttachGlobal</code>, the default, or <code>cudaMemAttachHost</code>). <sup class="src"><a href="#F6-31-src-H1">H1</a></sup></p>
+<p>Three device attributes decide what you may do with it. Their one-line descriptions in this build's <code>driver_types.h</code> are: <code>cudaDevAttrManagedMemory</code>, "Device can allocate managed memory on this system"; <code>cudaDevAttrConcurrentManagedAccess</code>, "Device can coherently access managed memory concurrently with the CPU"; <code>cudaDevAttrPageableMemoryAccess</code>, "Device supports coherently accessing pageable memory without calling cudaHostRegister on it". <sup class="src"><a href="#F6-31-src-H2">H2</a></sup> Listing 1 prints the first two before doing anything else. Record them in your device report (<a href="#F6-07">F6-07</a>): the rest of this chapter depends on them.</p>
+<h3 id="F6-31-l2-sync">The one rule you must not break: synchronise before the CPU touches it</h3>
+<p>A managed pointer does not make the GPU's work synchronous. The kernel launch still returns before the kernel finishes (<a href="#F6-28">F6-28</a>). If the CPU reads the data while the kernel is still writing it, it reads a mix of old and new values, or worse. On a device whose <code>concurrentManagedAccess</code> is 0, the rules are stricter: the header's description of <code>cudaStreamAttachMemAsync</code> speaks of "exclusive ownership of the managed memory region by an active GPU", by default for "whole-GPU activity", and describes how attaching memory to a single stream lets the CPU access it "so long as all operations in <i>stream</i> have completed, regardless of whether other streams are active". <sup class="src"><a href="#F6-31-src-H1">H1</a></sup> Either way, the safe program waits (stream, event or device synchronisation) before the CPU touches managed data that the GPU may be using. Listing 1 waits with <code>cudaEventSynchronize(stop)</code> at line 39 and says so in a comment.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>What exactly happens when the CPU accesses managed memory while a kernel runs on a device with <code>concurrentManagedAccess</code> = 0 (an error, a crash of the process, or undefined behaviour), and on which operating systems and GPU generations each case applies, is described in the CUDA Programming Guide's unified-memory section (D1), which was not opened in this build. Do not test it on a machine you depend on; read D1 for your toolkit and record the answer in your dossier.</p></div>
+<h3 id="F6-31-l2-prefetch">Prefetching</h3>
+<p><code>cudaMemPrefetchAsync(p, bytes, dst, stream)</code> enqueues a migration in a stream. The header's description is the specification you need: the range "must refer to managed memory"; passing <code>cudaCpuDeviceId</code> as destination "will prefetch the data to host memory"; to prefetch to a GPU, <code>cudaDevAttrConcurrentManagedAccess</code> "must be non-zero"; the range is rounded to CPU page size; "if no physical memory has been allocated for this region, then this memory region will be populated and mapped on the destination device"; by default "any mappings to the previous location of the migrated pages are removed"; and the call "is asynchronous with respect to the host and all work on other devices". <sup class="src"><a href="#F6-31-src-H1">H1</a></sup> Because it is a stream operation, a prefetch before a kernel in the same stream is ordered before it; a prefetch back to the CPU after the kernel is ordered after it. That is exactly the pattern of Listing 1, lines 31–36.</p>
+<p>Note the two promises the header makes: prefetching "is not required for functionality", and "memory accesses to this range are always coherent and are allowed even when the data is actively being migrated". <sup class="src"><a href="#F6-31-src-H1">H1</a></sup> A wrong prefetch costs time, never correctness. That makes managed memory a good way to <i>start</i> a port: get it correct with no copies at all, then add prefetches where the profiler shows faults (<a href="#F6-32">F6-32</a>).</p>
+<h3 id="F6-31-l2-advice">Advice</h3>
+<p><code>cudaMemAdvise(p, bytes, advice, device)</code> attaches a usage hint to a range. The header documents three hints and their unset forms: <sup class="src"><a href="#F6-31-src-H1">H1</a></sup></p>
+<div class="tw"><table>
+<thead><tr><th>Advice</th><th>Documented effect (paraphrased from the header)</th><th>Use it when</th></tr></thead>
+<tbody>
+<tr><td><code>cudaMemAdviseSetReadMostly</code></td><td>Reads from any processor create a read-only copy of the accessed pages in that processor's memory; a write invalidates all copies except the writer's.</td><td>A lookup table read by CPU and GPU, rarely written.</td></tr>
+<tr><td><code>cudaMemAdviseSetPreferredLocation</code></td><td>Sets where the data should live; does not migrate immediately; guides migration when a fault occurs; can override the driver's thrash detection, and then "the page will continue to thrash indefinitely" if accesses keep alternating.</td><td>Data that should stay on one processor while the other occasionally maps it.</td></tr>
+<tr><td><code>cudaMemAdviseSetAccessedBy</code></td><td>Does not migrate data; keeps the range mapped in the given processor's page tables wherever the data is, so accesses do not fault.</td><td>"Data locality is not important, but avoiding faults is" (the header's words).</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-31-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: runners are free to hire but each trip has a fixed cost, so the questions are how many trips, how big, and whether anyone has to wait for them.</p>
+<h3 id="F6-31-l3-cpu">Demand paging, measured on the CPU</h3>
+<p>The GPU side of managed memory could not be measured in this build. The idea underneath it can: an operating system that maps memory lazily and fills a page only when it is first touched. Listing 2 maps 256 MiB of anonymous memory, touches one byte per 4096-byte page, and counts minor page faults with <code>getrusage</code>. Its run without sanitizers (R4) is the clean measurement:</p>
+<pre class="output" data-run="F6-31/first_touch_noasan"></pre>
+<p>Read it like a profile. The mapping has 65,536 pages. Pass 1 faults on (almost) every one of them: that is demand paging, one fault per first touch. Pass 2 touches the same pages and faults on none. The <code>MAP_POPULATE</code> mapping pays for all its pages during <code>mmap</code> itself, and pass 3 then runs without faults. The fault counts are the operating system's own numbers; the times were measured in this cloud container and vary from run to run, so treat them as an order of magnitude for this machine only (AH-23). <sup class="src"><a href="#F6-31-src-R4">R4</a></sup> <sup class="src"><a href="#F6-31-src-D5">D5</a></sup></p>
+<p>Two transferable lessons: the cost of the first touch is per page, so it scales with the number of pages, not with how much of each page you use; and paying it in advance (populate, prefetch) moves the cost, it does not remove it. A prefetch moves it to a place where it can overlap with other work or happen as one bulk transfer.</p>
+<h3 id="F6-31-l3-model">A cost model for managed memory</h3>
+<p>Listing 3 models four strategies for a kernel that touches every byte of a buffer of <i>B</i> bytes, <i>N</i> times. Bulk transfers cost α + <i>B</i>/β (TG-1's link: α = 10 µs, β = 16 GB/s, <a href="#F1-62">F1-62</a>). On-demand migration is modelled as <i>B</i>/<i>s</i> fault groups of size <i>s</i>, each paying a fault cost φ, plus the same <i>B</i>/β of transfer. All of α, β, <i>s</i> and φ are invented teaching values; the point is the structure, not the numbers:</p>
+<ul>
+<li>explicit copies and prefetch: 2(α + <i>B</i>/β) + <i>N</i>·<i>k</i>;</li>
+<li>on-demand: 2((<i>B</i>/<i>s</i>)·φ + <i>B</i>/β) + <i>N</i>·<i>k</i>;</li>
+<li>ping-pong (the CPU reads after every pass): <i>N</i> · 2((<i>B</i>/<i>s</i>)·φ + <i>B</i>/β) + <i>N</i>·<i>k</i>.</li>
+</ul>
+<p>The structure says three things a measurement must then confirm. The fault term grows with the number of groups, so larger groups (or prefetching, which is one bulk operation) shrink it. Ping-pong multiplies the transfer term by <i>N</i>: no fault granularity can fix an algorithm that moves the data every pass. And when the kernel is long compared with the transfers, all strategies converge. <sup class="src"><a href="#F6-31-src-R3">R3</a></sup></p>
+<h3 id="F6-31-l3-multi">Where the data lives: what the header says about multi-GPU systems and Windows</h3>
+<p>The documentation of <code>cudaMallocManaged</code> is unusually explicit about placement. On systems where all GPUs report <code>concurrentManagedAccess</code>, managed memory "may not be populated when this API returns and instead may be populated on access", and can migrate at any time. Where all GPUs report 0 for that attribute but support peer-to-peer access, "the physical storage for managed memory is created on the GPU which is active at the time cudaMallocManaged is called", other GPUs reach it "at reduced bandwidth via peer mappings over the PCIe bus", and "the Unified Memory driver does not migrate memory among such GPUs". In the remaining mixed case the location is "system-dependent", and the header adds that on Windows in that case "the physical storage is always created in 'zero-copy' or host memory". <sup class="src"><a href="#F6-31-src-H1">H1</a></sup> Practical consequence: the same managed-memory program can behave very differently on two machines. Record the attributes of every GPU in the dossier before interpreting any timing.</p>
+<h3 id="F6-31-l3-oversub">Oversubscription and eviction</h3>
+<p>On GPUs with a non-zero <code>concurrentManagedAccess</code>, the header says that "device memory oversubscription is possible": managed memory "may be evicted from device memory to host memory at any time by the Unified Memory driver in order to make room for other allocations". Memory from <code>cudaMalloc</code> is not evicted by prefetching. <sup class="src"><a href="#F6-31-src-H1">H1</a></sup> That allows data sets larger than GPU memory, at the price of migrations you did not plan. When a working set does not fit, chunked explicit copies (<a href="#F6-29">F6-29</a>) give you control over every byte that moves; managed memory gives you convenience and lets the driver decide.</p>
+<h3 id="F6-31-l3-when">When to use which</h3>
+<p>Use managed memory to get a port correct quickly, for data structures with pointers that both processors follow (a linked structure would need deep copies otherwise), and for working sets that may exceed GPU memory. Add prefetches and advice where the profiler shows faults. Use explicit device memory and pinned staging buffers when you need predictable transfer times and overlap that you plan chunk by chunk, as in the E8 pipeline. Never decide by belief: write both, profile both (<a href="#F6-32">F6-32</a>).</p>
+
+<h2 id="F6-31-hardware">How the hardware actually does it</h2>
+<p>Both processors translate virtual addresses through page tables (<a href="#F1-38">F1-38</a>, <a href="#F3-21">F3-21</a>). A managed range has a virtual address that is the same for the CPU and the GPU; what changes is which page table holds a valid entry, and which physical memory that entry points to. Migration is therefore three things: unmapping in one page table, a DMA copy over the link (<a href="#F1-44">F1-44</a>, <a href="#F1-62">F1-62</a>), and mapping in the other page table. A GPU that can take page faults lets a warp stop on an unmapped page and resume after the driver has done those three steps; prefetch does them before any warp asks. <sup class="src"><a href="#F6-31-src-D1">D1</a></sup> <sup class="src"><a href="#F6-31-src-D4">D4</a></sup> TLBs on both sides cache translations, so unmapping a page also means invalidating cached translations, one more fixed cost per migration (<a href="#F1-38">F1-38</a>).</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The migration granularity (single pages or larger groups, and whether it adapts to the access pattern), the cost of handling one GPU page fault, how many faults a GPU can have outstanding, how faults from many warps are batched, and which GPU generations support GPU page faults at all are not stated in the headers read in this build. The fault group size and fault cost in Listing 3 are invented. Read the CUDA Programming Guide's unified-memory sections (D1), the Best Practices Guide (D2) and your GPU's architecture whitepaper (D3), and measure the fault count and the migrated bytes with Nsight Systems' unified-memory tracing (<a href="#F6-32">F6-32</a>) on your GPU.</p></div>
+
+<h2 id="F6-31-worked">Worked example</h2>
+<p>A buffer of 256 MiB = 268,435,456 bytes; a kernel that takes 2 ms per pass; TG-1's link: α = 0.010 ms, β = 16 GB/s = 16,000,000 bytes per ms; on-demand fault groups of 64 KiB with φ = 20 µs each (invented).</p>
+<ol>
+<li><b>Transfer time, one direction.</b> <i>B</i>/β = 268,435,456 / 16,000,000 = 16.777 ms. Bulk: 16.787 ms with α.</li>
+<li><b>Explicit copies, one pass.</b> In and out: 2 × 16.787 = 33.574 ms, plus 2 ms of kernel: 35.574 ms.</li>
+<li><b>On-demand, one pass.</b> Number of groups: 268,435,456 / 65,536 = 4096. Fault cost: 4096 × 0.020 = 81.92 ms per direction, plus 16.777 ms of transfer = 98.697 ms. Both directions plus kernel: 2 × 98.697 + 2 = 199.394 ms, 5.6 times the explicit version.</li>
+<li><b>Ten passes, data stays on the GPU.</b> The transfers do not repeat: explicit 33.574 + 20 = 53.574 ms; on-demand 197.394 + 20 = 217.394 ms.</li>
+<li><b>Ten passes with the CPU reading after each (ping-pong).</b> 10 × 197.394 + 20 = 1993.94 ms: 37 times the explicit version.</li>
+<li><b>Larger groups (2 MiB).</b> 128 groups, fault cost 2.56 ms per direction: on-demand 2 × 19.337 + 20 = 58.674 ms, only 10 % worse than explicit. Ping-pong still costs 406.744 ms.</li>
+</ol>
+<p>The real output of Listing 3 on these inputs (R3):</p>
+<pre class="output" data-run="F6-31/um_model"></pre>
+<p>The lesson is in the ratios, not the milliseconds: fault granularity matters a lot for one-way traffic, and nothing but a change of algorithm fixes ping-pong.</p>
+
+<h2 id="F6-31-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>managed.cu</code>: one managed buffer filled by the CPU, processed by the GPU and checked by the CPU, first with on-demand migration, then with prefetches in both directions.</p>
+<pre class="listing" data-src="F6-31/managed.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings managed.cu -o managed</code>, then <code>./managed</code>. <sup class="src"><a href="#F6-31-src-R1">R1</a></sup></p>
+<pre class="output" data-run="F6-31/managed"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> This build has no GPU. The program compiled without warnings; its first runtime call returned <code>cudaErrorNoDevice</code>. On an NVIDIA GPU the expected output is the two attribute values, then one or two timing lines each ending in <code>0 errors</code>, and exit status 0. No value, time or fault count has been observed in this build. Record yours with the GPU name, driver and toolkit versions and the operating system.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17</td><td><code>runOnce(…, bool prefetch, …)</code></td><td>One complete round trip: CPU fill, GPU kernel, CPU check.</td><td>The CPU touches every page before and after the kernel, so the data must move both ways every time.</td></tr>
+<tr><td>22–24</td><td>CPU fill loop</td><td>Writes every element on the CPU.</td><td>After this loop the pages are resident in host memory (first touch on the CPU).</td></tr>
+<tr><td>29</td><td><code>cudaEventRecord(start, stream)</code></td><td>Starts the timed interval.</td><td>The interval contains migrations, the kernel and, with prefetch, the migration back.</td></tr>
+<tr><td>31</td><td><code>cudaMemPrefetchAsync(x, bytes, device, stream)</code></td><td>Migrates the range to the GPU before the kernel.</td><td>One bulk operation instead of faults during the kernel (H1).</td></tr>
+<tr><td>33–34</td><td><code>scaleAdd</code> launch, checked</td><td>The GPU reads and writes every element through the same pointer.</td><td>No <code>cudaMemcpy</code> anywhere in the program.</td></tr>
+<tr><td>36</td><td>prefetch to <code>cudaCpuDeviceId</code></td><td>Migrates the result back to host memory, ordered after the kernel.</td><td>The CPU's check loop then runs without faults.</td></tr>
+<tr><td>39</td><td><code>cudaEventSynchronize(stop)</code></td><td>The host waits for the stream's work.</td><td>The rule of Layer 2: no CPU access before the GPU's work is done.</td></tr>
+<tr><td>43–47</td><td>check loop</td><td>Compares every element with 2x + 1.</td><td>Small integers are exact in <code>float</code>; equality is the right test.</td></tr>
+<tr><td>61–67</td><td><code>cudaDeviceGetAttribute</code> × 2</td><td>Reads <code>managedMemory</code> and <code>concurrentManagedAccess</code>.</td><td>Decides whether the program can run, and whether GPU prefetch is allowed (H1).</td></tr>
+<tr><td>69</td><td><code>cudaMallocManaged(&amp;x, bytes)</code></td><td>Allocates 64 MiB of managed memory.</td><td>One pointer for both processors; the memory is not cleared (H1).</td></tr>
+<tr><td>74–76</td><td>warm-up, then timed on-demand run</td><td>First run is discarded.</td><td>Context creation and first-use costs stay out of the measurement.</td></tr>
+<tr><td>77–82</td><td>prefetch run, only if allowed</td><td>Skips the GPU prefetch where the attribute is 0.</td><td>Prefetching to a GPU without the attribute is an error (H1).</td></tr>
+<tr><td>85</td><td><code>cudaFree(x)</code></td><td>Releases managed memory.</td><td>Managed memory is freed with <code>cudaFree</code>, not <code>cudaFreeHost</code> (H1).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>first_touch.cpp</code>: demand paging on the CPU, measured for real in this build with the operating system's own fault counter.</p>
+<pre class="listing" data-src="F6-31/first_touch.cpp"></pre>
+<p><b>Build and run</b>: by <code>run_lab.sh</code> with the university's flags (sanitizers on, R2), and by <code>run.sh</code> without sanitizers: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g first_touch.cpp</code> (R4). The forensic lab compares the two.</p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>15–20</td><td><code>minorFaults()</code></td><td>Returns <code>ru_minflt</code> from <code>getrusage(RUSAGE_SELF, …)</code>.</td><td>The operating system's count of minor faults for this process (D5).</td></tr>
+<tr><td>23–34</td><td><code>touch</code></td><td>Writes one byte in every 4096-byte page and reports faults and time for that loop alone.</td><td>One write per page is enough to cause the first-touch fault; more writes per page would not add faults.</td></tr>
+<tr><td>39–40</td><td>prints the page size and page count</td><td>Uses <code>sysconf(_SC_PAGESIZE)</code>.</td><td>The expected fault count is the page count; the program checks its own assumption.</td></tr>
+<tr><td>41</td><td><code>mmap(… MAP_PRIVATE | MAP_ANONYMOUS …)</code></td><td>Reserves 256 MiB of virtual memory.</td><td>No physical pages yet: the lazy mapping that demand paging fills.</td></tr>
+<tr><td>46</td><td><code>madvise(a, bytes, MADV_NOHUGEPAGE)</code></td><td>Asks for ordinary 4 KiB pages.</td><td>With huge pages the count would be much smaller and harder to read.</td></tr>
+<tr><td>51–52</td><td><code>MAP_POPULATE</code></td><td>Asks the kernel to fill the mapping at once.</td><td>The CPU analogue of a prefetch: the cost moves into the <code>mmap</code> call.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>um_model.cpp</code>: the cost model of Layer 3, input <code>um_model.in</code>. Ordinary C++; its output is in the Worked example.</p>
+<pre class="listing" data-src="F6-31/um_model.cpp"></pre>
+<p><b>Build and run</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined um_model.cpp -o um_model</code>, then <code>./um_model &lt; um_model.in</code>. <sup class="src"><a href="#F6-31-src-R3">R3</a></sup></p>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–19</td><td>link constants</td><td>TG-1's 16 GB/s and 10 µs.</td><td>Invented teaching values, the same as in <a href="#F6-29">F6-29</a>.</td></tr>
+<tr><td>25</td><td><code>groups</code></td><td>Number of fault groups for the buffer.</td><td>The fault term grows with it.</td></tr>
+<tr><td>26–27</td><td><code>bulk</code>, <code>demandOneWay</code></td><td>One direction, bulk versus faulting.</td><td>Same bytes on the link; the difference is the fixed cost per operation.</td></tr>
+<tr><td>29–32</td><td>the four totals</td><td>Explicit, prefetch, on-demand, ping-pong.</td><td>Ping-pong multiplies the one-way cost by the number of passes.</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-31-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A crate is either here or there; a page can be in both.</b> With <code>cudaMemAdviseSetReadMostly</code>, reads create read-only copies in several memories at once (H1). There is no "duplicate crate" in the story.</li>
+<li><b>Runners carry whole crates, not the one onion you asked for.</b> That part maps well; but the size of the "crate" (the migration granularity) is not something you choose, and it is not documented in the sources of this build.</li>
+<li><b>A cook can reach into the other store.</b> With <code>cudaMemAdviseSetAccessedBy</code> or on systems without migration, a processor can map and read memory in place over the link without moving it (H1); the story has no long-armed cooks.</li>
+<li><b>Waiting cooks do not stop the hall.</b> In the kitchen, other cooks keep working while one waits. On a GPU, other warps may keep the SMs busy while one warp waits for a fault, but how much work can continue during fault handling is not documented here (unverified box).</li>
+</ul>
+
+<h2 id="F6-31-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Wrong or partly old values on the CPU</td><td>The CPU read managed data before the kernel finished</td><td>Look for the synchronisation between the launch and the first CPU access</td><td>Synchronise the stream or an event first (Listing 1, line 39)</td></tr>
+<tr><td>Kernel many times slower with managed memory than with <code>cudaMalloc</code></td><td>Page faults during the kernel</td><td>Nsight Systems unified-memory rows: faults and migrated bytes (<a href="#F6-32">F6-32</a>)</td><td><code>cudaMemPrefetchAsync</code> before the kernel</td></tr>
+<tr><td>Everything slow, getting slower with more iterations</td><td>Ping-pong: the CPU touches the data every iteration</td><td>Count CPU accesses inside the loop; the model's ping-pong line</td><td>Keep the data on the GPU for the whole loop; move only small results; or advise <code>AccessedBy</code> for occasional CPU reads</td></tr>
+<tr><td><code>cudaMemPrefetchAsync</code> returns <code>cudaErrorInvalidDevice</code></td><td>Prefetch to a GPU without <code>concurrentManagedAccess</code> (H1)</td><td>Print the attribute (Listing 1, line 63)</td><td>Skip GPU prefetches on such devices, as Listing 1 does</td></tr>
+<tr><td>A fault count higher than the page count</td><td>Another component's memory is counted too, for example a sanitizer's shadow memory</td><td>Run without the tool (forensic lab)</td><td>Measure in a build without the instrumentation; state which build a number comes from</td></tr>
+<tr><td><code>cudaErrorNoDevice</code> at the first call (this build's real output)</td><td>No GPU visible</td><td>Device query (<a href="#F6-07">F6-07</a>)</td><td>Run on a GPU machine</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-31-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-29">F6-29</a>, where you copied every byte explicitly through pinned buffers, and <a href="#F1-38">F1-38</a> and <a href="#F3-21">F3-21</a>, where the CPU's page tables and page faults made virtual memory work. <b>What carries over:</b> asynchronous execution and the duty to synchronise before the CPU reads (<a href="#F6-28">F6-28</a>); the α–β cost of moving bytes over the link (<a href="#F1-62">F1-62</a>); the page-fault mechanism itself, now between two processors. <sup class="src"><a href="#F6-31-src-H1">H1</a></sup> <sup class="src"><a href="#F6-31-src-D1">D1</a></sup> <b>What changes:</b> most dangerous first: the code no longer shows when data moves, so a single CPU access inside a loop can move the whole buffer every iteration; behaviour depends on device attributes and the operating system (H1, H2); prefetching and advice are optional for correctness but decide performance. <b>What comes next:</b> <a href="#F6-32">F6-32</a> makes the invisible visible: a whole-program timeline with copies, kernels, launches and, on a GPU, unified-memory activity.</p></div>
+
+<h2 id="F6-31-check">Check yourself</h2>
+<ol>
+<li>What does <code>cudaMallocManaged</code> return, how is the memory freed, and is it cleared?</li>
+<li>Which statement is true? (a) A managed pointer makes kernel launches synchronous. (b) <code>cudaMemPrefetchAsync</code> is required for correctness on GPUs with page faults. (c) Prefetching to a GPU requires <code>cudaDevAttrConcurrentManagedAccess</code> to be non-zero. (d) <code>cudaMemAdviseSetPreferredLocation</code> migrates the data immediately.</li>
+<li>Predict, then run Listing 3: 512 MiB, 5 passes, kernel 4 ms, 64 KiB groups, 20 µs per group. Compute explicit, on-demand and ping-pong totals by hand first.</li>
+<li>In Listing 2's clean run, why does pass 2 report no faults, and what does <code>MAP_POPULATE</code> change?</li>
+<li>Explain in your own words why prefetching does not reduce the number of bytes moved, yet can make a program much faster.</li>
+<li>Apply to a new case: Ana's simulation keeps a 2 GiB grid in managed memory. Every 100 time steps, the CPU writes a small checkpoint of 1 MiB from the grid's corner. Which advice or prefetch would you use, and what should stay as it is?</li>
+<li>Your GPU reports <code>concurrentManagedAccess</code> = 0. Name two things in Listing 1 that behave differently or must be avoided.</li>
+<li>What does the header say happens to a page that thrashes constantly between host and device memory, and how can <code>SetPreferredLocation</code> change that?</li>
+</ol>
+
+<h2 id="F6-31-lab">Lab</h2>
+<p><b>Goal.</b> Measure, on your GPU, what on-demand migration and prefetching cost for the same work, and explain the difference with fault counts from a profiler. This lab prepares the unified-memory part of Track E (13.2 topic 9: "Unified / managed memory: page migration, prefetching and its costs"). <sup class="src"><a href="#F6-31-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> For steps 1–3: an NVIDIA GPU on Linux with a CUDA Toolkit and driver, or a cloud GPU instance; record <code>managedMemory</code> and <code>concurrentManagedAccess</code>. This build used <code>Cuda compilation tools, release 12.0, V12.0.140</code> and <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> (from the run logs) and had no GPU. Steps 4–5 need no GPU. Folder <code>university/labs/F6-31</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use. Do not run experiments that deliberately break the synchronisation rule on a machine whose work you cannot lose.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p><b>GPU required for steps 1–3.</b> In this build they produced only the "no device" error. Your numbers are the result; label them "measured on &lt;machine&gt;" with the date and versions (AH-23).</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-31</code>. Open <code>managed.out</code>: two attribute values, then the on-demand and (if allowed) prefetch times with <code>0 errors</code>.</li>
+<li>Run <code>./managed</code> 10 times and take the median of each time. Then profile it with Nsight Systems with unified-memory tracing enabled (<a href="#F6-32">F6-32</a> shows the general workflow; take the exact option names from the Nsight Systems documentation of your version) and write down the number of GPU page faults and the bytes migrated in each direction, for both runs.</li>
+<li>Add <code>cudaMemAdvise(x, bytes, cudaMemAdviseSetReadMostly, device)</code> after allocation, change the kernel so that it only reads <code>x</code> and writes a separate managed output, and measure again. Explain the change with the header's description of read-mostly.</li>
+<li>Open <code>first_touch_noasan.out</code> and <code>first_touch.out</code>; keep both for the forensic lab.</li>
+<li>Put your measured median times into the model: choose a fault-group size and fault cost that reproduce your on-demand time, and record them as "fitted on &lt;machine&gt;", not as facts about the GPU.</li>
+</ol>
+<p><b>Expected observations.</b> On a GPU: <code>0 errors</code> in every run; whether prefetch is faster, and by how much, is the measurement. In this build: <code>managed.cu:58: cudaGetDevice(&amp;device) failed: cudaErrorNoDevice (no CUDA-capable device is detected)</code> (R1), the CPU fault counts of R2 and R4, and the model of R3.</p>
+<p><b>Verification.</b> Every run reports <code>0 errors</code> and exits with status 0; <code>compute-sanitizer ./managed</code> reports no errors; your notes contain, per run, the median time, the GPU fault count and the bytes migrated, and a one-paragraph explanation consistent with the cost model's structure.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li><code>cudaErrorNoDevice</code> → no GPU visible → device query (<a href="#F6-07">F6-07</a>).</li>
+<li><code>prefetch to the GPU skipped</code> → <code>concurrentManagedAccess</code> is 0 → measure on-demand only and say so; read D1's section for such devices.</li>
+<li>The profiler shows no unified-memory rows → unified-memory tracing not enabled, or not supported in that configuration → check the Nsight Systems documentation for your version.</li>
+<li>Fault counts larger than expected in a CPU measurement → instrumentation counted too → compare with a build without sanitizers (forensic lab).</li>
+</ul>
+<p><b>Extension.</b> Allocate a managed buffer 1.5 times the size of your GPU's memory (read the size from your device report), run a kernel that streams through it once, and measure with and without chunked prefetching (prefetch chunk <i>i</i> + 1 while the kernel works on chunk <i>i</i>, in two streams). Compare with the pipeline of <a href="#F6-29">F6-29</a>.</p>
+
+<h2 id="F6-31-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Nadia wants to show her team that "first touch costs one fault per page". She runs the university's Listing 2, built with the standard lab flags, and gets numbers that do not fit: more faults than pages in pass 1, and faults in pass 3 on memory that was populated in advance. She concludes that <code>MAP_POPULATE</code> "does not work in containers". The evidence was produced in this build; no GPU is needed.</p>
+<p><b>Evidence pack.</b> (1) Listing 2 (above). (2) Nadia's run, built by <code>run_lab.sh</code> with <code>-fsanitize=address,undefined</code> (R2):</p>
+<pre class="output" data-run="F6-31/first_touch"></pre>
+<p>(3) The same source built without sanitizers (R4), shown in Layer 3. (4) The arithmetic: 256 MiB = 268,435,456 bytes = 65,536 pages of 4096 bytes.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: how many faults above the page count does pass 1 show in Nadia's run, and how many faults does pass 3 show? Compare with the clean run.</li>
+<li>Hypotheses: give at least two explanations (for example: <code>MAP_POPULATE</code> is ignored; huge pages; the instrumentation's own memory; another thread of the process).</li>
+<li>Which comparison decides between them? Compute what the extra count corresponds to, in bytes.</li>
+<li>Is Nadia's conclusion about <code>MAP_POPULATE</code> right?</li>
+<li>What rule would you add to the lab's method so that this cannot mislead the next learner, and how does it apply to GPU profiling?</li>
+</ol>
+<p><b>Method hints.</b> Change one thing at a time: same source, same machine, with and without the tool. Turn the extra count into bytes and look for a simple ratio to 256 MiB. Hypothesis → evidence → conclusion.</p>
+
+<h2 id="F6-31-project">Mini-project</h2>
+<p><b>Port with managed memory, then make it fast.</b> Take one of your earlier programs with explicit copies (for example the reduction of <a href="#CU301">CU301</a> or the pipeline of <a href="#F6-29">F6-29</a>) and port it to managed memory with no prefetches at all. Check that it is correct. Then add prefetches and advice one at a time, measuring each step, until it is within 10 % of the explicit version or you can explain, with profiler evidence, why it cannot be.</p>
+<p><b>Rubric.</b> Correct managed version with correct synchronisation (3). A table of steps with median times, fault counts and migrated bytes on a named machine (4). An explanation of each step's effect using the documented semantics and the cost model (3).</p>
+
+<h2 id="F6-31-summary">Summary</h2>
+<ul>
+<li>Managed memory gives one pointer valid on the CPU and on GPUs that support it; it is allocated with <code>cudaMallocManaged</code>, freed with <code>cudaFree</code>, and not cleared.</li>
+<li>Data still moves: pages migrate on demand when a processor touches them, at the price of page faults, or in bulk when you prefetch.</li>
+<li>The device attributes <code>managedMemory</code>, <code>concurrentManagedAccess</code> and <code>pageableMemoryAccess</code> decide what is allowed and how data is placed; record them before interpreting any timing.</li>
+<li>Always synchronise before the CPU touches managed data that the GPU may be using.</li>
+<li><code>cudaMemPrefetchAsync</code> and <code>cudaMemAdvise</code> never change results; they change where data is and how often it moves.</li>
+<li>Ping-pong access (CPU and GPU taking turns on the same data) multiplies transfers; only a change of algorithm fixes it.</li>
+<li>Demand paging on the CPU, measured in this build, shows the same structure: one fault per first-touched page, none afterwards, and populate-in-advance moving the cost rather than removing it.</li>
+</ul>
+
+<h2 id="F6-31-sources">Sources</h2>
+<ol>
+<li id="F6-31-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1). The guide's source registry (section 4.6) records that the page at the long-standing address was titled "CUDA Programming Guide", version 13.x, when opened. Sections used: unified memory programming (managed memory, page migration and faults, coherency and concurrency, prefetching and advice, system requirements). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-31-src-D2">D2 — NVIDIA, "CUDA C++ Best Practices Guide" (tier 1): unified memory and data transfer sections. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-31-src-D3">D3 — NVIDIA architecture whitepaper for the GPU used in your lab (tier 1; product and version to be recorded): page fault and migration support. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-31-src-D4">D4 — Remzi H. Arpaci-Dusseau and Andrea C. Arpaci-Dusseau, "Operating Systems: Three Easy Pieces" (tier 3; edition to be recorded): paging, TLBs, page faults and demand paging. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-31-src-D5">D5 — Linux man-pages project, manual pages <code>getrusage(2)</code> (field <code>ru_minflt</code>), <code>mmap(2)</code> (<code>MAP_POPULATE</code>) and <code>madvise(2)</code> (<code>MADV_NOHUGEPAGE</code>) (tier 2). <i>Title only — not opened during this build (dossier gate G1 open); the identifiers were checked only by compiling Listing 2 against the installed system headers.</i></li>
+<li id="F6-31-src-D6">D6 — AddressSanitizer documentation, project's own design notes on shadow memory (tier 2). <i>Title only — not opened during this build (dossier gate G1 open).</i> Used only in the forensic answer key, together with the arithmetic and the comparison run R4.</li>
+<li id="F6-31-src-H1">H1 — CUDA 12.0 headers as installed in the build container (Ubuntu package nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>cuda_runtime_api.h</code>, documentation comments of <code>cudaMallocManaged</code>, <code>cudaMemPrefetchAsync</code>, <code>cudaMemAdvise</code>, <code>cudaStreamAttachMemAsync</code>, <code>cudaFree</code>. Tier 1 (vendor file).</li>
+<li id="F6-31-src-H2">H2 — the same package's <code>driver_types.h</code>: one-line descriptions of <code>cudaDevAttrManagedMemory</code>, <code>cudaDevAttrPageableMemoryAccess</code>, <code>cudaDevAttrConcurrentManagedAccess</code> and the <code>cudaDeviceProp</code> field <code>concurrentManagedAccess</code>. Tier 1 (vendor file).</li>
+<li id="F6-31-src-C1">C1 — Systems Curriculum (this project), section 13.2 topic "Unified / managed memory" (quoted). A map, not a source (AH-4).</li>
+<li id="F6-31-src-R1">R1 — build and run of Listing 1 (<code>university/labs/F6-31/managed.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+<li id="F6-31-src-R2">R2 — build and run of Listing 2 with the university's flags including AddressSanitizer and UndefinedBehaviorSanitizer (<code>first_touch.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, exit code 0; Linux x86_64 cloud build container. Times are measurements on that container only.</li>
+<li id="F6-31-src-R3">R3 — run of Listing 3 on <code>um_model.in</code> (<code>um_model.log</code>), same g++ toolchain and sanitizers, exit code 0. A model with invented parameters, not a measurement.</li>
+<li id="F6-31-src-R4">R4 — build and run of Listing 2 without sanitizers by <code>run.sh</code> (<code>first_touch_noasan.log</code>), same compiler, exit code 0; same container.</li>
+</ol>
+
+<h2 id="F6-31-glossary">Glossary links</h2>
+<p><a href="#gl-managed-memory-unified-memory">Managed memory (unified memory)</a> · <a href="#gl-page-migration">Page migration</a> · <a href="#gl-page-fault-gpu-managed-memory">Page fault (GPU, managed memory)</a> · <a href="#gl-prefetch-managed-memory">Prefetch (managed memory)</a> · <a href="#gl-memory-advice">Memory advice</a> · <a href="#gl-thrashing-ping-pong-migration">Thrashing (ping-pong migration)</a> · <a href="#gl-minor-page-fault">Minor page fault</a> · <a href="#gl-pinned-page-locked-memory">Pinned (page-locked) memory</a> · <a href="#gl-tg-1-teaching-gpu">TG-1 (teaching GPU)</a></p>
+
+<h2 id="F6-31-next">Next chapter</h2>
+<p>Next: <a href="#F6-32">F6-32 Profiling the whole program with Nsight Systems</a>. Previous: <a href="#F6-30">F6-30</a>. Back to the course: <a href="#CU303">CU303</a>.</p>
+
+<h2 id="F6-31-answers">Answers to Check yourself</h2>
+<ol>
+<li>A pointer valid on the CPU and on all GPUs in the system that support managed memory; it is freed with <code>cudaFree</code>; it is not cleared (H1).</li>
+<li>(c) (H1). (a) is false: launches stay asynchronous; you must synchronise before the CPU reads. (b) is false: the header says prefetching "is not required for functionality". (d) is false: setting the preferred location "does not cause data to migrate to that location immediately" (H1).</li>
+<li><i>B</i> = 536,870,912 bytes; <i>B</i>/β = 33.554 ms; bulk 33.564 ms. Explicit: 2 × 33.564 + 5 × 4 = 87.129 ms. Groups: 8192; fault cost 163.84 ms per direction; one way 197.394 ms; on-demand 2 × 197.394 + 20 = 414.789 ms; ping-pong 5 × 394.789 + 20 = 1993.944 ms. Add <code>q3 512 5 4 64 20</code> to the input and run the model to check (small differences in the last digit come from rounding in this hand calculation).</li>
+<li>The pages were already given physical memory in pass 1, so writing them again needs no fault. <code>MAP_POPULATE</code> makes the kernel fill the mapping during <code>mmap</code>, so the faults (counted by the system as minor faults in the clean run) happen there and pass 3 has none (R4, D5).</li>
+<li>The same bytes cross the link either way. Prefetching does it as one stream operation, with one fixed cost instead of one per fault group, ordered before the kernel, so no warp waits for a fault, and it can overlap with other work in other streams.</li>
+<li>Keep the grid on the GPU (prefetch it once, or set its preferred location to the GPU). For the checkpoint, either copy the 1 MiB corner into a small separate buffer on the GPU and prefetch or copy only that, or advise <code>AccessedBy</code> for the CPU on the corner so it can be read without migrating the whole grid. Do not let the CPU walk the grid.</li>
+<li>The GPU prefetch is not allowed (Listing 1 skips it, lines 77–82); and the CPU must not access the managed buffer while the GPU is active (by default, any GPU activity), so the synchronisation before the check loop is essential (H1, and the unverified box on the exact consequences).</li>
+<li>The driver's thrash detection may eventually pin such a page to host memory; with a preferred location set to device memory, the header says the page "will continue to thrash indefinitely" (H1).</li>
+</ol>
+<h3 id="F6-31-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> In Nadia's sanitizer build (R2), pass 1 shows 8,192 or 8,193 faults more than the 65,536 pages, and pass 3 shows 8,192 faults on populated memory. In the clean build (R4), pass 1 shows the page count plus at most a couple, and pass 3 shows 0. (Check the exact numbers in your copy of the outputs; the build copies the latest run.)</p>
+<p><b>Hypotheses.</b> (a) <code>MAP_POPULATE</code> is ignored in containers; (b) transparent huge pages change the count; (c) the instrumentation's own memory faults are counted in the same process; (d) a helper thread touches memory. (a) is ruled out by R4: same container, same source, pass 3 has 0 faults. (b) would reduce, not increase, the count, and the program asks for ordinary pages. (d) does not fit an exact multiple.</p>
+<p><b>Evidence-based conclusion.</b> The extra count is 8,192 pages × 4096 bytes = 32 MiB = 256 MiB / 8. AddressSanitizer keeps shadow memory that records the state of the application's memory at a ratio of one shadow byte per eight application bytes (D6, pending verification); writing to 256 MiB of new memory makes the tool touch 32 MiB of new shadow memory, which faults page by page in the same process. Populating <code>b</code> populated the application pages, not their shadow, so pass 3 still faults on the shadow. The comparison run is the proof; the shadow ratio explains the exact number.</p>
+<p><b>Is Nadia right?</b> No. <code>MAP_POPULATE</code> worked: the clean build shows the faults moved into the <code>mmap</code> call and none in pass 3.</p>
+<p><b>Fix and prevention.</b> Measure performance in a build without instrumentation, and keep sanitizer builds for correctness. State in every measurement which build it came from. On the GPU the same rule applies: tools that instrument kernels (Compute Sanitizer, a profiler's kernel replay, <a href="#F6-33">F6-33</a>) change what they measure; never take timing from a sanitizer run. <b>How the evidence was produced:</b> both runs are real, in this build, of the same unmodified source; the only difference is the compiler flags, recorded in the two logs. Nothing was injected.</p>

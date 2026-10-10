@@ -1,0 +1,469 @@
+<!--meta
+id: F0-80
+title: Reduced precision and testing tolerances
+course: MA302
+level: L3
+prereqs: F0-79, F0-78, F0-75, F0-73, HW301
+time: 10–12 hours including the lab
+hardware: none for the lab (the reduction kernel's addition order is modelled on the CPU). Listing 3 is a real CUDA kernel, built with nvcc and untested on hardware: the build container has no GPU.
+maps: Maths ladder rung 8 (guide 2.2): FP16/BF16/FP8 accuracy; course lab "Set the tolerance for a reduction-kernel test"; curriculum E3 (Kahan-summed reference, exact integer sums) and E7 (tolerance justified from FP16/BF16 input rounding); 13.4 (correctness first); MA302 project (the numerics notebook)
+analogy: F0 — everyday life at home (proposed in MA302 NOTES.md: reduced precision = measuring scoops with only a few marks each; FP32 accumulation = writing the running total in a notebook with many digits while measuring with the coarse scoops)
+-->
+
+<h2 id="F0-80-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>Amara bakes for a school fair: 4,096 small batches, each "a scoop of this times a scoop of that". Her good measuring set has 24 marks on every scoop (F0-73). Today she has to use the camping set, whose scoops have only 11 marks, or the toy set with 4. Two separate things go wrong. Each scoop is measured coarsely: that error is fixed the moment she scoops. And the running total of all batches, if she keeps it on the same coarse scoops, loses small additions entirely once the total is large. Her trick: measure with whatever scoops she has, but write the running total in her notebook with every digit. The first error stays; the second almost disappears.</p>
+<p>That trick is mixed precision, the way GPUs run most of today's arithmetic: inputs in FP16, BF16 or FP8, sums in FP32. This chapter measures both errors, turns them into test tolerances that can be defended line by line (the curriculum asks for exactly that in E3 and E7), and investigates a test that has passed every day for months while the kernel it checks was dropping data.</p>
+</div>
+
+<h2 id="F0-80-able">What you will be able to do</h2>
+<ul>
+<li><b>Compare</b> FP32, FP16, BF16 and the two FP8 formats by precision, range and special values, and predict which values each can represent.</li>
+<li><b>Separate</b> the error of a reduced-precision computation into input rounding and accumulation, and bound each.</li>
+<li><b>Derive</b> the tolerance for a GPU reduction test against a Kahan-summed reference, and for a mixed-precision dot product against an FP64 reference (curriculum E3, E7).</li>
+<li><b>Design</b> a numerical test that can fail: exact integer cases, sizes that hit edge cases, and planted bugs as negative controls (the MA302 course lab).</li>
+<li><b>Diagnose</b> a test whose tolerance was widened until it could no longer detect a bug (this chapter's forensic lab).</li>
+</ul>
+
+<div class="co jargon" id="F0-80-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>FP8 (E4M3 and E5M2)</dt><dd><b>Simple words:</b> 8-bit floating-point formats, with either more precision (E4M3) or more range (E5M2). <b>Analogy:</b> the toy scoop set: a handful of marks per scoop. <b>Precise:</b> 1 sign bit, then 4 exponent and 3 fraction bits (E4M3) or 5 and 2 (E5M2); unit roundoff 2<sup>−4</sup> and 2<sup>−3</sup>. The exact special values and largest number are set by the format's specification, not by IEEE 754 (Hardware section). <sup class="src"><a href="#F0-80-src-S2">S2</a></sup><sup class="src"><a href="#F0-80-src-S3">S3</a></sup></dd>
+<dt>Accumulator precision</dt><dd><b>Simple words:</b> the precision in which a sum or dot product keeps its running total. <b>Analogy:</b> whether Amara's running total is written on a coarse scoop or in her notebook. <b>Precise:</b> the format of the partial sums s<sub>i</sub> = s<sub>i−1</sub> + a<sub>i</sub>b<sub>i</sub>; with k terms, its contribution to the error is bounded by γ<sub>k</sub>(u<sub>acc</sub>) Σ|a<sub>i</sub>b<sub>i</sub>| (F0-75), and the bound says nothing once k u<sub>acc</sub> ≥ 1. <sup class="src"><a href="#F0-80-src-B1">B1</a></sup><sup class="src"><a href="#F0-80-src-D1">D1</a></sup></dd>
+<dt>Input rounding error</dt><dd><b>Simple words:</b> the error made by storing the data in a short format before any arithmetic. <b>Analogy:</b> the coarse scoop itself. <b>Precise:</b> replacing a<sub>i</sub>, b<sub>i</sub> by fl(a<sub>i</sub>), fl(b<sub>i</sub>) with relative errors ≤ u<sub>in</sub> changes each product by at most (2u<sub>in</sub> + u<sub>in</sub><sup>2</sup>)|a<sub>i</sub>b<sub>i</sub>|; no accumulator can remove it. <sup class="src"><a href="#F0-80-src-D1">D1</a></sup></dd>
+<dt>Error budget</dt><dd><b>Simple words:</b> a list of every source of error with a bound for each, added up into a tolerance. <b>Analogy:</b> "scoops: at most this much; adding up: at most that much; the reference itself: a crumb". <b>Precise:</b> tolerance = Σ (bound of each independent error source), each term derived from u of the format involved, the problem's size and conditioning (Σ|x|), and the reference's own error. <sup class="src"><a href="#F0-80-src-D1">D1</a></sup><sup class="src"><a href="#F0-80-src-U1">U1</a></sup></dd>
+<dt>Negative control (in a numerical test)</dt><dd><b>Simple words:</b> a deliberately broken version that the test must reject. <b>Analogy:</b> before trusting the kitchen scale, put a known weight on it. <b>Precise:</b> a planted fault (an off-by-one, a dropped tail) run through the same test; if the test still passes, its tolerance or its inputs are too weak to detect faults of that size. <sup class="src"><a href="#F0-80-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F0-80-pictures">The idea in pictures</h2>
+<p>Figure 1 shows where each format spends its bits. Figure 2 shows what that costs in one dot product of 4,096 terms, split into the total error and the part caused by the accumulator alone.</p>
+<figure id="F0-80-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F0-80-f1t F0-80-f1d">
+<title id="F0-80-f1t">Bit layouts of five floating-point formats, one box per bit</title>
+<desc id="F0-80-f1d">Five rows of small boxes, one box per bit, sign first, then exponent bits, then fraction bits. binary32 (FP32): 1 sign, 8 exponent and 23 fraction bits, 32 in all; unit roundoff 2^-24, about 6.0e-8; largest value about 3.4e38. binary16 (FP16): 1, 5 and 10 bits, 16 in all; u = 2^-11, about 4.9e-4; largest 65504. bfloat16 (BF16): 1, 8 and 7 bits, 16 in all; the same exponent field as FP32, so the same range, but u = 2^-8, about 3.9e-3. FP8 E5M2: 1, 5 and 2 bits; the FP16 exponent field with only 2 fraction bits; u = 2^-3; largest 57344. FP8 E4M3: 1, 4 and 3 bits; u = 2^-4; its largest value depends on how the format uses its top exponent pattern, discussed in the text. The exponent field sets the range and the fraction field sets the precision: each fraction bit fewer doubles u.</desc>
+<rect class="sv-b8" x="150" y="8" width="14" height="12"/><text class="sv-ts" x="168" y="18">sign</text>
+<rect class="sv-b1" x="210" y="8" width="14" height="12"/><text class="sv-ts" x="228" y="18">exponent</text>
+<rect class="sv-b2" x="290" y="8" width="14" height="12"/><text class="sv-ts" x="308" y="18">fraction (significand without the hidden 1)</text>
+<text class="sv-tb" x="140" y="55" text-anchor="end">binary32 (FP32)</text>
+<rect class="sv-b8" x="150" y="40" width="12" height="20"/>
+<rect class="sv-b1" x="164" y="40" width="12" height="20"/>
+<rect class="sv-b1" x="178" y="40" width="12" height="20"/>
+<rect class="sv-b1" x="192" y="40" width="12" height="20"/>
+<rect class="sv-b1" x="206" y="40" width="12" height="20"/>
+<rect class="sv-b1" x="220" y="40" width="12" height="20"/>
+<rect class="sv-b1" x="234" y="40" width="12" height="20"/>
+<rect class="sv-b1" x="248" y="40" width="12" height="20"/>
+<rect class="sv-b1" x="262" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="276" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="290" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="304" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="318" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="332" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="346" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="360" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="374" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="388" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="402" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="416" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="430" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="444" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="458" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="472" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="486" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="500" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="514" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="528" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="542" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="556" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="570" y="40" width="12" height="20"/>
+<rect class="sv-b2" x="584" y="40" width="12" height="20"/>
+<text class="sv-ts" x="150" y="76">1 + 8 + 23 = 32 bits · u = 2^-24 ≈ 6.0e-8, max 3.4e38</text>
+<text class="sv-tb" x="140" y="107" text-anchor="end">binary16 (FP16)</text>
+<rect class="sv-b8" x="150" y="92" width="12" height="20"/>
+<rect class="sv-b1" x="164" y="92" width="12" height="20"/>
+<rect class="sv-b1" x="178" y="92" width="12" height="20"/>
+<rect class="sv-b1" x="192" y="92" width="12" height="20"/>
+<rect class="sv-b1" x="206" y="92" width="12" height="20"/>
+<rect class="sv-b1" x="220" y="92" width="12" height="20"/>
+<rect class="sv-b2" x="234" y="92" width="12" height="20"/>
+<rect class="sv-b2" x="248" y="92" width="12" height="20"/>
+<rect class="sv-b2" x="262" y="92" width="12" height="20"/>
+<rect class="sv-b2" x="276" y="92" width="12" height="20"/>
+<rect class="sv-b2" x="290" y="92" width="12" height="20"/>
+<rect class="sv-b2" x="304" y="92" width="12" height="20"/>
+<rect class="sv-b2" x="318" y="92" width="12" height="20"/>
+<rect class="sv-b2" x="332" y="92" width="12" height="20"/>
+<rect class="sv-b2" x="346" y="92" width="12" height="20"/>
+<rect class="sv-b2" x="360" y="92" width="12" height="20"/>
+<text class="sv-ts" x="150" y="128">1 + 5 + 10 = 16 bits · u = 2^-11 ≈ 4.9e-4, max 65504</text>
+<text class="sv-tb" x="140" y="159" text-anchor="end">bfloat16 (BF16)</text>
+<rect class="sv-b8" x="150" y="144" width="12" height="20"/>
+<rect class="sv-b1" x="164" y="144" width="12" height="20"/>
+<rect class="sv-b1" x="178" y="144" width="12" height="20"/>
+<rect class="sv-b1" x="192" y="144" width="12" height="20"/>
+<rect class="sv-b1" x="206" y="144" width="12" height="20"/>
+<rect class="sv-b1" x="220" y="144" width="12" height="20"/>
+<rect class="sv-b1" x="234" y="144" width="12" height="20"/>
+<rect class="sv-b1" x="248" y="144" width="12" height="20"/>
+<rect class="sv-b1" x="262" y="144" width="12" height="20"/>
+<rect class="sv-b2" x="276" y="144" width="12" height="20"/>
+<rect class="sv-b2" x="290" y="144" width="12" height="20"/>
+<rect class="sv-b2" x="304" y="144" width="12" height="20"/>
+<rect class="sv-b2" x="318" y="144" width="12" height="20"/>
+<rect class="sv-b2" x="332" y="144" width="12" height="20"/>
+<rect class="sv-b2" x="346" y="144" width="12" height="20"/>
+<rect class="sv-b2" x="360" y="144" width="12" height="20"/>
+<text class="sv-ts" x="150" y="180">1 + 8 + 7 = 16 bits · u = 2^-8 ≈ 3.9e-3, max 3.4e38</text>
+<text class="sv-tb" x="140" y="211" text-anchor="end">FP8 E5M2</text>
+<rect class="sv-b8" x="150" y="196" width="12" height="20"/>
+<rect class="sv-b1" x="164" y="196" width="12" height="20"/>
+<rect class="sv-b1" x="178" y="196" width="12" height="20"/>
+<rect class="sv-b1" x="192" y="196" width="12" height="20"/>
+<rect class="sv-b1" x="206" y="196" width="12" height="20"/>
+<rect class="sv-b1" x="220" y="196" width="12" height="20"/>
+<rect class="sv-b2" x="234" y="196" width="12" height="20"/>
+<rect class="sv-b2" x="248" y="196" width="12" height="20"/>
+<text class="sv-ts" x="150" y="232">1 + 5 + 2 = 8 bits · u = 2^-3 = 0.125, max 57344</text>
+<text class="sv-tb" x="140" y="263" text-anchor="end">FP8 E4M3</text>
+<rect class="sv-b8" x="150" y="248" width="12" height="20"/>
+<rect class="sv-b1" x="164" y="248" width="12" height="20"/>
+<rect class="sv-b1" x="178" y="248" width="12" height="20"/>
+<rect class="sv-b1" x="192" y="248" width="12" height="20"/>
+<rect class="sv-b1" x="206" y="248" width="12" height="20"/>
+<rect class="sv-b2" x="220" y="248" width="12" height="20"/>
+<rect class="sv-b2" x="234" y="248" width="12" height="20"/>
+<rect class="sv-b2" x="248" y="248" width="12" height="20"/>
+<text class="sv-ts" x="150" y="284">1 + 4 + 3 = 8 bits · u = 2^-4 = 0.0625, max: see text</text>
+</svg>
+</div><figcaption><b>Figure 1.</b> Bit layouts. FP32 and FP16 are IEEE 754 binary32 and binary16; BF16 keeps FP32's exponent with 7 fraction bits; the FP8 layouts follow the 8-bit formats' own specification (Hardware section). u and maxima for FP32, FP16, BF16 and E5M2 from run R1. <sup class="src"><a href="#F0-80-src-S1">S1</a></sup><sup class="src"><a href="#F0-80-src-S2">S2</a></sup><sup class="src"><a href="#F0-80-src-R1">R1</a></sup></figcaption></figure>
+<figure id="F0-80-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F0-80-f2t F0-80-f2d">
+<title id="F0-80-f2t">Error of a 4096-term dot product for each input format and accumulator</title>
+<desc id="F0-80-f2d">Horizontal bars on a logarithmic scale from 1e-7 to 10, one row per case, from run R2; exact dot product 3.20, sum of |a_i b_i| 1021. FP32 inputs, FP32 accumulator: total error 1.8e-5. FP16 inputs, FP32 accumulator: 4.2e-3, almost all from rounding the inputs. FP16 inputs, FP16 accumulator: 0.10, now dominated by accumulation. BF16 inputs, FP32 accumulator: 0.026. BF16 inputs, BF16 accumulator: 1.86, larger than half of the true result 3.2. FP8 E4M3 model inputs, FP32 accumulator: 0.090. FP8 E5M2 model inputs, FP32 accumulator: 2.89. Each row has a dark bar for the total error and a lighter thin bar for the part caused by accumulation alone; for every FP32 accumulator the accumulation part is at most 3.4e-5, and for the E4M3 row it was exactly 0 in this run, so no thin bar is drawn.</desc>
+<line class="sv-dash" x1="250.0" y1="20" x2="250.0" y2="285"/>
+<text class="sv-ts" x="250.0" y="302" text-anchor="middle">1e-7</text>
+<line class="sv-dash" x1="298.8" y1="20" x2="298.8" y2="285"/>
+<text class="sv-ts" x="298.8" y="302" text-anchor="middle">1e-6</text>
+<line class="sv-dash" x1="347.5" y1="20" x2="347.5" y2="285"/>
+<text class="sv-ts" x="347.5" y="302" text-anchor="middle">1e-5</text>
+<line class="sv-dash" x1="396.2" y1="20" x2="396.2" y2="285"/>
+<text class="sv-ts" x="396.2" y="302" text-anchor="middle">1e-4</text>
+<line class="sv-dash" x1="445.0" y1="20" x2="445.0" y2="285"/>
+<text class="sv-ts" x="445.0" y="302" text-anchor="middle">1e-3</text>
+<line class="sv-dash" x1="493.8" y1="20" x2="493.8" y2="285"/>
+<text class="sv-ts" x="493.8" y="302" text-anchor="middle">1e-2</text>
+<line class="sv-dash" x1="542.5" y1="20" x2="542.5" y2="285"/>
+<text class="sv-ts" x="542.5" y="302" text-anchor="middle">1e-1</text>
+<line class="sv-dash" x1="591.2" y1="20" x2="591.2" y2="285"/>
+<text class="sv-ts" x="591.2" y="302" text-anchor="middle">1e0</text>
+<line class="sv-dash" x1="640.0" y1="20" x2="640.0" y2="285"/>
+<text class="sv-ts" x="640.0" y="302" text-anchor="middle">1e1</text>
+<text class="sv-t" x="445.0" y="322" text-anchor="middle">absolute error of the dot product (log scale)</text>
+<text class="sv-t" x="240" y="42" text-anchor="end">FP32 in, FP32 acc.</text>
+<rect class="sv-b3" x="250" y="28" width="110.3" height="18"/>
+<rect class="sv-b6" x="250" y="48" width="111.0" height="8"/>
+<text class="sv-ts" x="366.3" y="42">1.8e-05</text>
+<text class="sv-t" x="240" y="79" text-anchor="end">FP16 in, FP32 acc.</text>
+<rect class="sv-b3" x="250" y="65" width="225.3" height="18"/>
+<rect class="sv-b6" x="250" y="85" width="123.2" height="8"/>
+<text class="sv-ts" x="481.3" y="79">0.0042</text>
+<text class="sv-t" x="240" y="116" text-anchor="end">FP16 in, FP16 acc.</text>
+<rect class="sv-b3" x="250" y="102" width="292.9" height="18"/>
+<rect class="sv-b6" x="250" y="122" width="293.8" height="8"/>
+<text class="sv-ts" x="548.9" y="116">0.1</text>
+<text class="sv-t" x="240" y="153" text-anchor="end">BF16 in, FP32 acc.</text>
+<rect class="sv-b3" x="250" y="139" width="263.6" height="18"/>
+<rect class="sv-b6" x="250" y="159" width="106.4" height="8"/>
+<text class="sv-ts" x="519.6" y="153">0.026</text>
+<text class="sv-t" x="240" y="190" text-anchor="end">BF16 in, BF16 acc.</text>
+<rect class="sv-b3" x="250" y="176" width="354.3" height="18"/>
+<rect class="sv-b6" x="250" y="196" width="354.6" height="8"/>
+<text class="sv-ts" x="610.3" y="190">1.9</text>
+<text class="sv-t" x="240" y="227" text-anchor="end">FP8 E4M3 in, FP32 acc.</text>
+<rect class="sv-b3" x="250" y="213" width="290.2" height="18"/>
+<text class="sv-ts" x="546.2" y="227">0.09</text>
+<text class="sv-t" x="240" y="264" text-anchor="end">FP8 E5M2 in, FP32 acc.</text>
+<rect class="sv-b3" x="250" y="250" width="363.7" height="18"/>
+<rect class="sv-b6" x="250" y="270" width="47.7" height="8"/>
+<text class="sv-ts" x="619.7" y="264">2.9</text>
+<rect class="sv-b3" x="660" y="30" width="14" height="12"/><text class="sv-ts" x="680" y="40">total</text>
+<rect class="sv-b6" x="660" y="52" width="14" height="8"/><text class="sv-ts" x="680" y="60">accum.</text>
+</svg>
+</div><figcaption><b>Figure 2.</b> Absolute error of a dot product of 4,096 random terms in [−1, 1] (exact value 3.20), for each input format and accumulator, from run R2. FP8 rows use this course's model of the formats. <sup class="src"><a href="#F0-80-src-R2">R2</a></sup></figcaption></figure>
+
+<h2 id="F0-80-layer1">Layer 1 — the kid explanation</h2>
+<p>Computers can store numbers with lots of digits or with very few. Few digits are faster and take less memory, which is why AI chips love 16-bit and even 8-bit numbers. But a number with three significant bits cannot tell 0.1 from 0.09375.</p>
+<p>There are two places where precision can be lost. Storing the inputs short loses a little on every input. Keeping the running total short is worse: once the total is big, small additions fall off the end and are never counted. So the usual trick is short inputs, long total.</p>
+<p>When you test such a program, you cannot ask for the exact answer. You must say how far off is acceptable, and you must be able to explain that number. If you make the allowed error bigger every time a test fails, one day it is so big that the test cannot catch anything at all.</p>
+
+<h2 id="F0-80-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F0-80-l2-formats">The formats</h3>
+<p>Listing 1 prints each format's unit roundoff u = 2<sup>−p</sup>, range and the value each stores for six inputs (run R1). Points to notice: <sup class="src"><a href="#F0-80-src-R1">R1</a></sup></p>
+<ul>
+<li>FP16 has u = 2<sup>−11</sup> ≈ 4.9 × 10<sup>−4</sup> (about 3 decimal digits) but a maximum of 65,504: 70,000 overflows to infinity.</li>
+<li>BF16 has the same exponent range as FP32 (70,000 is stored as 70,144) but only u = 2<sup>−8</sup> ≈ 3.9 × 10<sup>−3</sup>: 1000.3 is stored as 1000.</li>
+<li>FP8 is coarser still: π becomes 3 (E5M2) or 3.25 (E4M3 model), and 10<sup>−5</sup> underflows to 0 in the E4M3 model.</li>
+</ul>
+<p>The model in <code>lowp.hpp</code> rounds to nearest, ties to even, with subnormals and overflow to infinity. Run R7 checks it against GCC's <code>std::float16_t</code> and <code>std::bfloat16_t</code> (C++23) on 200,000 values spread over many binades: zero differences. The FP8 rows rest on the model alone (see the unverified box). <sup class="src"><a href="#F0-80-src-R7">R7</a></sup><sup class="src"><a href="#F0-80-src-B2">B2</a></sup></p>
+<h3 id="F0-80-l2-budget">Two errors, two bounds</h3>
+<p>For a dot product s = Σa<sub>i</sub>b<sub>i</sub> computed from rounded inputs with an accumulator of unit roundoff u<sub>acc</sub>: <sup class="src"><a href="#F0-80-src-D1">D1</a></sup><sup class="src"><a href="#F0-80-src-B1">B1</a></sup></p>
+<p class="n"><code>|ŝ − s| ≤ (2u<sub>in</sub> + u<sub>in</sub><sup>2</sup>) Σ|a<sub>i</sub>b<sub>i</sub>|  +  γ<sub>k</sub>(u<sub>acc</sub>) Σ|fl(a<sub>i</sub>)fl(b<sub>i</sub>)|</code></p>
+<p>The first term is the input rounding error; the second is the accumulation error with the recursive-summation bound of F0-75 (Σ of the rounded products, which differs from Σ|a<sub>i</sub>b<sub>i</sub>| by a factor 1 + O(u<sub>in</sub>)). Run R2 measures both parts separately for k = 4,096: <sup class="src"><a href="#F0-80-src-R2">R2</a></sup></p>
+<ul>
+<li><b>FP16 inputs, FP32 accumulator:</b> total 4.2 × 10<sup>−3</sup>, of which 4.1 × 10<sup>−3</sup> is input rounding and 3.4 × 10<sup>−5</sup> accumulation. The accumulator is irrelevant; the inputs set the accuracy.</li>
+<li><b>FP16 inputs, FP16 accumulator:</b> total 0.10, now dominated by accumulation (0.106). The bound is useless here: k u<sub>acc</sub> = 4096 × 2<sup>−11</sup> = 2 ≥ 1.</li>
+<li><b>BF16 inputs, BF16 accumulator:</b> 1.86, more than half the true result 3.20.</li>
+<li><b>FP8 inputs, FP32 accumulator:</b> 0.090 (E4M3 model) and 2.89 (E5M2), all from input rounding.</li>
+</ul>
+<p>The measured errors are far below the bounds (input part: 4.1 × 10<sup>−3</sup> against a bound of 1.0 for FP16), because rounding errors of random data partly cancel. A bound is what a test can rely on; a typical value is not. <sup class="src"><a href="#F0-80-src-R2">R2</a></sup><sup class="src"><a href="#F0-80-src-B1">B1</a></sup></p>
+<h3 id="F0-80-l2-tests">Tolerances that can be defended</h3>
+<p>The curriculum's acceptance tests say what is required, verbatim: for E3, "Sum of 2^28 floats matches a Kahan-summed CPU reference within your stated tolerance; integer sums are exact."; for E7, "Error versus an FP64 reference within a tolerance justified from FP16/BF16 input rounding." A tolerance meets that only if each term in it can be traced to a format, a size and a bound. <sup class="src"><a href="#F0-80-src-U1">U1</a></sup></p>
+<p>For a reduction kernel of depth d (the longest chain of roundings, F0-75) against a Kahan reference in double: tol = γ<sub>d</sub>(u<sub>float</sub>) Σ|x<sub>i</sub>| + 4u<sub>double</sub> Σ|x<sub>i</sub>|. The first term is the kernel's worst case; the second is a generous margin for the reference's own error. For E7, the input term above with u<sub>in</sub> of FP16 or BF16, plus the FP32 accumulation term, plus the FP64 reference's error. <sup class="src"><a href="#F0-80-src-D1">D1</a></sup><sup class="src"><a href="#F0-80-src-B1">B1</a></sup></p>
+<h3 id="F0-80-l2-design">A test must be able to fail</h3>
+<p>Listing 4 (the MA302 course lab) tests a reduction three ways and proves each way with negative controls: two planted bugs, one that drops the last n mod 256 elements and one that drops the last element. Run R4: <sup class="src"><a href="#F0-80-src-R4">R4</a></sup></p>
+<ul>
+<li>The correct kernel passes everything; its largest error is 3.2 % of the tolerance.</li>
+<li>The tolerance test alone misses the "drops tail" bug at n = 2<sup>20</sup> + 3: three missing values in [0, 1) are only 24 % of a tolerance of 5.2. The exact integer test (values i mod 7, every partial sum an integer below 2<sup>24</sup>, so float addition is exact in any order) catches it.</li>
+<li>No test can catch "drops tail" at n = 256 or 65,536: those sizes have no tail. Only sizes that are not multiples of the block size exercise that code.</li>
+<li>The exact test misses "drops last" at n = 1,000,000, because the dropped value is 999,999 mod 7 = 0. Two kinds of data and several sizes are needed.</li>
+</ul>
+
+<h2 id="F0-80-layer3">Layer 3 — the engineer's depth</h2>
+<p><b>Probabilistic bounds.</b> The γ<sub>k</sub> bound grows like ku, but for rounding errors that behave like independent random variables the error grows like √k u with high probability. Such bounds explain why measured errors sit orders of magnitude below worst case (run R2) and allow tighter tolerances when a small, quantified chance of a false failure is acceptable. A test tolerance based on them must state that probability. <sup class="src"><a href="#F0-80-src-B4">B4</a></sup><sup class="src"><a href="#F0-80-src-B1">B1</a></sup></p>
+<p><b>Scaling.</b> FP16's narrow range and FP8's tiny one make overflow and underflow a design problem: values are multiplied by a scale factor before conversion and divided after, per tensor or per block, so that they land in the format's best range. In the formats table, 70,000 overflows FP16 and 10<sup>−5</sup> underflows the E4M3 model; scaled by 2<sup>−4</sup> or 2<sup>10</sup> they would not. <sup class="src"><a href="#F0-80-src-R1">R1</a></sup><sup class="src"><a href="#F0-80-src-S3">S3</a></sup></p>
+<p><b>Mixed-precision solvers.</b> Iterative refinement (F0-77) can factor a matrix in FP16 or FP32 and refine in FP64, recovering FP64 accuracy when κ(A) u<sub>low</sub> is well below 1 (F0-78). The condition number decides whether the cheap precision is usable. <sup class="src"><a href="#F0-80-src-B4">B4</a></sup></p>
+<p><b>Contraction.</b> A compiler may fuse a × x + b into one FMA with a single rounding. That changes results (usually for the better) and therefore changes what "bitwise equal to the CPU" means. Run R8 shows nvcc generating <code>fma.rn.f32</code> for <code>a * x[i] + b</code> by default and <code>mul.rn.f32</code> plus <code>add.rn.f32</code> with <code>--fmad=false</code>; nvcc's own help text says the option enables contraction and that <code>--use_fast_math</code> implies it. <sup class="src"><a href="#F0-80-src-R8">R8</a></sup></p>
+<pre class="output" data-run="F0-80/fmad_ptx"></pre>
+<pre class="output" data-run="F0-80/nvcc_fmad_help"></pre>
+
+<h2 id="F0-80-hardware">How the hardware actually does it</h2>
+<p>GPUs store and move FP16, BF16 and FP8 data at half or a quarter of FP32's bytes, and their matrix units multiply small tiles of such inputs and add the products into wider accumulators (HW301). Listing 3 is a plain FP32 reduction kernel: its PTX (run R9) contains only <code>add.f32</code> instructions, one for the grid-stride loop and one for the tree, so its addition order is exactly the one modelled by <code>reduce_model.hpp</code>, with no contraction to account for. <sup class="src"><a href="#F0-80-src-R9">R9</a></sup><sup class="src"><a href="#F0-80-src-U1">U1</a></sup></p>
+<pre class="output" data-run="F0-80/reduce_ptx"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span>
+<p><b>FP8 details.</b> This course's E4M3 model is IEEE-like (largest value 240, top exponent reserved for infinity and NaN). The 8-bit floating-point specification published through the Open Compute Project (OFP8) is reported to define E4M3 differently: no infinities, a single NaN pattern per sign, and a largest finite value of 448; and conversions may saturate instead of overflowing. None of this was checked in this build. Read OFP8 (S2) and the FP8 paper (S3) for the version in your dossier and correct <code>kE4M3</code> in <code>lowp.hpp</code> before using its numbers.</p>
+<p><b>Other formats and units.</b> TF32 (a format with FP32's exponent and a 10-bit fraction used by NVIDIA matrix units), the BF16 definition in Intel's BFLOAT16 white paper <sup class="src"><a href="#F0-80-src-S4">S4</a></sup>, which input and accumulator precisions each GPU's matrix instructions support, and whether those units round their internal sums exactly as an FP32 add does, were not checked. Read the CUDA C++ Programming Guide (warp matrix functions), the PTX ISA and the AMD ISA guides named in curriculum E7 for the versions in your dossier.</p>
+<p><b>Untested on hardware.</b> No GPU exists in the build container. Listing 3 was compiled with nvcc and run: it stopped at its first checked call with "no CUDA-capable device is detected" (run R3). <sup class="src"><a href="#F0-80-src-R3">R3</a></sup> All kernel results in this chapter come from the CPU model of its order; that the GPU gives the same bits is a prediction to check on hardware.</p>
+</div>
+
+<h2 id="F0-80-worked">Worked example</h2>
+<p><b>The tolerance for one run of Listing 3:</b> n = 2<sup>20</sup> + 3 floats uniform in [0, 1), 128 blocks of 256 threads.</p>
+<ol>
+<li><b>Elements per thread:</b> the grid has 128 × 256 = 32,768 threads; 32,768 × 32 = 1,048,576, so three threads get 33 elements and the rest 32. The longest per-thread chain has 33 − 1 = 32 additions.</li>
+<li><b>Depth:</b> 32 (per thread) + 8 (tree over 256 = 2<sup>8</sup> threads) + 127 (adding 128 block partials in order) = 167.</li>
+<li><b>Kernel term:</b> γ<sub>167</sub> = 167u/(1 − 167u) with u = 2<sup>−24</sup>: 167 × 5.96 × 10<sup>−8</sup> = 9.954 × 10<sup>−6</sup>. With Σ|x<sub>i</sub>| = 524,297.14: 9.954 × 10<sup>−6</sup> × 524,297 ≈ 5.219.</li>
+<li><b>Reference term:</b> 4 × 2<sup>−53</sup> × 524,297 ≈ 2.3 × 10<sup>−10</sup>. Negligible, but written down.</li>
+<li><b>Tolerance:</b> 5.219, a relative tolerance of about 10<sup>−5</sup> for this data.</li>
+<li><b>Result (CPU model of the kernel's order):</b> 524,297 against the reference 524,297.1446: error 0.1446, 2.8 % of the tolerance. <sup class="src"><a href="#F0-80-src-D1">D1</a></sup></li>
+</ol>
+<p><b>Number check, run R6</b> — real output of <code>worked.cpp</code>: <sup class="src"><a href="#F0-80-src-R6">R6</a></sup></p>
+<pre class="output" data-run="F0-80/worked"></pre>
+
+<h2 id="F0-80-code">Code walk-through</h2>
+<p><b>Shared code</b> — <code>lowp.hpp</code>: the format model.</p>
+<pre class="listing" data-src="F0-80/lowp.hpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">11–23</td><td><code>Format</code>, five formats</td><td>p, e<sub>min</sub>, e<sub>max</sub> per format.</td><td>Three numbers describe an IEEE-like format completely.</td></tr>
+<tr><td class="n">25–43</td><td><code>unitRoundoff</code> … <code>minSubnormal</code></td><td>u = 2<sup>−p</sup>, (2 − 2<sup>1−p</sup>) 2<sup>e<sub>max</sub></sup>, 2<sup>e<sub>min</sub></sup>, 2<sup>e<sub>min</sub>−p+1</sup>.</td><td>The formulas behind the table of Listing 1.</td></tr>
+<tr><td class="n">50–54</td><td><code>ilogb</code>, <code>quantum</code></td><td>The spacing of the format at x, fixed at the subnormal spacing below 2<sup>e<sub>min</sub></sup>.</td><td>Gradual underflow (F0-73).</td></tr>
+<tr><td class="n">55–56</td><td><code>nearbyint(x / quantum)</code></td><td>Rounds to the nearest multiple, ties to even.</td><td>Exact in double for every format narrower than double; checked against C++23 types (run R7).</td></tr>
+<tr><td class="n">57–59</td><td>overflow</td><td>Beyond the largest finite value: infinity.</td><td>The IEEE-like choice; see the FP8 unverified box.</td></tr>
+</tbody></table></div>
+<p><b>Listing 1</b> — <code>formats.cpp</code>: the formats side by side.</p>
+<pre class="listing" data-src="F0-80/formats.cpp"></pre>
+<p><b>Build command</b> (the one actually used): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined formats.cpp -o formats</code>, then <code>./formats</code>.</p>
+<p><b>Output</b> (run R1):</p>
+<pre class="output" data-run="F0-80/formats"></pre>
+<p><b>Listing 2</b> — <code>dot.cpp</code>: one dot product, seven combinations of input format and accumulator, with the error split into its two parts.</p>
+<pre class="listing" data-src="F0-80/dot.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">18–29</td><td>data, <code>exact</code></td><td>4,096 pairs in [−1, 1]; dot product and Σ|a<sub>i</sub>b<sub>i</sub>| in double.</td><td>Double's u is 2<sup>29</sup> times smaller than FP32's: an adequate reference here.</td></tr>
+<tr><td class="n">40</td><td><code>roundTo(a[i], *c.in)</code></td><td>Stores the inputs short.</td><td>The input rounding error happens here.</td></tr>
+<tr><td class="n">41</td><td><code>roundedExact</code></td><td>Products of the short inputs summed in double.</td><td>Isolates the input part: roundedExact − exact.</td></tr>
+<tr><td class="n">42–43</td><td><code>acc = roundTo(acc + roundTo(ai * bi, …), …)</code></td><td>Product and sum rounded to the accumulator.</td><td>The accumulation part: acc − roundedExact.</td></tr>
+<tr><td class="n">49</td><td>input bound</td><td>(2u<sub>in</sub> + u<sub>in</sub><sup>2</sup>) Σ|a<sub>i</sub>b<sub>i</sub>|.</td><td>The first term of the budget.</td></tr>
+<tr><td class="n">50–55</td><td>accumulation bound</td><td>γ<sub>k</sub>(u<sub>acc</sub>) Σ|a<sub>i</sub>b<sub>i</sub>|, or "none" when k u<sub>acc</sub> ≥ 1.</td><td>A bound that is honest about where it stops meaning anything.</td></tr>
+</tbody></table></div>
+<p><b>Output</b> (run R2):</p>
+<pre class="output" data-run="F0-80/dot"></pre>
+<p>The E4M3 row shows an accumulation part of exactly 0 in this run: products of two inputs with 4-bit significands are short, and their running sums stayed within FP32's 24 bits, so every FP32 addition happened to be exact. Do not rely on that for other data. <sup class="src"><a href="#F0-80-src-R2">R2</a></sup></p>
+<p><b>Listing 3</b> — <code>reduce.cu</code>: the reduction kernel whose test this chapter designs, with checked CUDA calls and the tolerance of the worked example. Untested on hardware.</p>
+<pre class="listing" data-src="F0-80/reduce.cu"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">11–17</td><td><code>check</code></td><td>Stops with the runtime's own message on any error.</td><td>That message is the evidence in run R3.</td></tr>
+<tr><td class="n">27–30</td><td>grid-stride loop</td><td>Each thread sums every 32,768th element in float.</td><td>The longest chain: up to 33 elements.</td></tr>
+<tr><td class="n">31–38</td><td>shared-memory tree</td><td>Halves the active threads 8 times.</td><td>Depth 8 for 256 threads.</td></tr>
+<tr><td class="n">72–75</td><td>block partials</td><td>Added in order on the host.</td><td>127 more additions; deterministic order.</td></tr>
+<tr><td class="n">76–83</td><td>Kahan reference</td><td>The E3 reference, in double.</td><td>Far more accurate than the kernel.</td></tr>
+<tr><td class="n">84–93</td><td>tolerance and verdict</td><td>Depth, γ<sub>depth</sub> Σ|x| + 4u<sub>d</sub>Σ|x|; exit code 1 on failure.</td><td>The worked example in code.</td></tr>
+</tbody></table></div>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings reduce.cu -o reduce</code> (<code>Cuda compilation tools, release 12.0, V12.0.140</code>), then <code>./reduce</code>.</p>
+<p><b>Output</b> (run R3; exit code 1, untested on hardware):</p>
+<pre class="output" data-run="F0-80/reduce"></pre>
+<p><b>Shared code</b> — <code>reduce_model.hpp</code>: the CPU model of the kernel's addition order, two planted bugs, the reference, the depth and the tolerance.</p>
+<pre class="listing" data-src="F0-80/reduce_model.hpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">15–26</td><td><code>Variant</code>, <code>loopEnd</code></td><td>The correct bound, n rounded down to a multiple of 256, and n − 1.</td><td>Negative controls: realistic indexing bugs.</td></tr>
+<tr><td class="n">30–52</td><td><code>sumKernelModel</code></td><td>Grid-stride sums, tree per block, partials in order, all in float.</td><td>Same order, so the same roundings as Listing 3.</td></tr>
+<tr><td class="n">68–74</td><td><code>kernelDepth</code></td><td>ceil(n / 32768) − 1 + 8 + 127.</td><td>The depth rule of F0-75 for this kernel.</td></tr>
+<tr><td class="n">78–88</td><td><code>reductionTolerance</code></td><td>γ<sub>d</sub>(2<sup>−24</sup>) Σ|x| + 4 × 2<sup>−53</sup> Σ|x|.</td><td>Every term traceable to a format and a bound.</td></tr>
+</tbody></table></div>
+<p><b>Listing 4</b> — <code>reduce_test.cpp</code> (the MA302 course lab): the test, run against the correct kernel and both negative controls.</p>
+<pre class="listing" data-src="F0-80/reduce_test.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">10–27</td><td><code>uniformData</code>, <code>mixedData</code></td><td>[0, 1) values exact in float; signed values over seven decades.</td><td>Easy and hard sums (κ large for mixed data, F0-75).</td></tr>
+<tr><td class="n">31–40</td><td><code>exactIntegerTest</code></td><td>Values i mod 7; compares for equality.</td><td>E3's "integer sums are exact": no tolerance needed, catches any lost element.</td></tr>
+<tr><td class="n">43–49</td><td><code>toleranceTest</code></td><td>|kernel − reference| ≤ derived tolerance.</td><td>E3's "within your stated tolerance".</td></tr>
+<tr><td class="n">53</td><td><code>sizes</code></td><td>1, 255, 256, 257, 65,536, 10<sup>6</sup>, 2<sup>20</sup> + 3.</td><td>Edges of the block size and sizes with and without a tail.</td></tr>
+</tbody></table></div>
+<p><b>Output</b> (run R4):</p>
+<pre class="output" data-run="F0-80/reduce_test"></pre>
+
+<h2 id="F0-80-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A coarse scoop is coarse everywhere; a float is coarse relative to its size.</b> FP16 represents 0.001 to about 3 digits and 60,000 to about 3 digits, but not 70,000 at all: range limits have no equivalent on a scoop. <sup class="src"><a href="#F0-80-src-R1">R1</a></sup></li>
+<li><b>Amara's notebook is exact; the FP32 accumulator is not.</b> It is only 2<sup>13</sup> times finer than FP16, so for very long sums or catastrophic cancellation it matters again (FP16 inputs with FP32 accumulation still have an accumulation part of 3.4 × 10<sup>−5</sup>). <sup class="src"><a href="#F0-80-src-R2">R2</a></sup></li>
+<li><b>Scoop errors are visible; tolerance errors are silent.</b> A tolerance that is too loose produces no symptom at all until something else fails (forensic lab). <sup class="src"><a href="#F0-80-src-R5">R5</a></sup></li>
+<li><b>Real ingredients do not come with known totals.</b> Tests can choose data with exactly known sums (integers); real workloads cannot, which is why both kinds of test are needed. <sup class="src"><a href="#F0-80-src-R4">R4</a></sup></li>
+</ul>
+
+<h2 id="F0-80-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Test widened after "flaky" failures, then never fails (run R5).</td><td>Tolerance chosen by trial, not derived.</td><td>Run a planted bug through the test.</td><td>Derive the tolerance (error budget); add negative controls.</td></tr>
+<tr><td>Reference and result disagree by more than the tolerance on large inputs only.</td><td>Reference is a plain float loop, less accurate than the kernel.</td><td>Compare the reference with a Kahan-in-double sum.</td><td>Kahan (or pairwise) in double as reference (E3).</td></tr>
+<tr><td>Bug found in production at sizes the tests "covered".</td><td>Test sizes all multiples of the block size.</td><td>List which code paths each size exercises.</td><td>Sizes 1, B − 1, B, B + 1, and a large non-multiple.</td></tr>
+<tr><td>FP16 results inf or 0.</td><td>Values outside FP16's range (above 65,504; below about 6 × 10<sup>−8</sup>).</td><td>Check max |x| and min |x| ≠ 0 before conversion.</td><td>Scale before conversion; BF16 for range.</td></tr>
+<tr><td>GPU and CPU differ bitwise although the order is the same.</td><td>FMA contraction on one side (run R8).</td><td>Read the PTX or disassembly.</td><td>Compare within a tolerance, or control contraction (<code>--fmad=false</code>, <code>-ffp-contract=off</code>) for bitwise tests.</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F0-80-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F0-73 to F0-75 built the standard model, summation bounds and the depth rule; F0-78 the condition number; HW301 introduced FP16, BF16 and matrix units. <b>What carries over:</b> u, γ<sub>k</sub>, Σ|x| as the scale of a sum's error, and a Kahan reference. <b>What changes:</b> u is now a design choice per tensor; errors are split into input and accumulation parts; and every tolerance becomes a written budget with negative controls that prove the test can fail. <sup class="src"><a href="#F0-80-src-U1">U1</a></sup> <b>What comes next:</b> the curriculum milestones E3 and E7 use these budgets directly, and the GPU courses (CU301 onwards) run the kernels on real hardware where the predictions of this chapter can be checked.</p>
+</div>
+
+<h2 id="F0-80-check">Check yourself</h2>
+<ol>
+<li>Give u and the largest finite value of FP16 and BF16. Which would you use for values between 10<sup>−6</sup> and 10<sup>6</sup>, and why?</li>
+<li>Name the two parts of the error of a mixed-precision dot product and say which one a wider accumulator removes.</li>
+<li>Multiple choice: for k = 4096 terms, the γ<sub>k</sub> bound for an FP16 accumulator is (a) about 2 (b) about 0.25 (c) not meaningful because k u ≥ 1 (d) exactly 0.</li>
+<li>Compute the depth and the tolerance term γ<sub>d</sub>Σ|x| for Listing 3's kernel with n = 2<sup>22</sup> uniform values in [0, 1) (Σ|x| ≈ 2<sup>21</sup>).</li>
+<li>Why does the exact integer test use i mod 7 and not random floats?</li>
+<li>Explain in your own words why a passing test is evidence only if a broken version fails it.</li>
+<li>Apply it to a new case: an E7 GEMM with K = 1024, BF16 inputs in [−1, 1], FP32 accumulation. Write the error budget for one output element.</li>
+<li>Predict, then run: in Listing 2 add the case FP32 inputs with BF16 accumulator. Will its error be closer to the BF16/BF16 row or to the FP32/FP32 row?</li>
+</ol>
+
+<h2 id="F0-80-lab">Lab</h2>
+<h3 id="F0-80-lab-goal">Goal</h3>
+<p>Set the tolerance for a reduction-kernel test (the MA302 course lab), prove that the test can fail, and write the E7-style budget for a mixed-precision dot product.</p>
+<h3 id="F0-80-lab-need">Hardware and software needed</h3>
+<p>A computer with a C++20 compiler; this build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, and <code>Cuda compilation tools, release 12.0, V12.0.140</code> for Listing 3. A CUDA GPU is optional: without one, Listing 3 compiles and stops at its first checked call, as in run R3.</p>
+<h3 id="F0-80-lab-safety">Safety</h3>
+<p>None beyond normal computer use.</p>
+<h3 id="F0-80-lab-steps">Steps</h3>
+<ol>
+<li>Build and run Listings 1, 2 and 4 and <code>worked.cpp</code>; compare with runs R1, R2, R4 and R6.</li>
+<li>Add a third planted bug of your own (for example, the tree loop starting at <code>half = blockDim.x / 4</code>) and show which tests catch it.</li>
+<li>Change the kernel model to 64 threads per block and 1,024 blocks. Recompute the depth, predict whether the tolerance gets tighter or looser, and run.</li>
+<li>Write <code>dotTolerance(a, b, inFormat, accFormat)</code> from the budget in Layer 2 and use it to test all seven cases of Listing 2. All must pass; then plant a bug (skip one term) and show that it fails for k = 4096.</li>
+<li>If a CUDA GPU is available: run Listing 3, record the result and the GPU model, and compare <code>gpu</code> bitwise with <code>sumKernelModel</code> on the same data.</li>
+</ol>
+<h3 id="F0-80-lab-expect">Expected observations</h3>
+<p>Your bug is caught by at least one test at some size; if it is not, the sizes or data are too narrow. With more blocks the depth is dominated by the 1,023 in-order partial additions, so the tolerance gets looser, which is a reason to reduce the partials with a tree too. Every case of Listing 2 passes its derived tolerance with a large margin; skipping one term of size about 0.25 fails cases whose tolerance is below that. On a GPU, the bitwise comparison is the prediction this chapter could not check.</p>
+<h3 id="F0-80-lab-verify">Verification</h3>
+<p>A table: test × variant × size with PASS/FAIL, in which every planted bug fails somewhere and the correct kernel passes everywhere; the budget for each case of Listing 2 with its terms written out; for step 5, the GPU, driver and toolkit versions with the result, or "untested on hardware".</p>
+<h3 id="F0-80-lab-trouble">Troubleshooting</h3>
+<ul>
+<li>The correct kernel fails the tolerance test → the depth is undercounted (forgot the in-order partials) or Σ|x| was taken as |Σx| → recompute both.</li>
+<li>The exact test fails for the correct kernel → a partial sum exceeded 2<sup>24</sup> → keep n × 6 below 2<sup>24</sup> or use smaller values.</li>
+<li>Listing 3 prints a CUDA error → read it: "no CUDA-capable device" means no GPU, not a bug in the kernel.</li>
+</ul>
+<h3 id="F0-80-lab-ext">Extension</h3>
+<p>Implement a probabilistic tolerance λ√d u Σ|x| (Layer 3) with λ chosen for a stated false-failure probability, and compare how many of your planted bugs each tolerance catches.</p>
+
+<h2 id="F0-80-forensic">Forensic lab</h2>
+<h3 id="F0-80-for-scenario">Scenario: "The test that always passes"</h3>
+<p>Kenji's team counts bright pixels on the GPU. A field engineer reports that for a test frame of 1,000,000 pixels, all bright and counted as 1.0, the GPU says 999,936. Continuous integration has run <code>test_sum_kernel</code> on every commit for months without a single failure. Its tolerance was widened from 10<sup>−6</sup> to 10<sup>−2</sup> last spring in a commit called "stop flaky failures".</p>
+<h3 id="F0-80-for-evidence">Evidence pack</h3>
+<p>Real output of the test log and the field report (run R5, from <code>always_passes.cpp</code>, which contains deliberate mistakes; the kernel is its CPU order model): <sup class="src"><a href="#F0-80-src-R5">R5</a></sup></p>
+<pre class="output" data-run="F0-80/always_passes"></pre>
+<h3 id="F0-80-for-questions">Questions</h3>
+<ol>
+<li>How many pixels are missing in the field report, and what is special about that number for a kernel with 256 threads per block?</li>
+<li>Why did the test pass at n = 1,000,000 and n = 4,194,300?</li>
+<li>Why did the old tolerance of 10<sup>−6</sup> give "flaky failures"? Use the n = 1,048,576 row, where the kernel is correct.</li>
+<li>Derive the tolerance this test should have had at n = 1,000,000 and say whether the buggy kernel would then fail.</li>
+<li>List every fault in the test, and write the test you would replace it with.</li>
+</ol>
+<h3 id="F0-80-for-hints">Method hints</h3>
+<p>Compute 1,000,000 mod 256. For question 3, compare the CPU reference with what Listing 4's Kahan reference would give, and remember F0-75: a plain float loop over 10<sup>6</sup> values has depth 10<sup>6</sup>.</p>
+
+<h2 id="F0-80-project">Mini-project</h2>
+<p><b>The MA302 numerics notebook.</b> Assemble the pages you built in F0-73 to F0-79 into one HTML numerics notebook with tested C++ examples (the MA302 course project), and add this chapter's page: the format table, the dot-product budget with your <code>dotTolerance</code>, and the reduction test with its negative controls. Every number on every page must come from a listing in the notebook's repository, built with recorded flags, with a script that rebuilds and reruns everything.</p>
+<p><b>Rubric (5 points):</b> all pages present, each with at least one tested example (1); every tolerance in the notebook written as a budget with its terms (1); negative controls that fail for every tolerance test (1); one script rebuilds all numbers, and its log shows toolchain and exit codes (1); a clear, honest account of what was not tested on hardware (1).</p>
+
+<h2 id="F0-80-summary">Summary</h2>
+<ul>
+<li>FP16 trades range for precision against BF16 (u = 2<sup>−11</sup> against 2<sup>−8</sup>); FP8 has u of 2<sup>−4</sup> or 2<sup>−3</sup>.</li>
+<li>Reduced-precision error = input rounding + accumulation; a wide accumulator removes only the second (run R2).</li>
+<li>A tolerance is an error budget: γ<sub>depth</sub>Σ|x| for the kernel plus the reference's error (E3); input rounding from u<sub>in</sub> plus accumulation (E7).</li>
+<li>A test must be shown to fail: exact integer sums, sizes with and without tails, planted bugs (run R4).</li>
+<li>A tolerance widened to stop failures can hide a lost tail of 64 values in a million (run R5).</li>
+</ul>
+
+<h2 id="F0-80-sources">Sources</h2>
+<ol>
+<li id="F0-80-src-D1"><b>D1</b> — Derivations and arithmetic worked out in this chapter (the two-part error budget, the input-rounding bound, the depth and tolerance of Listing 3, the definitions of error budget and negative control). Shown in the text and recomputed by runs R2, R4 and R6. The Source Researcher must check the bounds against B1 (dossier gate G1 open).</li>
+<li id="F0-80-src-S1"><b>S1</b> — IEEE, "IEEE Standard for Floating-Point Arithmetic" (IEEE 754; tier 1): the binary16 and binary32 formats. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F0-80-src-S2"><b>S2</b> — Open Compute Project, "OCP 8-bit Floating Point Specification (OFP8)" (tier 1 for FP8): the E4M3 and E5M2 encodings, special values and conversions. Title only — not opened during this build; version to be recorded (dossier gate G1 open). Proposed as the FP8 source of record (MA302 NOTES.md).</li>
+<li id="F0-80-src-S3"><b>S3</b> — Paulius Micikevicius and others, "FP8 Formats for Deep Learning" (2022; tier 5): the two FP8 formats and scaling. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F0-80-src-S4"><b>S4</b> — Intel, "BFLOAT16 – Hardware Numerics Definition" (white paper; tier 2): the bfloat16 format. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F0-80-src-B1"><b>B1</b> — Nicholas J. Higham, "Accuracy and Stability of Numerical Algorithms" (SIAM; tier 3): error analysis of inner products and summation, γ<sub>k</sub>. Proposed registry 4.2 textbook (MA302 NOTES.md). Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F0-80-src-B2"><b>B2</b> — ISO/IEC, C++ working draft (tier 1): the extended floating-point types <code>std::float16_t</code> and <code>std::bfloat16_t</code> of &lt;stdfloat&gt; (C++23). Title only — not opened during this build; the types' behaviour on this toolchain is shown by run R7 (dossier gate G1 open).</li>
+<li id="F0-80-src-B4"><b>B4</b> — Nicholas J. Higham, Theo Mary, "Mixed precision algorithms in numerical linear algebra" (Acta Numerica, 2022; tier 5): mixed-precision iterative refinement and probabilistic rounding error bounds. Title only — not opened during this build (dossier gate G1 open).</li>
+<li id="F0-80-src-U1"><b>U1</b> — Systems Curriculum (this repository), Track E: milestones E3 and E7 (acceptance tests quoted verbatim in Layer 2) and 13.4; University Authoring Guide course cards of MA302 and HW301. Map, not a source for technical claims (AH-4). See <a href="#trackE">Track E</a>.</li>
+<li id="F0-80-src-R1"><b>R1</b> — Lab run of Listing 1 (<code>formats.cpp</code> with <code>lowp.hpp</code>) in this build: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>-std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined</code>, Linux x86_64 build container, exit code 0 (<code>university/labs/F0-80/formats.log</code>).</li>
+<li id="F0-80-src-R2"><b>R2</b> — Lab run of Listing 2 (<code>dot.cpp</code>), same toolchain and flags, exit code 0 (<code>dot.log</code>).</li>
+<li id="F0-80-src-R3"><b>R3</b> — Build and run of Listing 3 (<code>reduce.cu</code>): <code>Cuda compilation tools, release 12.0, V12.0.140</code>, <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings</code>; the build succeeded; the run exited with code 1 and the runtime's message "no CUDA-capable device is detected" (<code>reduce.log</code>). Untested on hardware.</li>
+<li id="F0-80-src-R4"><b>R4</b> — Lab run of Listing 4 (<code>reduce_test.cpp</code> with <code>reduce_model.hpp</code>), g++ toolchain and flags as R1, exit code 0 (<code>reduce_test.log</code>). The kernel is the CPU model of its order.</li>
+<li id="F0-80-src-R5"><b>R5</b> — Lab run of the forensic evidence program <code>always_passes.cpp</code> (deliberate faults described in the answer key), same toolchain and flags, exit code 0 (<code>always_passes.log</code>).</li>
+<li id="F0-80-src-R6"><b>R6</b> — Lab run of <code>worked.cpp</code> (worked example check), same toolchain and flags, exit code 0 (<code>worked.log</code>).</li>
+<li id="F0-80-src-R7"><b>R7</b> — Run step <code>stdfloat_check</code> of <code>run.sh</code>: <code>stdfloat_check.cc</code> built with <code>g++ -std=c++23 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined</code> and run, exit code 0 (<code>stdfloat_check.log</code>).</li>
+<li id="F0-80-src-R8"><b>R8</b> — Run steps <code>fmad_ptx</code> and <code>nvcc_fmad_help</code> of <code>run.sh</code>: PTX of <code>fma_demo.cuh</code> generated by nvcc 12.0 with <code>--fmad=true</code> and <code>--fmad=false</code>, and nvcc's help text for <code>--fmad</code>; compiled only, exit code 0 (<code>fmad_ptx.log</code>, <code>nvcc_fmad_help.log</code>).</li>
+<li id="F0-80-src-R9"><b>R9</b> — Run step <code>reduce_ptx</code> of <code>run.sh</code>: the floating-point instructions in the PTX of <code>reduce.cu</code> (nvcc 12.0, <code>-O2</code>); compiled only, exit code 0 (<code>reduce_ptx.log</code>).</li>
+</ol>
+
+<h2 id="F0-80-glossary">Glossary links</h2>
+<p><a href="#gl-fp8-e4m3-and-e5m2">FP8 (E4M3 and E5M2)</a> · <a href="#gl-accumulator-precision">Accumulator precision</a> · <a href="#gl-input-rounding-error">Input rounding error</a> · <a href="#gl-error-budget">Error budget</a> · <a href="#gl-negative-control-in-a-numerical-test">Negative control (in a numerical test)</a> · <a href="#gl-fp16-bf16">FP16 / BF16</a> (HW301) · <a href="#gl-mixed-precision">Mixed precision</a> (HW301) · <a href="#gl-fma-fused-multiply-add">FMA (fused multiply-add)</a> (SP302) · <a href="#gl-floating-point-tolerance">Floating-point tolerance</a> (SP101) · <a href="#gl-test-tolerance-justified">Test tolerance (justified)</a> (F0-75) · <a href="#gl-depth-of-a-summation-order">Depth (of a summation order)</a> (F0-75)</p>
+
+<h2 id="F0-80-next">Next chapter</h2>
+<p>This is the last chapter of the course. Previous: <a href="#F0-79">F0-79 Discretising a controller</a>. Back to the course: <a href="#MA302">MA302 Numerical methods and floating point</a>. The milestones that use this chapter: <a href="#trackE">Track E</a> (E3, E7).</p>
+
+<h2 id="F0-80-answers">Answers to Check yourself</h2>
+<ol>
+<li>FP16: u = 2<sup>−11</sup> ≈ 4.9 × 10<sup>−4</sup>, max 65,504. BF16: u = 2<sup>−8</sup> ≈ 3.9 × 10<sup>−3</sup>, max ≈ 3.4 × 10<sup>38</sup>. For 10<sup>−6</sup> to 10<sup>6</sup>: BF16, because FP16 overflows above 65,504 (and 10<sup>−6</sup> is subnormal in FP16, with reduced precision); or FP16 with scaling, if its extra precision is needed.</li>
+<li>Input rounding and accumulation. A wider accumulator removes (almost all of) the accumulation part; the input rounding part stays.</li>
+<li>(c): k u = 4096 × 2<sup>−11</sup> = 2 ≥ 1, so γ<sub>k</sub> is not defined (the printed "none").</li>
+<li>Per thread: 2<sup>22</sup>/2<sup>15</sup> = 128 elements, 127 additions; depth = 127 + 8 + 127 = 262. γ<sub>262</sub> ≈ 262 × 5.96 × 10<sup>−8</sup> = 1.56 × 10<sup>−5</sup>; times 2<sup>21</sup> ≈ 2.1 × 10<sup>6</sup>: about 32.7.</li>
+<li>Small integers and all their partial sums (below 2<sup>24</sup>) are exactly representable in float, so every addition is exact in every order: the correct result is known exactly and any difference, even one missing element, is a bug. Values 0–6 keep the partial sums small, and the zeros (every seventh value) also show that some bugs can hide (the "drops last" case at n = 10<sup>6</sup>).</li>
+<li>Your words may differ. A test that cannot fail tells you nothing: passing is only informative if a wrong result of the size you care about would have been rejected. A planted bug of that size is the experiment that shows it.</li>
+<li>Per output element: input part (2u + u<sup>2</sup>) Σ<sub>k</sub>|a<sub>ik</sub>b<sub>kj</sub>| with u = 2<sup>−8</sup> (≈ 7.8 × 10<sup>−3</sup> Σ|ab|); accumulation part γ<sub>d</sub>(2<sup>−24</sup>) Σ|ab| with d the depth of the accumulation order used by the kernel (at most 1023 for a sequential order over K = 1024); reference part: FP64, negligible but stated. With entries in [−1, 1], Σ|ab| ≤ 1024. The budget is the sum of the three.</li>
+<li>Closer to the BF16/BF16 row: with k u<sub>acc</sub> = 4096 × 2<sup>−8</sup> = 16, accumulation dominates, as in the BF16/BF16 case, so its error will be of similar size. Run it to check.</li>
+</ol>
+<h3 id="F0-80-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>1,000,000 − 999,936 = 64 pixels, and 1,000,000 mod 256 = 64: the kernel drops the last n mod 256 elements (the <code>DropTail</code> loop bound in <code>reduce_model.hpp</code>, line 20).</li>
+<li>The relative tolerance 10<sup>−2</sup> allows a difference of 1 % of the sum; 64 missing values of about 0.5 are about 32 out of 500,000, near 6 × 10<sup>−5</sup> (the log shows 6.18 × 10<sup>−5</sup>, which also contains the reference's own error), and 4,194,300 mod 256 = 252 missing values give 7.3 × 10<sup>−5</sup>. Both are far inside 1 %.</li>
+<li>The reference itself is a plain float loop with depth 10<sup>6</sup>: at n = 1,048,576, where the kernel drops nothing (a multiple of 256), the two still differ by 9.1 × 10<sup>−6</sup> relative, almost all of it the reference's error. A tolerance of 10<sup>−6</sup> was tighter than the reference's own accuracy, so it failed depending on data; the failures were the test's fault, and widening the tolerance hid the kernel's.</li>
+<li>With a Kahan reference in double: depth = ceil(10<sup>6</sup>/32,768) − 1 + 8 + 127 = 31 − 1 + 135 = 165; γ<sub>165</sub> ≈ 9.83 × 10<sup>−6</sup>; Σ|x| ≈ 5 × 10<sup>5</sup>; tolerance ≈ 4.9. The missing 64 values sum to about 32, so the buggy kernel fails by a factor of about 6.5, in line with run R4's "drops tail" row at n = 10<sup>6</sup> (err/tol 6.36). And the exact integer test would fail it outright.</li>
+<li>Faults: (a) the kernel's loop bound drops the tail; (b) the reference is a plain float loop instead of Kahan in double; (c) the tolerance is an arbitrary relative 10<sup>−2</sup> instead of a derived budget; (d) no exact integer test; (e) no negative controls. Replacement: Listing 4 (exact integer test, derived tolerance against a Kahan reference, sizes with and without tails, two data distributions), run against planted bugs in CI.</li>
+</ol>
+<p><b>How the evidence was produced:</b> <code>always_passes.cpp</code> fills arrays of the listed sizes with values in [0, 1) (seeded splitmix64), sums them with <code>sumKernelModel(x, Variant::DropTail)</code> and with a plain float loop, and applies the relative test with 10<sup>−2</sup>; the field report sums 1,000,000 ones with the same model. <b>Wrong answers and why:</b> "float cannot count to a million" — 1,000,000 is far below 2<sup>24</sup> = 16,777,216, and integer sums are exact there (F0-73); "rounding error in the GPU sum" — rounding cannot lose exactly 64 when every value is 1.0 and all partial sums are small integers; "the GPU is faulty" — the result is reproduced exactly by the CPU model of the kernel's order.</p>

@@ -1,0 +1,359 @@
+<!--meta
+id: F4-35
+title: A devicetree-driven driver model
+course: DR403
+level: L4
+prereqs: F4-31; F4-34; DR301 (F4-02, the PCI driver model); DR402 (D4)
+time: 14–18 hours including the lab, the forensic lab and the mini-project
+hardware: none required (QEMU 8.2.2 machine virt, aarch64-linux-gnu-g++ 13.3.0, g++ 13.3.0, Python 3.13.16 in the build container); D8's board tests need a board with a GPIO LED, an I2C sensor and a logic analyser, untested in this build
+maps: Curriculum milestone D8 (a devicetree-driven driver model with clocks, resets, pin control and GPIO), section 11.1 (explicit clocks, resets, pins) and 11.5 (bring-up order); course forensic "Device reads all zeros"
+analogy: F4 — the school and its visitors; registered: driver = an interpreter, interrupt = the doorbell; proposed: clocks, resets and pins = lights on, door unlocked and furniture arranged before a lesson, deferred probe = the timetable postpones a lesson until the room is ready (see NOTES.md)
+-->
+
+<h2 id="F4-35-hook">Story hook</h2>
+<p>The new principal of F4-31 now has the building plan in hand. On Monday morning he sends interpreters to the rooms the plan lists: the French interpreter to room 12, where the plan says a French-speaking visitor waits; the sign-language interpreter to the hall. At room 12 the interpreter finds the door locked, the lights off and the chairs stacked. She sits in the dark corridor, waits, hears nothing, and writes in her report: "Visitor said nothing." The report is filed. Nobody questions it, because it is a report, and reports are trusted.</p>
+<p>Room 12 was not empty. Its visitor was sitting in the dark behind a locked door, unable to hear the knock. The plan said, in small print, "needs the east-wing lights (switch 2) and the east door (key 2)". Someone had switched on the lights in the <i>west</i> wing (switch 3) instead.</p>
+<p>On an SoC, many devices behave like room 12. Before their registers answer, their clock must run, their reset line must be released, and their pins must be connected to the right function. If any of that is wrong, many devices do not raise an error. They read as zero, and a driver that does not check turns zero into a plausible-looking result: a temperature of 0.000 °C, an empty status, a silent UART. This chapter builds the driver model that does the switching on, in the right order, from the devicetree, and then works through the course's forensic case, "Device reads all zeros".</p>
+
+<h2 id="F4-35-able">What you will be able to do</h2>
+<ul>
+<li><b>Build</b> a driver model that creates a device for every devicetree node with a <code>compatible</code>, matches drivers by compatible string from a table the linker assembles, and probes them in passes.</li>
+<li><b>Implement</b> providers for clocks, interrupt controllers, pins and (in the simulated SoC) resets, resolve consumers' <code>clocks</code>, <code>resets</code> and pin properties through phandles and <code>#…-cells</code>, and <b>defer</b> a probe until its providers exist.</li>
+<li><b>Show</b> on QEMU's virt machine that every supported node is bound by the generic mechanism and that probing works when consumers are listed before providers: the QEMU acceptance tests of milestone D8.</li>
+<li><b>Verify</b> in a probe that a device really answers (identification registers, a counter that moves) before reporting it bound.</li>
+<li><b>Diagnose</b> a device that reads all zeros from the devicetree and a register dump: a clock left gated because the tree names the wrong clock.</li>
+</ul>
+
+<div class="co jargon" id="F4-35-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Driver model</dt><dd><b>Simple words:</b> the part of the kernel that decides which driver handles which device, and in what order they start. <b>Analogy:</b> the office that sends each interpreter to the right room at the right time. <b>Precise:</b> the kernel's set of device records, driver descriptors, the matching rule (here: <code>compatible</code> strings) and the probe sequence, including retries for devices whose dependencies are not ready. <sup class="src"><a href="#F4-35-src-C1">C1</a></sup></dd>
+<dt>Deferred probe</dt><dd><b>Simple words:</b> putting off a device's start-up until the things it depends on are ready, and trying again later. <b>Analogy:</b> the timetable postpones a lesson until the room is ready. <b>Precise:</b> a probe result meaning "a provider I need (clock, reset, interrupt controller, pin controller, regulator) has not been probed yet"; the driver model keeps the device waiting and retries after other probes succeed, stopping when a full pass makes no progress. <sup class="src"><a href="#F4-35-src-D3">D3</a></sup> <sup class="src"><a href="#F4-35-src-R2">R2</a></sup></dd>
+<dt>Clock provider and consumer</dt><dd><b>Simple words:</b> a clock controller hands out clocks; a device that needs one says which, in the devicetree. <b>Analogy:</b> the light switches of a wing, and the note on a room's door saying which switch it needs. <b>Precise:</b> a provider node has <code>#clock-cells</code>; a consumer's <code>clocks</code> property is a list of (phandle, <i>n</i> specifier cells) entries, with <i>n</i> taken from the provider, optionally named by <code>clock-names</code>. <sup class="src"><a href="#F4-35-src-D1">D1</a></sup> <sup class="src"><a href="#F4-35-src-D2">D2</a></sup></dd>
+<dt>Clock gating</dt><dd><b>Simple words:</b> switching a block's clock off to save power, which also stops the block from working. <b>Analogy:</b> the lights in a wing switched off. <b>Precise:</b> a gate in the SoC's clock tree, controlled by a register bit, that stops the clock to one block; what a gated block does on a register access is a property of the chip (reads as zero, stale data, bus error or a hang), documented in its TRM if at all. <sup class="src"><a href="#F4-35-src-D5">D5</a></sup></dd>
+<dt>Reset controller</dt><dd><b>Simple words:</b> the block that holds other blocks in their starting state until software lets them go. <b>Analogy:</b> the locked door of a room. <b>Precise:</b> a provider with <code>#reset-cells</code> whose lines hold blocks in reset; a consumer's <code>resets</code> property names the line to release (and optionally <code>reset-names</code>). <sup class="src"><a href="#F4-35-src-D2">D2</a></sup></dd>
+<dt>Pin multiplexing (pin control)</dt><dd><b>Simple words:</b> choosing which of several jobs a chip's pin does, for example GPIO, UART or SD card. <b>Analogy:</b> arranging the furniture of a room for this lesson, not the last one. <b>Precise:</b> per-pin function-select registers in a pin controller, set by the OS (or firmware) according to pin configuration properties referenced from the consumer's node; Linux uses <code>pinctrl-0</code> and <code>pinctrl-names</code> with vendor-specific child nodes. <sup class="src"><a href="#F4-35-src-D2">D2</a></sup> <sup class="src"><a href="#F4-35-src-D6">D6</a></sup></dd>
+<dt>Linker-section driver table</dt><dd><b>Simple words:</b> a list of drivers that the build tools assemble automatically from every driver file. <b>Analogy:</b> each interpreter signs a sheet on arrival; the office reads the sheet. <b>Precise:</b> each driver places a descriptor in a named section with <code>__attribute__((used, section(...)))</code>; the linker script collects the section and defines start and end symbols, so the driver core needs no central list. <sup class="src"><a href="#F4-35-src-D4">D4</a></sup> <sup class="src"><a href="#F4-35-src-R1">R1</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-35-pictures">The idea in pictures</h2>
+<p>Figure 1 is the driver stack of this course's kernel, from the devicetree to a register. The required driver-stack diagram of guide 9.2 starts at an application and a system call; this kernel has neither yet, so the stack starts at the boot code that hands over the tree.</p>
+<figure id="F4-35-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 350" role="img" aria-labelledby="F4-35-f1t F4-35-f1d">
+<title id="F4-35-f1t">Figure 1: the driver stack of the DR403 kernel</title>
+<desc id="F4-35-f1d">Top: the devicetree blob, x0 at entry. Arrow down to dm::init, which creates one device record per node with a compatible: state waiting, no driver or disabled. On the right, the driver table built by the linker from the section dr403_drivers: fixed-clock, gic-v2, pl011-uart, pl031-rtc, pl061-gpio, virtio-mmio, armv8-timer, qemu-fw-cfg, psci, bcm2835-gpio. An arrow labelled "match by compatible" joins the device records and the table. Below, dm::probe_all, a loop of passes: each waiting device's probe either returns OK (bound), FAIL (failed) or DEFER (try again next pass). The probe calls into providers in a box on the left: clocks (clock_enable), interrupt controllers (irq_parent_ready), pins (pins_set). At the bottom, the device's registers on the bus. A return arrow from DEFER back to the start of the loop is labelled "until a pass makes no progress".</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="350"/>
+<rect class="sv-b5" x="230" y="12" width="300" height="38" rx="6"/><text class="sv-tb" x="244" y="36">Devicetree blob (x0 at entry)</text>
+<line class="sv-line" x1="380" y1="50" x2="380" y2="66"/><polygon class="sv-head" points="375,64 380,72 385,64"/>
+<rect class="sv-b1" x="230" y="72" width="300" height="56" rx="6"/><text class="sv-tb" x="244" y="94">dm::init: one device per node</text><text class="sv-ts" x="244" y="116">waiting · no driver · disabled</text>
+<rect class="sv-b3" x="560" y="60" width="190" height="150" rx="6"/><text class="sv-tb" x="570" y="80">Driver table</text><text class="sv-ts" x="570" y="100">(linker section)</text><text class="sv-tm" x="570" y="122">fixed-clock gic-v2</text><text class="sv-tm" x="570" y="140">pl011 pl031 pl061</text><text class="sv-tm" x="570" y="158">virtio timer fw-cfg</text><text class="sv-tm" x="570" y="176">psci bcm2835-gpio</text>
+<line class="sv-line" x1="530" y1="100" x2="554" y2="100"/><polygon class="sv-head" points="552,95 560,100 552,105"/><text class="sv-ts" x="470" y="146">match by</text><text class="sv-ts" x="470" y="162">compatible</text>
+<line class="sv-line" x1="380" y1="128" x2="380" y2="166"/><polygon class="sv-head" points="375,164 380,172 385,164"/>
+<rect class="sv-b2" x="230" y="172" width="300" height="80" rx="6"/><text class="sv-tb" x="244" y="194">dm::probe_all: passes</text><text class="sv-ts" x="244" y="216">probe → OK (bound) · FAIL (failed)</text><text class="sv-ts" x="244" y="236">· DEFER (next pass)</text>
+<path class="sv-line2" d="M 530 230 C 600 240, 600 160, 534 182"/><polygon class="sv-head" points="538,176 530,184 541,187"/><text class="sv-ts" x="600" y="236">until no progress</text>
+<rect class="sv-b4" x="16" y="162" width="190" height="100" rx="6"/><text class="sv-tb" x="26" y="184">Providers</text><text class="sv-ts" x="26" y="206">clock_enable</text><text class="sv-ts" x="26" y="226">irq_parent_ready</text><text class="sv-ts" x="26" y="246">pins_set</text>
+<line class="sv-line" x1="230" y1="212" x2="212" y2="212"/><polygon class="sv-head" points="214,207 206,212 214,217"/>
+<line class="sv-line" x1="380" y1="252" x2="380" y2="286"/><polygon class="sv-head" points="375,284 380,292 385,284"/>
+<rect class="sv-box" x="230" y="292" width="300" height="44" rx="6"/><text class="sv-t" x="244" y="319">Device registers (MMIO, translated reg)</text>
+</svg></div><figcaption><b>Figure 1.</b> From the tree to the registers. Straight arrows are control flow; the curved arrow is the retry of deferred probes. <sup class="src"><a href="#F4-35-src-R1">R1</a></sup> <sup class="src"><a href="#F4-35-src-R2">R2</a></sup></figcaption></figure>
+<p>Figure 2 shows one consumer and its three providers in the course's simulated SoC, with the register bit each reference controls. The temperature sensor works only if all three are right; the forensic lab changes one number in the tree.</p>
+<figure id="F4-35-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F4-35-f2t F4-35-f2d">
+<title id="F4-35-f2t">Figure 2: a consumer and its clock, reset and pin providers</title>
+<desc id="F4-35-f2d">Centre: the node tsens@10003000 with three properties: clocks = &lt;&amp;ccu 2&gt;, resets = &lt;&amp;rcu 2&gt;, pins = &lt;&amp;pinmux 4 1 3&gt;. Three arrows go to three provider boxes on the right. The clock controller at 0x10001000, #clock-cells 1, register GATES with bit 2 set to 1: clock 2 runs. The reset controller at 0x10002000, #reset-cells 1, register ASSERT with bit 2 cleared to 0: line 2 released. The pin controller at 0x10000000, register for pin 4 set to function 3. A note at the bottom: if GATES bit 2 is 0, every sensor register reads 0 in this model.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<rect class="sv-b2" x="16" y="70" width="290" height="150" rx="6"/><text class="sv-tb" x="28" y="94">tsens@10003000 (consumer)</text><text class="sv-tm" x="28" y="126">clocks = &lt;&amp;ccu 2&gt;</text><text class="sv-tm" x="28" y="156">resets = &lt;&amp;rcu 2&gt;</text><text class="sv-tm" x="28" y="186">pins = &lt;&amp;pinmux 4 1 3&gt;</text>
+<rect class="sv-b3" x="420" y="20" width="324" height="70" rx="6"/><text class="sv-tb" x="432" y="42">ccu: clock controller</text><text class="sv-ts" x="432" y="62">#clock-cells = 1; GATES bit 2 → 1</text><text class="sv-ts" x="432" y="80">clock 2 runs</text>
+<rect class="sv-b4" x="420" y="110" width="324" height="70" rx="6"/><text class="sv-tb" x="432" y="132">rcu: reset controller</text><text class="sv-ts" x="432" y="152">#reset-cells = 1; ASSERT bit 2 → 0</text><text class="sv-ts" x="432" y="170">line 2 released</text>
+<rect class="sv-b5" x="420" y="200" width="324" height="70" rx="6"/><text class="sv-tb" x="432" y="222">pinmux: pin controller</text><text class="sv-ts" x="432" y="242">pin 4 → function 3</text><text class="sv-ts" x="432" y="260">(first 4, count 1, function 3)</text>
+<line class="sv-line" x1="306" y1="122" x2="412" y2="58"/><polygon class="sv-head" points="408,53 418,55 412,63"/>
+<line class="sv-line" x1="306" y1="152" x2="412" y2="146"/><polygon class="sv-head" points="410,141 418,146 410,151"/>
+<line class="sv-line" x1="306" y1="182" x2="412" y2="232"/><polygon class="sv-head" points="406,234 418,236 412,226"/>
+<text class="sv-ts" x="16" y="250">Model rule: clock gate closed → every</text><text class="sv-ts" x="16" y="268">sensor register reads 0, writes are lost.</text>
+</svg></div><figcaption><b>Figure 2.</b> The simulated SoC's sensor and its providers, as <code>soc.dts</code> describes them. Arrows are phandle references (consumer to provider). The model's behaviour for a gated clock is this course's choice, one of several real chips show. <sup class="src"><a href="#F4-35-src-R5">R5</a></sup> <sup class="src"><a href="#F4-35-src-R6">R6</a></sup></figcaption></figure>
+
+<h2 id="F4-35-layer1">Layer 1 — the kid explanation</h2>
+<p>A computer chip has many small helpers inside it, and most of them are asleep when it starts. To wake one up, the computer has to do three things in order: give it a heartbeat (a clock), let go of its "stay still" button (a reset), and plug its wires into the right sockets (the pins). The building plan says which heartbeat, which button and which sockets each helper needs. If the computer wakes up the wrong heartbeat, the helper stays asleep and every answer it gives is "nothing", which can look like a real answer if nobody checks.</p>
+
+<h2 id="F4-35-layer2">Layer 2 — the student explanation</h2>
+<p>In DR301 you built a driver model for PCI: enumerate the bus, read each function's vendor and device ID, call the driver that claims that pair. On an SoC, the list of devices comes from the devicetree instead, and the matching key is the <code>compatible</code> string. The shape is the same: a list of devices, a list of drivers, a rule that matches them, and a probe function per driver that checks the device and sets it up. <sup class="src"><a href="#F4-35-src-C1">C1</a></sup></p>
+<p>What is new is dependencies. A PCI device's clocks and power were set by firmware. An SoC device's node names its <b>providers</b>: the clock controller and clock number (<code>clocks</code>), the reset controller and line (<code>resets</code>), the pin controller and pin configuration, the interrupt controller (<code>interrupt-parent</code>). Those providers have drivers too, and they must be probed first. The devicetree does not list nodes in dependency order; on QEMU's virt machine, for example, the UART, RTC and GPIO nodes come before the interrupt controller and the clock they use. <sup class="src"><a href="#F4-35-src-D1">D1</a></sup> <sup class="src"><a href="#F4-35-src-R2">R2</a></sup></p>
+<p>The solution is <b>deferred probing</b>: a probe that finds a provider missing returns "defer", and the driver model tries again in the next pass, after other drivers (including the providers) have probed. Passes continue until every device is bound or failed, or a pass makes no progress. The lab's kernel binds nine devices on QEMU virt; four of them, the UART, RTC, GPIO controller and the one populated virtio transport, after a deferral. A small Python script checks the log against D8's acceptance tests. <sup class="src"><a href="#F4-35-src-R2">R2</a></sup> <sup class="src"><a href="#F4-35-src-R3">R3</a></sup></p>
+<p>QEMU's virt machine has a fixed clock and no reset or pin controllers, so the lab adds a small simulated SoC on the host, described by its own devicetree, with a clock controller, a reset controller, a pin multiplexer and a temperature sensor wired to clock 2, reset line 2 and pin 4. In this model, a sensor whose clock is gated reads as zero. With the right tree it reads 41.250 °C; with a tree that names clock 3, it reads 0.000 °C and the driver reports success. That is the forensic lab. <sup class="src"><a href="#F4-35-src-R6">R6</a></sup> <sup class="src"><a href="#F4-35-src-R7">R7</a></sup></p>
+
+<h2 id="F4-35-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F4-35-l3-model">Devices, drivers, matching</h3>
+<p>The kernel's <code>dm::init</code> walks the tree once and creates a device record for every node that has a <code>compatible</code> property: its node offset, its first <code>reg</code> entry translated to a CPU address (F4-31), and a state. A node with <code>status</code> other than "okay" becomes <i>disabled</i>; a node no driver claims becomes <i>no driver</i>; the rest are <i>waiting</i>. The QEMU virt tree with one virtio device attached gives 48 such nodes. <sup class="src"><a href="#F4-35-src-R2">R2</a></sup></p>
+<p>Drivers are not listed anywhere in the core. Each driver file ends with one <code>DR403_DRIVER(...)</code> line, which places a constant descriptor (name, compatible list, probe function) in the linker section <code>dr403_drivers</code>. The linker script collects that section between <code>__drivers_start</code> and <code>__drivers_end</code>, and <code>match</code> walks it. The build record lists the ten descriptors the linker found. <sup class="src"><a href="#F4-35-src-R1">R1</a></sup> <sup class="src"><a href="#F4-35-src-D4">D4</a></sup></p>
+<pre class="output" data-run="F4-35/kbuild"></pre>
+<p>Matching walks the driver table and, for each driver, its compatible list, and asks whether the node's <code>compatible</code> list contains that string anywhere. This kernel takes the first driver that matches. Linux's rule is more careful: it prefers the driver that matches the node's <i>earliest</i> (most specific) compatible entry. With one driver per IP block, as here, the two rules agree; with a vendor-specific driver and a generic one both present, they do not, and the mini-project asks you to implement the specific-first rule. <sup class="src"><a href="#F4-35-src-D3">D3</a></sup></p>
+<div class="co warning"><span class="lbl">Watch out</span><p>The driver table contains pointers (to names, compatible lists and probe functions). In a position-independent image these are absolute addresses fixed at start-up by the relocation loop of <code>start.S</code>. If the relocation table is cut short, the driver table keeps link-time addresses (near 0) and no driver ever matches. F4-37 shows that failure: "bound 0", with every node "no driver".</p></div>
+
+<h3 id="F4-35-l3-probe">Probing in passes</h3>
+<p><code>dm::probe_all</code> repeats passes over the waiting devices. Each probe returns one of three results: <code>kOk</code> (the device answered and is set up: <i>bound</i>), <code>kFail</code> (it is not the device the tree promised, or a required property is missing: <i>failed</i>, never retried), or <code>kDefer</code> (a provider is missing: stay <i>waiting</i>). The loop stops when a pass leaves nothing waiting, or when a pass makes no progress, which means the remaining devices wait for providers that will never come (a missing driver, or a cycle). Those remain <i>waiting</i> in the report, which is itself a finding. <sup class="src"><a href="#F4-35-src-R2">R2</a></sup></p>
+<p>On QEMU virt, pass 1 binds the five devices with no unmet dependencies (PSCI, fw-cfg, the GIC, the timer and the fixed clock) and defers 35: the 32 virtio transports and the UART, RTC and GPIO controller. Their nodes come earlier in the tree than the GIC and the clock. Pass 2 finishes all 35: four bound, 31 failed because their virtio transports are empty (device ID 0: nothing plugged in). Nothing is left waiting. <sup class="src"><a href="#F4-35-src-R2">R2</a></sup></p>
+<pre class="output" data-run="F4-35/d8_virt"></pre>
+<p>Deferral in passes is simple and costs repeated work: each pass calls every waiting probe again. With hundreds of devices and deep dependency chains this becomes slow; Linux retries deferred probes when any driver binds, and newer kernels also read the dependency properties ahead of time to order probes ("device links" from firmware). For a teaching kernel with tens of devices, passes are clear and enough. <sup class="src"><a href="#F4-35-src-D3">D3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The description of Linux's deferred-probe mechanism, its retry trigger and its device links from firmware nodes, and of Linux's most-specific-compatible matching rule, is from the author's memory of the Linux driver-model documentation and source; none was opened in this build. This kernel's behaviour is what the run shows; Linux's must be read from its documentation and source.</p></div>
+
+<h3 id="F4-35-l3-verify">"Bound" must mean "answered"</h3>
+<p>A probe that only records a base address proves nothing about the hardware. Every probe in <code>drivers.cc</code> checks something the device can only get right if it is really there and running: the PrimeCell part number for the PL011 (0x011), PL031 (0x031) and PL061 (0x061); the virtio magic "virt" and a non-zero device ID <sup class="src"><a href="#F4-35-src-D7">D7</a></sup>; the GIC distributor's type register; the timer counter advancing over a 10 ms wait; the fw-cfg signature "QEMU"; the RTC's seconds register increasing over 1.1 s of counter time. The log prints each value. <sup class="src"><a href="#F4-35-src-R2">R2</a></sup></p>
+<p>Two of those values decode into facts about the machine. <code>GICD_TYPER</code> = 0x8: its low five bits, ITLinesNumber, are 8, and the distributor supports 32 × (8 + 1) = 288 interrupt lines. The timer's 10 ms wait advanced the counter by about 628 thousand ticks at 62.5 MHz, which is 10 ms plus the time the probe itself took under emulation (the exact count differs per run and per machine). <sup class="src"><a href="#F4-35-src-R2">R2</a></sup> <sup class="src"><a href="#F4-35-src-D5">D5</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The register offsets used by the probes (PrimeCell IDs at 0xFE0 and 0xFE4; PL031 RTCDR at 0x000; PL061 GPIODIR at 0x400 and the masked GPIODATA at 0x3FC; GICD_TYPER at 0x004 and GICD_IIDR at 0x008; virtio-mmio magic, version and device ID at 0x000, 0x004 and 0x008; fw-cfg's selector at 0x8) are from the author's memory of the respective Arm TRMs, the GIC architecture specification, the VIRTIO specification and QEMU's fw-cfg documentation; none was opened in this build. The values read back in QEMU are consistent with them, which shows that QEMU's models and the author's memory agree, not that silicon does.</p></div>
+
+<h3 id="F4-35-l3-providers">Providers: clocks, interrupt parents, pins, resets</h3>
+<p><b>Clocks.</b> A clock consumer's <code>clocks</code> property is a list of entries, each a phandle followed by as many cells as the provider's <code>#clock-cells</code> says. To find entry <i>i</i>, <code>clock_enable</code> walks the list from the start, looking up each phandle's provider to learn how many cells to skip, since entries can have different lengths when different providers are used. The QEMU PL011's <code>clocks = &lt;0x8000 0x8000&gt;</code> is two entries of length one (the fixed clock has <code>#clock-cells = 0</code>), and the PL011 driver picks the entry named "uartclk" through <code>clock-names</code>. If the provider has not registered yet, the result is "defer". <sup class="src"><a href="#F4-35-src-D2">D2</a></sup> <sup class="src"><a href="#F4-35-src-R2">R2</a></sup></p>
+<p><b>Interrupt parents.</b> A device's interrupt controller is named by the nearest <code>interrupt-parent</code> on the node or an ancestor (the root of QEMU's tree sets it for everyone). <code>irq_parent_ready</code> defers until that controller's driver has registered. This is what deferred the virtio transports, RTC and GPIO controller on virt. <sup class="src"><a href="#F4-35-src-D1">D1</a></sup></p>
+<p><b>Pins.</b> Linux's pin-control binding uses <code>pinctrl-0</code> and <code>pinctrl-names</code> pointing to configuration nodes inside the pin controller, whose content is vendor-specific. This course uses a simpler, own format for its own trees: a property <code>&lt;&amp;provider first count function&gt;</code>. F4-36 uses it on the Raspberry Pi model (<code>dr403,sd-pins</code>) and the simulated SoC uses it (<code>pins</code>). The binding is the course's, not a standard; the NOTES record it as a decision. <sup class="src"><a href="#F4-35-src-D6">D6</a></sup></p>
+<p><b>Resets.</b> QEMU's virt machine has no reset controller, so the kernel's driver model has no reset framework yet; the simulated SoC has one, with <code>#reset-cells = 1</code> and a register in which bit <i>n</i> = 1 holds line <i>n</i> in reset. Adding a reset provider to the kernel, following the clock provider's pattern, is lab step 3. D8's build step asks for "minimal clock, reset, pinctrl and GPIO frameworks"; this build has clocks, interrupt parents and pins in the kernel, and resets only in the host model. <sup class="src"><a href="#F4-35-src-C1">C1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The clock, reset and pin-control binding rules stated here (<code>#clock-cells</code>, <code>clock-names</code>, <code>#reset-cells</code>, <code>reset-names</code>, <code>pinctrl-0</code>/<code>pinctrl-names</code>) are from the author's memory of the Linux kernel's devicetree binding documents and the Devicetree Specification, not opened in this build. The course's own <code>pins</code> and <code>dr403,sd-pins</code> properties are not standard bindings and would be rejected by binding checkers; real board trees use the vendor's pin-control binding.</p></div>
+
+<h3 id="F4-35-l3-order">What order the hardware needs</h3>
+<p>For a block on an SoC the safe order is usually: supply power (regulator, power domain), enable the clocks, release the reset, configure the pins, then touch the block's registers. Releasing a reset while the clock is off may leave the block half-initialised on some chips, because its reset logic needs clock edges; muxing pins to a block that is still in reset may glitch the lines. The TRM's chapter on the block, or the reset controller chapter, says what the chip requires; the Linux driver for the block often encodes the order and any delays. <sup class="src"><a href="#F4-35-src-D5">D5</a></sup></p>
+<p>The simulated sensor follows this order: clock on, reset off, pin function, start conversions, read. Its probe also shows the trap of trusting an unchecked read. It writes "start conversions" to the control register and reads the data register once, and does not read the identification register first. In this model a gated sensor ignores the write and reads zero, so the probe prints a temperature of 0.000 °C and returns "OK". <sup class="src"><a href="#F4-35-src-R6">R6</a></sup> <sup class="src"><a href="#F4-35-src-R7">R7</a></sup></p>
+<pre class="output" data-run="F4-35/minidtc_soc"></pre>
+<pre class="output" data-run="F4-35/socsim_ok"></pre>
+<p>The good run shows deferral in the simulated SoC too: the sensor is listed first in <code>soc.dts</code>, defers in pass 1 ("clock provider not probed yet"), and binds in pass 2 after the three providers. The register dump confirms each step: <code>GATES</code> = 0x4 (bit 2, clock 2 running), <code>ASSERT</code> = 0xfffffffb (bit 2 clear, line 2 released), pin 4 at function 3, the sensor's ID register "TSN1" (0x54534e31), conversions enabled, and data 0xa122 = 41250 m°C. <sup class="src"><a href="#F4-35-src-R6">R6</a></sup></p>
+
+<h2 id="F4-35-hardware">How the hardware actually does it</h2>
+<p>An SoC's clock tree starts at oscillators and PLLs, passes through multiplexers that choose a parent and dividers that set a rate, and ends in gates, one or more per block: often a separate gate for the bus interface clock and for the functional clock, as the PL011's <code>apb_pclk</code> and <code>uartclk</code>. Gating saves power by stopping the clock; it also stops the block's logic. A register access to a block whose bus interface clock is gated cannot be answered by the block; the interconnect or a wrapper decides what the CPU sees. <sup class="src"><a href="#F4-35-src-D5">D5</a></sup></p>
+<p>Reset controllers hold blocks in reset until software releases them. Many SoCs come out of power-on with most blocks held in reset and gated, and the boot firmware enables only what it uses (the boot medium, a UART, DRAM). That is why curriculum 11.5 says to trust firmware-enabled clocks at first and add clock and reset drivers only when a device needs a clock or reset the firmware left off. <sup class="src"><a href="#F4-35-src-C1">C1</a></sup></p>
+<p>Pin controllers connect each package pin to one of several internal signals. On the BCM2835 family, which the F4-36 lab uses, each GPIO pin has a 3-bit function field in a GPFSEL register: ten pins per register, at bit 3 × (pin mod 10) of register pin ÷ 10. The kernel's <code>bcm2835-gpio</code> driver implements exactly that as a pin provider. <sup class="src"><a href="#F4-35-src-D6">D6</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> No real SoC was used. The behaviour of the simulated SoC (gated block reads as zero, writes lost; reset bits active-high; one gate bit per clock) is this course's model, chosen to reproduce the forensic case; real chips may instead raise an external abort, return stale values, or stall the bus forever. The clock-tree description and the BCM2835 GPFSEL layout are from the author's memory of general SoC documentation and of "BCM2835 ARM Peripherals", not opened in this build; F4-36's run shows QEMU's model of GPFSEL behaving that way, not the silicon. Which behaviour your SoC has, and what order its blocks need, is in its TRM.</p></div>
+<div class="co safety"><span class="lbl">Safety</span><p>Clock, reset and pin drivers can do physical harm on a real board: muxing a pin that drives a regulator enable or a motor driver to the wrong function can switch power rails or actuators; changing a PLL or a CPU clock divider beyond its rated range can crash or overheat the chip. Start with the clocks and pins firmware already set, change only what a device needs, check every value against the TRM and the schematic, and test on a spare board. See the university <a href="#safety">safety rules</a>.</p></div>
+
+<h2 id="F4-35-worked">Worked example</h2>
+<p><b>Question.</b> Trace the PL011's probe on QEMU virt through both passes, from its devicetree node to "bound (after deferral)".</p>
+<p><b>Step 1: the record.</b> <code>dm::init</code> finds <code>/pl011@9000000</code>, compatible "arm,pl011", translated base 0x9000000, status absent (okay); <code>match</code> finds the descriptor <code>pl011_driver</code> whose list contains "arm,pl011". State: waiting. <sup class="src"><a href="#F4-35-src-R2">R2</a></sup></p>
+<p><b>Step 2: pass 1.</b> <code>pl011_probe</code> looks up "uartclk" in <code>clock-names = "uartclk", "apb_pclk"</code>: index 0. <code>clock_enable(dev, 0, rate)</code> reads <code>clocks = &lt;0x8000 0x8000&gt;</code>, finds the node with phandle 0x8000 (<code>/apb-pclk</code>), reads its <code>#clock-cells</code> = 0, so entry 0 is the single cell 0x8000. It searches the registered clock providers. The <code>/apb-pclk</code> node comes after the PL011 in the tree, so its driver has not run: "clock provider not probed yet", <code>kDefer</code>.</p>
+<p><b>Step 3: still pass 1.</b> Later in the same pass, <code>fixed_clock_probe</code> runs for <code>/apb-pclk</code>, registers <code>fixed_rate</code> as the provider and prints "fixed-clock /apb-pclk: 24000000 Hz". The log shows "probe pass 1: 5 finished, 35 still waiting".</p>
+<p><b>Step 4: pass 2.</b> <code>pl011_probe</code> runs again. This time <code>clock_enable</code> finds the provider and calls <code>fixed_rate</code>, which reads <code>clock-frequency</code> = 24000000. The probe reads the PrimeCell part number: 0xfe0 low byte 0x11 and 0xfe4 low nibble 0x0 give 0x011. It prints "part 0x011, uartclk 24000000 Hz" and returns <code>kOk</code>. With <code>defers</code> = 1, the report marks it "(after deferral)".</p>
+<p><b>Step 5: the acceptance check.</b> <code>d8check.py</code> reads the report: every node whose compatible is in its supported list is "bound" (the 31 empty virtio transports are reported as a count, which is correct behaviour: nothing is plugged in), and at least one device was bound after a deferral. Both D8 QEMU tests pass. <sup class="src"><a href="#F4-35-src-R3">R3</a></sup></p>
+<pre class="output" data-run="F4-35/d8_check"></pre>
+
+<h2 id="F4-35-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>dm.h</code>: the interface of the driver model.</p>
+<pre class="listing" data-src="F4-35/dm.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–11</td><td><code>Probe</code>, <code>State</code></td><td>Three probe results; five device states.</td><td>"Failed" and "waiting" are different findings; the report keeps them apart.</td></tr>
+<tr><td>13–27</td><td><code>Device</code>, <code>Driver</code></td><td>Node, driver, state, base, last reason, deferral count; name, compatible list, probe.</td><td>The reason string turns a hang into a sentence in the log.</td></tr>
+<tr><td>30–33</td><td><code>DR403_DRIVER</code></td><td>Defines the compatible list and puts a descriptor in section <code>dr403_drivers</code>.</td><td><code>used</code> stops the compiler dropping an object nothing references by name.</td></tr>
+<tr><td>45–57</td><td>provider interfaces</td><td>Clock rate functions, interrupt controllers, pin functions.</td><td>Consumers ask through these; they never touch a provider's registers.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>dm.cc</code>: the core.</p>
+<pre class="listing" data-src="F4-35/dm.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>24–34</td><td><code>match</code></td><td>First driver with any matching compatible.</td><td>Simple; not Linux's most-specific-first rule (mini-project).</td></tr>
+<tr><td>57–75</td><td><code>init</code></td><td>One record per node with a compatible; disabled nodes never probe.</td><td>The <code>status</code> rule of F4-31 and F4-32, enforced in one place.</td></tr>
+<tr><td>77–109</td><td><code>probe_all</code></td><td>Passes until nothing waits or nothing progresses; prints at most three deferrals per pass.</td><td>Terminates even with a missing provider; the log stays readable with 32 transports.</td></tr>
+<tr><td>120–141</td><td><code>report</code></td><td>Counts per state, then one line per device; empty virtio transports as a count.</td><td>D8's "the boot log lists bound and unbound nodes".</td></tr>
+<tr><td>153–189</td><td><code>clock_enable</code></td><td>Walks <code>clocks</code> entry by entry using each provider's <code>#clock-cells</code>; defers if the provider is not registered.</td><td>Entries can differ in length; skipping by a fixed size is a classic bug.</td></tr>
+<tr><td>199–217</td><td><code>irq_parent_ready</code></td><td>Nearest <code>interrupt-parent</code> up the tree; defer until registered.</td><td>Inheritance from ancestors is part of the binding.</td></tr>
+<tr><td>226–245</td><td><code>pins_set</code></td><td>The course's 4-cell pin property; defer until the pin provider exists.</td><td>Used by F4-36's SD host driver.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>drivers.cc</code>: the drivers for QEMU virt.</p>
+<pre class="listing" data-src="F4-35/drivers.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–25</td><td><code>clock_index</code></td><td>Position of a name in <code>clock-names</code>.</td><td>Ask for clocks by name, not by position: trees may order them differently.</td></tr>
+<tr><td>29–32</td><td><code>primecell_part</code></td><td>12-bit part number from two ID registers.</td><td>The check that makes "bound" mean "answered".</td></tr>
+<tr><td>35–46</td><td>fixed-clock</td><td>A clock provider whose rate is a property.</td><td>The smallest possible provider; real clock controllers compute rates from PLLs and dividers.</td></tr>
+<tr><td>49–58</td><td>GIC</td><td>Reads TYPER and IIDR, registers as an interrupt provider.</td><td>Unblocks every device whose interrupt parent it is.</td></tr>
+<tr><td>61–80</td><td>PL011</td><td>Clock by name if the node has one, then the part number.</td><td>The F4-37 Raspberry Pi tree has no <code>clocks</code>: the driver still binds and says the rate is unknown.</td></tr>
+<tr><td>83–100</td><td>PL031</td><td>Clock, interrupt parent, then RTC ticking over 1.1 s.</td><td>A behavioural check: the register must change.</td></tr>
+<tr><td>122–141</td><td>virtio-mmio</td><td>Magic, then device ID; ID 0 fails as "empty transport".</td><td>QEMU creates 32 transports; only populated ones are devices.</td></tr>
+<tr><td>144–154</td><td>timer</td><td>Counter frequency and a 10 ms wait.</td><td>D10 prints this frequency on both platforms.</td></tr>
+<tr><td>171–201</td><td>PSCI</td><td><code>method</code> selects <code>smc</code> or <code>hvc</code>; reads the version; registers power-off.</td><td>The F4-32 interface, found through the tree instead of assumed.</td></tr>
+</tbody></table></div>
+<p><b>Listing 4</b> — <code>kmain.cc</code>: the kernel's main.</p>
+<pre class="listing" data-src="F4-35/kmain.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–33</td><td><code>early_console</code></td><td>A PL011 found through <code>/chosen/stdout-path</code>, before the driver model runs.</td><td>The only device used outside the driver model; it is still found through the tree.</td></tr>
+<tr><td>51–62</td><td>memory</td><td>Sums available memory nodes.</td><td>Printed for D10's acceptance test.</td></tr>
+<tr><td>63–68</td><td>CPUs</td><td>Counts <code>/cpus</code> children of type "cpu".</td><td>Printed for D10.</td></tr>
+<tr><td>70–74</td><td>driver model</td><td><code>init</code>, <code>probe_all</code>, <code>report</code>, power off.</td><td>No board-specific code anywhere in <code>kmain</code>.</td></tr>
+</tbody></table></div>
+<p><b>Listing 5</b> — <code>bcm2835_gpio.cc</code>: a pin provider, used in F4-36 and F4-37.</p>
+<pre class="listing" data-src="F4-35/bcm2835_gpio.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–25</td><td><code>set_function</code></td><td>Read-modify-write of a 3-bit field per pin; prints GPFSEL4 and 5.</td><td>Only the requested pins change; the print is evidence for F4-36's pin lab.</td></tr>
+<tr><td>27–35</td><td>probe, descriptor</td><td>Registers the provider; no clocks needed.</td><td>On virt this driver is linked in but never matches.</td></tr>
+</tbody></table></div>
+<p><b>Listing 6</b> — <code>d8check.py</code>: D8's QEMU tests, checked on the log.</p>
+<pre class="listing" data-src="F4-35/d8check.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>13–14</td><td><code>SUPPORTED</code></td><td>The compatibles the kernel's drivers declare.</td><td>Must be kept in step with <code>drivers.cc</code>; the mini-project generates it.</td></tr>
+<tr><td>17–22</td><td>check</td><td>A supported node in any state but "bound" is a failure.</td><td>Test 1: bound by the generic mechanism.</td></tr>
+<tr><td>24, 30</td><td>deferral</td><td>At least one "(after deferral)".</td><td>Test 3: consumers before providers still probe.</td></tr>
+</tbody></table></div>
+<p><b>Listing 7</b> — <code>soc.dts</code> and <code>socsim.cc</code>: the simulated SoC and its driver model.</p>
+<pre class="listing" data-src="F4-35/soc.dts"></pre>
+<pre class="listing" data-src="F4-35/socsim.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>DTS 17–23</td><td><code>tsens</code></td><td>The consumer, listed before its providers.</td><td>Forces a deferral, as on real trees.</td></tr>
+<tr><td>DTS 24–30</td><td><code>i2c</code></td><td>Disabled.</td><td>Shows "disabled" in the report.</td></tr>
+<tr><td>DTS 31–44</td><td>providers</td><td>Labels <code>ccu</code>, <code>rcu</code>, <code>pinmux</code> become phandles in <code>minidtc.py</code>.</td><td>The numbers after each phandle are the specifier cells.</td></tr>
+<tr><td>sim 24–36</td><td><code>struct Soc</code></td><td>Gates, resets (all asserted at start), pin functions; the sensor's fixed wiring: clock 2, reset 2, pin 4 function 3.</td><td>The wiring is silicon; software learns it only from the tree.</td></tr>
+<tr><td>sim 49–63</td><td>sensor reads</td><td>Gated: 0. ID "TSN1"; data 41250 if not in reset, enabled and pin muxed.</td><td>The model rule of Figure 2.</td></tr>
+<tr><td>sim 100–121</td><td><code>provider_arg</code></td><td>Resolves a (phandle, cells) property; defers if the provider is not probed.</td><td>The same pattern as the kernel's <code>clock_enable</code>, generalised.</td></tr>
+<tr><td>sim 145–169</td><td><code>tsens_probe</code></td><td>Clock, reset, pins, start, read once; no ID check.</td><td>The missing ID check is part of the forensic case.</td></tr>
+<tr><td>sim 219–244</td><td>pass loop</td><td>Same pass logic as <code>dm::probe_all</code>.</td><td>Deferral works the same on the host.</td></tr>
+<tr><td>sim 249–256</td><td>register dump</td><td>Six registers after probing.</td><td>The evidence the course forensic asks for.</td></tr>
+</tbody></table></div>
+<p>The simulated SoC builds with sanitizers and no warnings. <sup class="src"><a href="#F4-35-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F4-35/socsim_build"></pre>
+
+<h2 id="F4-35-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A dark room still has a visitor who can shout. A gated block cannot say anything; in the model, and on some chips, it returns zeros that look like data. On others, the CPU waits forever for an answer that never comes: no report at all.</li>
+<li>Switching on the wrong lights in the school wastes electricity. Enabling the wrong clock on an SoC can also power a block that interferes with another, or change the rate of a clock another running device shares.</li>
+<li>Postponing a lesson costs a period. Deferring a probe costs a pass over all waiting devices, and a probe that defers for a provider that will never appear waits forever unless the model detects "no progress".</li>
+<li>In the school, the plan's small print is read by a person who can notice "switch 3 is the west wing". The kernel reads cell values and cannot tell that clock 3 is not the sensor's clock; only the device's behaviour (and an ID check) can reveal that.</li>
+</ul>
+
+<h2 id="F4-35-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Probes that do not check the device.</b> A probe that returns OK after writing registers it never reads back will "bind" a gated, absent or wrong device. Read an ID or status register that only a working device can produce. (Forensic lab.)</li>
+<li><b>Skipping <code>clocks</code> entries by a fixed size.</b> Different providers have different <code>#clock-cells</code>; walk entry by entry.</li>
+<li><b>Treating "waiting" as "failed" (or the reverse).</b> A device still waiting at the end names a missing provider driver or a cycle; a failed one names a device that did not answer. Print the reason for both.</li>
+<li><b>Probing forever.</b> Without "stop when a pass makes no progress", a missing provider hangs the boot. The kernel prints the stuck devices instead.</li>
+<li><b>Assuming tree order is dependency order.</b> QEMU's virt tree lists the UART before its clock and interrupt controller; board trees do the same.</li>
+<li><b>Losing the driver table.</b> Without <code>used</code> and <code>KEEP</code>, the compiler or the linker's garbage collection removes descriptors nothing references; with a broken relocation table, their pointers are wrong (F4-37). Check the image: the lab lists the descriptors with <code>nm</code>.</li>
+<li><b>Debugging zeros.</b> When a device reads all zeros, dump the clock gate, reset and pin registers next to the device's registers, and compare the devicetree's provider numbers with the TRM's clock and reset tables.</li>
+</ul>
+
+<div class="co transition" id="F4-35-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F4-02">F4-02</a> built a PCI driver model (enumerate, match IDs, probe); <a href="#F4-31">F4-31</a> read devicetrees; <a href="#F4-34">F4-34</a> chose a board by its documentation. <b>What carries over:</b> the device and driver records, probe functions that check the hardware, the report of bound and unbound devices. <b>What changes:</b> the device list comes from the tree, the matching key is a compatible string, drivers come from a linker-assembled table, and probes have dependencies on providers (clocks, resets, pins, interrupt controllers) that must be satisfied, in order, with deferral. <sup class="src"><a href="#F4-35-src-C1">C1</a></sup> <b>What comes next:</b> <a href="#F4-36">F4-36</a> writes a real consumer of this model: an SD host controller driver that needs a pin provider, and the SD protocol behind it.</p></div>
+
+<h2 id="F4-35-check">Check yourself</h2>
+<ol>
+<li>Explain in your own words why a devicetree driver model needs deferred probing and a PCI driver model of DR301 did not.</li>
+<li>A node has <code>clocks = &lt;&amp;ccu 5 &amp;fixed &amp;ccu 9&gt;</code>, where <code>ccu</code> has <code>#clock-cells = &lt;1&gt;</code> and <code>fixed</code> has <code>#clock-cells = &lt;0&gt;</code>. How many entries are there, and which cells form entry 2?</li>
+<li>Which result should a probe return when the device's interrupt controller has no driver at all in the kernel? (a) kOk; (b) kDefer, and the model reports it as waiting; (c) kFail; (d) it depends on the pass number.</li>
+<li>Predict, then run: if you move the <code>/apb-pclk</code> provider's descriptor so that its driver is probed first in each pass, does the PL011 still defer in pass 1? (Hint: the order of probes in a pass follows the tree, not the driver table.)</li>
+<li>Why does the virtio driver fail 31 transports rather than defer them, and why is that correct?</li>
+<li>Apply it to a new case: an I2C controller node needs <code>clocks</code>, <code>resets</code> and pins, and the tree lists it after all three providers. Will it defer? What could still make it read zeros?</li>
+<li>The simulated sensor's probe reads the data register once and reports success. Write, in one sentence each, two checks that would have made the forensic tree fail loudly.</li>
+<li>What does "probe pass 2: 35 finished, 0 still waiting" tell you that "bound 9" does not?</li>
+</ol>
+
+<h2 id="F4-35-lab">Lab</h2>
+<p><b>Goal.</b> Build the devicetree-driven driver model, pass D8's QEMU acceptance tests, and extend it with resets and GPIO consumers. Milestone D8, quoted from curriculum 11.6: <sup class="src"><a href="#F4-35-src-C1">C1</a></sup></p>
+<ul>
+<li><b>Goal:</b> "Drivers bind by compatible string from the devicetree; minimal clock, reset, pinctrl and GPIO frameworks exist; a board peripheral works through them."</li>
+<li><b>Accept:</b> "On QEMU's aarch64 virt machine, every devicetree node with a compatible your kernel supports (PL011 UART, PL031 RTC, PL061 GPIO, virtio-mmio, GIC, timer) is bound by the generic mechanism, not by special-case code; the boot log lists bound and unbound nodes." "On the board: a GPIO LED blinks at a rate set from your timer, and the I2C sensor reads correctly (logic-analyser trace attached to the log)." "Probe ordering works when the devicetree lists a consumer before its provider."</li>
+</ul>
+<p><b>Hardware and software needed.</b> No hardware for the QEMU tests. The build used <code>aarch64-linux-gnu-g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>GNU ld (GNU Binutils for Ubuntu) 2.42</code>, <code>QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)</code>, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> and Python 3.13.16, as printed in the logs. Run <code>university/labs/run_lab.sh university/labs/F4-35</code> from the repository root. The board test needs the board you chose in F4-34, an LED on a GPIO, an I2C sensor and a logic analyser.</p>
+<p><b>Safety.</b> None beyond normal computer use for QEMU. For the board test, follow the safety box above: change only the pins your LED and sensor use, check them against the schematic, and keep to the board's I/O voltage.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. <code>d8_virt.out</code> should show two probe passes and nine bound devices; <code>d8_check.out</code> should report "PASS" for tests 1 and 3.</li>
+<li>Run the kernel with no virtio device (remove <code>-device virtio-rng-device</code>) and with two. Predict the counts first.</li>
+<li>Add a reset framework to <code>dm</code>: <code>reset_provider</code>, <code>reset_deassert(dev, index)</code> following <code>#reset-cells</code>, with deferral. Test it on the host by porting <code>socsim</code>'s reset controller and sensor to use your functions (the mini-project goes further).</li>
+<li>Add a GPIO framework: the PL061 driver registers as a GPIO provider (<code>#gpio-cells</code> in QEMU's tree), and a driver for the <code>gpio-keys</code> node (currently "no driver") resolves its <code>gpios</code> property through it and prints the pin and flags it would watch.</li>
+<li>Make the simulated sensor's probe check the ID register after enabling the clock and fail with "ID reads 0x00000000: clock, reset or pins wrong" if it is not "TSN1". Run it on the forensic tree.</li>
+<li>Board (D8 test 2): with your kernel on the board, bind the board's GPIO and I2C controllers through the tree, blink an LED at a rate from the timer, read the sensor, and record the I2C transfer with a logic analyser.</li>
+</ol>
+<p><b>Expected observations.</b> Measured on the build container: 48 nodes with a compatible; bound 9, failed 31 (empty virtio transports), no driver 8; four bound after a deferral; PSCI 1.1; GIC with 288 lines; fixed clock 24000000 Hz; the sensor reads 41.250 °C with the good tree. Step 2 changes only the virtio counts. Step 5 makes the forensic run fail loudly.</p>
+<p><b>Verification.</b> <code>d8check.py</code> passes on your extended kernel's log; your step-3 reset framework defers correctly when the reset node is listed after its consumer; step 4 lists <code>/gpio-keys</code> as bound; step 6 is verified by the logic-analyser trace attached to the log, as D8 requires.</p>
+<p><b>Troubleshooting.</b></p>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Likely cause</th><th>Check</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Every node "no driver"</td><td>Driver table empty or its pointers not relocated</td><td><code>nm</code> for <code>_driver</code> symbols; F4-37's relocation check</td><td><code>KEEP</code> the section; compute <code>__rela_end</code> outside the section</td></tr>
+<tr><td>Probes defer forever, last pass "0 finished"</td><td>A provider has no driver, or its driver never registers</td><td>The deferral reason in the log</td><td>Add or fix the provider driver</td></tr>
+<tr><td>PL011 bound with "uartclk 0 Hz"</td><td>Provider's <code>clock-frequency</code> missing, or wrong <code>clock-names</code></td><td>The provider node in the dump</td><td>Fix the tree or the name lookup</td></tr>
+<tr><td>A new driver never runs</td><td>Its file not in the build, or the compatible string misspelled</td><td><code>kbuild.out</code> descriptor list; the node's <code>compatible</code></td><td>Add the file; copy the string from the tree</td></tr>
+</tbody></table></div>
+<p><b>Extension.</b> Implement Linux's matching rule (the driver that matches the earliest entry of the node's compatible list wins) and write a test tree in which the first-match rule and the specific-first rule disagree.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> D8's board test (GPIO LED at a timer-set rate, I2C sensor with a logic-analyser trace) was not run: no board, LED, sensor or logic analyser was available, and the kernel has no I2C driver yet (the curriculum's I2C example of section 5.6 was not built in this course's labs). The QEMU tests pass in this build; D8 is complete only when the board test passes too. The reset framework of step 3 and the GPIO framework of step 4 have no reference run.</p></div>
+
+<h2 id="F4-35-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> "Device reads all zeros." A temperature sensor worked on revision A of a board. On revision B, which the hardware team says changed "only the power supply layout", the kernel boots normally and its log says the sensor driver probed successfully, but every reading is 0.000 °C, in a warm room. The software is the same binary. The board support package for revision B came with its own devicetree.</p>
+<p><b>Evidence pack.</b> The kernel's probe log and register dump on revision B (the course's simulated SoC, running the revision-B devicetree) <sup class="src"><a href="#F4-35-src-R7">R7</a></sup>:</p>
+<pre class="output" data-run="F4-35/forensic_tsens"></pre>
+<p>The sensor's node in the revision-B devicetree <sup class="src"><a href="#F4-35-src-R8">R8</a></sup>:</p>
+<pre class="output" data-run="F4-35/forensic_dts"></pre>
+<p>For comparison, the revision-A run is <code>socsim_ok.out</code> (Layer 3), and the SoC's documentation (the model's comments in <code>socsim.cc</code>, standing in for the TRM) says: the sensor is wired to clock 2, reset line 2 and pin 4 with function 3; CCU <code>GATES</code> bit <i>n</i> = 1 means clock <i>n</i> runs; RCU <code>ASSERT</code> bit <i>n</i> = 1 means line <i>n</i> is held in reset.</p>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: list every register in the dump whose value differs from revision A, and every line of the probe log that differs.</li>
+<li>Decode <code>GATES</code>, <code>ASSERT</code> and <code>PINMUX PIN4</code> on revision B. Which of the sensor's three requirements are met?</li>
+<li>State at least three hypotheses (sensor broken; sensor held in reset; pins wrong; clock not running; driver bug) and the evidence for or against each.</li>
+<li>Where does the wrong value come from, and why did the driver report success?</li>
+<li>Give the fix, and two changes that would have made this failure loud at boot instead of silent.</li>
+<li>The hardware team said only the power layout changed. What would you ask them, and what would you check in the board support package's history?</li>
+</ol>
+<p><b>Method hints.</b> Compare the two runs line by line before forming a theory. Decode each control register bit by bit against the documentation. A device whose identification register reads zero is not answering, whatever its data register says; ask what could stop it answering, and which of those the dump rules out.</p>
+
+<h2 id="F4-35-project">Mini-project</h2>
+<p><b>One driver model, two worlds.</b> Make the kernel's <code>dm.cc</code> compile and run on the host against the simulated SoC: replace <code>k::rd32</code>/<code>k::wr32</code> by a backend that the host build routes to <code>socsim</code>'s <code>Soc</code> model, add the reset framework of lab step 3, port the CCU, RCU, pinmux and sensor drivers to the kernel's <code>DR403_DRIVER</code> interface, and run them under AddressSanitizer with the good and the revision-B tree. Generate <code>d8check.py</code>'s supported list from the driver table instead of writing it by hand. Implement the specific-first matching rule. <sup class="src"><a href="#F4-35-src-C1">C1</a></sup></p>
+<p><b>Rubric.</b> The same <code>dm.cc</code> source builds for the kernel and the host without <code>#ifdef</code> in the core (2). Resets are a provider framework with deferral, tested with the consumer before and after the provider in the tree (2). The sensor driver checks the ID register and fails loudly on the revision-B tree, with a reason naming clock, reset and pins (2). The supported list is generated, and the check fails if a driver is added without a test node (2). Specific-first matching is tested on a tree where first-match would choose differently (2).</p>
+
+<h2 id="F4-35-summary">Summary</h2>
+<ul>
+<li>A devicetree driver model creates devices from nodes with <code>compatible</code>, matches drivers by compatible string, and probes them; here the driver table is assembled by the linker from a named section.</li>
+<li>SoC devices depend on providers (clocks, resets, pins, interrupt controllers) named by phandles with provider-defined cell counts; probes defer until providers exist, in passes that stop when nothing progresses.</li>
+<li>On QEMU virt, 9 nodes bound, 4 after a deferral, and D8's two QEMU tests passed; the board test is untested in this build.</li>
+<li>"Bound" must mean "answered": check an ID or a behaviour, not only a base address.</li>
+<li>The safe order is power, clock, reset release, pins, then registers; the TRM decides the details.</li>
+<li>A device that reads all zeros is often not running: compare the tree's provider numbers with the TRM, and dump the gate, reset and pin registers beside the device's.</li>
+</ul>
+
+<h2 id="F4-35-sources">Sources</h2>
+<ol>
+<li id="F4-35-src-D1">devicetree.org, "Devicetree Specification" (tier 1): <code>compatible</code>, <code>status</code>, phandles, <code>interrupt-parent</code> and its inheritance, interrupt specifiers. <i>Title only — not opened during this build; the Source Researcher must confirm the release and sections (dossier gate G1 open).</i></li>
+<li id="F4-35-src-D2">The Linux kernel documentation (tier 2), devicetree bindings for clocks (<code>#clock-cells</code>, <code>clocks</code>, <code>clock-names</code>), resets (<code>#reset-cells</code>, <code>resets</code>, <code>reset-names</code>), pin control and GPIO, and the dt-schema tools (curriculum reading list item 95). <i>Title only — not opened during this build; the Source Researcher must confirm the kernel version and files (dossier gate G1 open).</i></li>
+<li id="F4-35-src-D3">The Linux kernel documentation (tier 2), the driver model ("Device drivers infrastructure", deferred probing, device links) and "The Common Clk Framework" (curriculum item 119). <i>Title only — not opened during this build; the Source Researcher must confirm the kernel version and sections (dossier gate G1 open).</i></li>
+<li id="F4-35-src-D4">GNU Binutils, "LD" manual (tier 2): <code>KEEP</code>, output section symbols, and GCC's manual for the <code>section</code> and <code>used</code> attributes. <i>Title only — not opened during this build; the Source Researcher must confirm the versions and sections (dossier gate G1 open).</i></li>
+<li id="F4-35-src-D5">Arm, "Arm Generic Interrupt Controller Architecture Specification" (GICD_TYPER, GICD_IIDR) and the PrimeCell TRMs for PL011, PL031 and PL061 (ID registers, RTCDR, GPIODIR, GPIODATA); general SoC clock-tree and reset documentation as found in vendor TRMs (tier 1). <i>Title only — not opened during this build; the Source Researcher must confirm editions and sections (dossier gate G1 open).</i></li>
+<li id="F4-35-src-D6">Broadcom, "BCM2835 ARM Peripherals" (tier 1), GPIO chapter: GPFSEL registers and alternate functions. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-35-src-D7">OASIS, "Virtual I/O Device (VIRTIO) Specification" (tier 1), "Virtio Over MMIO"; QEMU documentation, "QEMU Firmware Configuration (fw_cfg) Device" (tier 2). <i>Title only — not opened during this build; the Source Researcher must confirm versions and sections (dossier gate G1 open).</i></li>
+<li id="F4-35-src-C1">Systems Curriculum (this project), milestone D8 in section 11.6, and sections 11.1 and 11.5 (local file <code>SYSTEMS_CURRICULUM.html</code>): D8's goal, build step and acceptance tests quoted verbatim, the explicit clocks/resets/pins row, the bring-up order. A map, not a source (AH-4).</li>
+<li id="F4-35-src-R1">R1 — kernel build and driver table: <code>kbuild.log</code>; aarch64-linux-gnu-g++ 13.3.0, GNU ld 2.42; exit code 0.</li>
+<li id="F4-35-src-R2">R2 — the kernel on QEMU virt: <code>d8_virt.log</code>; QEMU 8.2.2; exit code 0; untested on hardware.</li>
+<li id="F4-35-src-R3">R3 — D8 checks on the log: <code>d8_check.log</code>; Python 3.13.16; exit code 0.</li>
+<li id="F4-35-src-R4">R4 — simulated SoC build: <code>socsim_build.log</code>; g++ 13.3.0 with AddressSanitizer and UBSan; exit code 0.</li>
+<li id="F4-35-src-R5">R5 — simulated SoC tree compiled: <code>minidtc_soc.log</code>; Python 3.13.16; exit code 0.</li>
+<li id="F4-35-src-R6">R6 — simulated SoC, revision-A tree: <code>socsim_ok.log</code>; g++ 13.3.0; exit code 0; a model, not hardware.</li>
+<li id="F4-35-src-R7">R7 — simulated SoC, revision-B tree (forensic): <code>forensic_tsens.log</code>; g++ 13.3.0; exit code 0; a model, not hardware.</li>
+<li id="F4-35-src-R8">R8 — the revision-B sensor node: <code>forensic_dts.log</code>; GNU grep; exit code 0.</li>
+</ol>
+
+<h2 id="F4-35-glossary">Glossary links</h2>
+<p><a href="#gl-driver-model">Driver model</a> · <a href="#gl-probe-driver">Probe (driver)</a> · <a href="#gl-deferred-probe">Deferred probe</a> · <a href="#gl-clock-provider-and-consumer">Clock provider and consumer</a> · <a href="#gl-clock-gating-clock-enable">Clock gating (clock enable)</a> · <a href="#gl-reset-controller">Reset controller</a> · <a href="#gl-pin-multiplexing-pin-control">Pin multiplexing (pin control)</a> · <a href="#gl-linker-section-driver-table">Linker-section driver table</a> · <a href="#gl-compatible-string">Compatible string</a> · <a href="#gl-phandle">Phandle</a> · <a href="#gl-gpio-general-purpose-input-output">GPIO (general-purpose input/output)</a> · <a href="#gl-clock-tree">Clock tree</a></p>
+
+<h2 id="F4-35-next">Next chapter</h2>
+<p><a href="#F4-36">F4-36 SD and eMMC storage</a> writes an SD host controller driver as a consumer of this driver model, initialises a card through the SD protocol, and reads and writes blocks on QEMU's Raspberry Pi model. Back to the course: <a href="#DR403">DR403</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#socs">section 11, platforms and SoCs</a>.</p>
+
+<h2 id="F4-35-answers">Answers to Check yourself</h2>
+<ol>
+<li>Good answers say: on PCI, firmware has already powered and clocked every device and the bus enumerates them in an order that has no dependencies between functions, so any order works. On an SoC, devices depend on other devices (clock, reset, pin and interrupt providers) that have their own drivers, and the tree does not list them in dependency order, so a probe may run before its provider and must be retried.</li>
+<li>Three entries: (&amp;ccu 5), (&amp;fixed), (&amp;ccu 9). Entry 2 is the phandle of <code>ccu</code> followed by the cell 9. Skipping by a fixed two cells would land in the middle of the list after entry 1.</li>
+<li>(b). The device waits for a provider; when a pass makes no progress, the model stops and the report shows it "waiting" with the reason, pointing to the missing driver. (a) would claim the device works without its interrupt controller. (c) would hide the real cause (the device may be fine). (d) is wrong: the result depends on the provider's state, not on the pass number.</li>
+<li>Yes. Probes run in the order of the device records, which follow the tree; the PL011 node comes before <code>/apb-pclk</code>, so its probe runs first in pass 1 and defers, whatever the order of the driver table.</li>
+<li>An empty transport (device ID 0) is a definite answer: nothing is plugged in and nothing ever will be during this boot. Deferring would mean "try again later", which can never succeed and would keep the loop running.</li>
+<li>No deferral is needed if the providers' drivers probe first; it will be probed in pass 1. It can still read zeros if the tree's clock or reset numbers are wrong for this board (the forensic case), if a power domain or regulator is off and the model has no driver for it, or if the pins are muxed to another function.</li>
+<li>Read the ID register after enabling the clock and releasing the reset, and fail if it is not the expected value. And read the control register back after writing "start" and fail if the bit did not stick (a gated block loses writes).</li>
+<li>That nothing is left waiting: every device's dependencies were resolved and every probe gave a final answer. "Bound 9" alone does not say whether others are still waiting for a provider that never came.</li>
+</ol>
+<h3 id="F4-35-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Registers: <code>GATES</code> 0x00000008 (A: 0x00000004); <code>TSENS ID</code> 0x00000000 (A: 0x54534e31); <code>TSENS CTRL</code> 0x00000000 (A: 0x00000001); <code>TSENS DATA</code> 0x00000000 (A: 0x0000a122). Unchanged: <code>ASSERT</code> 0xfffffffb, <code>PINMUX PIN4</code> 0x3. Log: "clock 3 on" (A: "clock 2 on") and "temperature 0.000 C" (A: 41.250 C).</li>
+<li><code>GATES</code> = 0x8: only bit 3 set, so clock 3 runs and clock 2, the sensor's clock, is gated. <code>ASSERT</code> = 0xfffffffb: bit 2 clear, line 2 released (met). <code>PINMUX PIN4</code> = 3: function 3 (met). Only the clock requirement fails.</li>
+<li>Sensor broken: possible in general, but the ID register reads 0, and a broken sensor with a running clock would still return its ID; ruled out by the next point. Held in reset: ruled out, line 2 is released. Pins wrong: ruled out, pin 4 is at function 3 (and in the model wrong pins give 0x7fffffff, not 0). Clock not running: supported, bit 2 of <code>GATES</code> is 0 and every sensor register, including ID and the CTRL bit the driver wrote, reads 0, the documented behaviour of a gated block. Driver bug: the driver enabled exactly what the tree said; its bug is that it did not check the ID.</li>
+<li>From the revision-B devicetree: line 20, <code>clocks = &lt;&amp;ccu 3&gt;</code>, where revision A has <code>&lt;&amp;ccu 2&gt;</code>. The driver did what the tree said, wrote "start" (lost), read DATA (0) and returned OK because it never checked that the device answered. How the fault was injected: <code>run.sh</code> generates <code>board_rev_b.dts</code> from <code>soc.dts</code> with <code>sed</code>, changing the clock number from 2 to 3.</li>
+<li>Fix: <code>clocks = &lt;&amp;ccu 2&gt;</code> in the revision-B tree. Loud failures: the sensor probe checks the ID register after enabling clock and reset (lab step 5); and a board test in CI reads the sensor and fails on a value outside a plausible range (for example 0.000 °C at room temperature). A binding check that compares clock numbers with the TRM's table (or the vendor's binding header) would catch it before boot.</li>
+<li>Ask whether any clock or power wiring changed (a different clock output for the sensor, a new power domain), and for the revision-B schematic. In the board support package, find the commit that created the revision-B tree and diff it against revision A: an unexplained provider-number change in a "power layout" revision is the lead. Here the hardware did not change; the tree did.</li>
+</ol>

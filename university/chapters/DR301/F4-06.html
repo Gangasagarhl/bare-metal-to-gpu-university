@@ -1,0 +1,316 @@
+<!--meta
+id: F4-06
+title: AHCI SATA
+course: DR301
+level: L3
+prereqs: F4-01 to F4-05; OS302; HW205 (F1-50) recommended
+time: 8–10 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with TCG, q35 machine with its built-in ICH9 AHCI controller). A spare PC with a SATA disk you may erase is optional and untested in this build.
+maps: Curriculum Track C, milestone C5 (AHCI SATA driver); the course forensic "The slow boot driver" (curriculum 4.3)
+analogy: F4 — the school and its visitors (the loading dock with 32 numbered bays and a clerk who signs the delivery book)
+-->
+
+<h2 id="F4-06-hook">Story hook</h2>
+<p>A school that has worked with one friendly supplier (virtio, F4-05) now signs a contract with a big old logistics company. The company has rules for everything. Its loading dock has 32 numbered bays; every order goes on a printed form of exactly 20 bytes, filed in the bay's folder together with a list of shelves to fill; the dock clerk has a book where he writes, in the company's own format, what happened; and before the first delivery somebody must walk down the access road to every one of the company's six gates and shout to see whether anyone answers.</p>
+<p>That last rule is the subject of this course's forensic case. A boot-trace summary shows one storage driver taking five seconds while every other driver takes milliseconds. By the end of this chapter you will have written an AHCI driver for SATA disks, checked it with the same random test as virtio-blk, broken a command on purpose and recovered from it, and you will be able to point at the exact hardware step that cost those five seconds.</p>
+
+<h2 id="F4-06-able">What you will be able to do</h2>
+<ul>
+<li><b>Find</b> an AHCI controller by its class code and read its capabilities from the ABAR.</li>
+<li><b>Bring up</b> a port in the order the specification prescribes: stop, reset the link, give it a command list and a received-FIS area, enable FIS receive, then start.</li>
+<li><b>Build</b> a command: a host-to-device register FIS, a command header, a command table and physical region descriptors.</li>
+<li><b>Identify</b> a disk with IDENTIFY DEVICE and decode its strings and capacity.</li>
+<li><b>Recover</b> from a failed command with a port stop and start, and explain when a COMRESET is needed.</li>
+<li><b>Diagnose</b> a slow boot from a driver-timing table by connecting the slow driver to the hardware step it waits for.</li>
+</ul>
+
+<div class="co jargon" id="F4-06-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>AHCI (Advanced Host Controller Interface)</dt><dd><b>Simple words:</b> the standard way a computer talks to the chip that runs its SATA ports. <b>Analogy:</b> the logistics company's rule book for its loading dock. <b>Precise:</b> a register-level interface for SATA host bus adapters, found on PCI with class code 01h, subclass 06h, programming interface 01h; registers in a memory BAR (ABAR, BAR5), commands passed through per-port command lists in memory. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup></dd>
+<dt>HBA (host bus adapter)</dt><dd><b>Simple words:</b> the controller chip between the computer's bus and its disks. <b>Analogy:</b> the loading dock itself. <b>Precise:</b> the AHCI controller: global registers (CAP, GHC, IS, PI, VS) and up to 32 ports, each with its own register block. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup></dd>
+<dt>FIS (frame information structure)</dt><dd><b>Simple words:</b> a packet on the SATA cable. <b>Analogy:</b> the company's printed forms. <b>Precise:</b> a typed frame exchanged between host and device; the driver builds register host-to-device FISes (type 27h) for commands and reads device-to-host FISes the HBA copies into the received-FIS area. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-D3">D3</a></sup></dd>
+<dt>Command list and command slot</dt><dd><b>Simple words:</b> a table of up to 32 commands a port can work on. <b>Analogy:</b> the 32 numbered bays. <b>Precise:</b> a 1 KiB-aligned array of 32-byte command headers at PxCLB; slot n is issued by setting bit n of PxCI and is finished when the HBA clears it. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup></dd>
+<dt>PRD (physical region descriptor)</dt><dd><b>Simple words:</b> one "put this many bytes here" entry for a command's data. <b>Analogy:</b> one shelf on the order's shelf list. <b>Precise:</b> a 16-byte entry of the command table's PRD table: data base address and a byte count minus one (bit 0 must give an even count); a command's data is the concatenation of its PRDs. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup></dd>
+<dt>COMRESET</dt><dd><b>Simple words:</b> resetting the SATA link and waiting for the disk to answer. <b>Analogy:</b> walking to a gate and shouting. <b>Precise:</b> an out-of-band reset signal the HBA sends when PxSCTL.DET is set to 1 and cleared again; a present device answers and the link comes up (PxSSTS.DET = 3); on an empty port nothing answers and only a timeout ends the wait. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-D3">D3</a></sup></dd>
+<dt>IDENTIFY DEVICE</dt><dd><b>Simple words:</b> the command that asks a disk to describe itself. <b>Analogy:</b> asking the visitor for an identity card. <b>Precise:</b> ATA command ECh, returning 256 16-bit words: serial number (words 10–19), firmware revision (23–26), model (27–46), the 48-bit sector count (100–103), and feature flags. <sup class="src"><a href="#F4-06-src-D2">D2</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-06-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the chain of memory structures behind one AHCI command; compare it with the virtqueue of F4-05's Figure 1. Figure 2 is the forensic case in one drawing: the same boot with two ways of probing the ports.</p>
+<figure id="F4-06-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 300" role="img" aria-labelledby="F4-06-f1t F4-06-f1d">
+<title id="F4-06-f1t">Figure 1: from a port register to the data, for one command</title>
+<desc id="F4-06-f1d">Left: the ABAR register block with the global registers and, for port 0, PxCLB, PxFB, PxCMD, PxCI, PxIS and PxTFD. PxCLB points to the command list, 32 command headers of 32 bytes; header 0 holds the FIS length 5 dwords, the write bit, the number of PRD entries and the command table address. That points to the command table: 64 bytes of command FIS (a register host-to-device FIS: type 27h, command, LBA, count), then the PRD table at offset 80h; each PRD points to a data buffer of up to 4 KiB in this driver. PxFB points to the received-FIS area where the HBA stores the device's answers. Setting bit 0 of PxCI issues slot 0; the HBA clears it when the command is done.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="300"/>
+<rect class="sv-b7" x="20" y="20" width="170" height="250" rx="5"/><text class="sv-tb" x="30" y="42">ABAR (BAR5)</text>
+<text class="sv-ts" x="30" y="64">CAP GHC IS PI VS</text>
+<text class="sv-ts" x="30" y="92">port 0 at +0x100:</text>
+<rect class="sv-b1" x="30" y="102" width="150" height="24" rx="3"/><text class="sv-ts" x="38" y="119">PxCLB</text>
+<rect class="sv-b4" x="30" y="132" width="150" height="24" rx="3"/><text class="sv-ts" x="38" y="149">PxFB</text>
+<text class="sv-ts" x="30" y="178">PxCMD (ST, FRE)</text>
+<text class="sv-ts" x="30" y="198">PxCI (issue slot n)</text>
+<text class="sv-ts" x="30" y="218">PxIS, PxTFD, PxSERR</text>
+<text class="sv-ts" x="30" y="238">PxSCTL, PxSSTS (link)</text>
+<rect class="sv-b1" x="240" y="20" width="170" height="150" rx="5"/><text class="sv-tb" x="250" y="42">command list</text><text class="sv-ts" x="250" y="62">32 headers × 32 B</text>
+<rect class="sv-b3" x="250" y="74" width="150" height="54" rx="3"/><text class="sv-ts" x="258" y="92">header 0: CFL 5,</text><text class="sv-ts" x="258" y="108">W, PRDTL, CTBA</text><text class="sv-ts" x="258" y="122">PRDBC (by HBA)</text>
+<text class="sv-ts" x="250" y="152">headers 1–31 unused</text>
+<rect class="sv-b3" x="460" y="20" width="200" height="150" rx="5"/><text class="sv-tb" x="470" y="42">command table</text>
+<rect class="sv-b6" x="470" y="52" width="180" height="40" rx="3"/><text class="sv-ts" x="478" y="70">CFIS: 27h, cmd,</text><text class="sv-ts" x="478" y="86">LBA 48 bits, count</text>
+<rect class="sv-b5" x="470" y="100" width="180" height="60" rx="3"/><text class="sv-ts" x="478" y="118">PRDT at +80h:</text><text class="sv-ts" x="478" y="134">{addr, bytes − 1}</text><text class="sv-ts" x="478" y="150">one per 4 KiB</text>
+<rect class="sv-b2" x="710" y="100" width="150" height="60" rx="5"/><text class="sv-tb" x="720" y="124">data buffer</text><text class="sv-ts" x="720" y="144">DMA by the HBA</text>
+<rect class="sv-b4" x="240" y="200" width="170" height="60" rx="5"/><text class="sv-tb" x="250" y="222">received FIS</text><text class="sv-ts" x="250" y="242">256 B: D2H, PIO setup</text>
+<line class="sv-line" x1="180" y1="114" x2="236" y2="60"/><polygon class="sv-head" points="226,62 234,70 238,58"/>
+<line class="sv-line" x1="180" y1="144" x2="236" y2="226"/><polygon class="sv-head" points="226,222 236,232 236,218"/>
+<line class="sv-line" x1="400" y1="100" x2="456" y2="72"/><polygon class="sv-head" points="446,72 452,82 458,70"/>
+<line class="sv-line" x1="650" y1="130" x2="706" y2="130"/><polygon class="sv-head" points="696,124 696,136 708,130"/>
+<text class="sv-ts" x="440" y="214">issue: PxCI |= 1 &lt;&lt; slot</text>
+<text class="sv-ts" x="440" y="234">done: HBA clears the bit; errors in PxIS.TFES, PxTFD</text>
+<text class="sv-ts" x="20" y="290">Offsets and sizes from the author's memory of D1; confirmed only by QEMU's behaviour and trace (R2, R4).</text>
+</svg></div><figcaption><b>Figure 1.</b> The pointer chain of an AHCI command. The same three ideas as virtio (a list of requests, a description of buffers, a register write to start) with a fixed format inherited from ATA. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-R4">R4</a></sup></figcaption></figure>
+
+<figure id="F4-06-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 250" role="img" aria-labelledby="F4-06-f2t F4-06-f2d">
+<title id="F4-06-f2t">Figure 2: the same boot, two port probes</title>
+<desc id="F4-06-f2d">Two horizontal time lines, not to scale in the first few milliseconds. Healthy boot: pci, rtc-cmos, i8042, virtio-blk and ahci each take a few milliseconds; the ahci bar is short because only port 0, where SSTS.DET already reports a device, gets a COMRESET; ports 1 to 5 cost one register read each. Slow boot: the first four drivers are the same, then the ahci bar is about five seconds long, divided into port 0 (a few milliseconds) and five segments of about one second each for ports 1 to 5, each a COMRESET followed by a full one-second wait for a link that never comes up because nothing is connected.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="250"/>
+<text class="sv-tb" x="20" y="34">healthy boot</text>
+<rect class="sv-b7" x="140" y="20" width="12" height="22"/><rect class="sv-b8" x="152" y="20" width="10" height="22"/><rect class="sv-b6" x="162" y="20" width="14" height="22"/><rect class="sv-b1" x="176" y="20" width="14" height="22"/>
+<text class="sv-ts" x="200" y="36">pci, rtc, i8042, virtio-blk, ahci: milliseconds each</text>
+<text class="sv-tb" x="20" y="104">slow boot</text>
+<rect class="sv-b7" x="140" y="90" width="12" height="22"/><rect class="sv-b8" x="152" y="90" width="10" height="22"/><rect class="sv-b6" x="162" y="90" width="14" height="22"/>
+<rect class="sv-b2" x="176" y="90" width="10" height="22"/>
+<rect class="sv-b5" x="186" y="90" width="134" height="22"/><rect class="sv-b5" x="322" y="90" width="134" height="22"/><rect class="sv-b5" x="458" y="90" width="134" height="22"/><rect class="sv-b5" x="594" y="90" width="134" height="22"/><rect class="sv-b5" x="730" y="90" width="134" height="22"/>
+<text class="sv-ts" x="200" y="134">port 1</text><text class="sv-ts" x="336" y="134">port 2</text><text class="sv-ts" x="472" y="134">port 3</text><text class="sv-ts" x="608" y="134">port 4</text><text class="sv-ts" x="744" y="134">port 5</text>
+<text class="sv-ts" x="186" y="154">each: COMRESET, then wait 1 s for SSTS.DET = 3; nothing is connected, so the wait always runs out</text>
+<line class="sv-line2" x1="140" y1="186" x2="864" y2="186"/><polygon class="sv-head" points="852,180 852,192 864,186"/>
+<text class="sv-ts" x="140" y="206">0 s</text><text class="sv-ts" x="450" y="206">about 2.5 s</text><text class="sv-ts" x="800" y="206">about 5 s</text>
+<text class="sv-ts" x="20" y="236">From R5: emulated QEMU TCG time from the kernel's 1 ms tick; real disks and controllers will differ.</text>
+</svg></div><figcaption><b>Figure 2.</b> Why one storage driver can dominate a boot: probing empty ports with a full link reset and a fixed timeout costs about a second per port, while reading the link state the firmware already established costs nothing. <sup class="src"><a href="#F4-06-src-R5">R5</a></sup></figcaption></figure>
+
+<h2 id="F4-06-layer1">Layer 1 — the kid explanation</h2>
+<p>A SATA disk is connected through a controller chip with several plugs. To use a disk, the computer writes an order on a form in memory ("read sector 1000 into this box"), puts it in one of 32 numbered trays, and tells the controller "tray 0 is ready". The controller sends the order down the cable, the disk answers, and the controller puts the data straight into the box. Before all that, the computer must find out which plugs have a disk. If it shouts down every empty plug and waits a whole second each time for an answer that never comes, starting the computer takes much longer than it needs to.</p>
+
+<h2 id="F4-06-layer2">Layer 2 — the student explanation</h2>
+<p>An AHCI controller appears on PCI as class 01h (mass storage), subclass 06h (SATA), interface 01h (AHCI). Its registers are in BAR5, called the ABAR: global registers first (CAP says how many ports and command slots exist, PI which ports are implemented, GHC holds reset, interrupt enable and "AHCI mode"), then one 128-byte block per port starting at offset 100h. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-R2">R2</a></sup></p>
+<p>Each port needs two areas of memory from the driver: a command list (32 command headers) and a received-FIS area where the HBA copies the disk's answers. A command is a 20-byte register FIS in a command table, plus a list of PRDs for the data. The driver points a command header at the table and sets the slot's bit in PxCI; when the bit clears, the command is done, and PxTFD holds the disk's status and error registers. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup></p>
+<p>The disk itself speaks ATA. IDENTIFY DEVICE (ECh) returns 512 bytes describing it; READ DMA EXT (25h) and WRITE DMA EXT (35h) move data with 48-bit sector numbers. Milestone C5 asks for "HBA reset and enable, port start/stop, command slots, PRD tables, interrupt handling, error recovery for at least a port reset", and its acceptance tests compare IDENTIFY with QEMU's configuration, rerun F4-05's random test on AHCI, and log the throughput next to virtio-blk's. <sup class="src"><a href="#F4-06-src-D2">D2</a></sup> <sup class="src"><a href="#F4-06-src-D7">D7</a></sup></p>
+
+<h2 id="F4-06-layer3">Layer 3 — the engineer's depth</h2>
+<h3>HBA initialisation</h3>
+<p>The driver enables memory decoding and bus mastering, sets GHC.HR (HBA reset) and waits until the HBA clears it, then sets GHC.AE (AHCI enable). It reads CAP: in R2, <code>0xc0141f05</code> decodes as NP = 5 (6 ports), NCS = 1Fh (32 command slots), S64A (64-bit addressing) and SNCQ (native command queuing) set. PI = <code>0x3f</code>: ports 0–5 implemented. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-R2">R2</a></sup></p>
+<h3>Port start and stop</h3>
+<p>Two DMA engines run per port: the FIS receive engine (enabled by PxCMD.FRE, running when PxCMD.FR is set) and the command engine (PxCMD.ST, running while PxCMD.CR is set). The specification's "Software Manipulation of Port DMA Engines" gives the order: to stop, clear ST and wait for CR to clear, then clear FRE and wait for FR to clear; PxCLB and PxFB may be changed only while both are stopped; to start, set FRE first, wait until the device is not busy (PxTFD.STS.BSY and DRQ clear), then set ST. An early version of the lab's driver set ST before FRE and waited on PxTFD before FRE was set; the HBA then had not received the device's first FIS, PxSIG read <code>0xffffffff</code>, and every port start waited the full timeout. The order in Listing 2 fixed both. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-R4">R4</a></sup></p>
+<h3>The link and the signature</h3>
+<p>PxSSTS reports the link: DET (bits 3:0) = 3 means a device is present and communication is established; R2's <code>0x113</code> also reports speed (bits 7:4 = 1, Gen 1) and power state (bits 11:8 = 1, active). A COMRESET is requested by writing PxSCTL.DET = 1, holding it at least 1 ms, and writing 0; the link renegotiates. After the device's first device-to-host FIS, PxSIG holds its signature: <code>0x00000101</code> for an ATA disk, <code>0xEB140101</code> for ATAPI (optical drives). <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-D3">D3</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>All AHCI register offsets and bit positions in this chapter (CAP fields, GHC.HR/IE/AE, the port register map, PxCMD ST/FRE/FR/CR, PxIS.DHRS/TFES, PxSSTS fields, signatures, the command header and PRD layouts, the PRDT at 80h) are from the author's memory of D1, and no second implementation was available in the build container to compare them against, unlike virtio in F4-05. They are confirmed only by QEMU 8.2.2's ICH9 AHCI model behaving as expected and by QEMU's own trace naming the registers the driver wrote (R4). The start/stop order and the 1 ms COMRESET minimum are from memory of D1; the speed and power fields of PxSSTS are from memory of D3.</p></div>
+<h3>Building a command</h3>
+<p>The register host-to-device FIS is 20 bytes (5 dwords): byte 0 type 27h, byte 1 bit 7 "C" (this FIS carries a command), byte 2 the command, bytes 4–6 and 8–10 the 48-bit LBA, byte 7 the device register (bit 6 = LBA mode), bytes 12–13 the sector count. The command header gives the FIS length in dwords (5), a "write" bit (data flows to the device), the number of PRD entries and the command table's address (128-byte aligned). Each PRD's byte count is stored minus one. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-D2">D2</a></sup></p>
+<p>The lab's driver uses one slot and waits for each command, so the random test runs at queue depth 1 only. Native command queuing (FPDMA QUEUED commands, PxSACT, up to 32 commands in flight) is the mini-project; until then, "the same 1 GiB random I/O test as C4" is only half done on AHCI: C4's test also runs at depth 32. <sup class="src"><a href="#F4-06-src-D7">D7</a></sup></p>
+<h3>Interrupts, and a flaw R2 exposes</h3>
+<p>The driver enables PxIE for device-to-host FIS and task-file errors, sets GHC.IE and installs a handler on the PCI interrupt line (line 10 through the PIC in R2). The handler reads the global IS to find ports, and clears PxIS and IS by writing back the bits it read, since both are write-1-to-clear (F4-01). R2 counts 4003 interrupts: one per command of the random test (4000) and of the error test (2), plus one more: IDENTIFY ran before interrupts were enabled, but its completion bits stayed set in PxIS, so setting GHC.IE raised an interrupt at once. The last lines of R4 show exactly that: GHC.IE written, then the handler clearing PxIS (<code>0x3</code>) and IS (<code>0x1</code>). <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-R2">R2</a></sup></p>
+<p>But the issuing code also polls PxCI and PxIS. R2's error line shows <code>PxIS=0x00000000</code> for a command that failed: the interrupt handler had already cleared the error bit before the polling code looked. The driver still detected the failure, through PxTFD's error bit, but two pieces of code consuming the same write-1-to-clear register is a design flaw. A correct driver either polls with interrupts masked, or lets the handler record the status in memory for the waiting code. Fixing it is lab step 4.</p>
+<h3>Errors and recovery</h3>
+<p>The lab reads LBA 2097152 on a disk of 2097152 sectors: one past the end. R2 shows PxTFD = <code>0x441</code>: status byte 41h (DRDY and ERR) and error register 04h, which in ATA is ABRT (command aborted). After an error the port's command engine stops processing; the recovery used here is the AHCI one for a non-fatal error: stop the port (clear ST, wait for CR), clear PxSERR and PxIS, and start it again. If the device stays busy (BSY or DRQ set), the next step would be a COMRESET. R2: the bad read returned −5 (−E_IO) and the following read of LBA 0 succeeded. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-D2">D2</a></sup> <sup class="src"><a href="#F4-06-src-R2">R2</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The ATA status and error bit meanings (DRDY 40h, ERR 01h, ABRT 04h) and the IDENTIFY word numbers are from memory of D2. The IDENTIFY words are indirectly confirmed: the model, serial and capacity the driver decoded match QEMU's command line and the 1 GiB image exactly (R2). A real disk would probably report a read past the end differently (an "ID not found" error rather than an abort); that is an expectation, not a tested fact. The recovery sequence is from memory of D1's error-handling chapter and was tested only for this one error in QEMU.</p></div>
+
+<h2 id="F4-06-hardware">How the hardware actually does it</h2>
+<p>On a PC the AHCI HBA is usually a function of the chipset (on the test machine of <code>DRIVERS.html</code>, an AMD SATA controller handled by <code>amdsata</code>; Microsoft's generic driver for the same interface is <code>storahci</code>). The SATA link is a serial connection with its own physical layer: a COMRESET is an out-of-band signal pattern, the device answers with COMINIT, and the two sides then negotiate speed before any FIS can flow. The disk on the other end runs its own firmware, which interprets the ATA commands, manages its cache and media, and decides how fast it reports "ready" after a reset. <sup class="src"><a href="#F4-06-src-D3">D3</a></sup> <sup class="src"><a href="#F4-06-src-D6">D6</a></sup></p>
+<p>The DMA itself is done by the HBA: it fetches the command header and table from memory, sends the FIS, and moves data between the disk's FISes and the buffers the PRDs name. In QEMU the "HBA" is QEMU's <code>ich9-ahci</code> model; the trace in R4 is the HBA's own view of the driver's register writes. <sup class="src"><a href="#F4-06-src-D8">D8</a></sup> <sup class="src"><a href="#F4-06-src-R4">R4</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The out-of-band signalling names (COMRESET, COMINIT) and the description of link negotiation are from memory of the Serial ATA specification (D3). How long real disks take to answer a COMRESET, and how long real controllers wait on empty ports, were not measured: no physical hardware was used in this build.</p></div>
+
+<h2 id="F4-06-worked">Worked example</h2>
+<p><b>Decoding CAP.</b> <code>0xc0141f05</code>: bits 4:0 = 00101b = 5, so 6 ports; bits 12:8 = 11111b = 31, so 32 slots; bit 31 (S64A) and bit 30 (SNCQ) set; bits 23:20 = 1 (interface speed Gen 1 in the author's memory of D1). Version register <code>0x00010000</code>: AHCI 1.0. <sup class="src"><a href="#F4-06-src-R2">R2</a></sup></p>
+<p><b>A read command in bytes.</b> Block 1000 (4 KiB) is LBA 8000 = 0x1F40, count 8. CFIS: <code>27 80 25 00 | 40 1F 00 40 | 00 00 00 00 | 08 00 00 00 | 00 00 00 00</code> (byte 4 = 40h is LBA bits 7:0 = 0x40, byte 5 = 1Fh, byte 7 = 40h the device register). Header: flags = 5 (no write bit), PRDTL = 1, CTBA = the table's address. PRD: address of the 4 KiB buffer, byte count 4095. <sup class="src"><a href="#F4-06-src-D1">D1</a></sup> <sup class="src"><a href="#F4-06-src-D2">D2</a></sup></p>
+<p><b>IDENTIFY strings.</b> ATA strings put the first character of each pair in the high byte of a 16-bit word. In memory (little-endian), the model "DR301 SATA DISK" appears as "RD03 1ASAT DIKS" until the driver swaps each pair (Listing 2, <code>ata_string</code>). The sector count at words 100–103 gives 2097152 × 512 = 1 GiB, the size of the image. All three values the acceptance test names match QEMU's configuration: model "DR301 SATA DISK", serial "DR301SATA0001" (both from <code>-device ide-hd,model=…,serial=…</code>) and the capacity. <sup class="src"><a href="#F4-06-src-R2">R2</a></sup></p>
+<p><b>Reading the trace.</b> R4, kernel part: GHC <code>0x80000001</code> (AE + HR: reset), then <code>0x80000000</code> (AE). Port 0: PxCMD written twice with <code>0x6</code> (stop: ST clear, then FRE clear), SCTL 1 then 0 (the COMRESET), CLB and FB set, SERR and IS cleared, PxCMD <code>0x16</code> (FRE on) then <code>0x4017</code> (ST on; bit 14, FR, read back as running and written back unchanged), then PxCI = 1 (the IDENTIFY). Ports 1–5: only the stop writes, no COMRESET, because their SSTS.DET was not 3. <sup class="src"><a href="#F4-06-src-R4">R4</a></sup></p>
+
+<h2 id="F4-06-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F4-06/</code>. The kernel links F4-05's virtio-blk driver and random test, F4-04's RTC and F4-03's i8042 driver as well, so that one boot can initialise every driver of the course (the boot-trace mode). <code>ahci.h</code> declares the interface of Listing 2.</p>
+<p><b>Listing 1</b> — <code>ahci_regs.h</code>, registers and structures</p>
+<pre class="listing" data-src="F4-06/ahci_regs.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–13</td><td><code>hba</code></td><td>Global registers and the bits used.</td><td>From memory of D1; see the unverified box.</td></tr>
+<tr><td>14–24</td><td><code>port</code></td><td>Per-port offsets and bits; DET = 3; the two signatures.</td><td>QEMU's trace names the same offsets (R4).</td></tr>
+<tr><td>25–28</td><td><code>ata</code></td><td>FIS type 27h; the four ATA commands.</td><td>The disk's language, not the HBA's.</td></tr>
+<tr><td>30–43</td><td><code>CmdHeader</code>, <code>Prd</code>, <code>CmdTable</code></td><td>The in-memory structures of Figure 1.</td><td><code>prdbc</code> is volatile: the HBA writes it.</td></tr>
+<tr><td>44–45</td><td><code>static_assert</code></td><td>32-byte header, 16-byte PRD, PRDT at 80h.</td><td>Layout errors fail the build, not the disk.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>ahci.cc</code>, the driver</p>
+<pre class="listing" data-src="F4-06/ahci.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–14</td><td>static areas</td><td>Command list 1 KiB-aligned, received FIS 256-byte, table 128-byte, IDENTIFY buffer.</td><td>The alignments D1 requires (from memory).</td></tr>
+<tr><td>25–31</td><td><code>wait_clear</code></td><td>Poll a register until bits clear or a timeout in ms.</td><td>Every wait has a limit.</td></tr>
+<tr><td>34–40</td><td><code>port_stop</code></td><td>ST off, wait CR; FRE off, wait FR.</td><td>The specification's stop order.</td></tr>
+<tr><td>44–50</td><td><code>port_start</code></td><td>FRE on, wait until not busy, ST on.</td><td>The order that fixed the early bug (Layer 3).</td></tr>
+<tr><td>54–66</td><td><code>port_reset</code></td><td>COMRESET; wait up to <code>limit_ms</code> for DET = 3, sleeping between checks; clear SERR.</td><td>The function at the centre of the forensic case.</td></tr>
+<tr><td>68–75</td><td><code>ahci_isr</code></td><td>Count; clear port and global interrupt status by writing back.</td><td>Write-1-to-clear, and the flaw of Layer 3.</td></tr>
+<tr><td>78–97</td><td><code>issue</code>: FIS and PRDs</td><td>Builds the register FIS and one PRD per 4 KiB.</td><td>Worked example in bytes.</td></tr>
+<tr><td>98–111</td><td><code>issue</code>: header and go</td><td>Header for slot 0, barrier, clear PxIS, set PxCI bit 0, poll with a 5 s limit.</td><td>Structures complete before the HBA may read them.</td></tr>
+<tr><td>112–125</td><td>error and recovery</td><td>Print IS, TFD, SERR; stop, clear, start; return −E_IO.</td><td>C5's "error recovery for at least a port reset".</td></tr>
+<tr><td>128–135</td><td><code>ata_string</code></td><td>Swap byte pairs, trim spaces.</td><td>ATA's string format.</td></tr>
+<tr><td>141–153</td><td>HBA init</td><td>ABAR from BAR5, bus mastering, reset, AE, print CAP and PI.</td><td>R2's first line.</td></tr>
+<tr><td>155–169</td><td>port probe</td><td>Stop each implemented port. Healthy: COMRESET only where DET already reads 3. Slow: COMRESET every port and wait 1 s.</td><td>Lines 160–166 are the whole difference between the two boots of R5.</td></tr>
+<tr><td>170–182</td><td>port setup</td><td>CLB, FB, clear status, start, read the signature, skip ATAPI.</td><td>Addresses written only while the engines are stopped.</td></tr>
+<tr><td>184–193</td><td>IDENTIFY</td><td>Serial, firmware, model and the 48-bit sector count.</td><td>Acceptance test 1.</td></tr>
+<tr><td>195–204</td><td>interrupts</td><td>Handler on the PCI line; PxIE; GHC.IE.</td><td>Through the 8259 PIC of F4-03 (MSI is C7).</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>f406_main.cc</code>, tests and the boot timeline</p>
+<pre class="listing" data-src="F4-06/f406_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>20–25</td><td><code>find</code></td><td>AHCI by class code 010601h; virtio-blk by ID.</td><td>Class matching: any AHCI controller, any vendor.</td></tr>
+<tr><td>27–35</td><td><code>cmdline_has</code></td><td>Reads the Multiboot command line (<code>-append</code>).</td><td>One kernel, three modes.</td></tr>
+<tr><td>37–43</td><td>adapters</td><td>AHCI: one slot, the command finishes inside <code>start</code>. virtio-blk: as in F4-05.</td><td>The same test drives both.</td></tr>
+<tr><td>45–52</td><td><code>report</code></td><td>Counts and KiB per emulated second.</td><td>Acceptance test 3's log line.</td></tr>
+<tr><td>54–80</td><td><code>tests</code></td><td>IDENTIFY; random test on AHCI and on virtio-blk with the same seed; the error test; interrupts; PASS or FAIL.</td><td>All three C5 tests in one boot.</td></tr>
+<tr><td>82–105</td><td><code>boottrace</code></td><td>Initialises pci, rtc-cmos, i8042, virtio-blk, ahci in order; one line per driver: start and duration in ms.</td><td>The forensic evidence is produced here.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>trace_csv.py</code>, two boots into one table</p>
+<pre class="listing" data-src="F4-06/trace_csv.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>12–18</td><td><code>load</code></td><td>Collects <code>BOOTTRACE</code> lines by driver name.</td><td>Ignores everything else on the serial line.</td></tr>
+<tr><td>21–27</td><td>join</td><td>Healthy and slow init times side by side, with the delta; sorted slowest first.</td><td>The columns of the boot-trace tables in <code>DRIVERS.html</code>.</td></tr>
+<tr><td>28–37</td><td>output</td><td>CSV and a summary with the sums.</td><td>What an analyst would be handed.</td></tr>
+</tbody></table></div>
+<p>The runs: build (R1), the C5 tests (R2), the host's image check (R3), QEMU's register trace (R4) and the two boot timelines (R5). Throughput figures in R2 are KiB per emulated second in QEMU TCG on a shared build machine; they change from run to run and say nothing about SATA disks.</p>
+<pre class="output" data-run="F4-06/build"></pre>
+<pre class="output" data-run="F4-06/ahci"></pre>
+<pre class="output" data-run="F4-06/image"></pre>
+<pre class="output" data-run="F4-06/ahci_trace"></pre>
+<p>R5, the two boot timelines, is the evidence pack of the forensic lab below.</p>
+
+<h2 id="F4-06-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>The bays are in the school's own building.</b> The command list and tables are in the computer's memory, written by the driver; the "dock" (HBA) only reads them. A real loading dock owns its own paperwork.</li>
+<li><b>Shouting at an empty gate is not foolish in principle.</b> A COMRESET on an empty port is sometimes needed (hot-plug, a link the firmware did not train). The analogy makes the slow probe look silly; the real lesson is that the firmware has often already done the work and the driver can read the result.</li>
+<li><b>Forms in a foreign language.</b> The register FIS carries ATA's old register layout (LBA split across bytes, a "device" register with an LBA bit). The analogy hides that AHCI is a modern wrapper around a decades-old command set.</li>
+</ul>
+
+<h2 id="F4-06-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Starting ST before FRE, or changing PxCLB while the engines run.</b> Symptom: PxSIG reads all ones, commands never complete, or the HBA reads a stale list. Follow the stop and start order exactly.</li>
+<li><b>Forgetting that PxIS and IS are write-1-to-clear.</b> Symptom: interrupt storms (bits never cleared) or lost events (cleared by someone else, as in R2's error line).</li>
+<li><b>PRD byte count not minus one.</b> Symptom: one byte too many per PRD; on a write, the disk receives garbage at the end of the sector or the command fails.</li>
+<li><b>Using LBA28 commands on large disks.</b> Symptom: works on small images, wraps around above 128 GiB. Use the EXT commands.</li>
+<li><b>Not checking the signature.</b> Symptom: an optical drive receives disk commands and aborts them.</li>
+<li><b>Resetting every port with a fixed long timeout.</b> Symptom: a boot that is seconds slower with every empty port (forensic lab).</li>
+<li><b>Polling and interrupt handling sharing status registers.</b> Symptom: errors seen only some of the time.</li>
+</ul>
+
+<div class="co transition" id="F4-06-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F4-05's descriptors, DMA and random test; F4-03's interrupt handling and write-1-to-clear status; F4-02's class-code matching. <b>What carries over:</b> memory structures that the device reads, publication order (structures before the "go" write), the random test and the host's image check. <b>What changes:</b> a fixed, older format with strict start and stop rules, two layers of protocol (AHCI for the HBA, ATA for the disk), a link that must be brought up, and real error reporting that the driver must recover from. <b>Next:</b> F4-07's NVMe drops the ATA layer and the link handshake: queues of 64-byte commands in memory, doorbells, and completion entries with a phase bit, designed for flash from the start.</p></div>
+
+<h2 id="F4-06-check">Check yourself</h2>
+<ol>
+<li>Which PCI class code identifies an AHCI controller, and in which BAR are its registers?</li>
+<li>Give the order of operations to stop a port and to start it.</li>
+<li>Decode PxSSTS = <code>0x123</code>.</li>
+<li>Write the CFIS bytes 0–13 for WRITE DMA EXT of 16 sectors at LBA 0x123456789.</li>
+<li>Why does the PRD byte count field hold the count minus one, and what must the lowest bit be?</li>
+<li>R2 counts 4003 interrupts. Account for each one.</li>
+<li>Apply to a new case: a laptop has an AHCI controller with PI = <code>0x01</code> and an NVMe SSD. What does the lab's healthy probe cost, and what would the slow probe cost?</li>
+<li>Why is reading PxSSTS.DET before resetting safe after firmware has run, and when is it not enough?</li>
+<li>Why did the error line in R2 show <code>PxIS=0x00000000</code>?</li>
+</ol>
+
+<h2 id="F4-06-lab">Lab</h2>
+<p><b>Goal.</b> Milestone C5: "Identify and read/write SATA disks through AHCI, using native command queuing later." Build: "HBA reset and enable, port start/stop, command slots, PRD tables, interrupt handling, error recovery for at least a port reset." <sup class="src"><a href="#F4-06-src-D7">D7</a></sup></p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2 (<code>q35</code>, whose ICH9 AHCI controller is built in; the disk is <code>-device ide-hd,bus=ide.0,model=…,serial=…</code>), g++ 13.3, GNU ld 2.42, Python 3. Run <code>university/labs/run_lab.sh university/labs/F4-06</code> from the repository root (about half a minute; the slow boot alone takes five emulated seconds).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>"Expect that a bad driver can corrupt disks (wrong LBA, wrong DMA address)... Disconnect disks you care about while testing storage drivers on real hardware." (curriculum safety box). This lab writes 4000 random blocks across a 1 GiB image file; on a spare PC the same code would write across the first gigabyte of whatever disk is on port 0. Never run it on a machine with a disk you want to keep, and physically disconnect other disks.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Check acceptance test 1 in R2 against the QEMU command line in <code>ahci.log</code>.</li>
+<li>Decode CAP, PI and PxSSTS by hand. In R4, match each kernel register write to a line of Listing 2.</li>
+<li>Record the two throughput lines of R2 in your design log, run the lab twice more, and record the spread. Write two sentences on why emulated figures cannot rank SATA against virtio-blk.</li>
+<li>Fix the polling-versus-interrupt flaw: let <code>ahci_isr</code> store PxIS in a variable that <code>issue</code> reads, and confirm that the error line then shows TFES.</li>
+<li>Add a COMRESET to the recovery path when PxTFD still shows BSY or DRQ after the restart, and test it by starting a command and resetting the port while it runs.</li>
+</ol>
+<p><b>Expected observations.</b> R2: 6 ports, 32 slots, NCQ; one SATA disk on port 0; IDENTIFY matching the command line; 1963 reads and 2037 writes on each driver (the same seed), 0 bad reads; the error test fails and recovers; PASS. R3: 2023 distinct blocks, 0 differ. R4: firmware writes first, then the kernel's sequence of the worked example. R5: ahci in milliseconds in the healthy boot and about five seconds in the slow boot; the other drivers unchanged.</p>
+<p><b>Verification</b> (the milestone's acceptance tests, verbatim): "IDENTIFY data (model, serial, capacity) matches the disk image QEMU attached." — R2 (the run script also checks model and serial). "The same 1 GiB random I/O test as C4 passes on AHCI." — R2 and R3 at queue depth 1 only; see the box. "Throughput is logged and compared with the virtio-blk result in the design log." — R2 logs both; the comparison is lab step 3. <sup class="src"><a href="#F4-06-src-D7">D7</a></sup></p>
+<div class="co unverified"><span class="lbl">Not tested in this build</span><p>The C4 test also runs at queue depth 32; the lab's AHCI driver uses one command slot, so depth 32 on AHCI waits for NCQ (mini-project). Nothing in this chapter was run on a physical SATA controller or disk. The throughput figures are emulated and not comparable with hardware.</p></div>
+<p><b>Troubleshooting.</b> "no AHCI disk": the machine is <code>pc</code> (no AHCI) instead of <code>q35</code>, or the disk is not on <code>ide.0</code>. SIG = <code>0xffffffff</code> and slow port starts: FRE was not set before waiting. Every command times out: bus mastering off, or the command list address written while the port was running.</p>
+<p><b>Extension.</b> Hot-plug: enable the port's PhyRdy-change interrupt and detect a disk added with QEMU's monitor (<code>device_add</code>). Mark the bits you use as unverified until you have read D1.</p>
+
+<h2 id="F4-06-forensic">Forensic lab: the slow boot driver</h2>
+<p><b>Scenario.</b> Mei's team ships a kernel for small servers. A customer complains that boots got five seconds slower after an update; the release notes mention only "more robust disk detection". Mei is handed a boot-trace summary in the style of the driver tables in this project's <code>DRIVERS.html</code> (driver, phase, start time, init time on a healthy and on a slow boot, delta) and the kernel log of the slow boot.</p>
+<div class="co note"><span class="lbl">About this evidence</span><p>The table is not a Windows ETL trace. It is produced by the lab kernel itself (Listing 3, <code>boottrace</code>) from its 1 ms PIT tick in two QEMU boots, and formatted by Listing 4 like the driver tables of <code>DRIVERS.html</code>. The times are emulated QEMU TCG milliseconds. Real boot traces of the test machine in <code>DRIVERS.html</code> show <code>amdsata</code> at 0.4 ms on both the healthy and the failing side.</p></div>
+<p><b>Evidence pack</b> (R5):</p>
+<pre class="output" data-run="F4-06/boottrace"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which driver dominates, by how much, and when did it start in the slow boot relative to the others?</li>
+<li>Divide its extra time by the number of empty ports. What does each port cost, and which line of the kernel log tells you so?</li>
+<li>Which hardware step in Listing 2 takes about one second per empty port, and why does it always run to its limit?</li>
+<li>What does the healthy probe do instead, and why is that safe after the firmware has run?</li>
+<li>The curriculum's table (section 4.3) maps <code>amdsata.sys</code> and <code>storahci.sys</code> to C5. In <code>DRIVERS.html</code>, List 1, <code>amdsata</code> shows 0.4 → 0.4 ms in <code>kernel_to_smss</code>. Does that row tell you the test machine's AHCI ports were probed in 0.4 ms? What else would you need?</li>
+<li>Prevention: what boot-time test and which log line would have caught the regression before release?</li>
+</ol>
+<p><b>Method hints.</b> Sort by delta, not by init time. Look for round numbers. Then find the loop in the code whose limit is that round number.</p>
+
+<h2 id="F4-06-project">Mini-project</h2>
+<p><b>NCQ and depth 32 on AHCI.</b> Use all 32 command slots with READ/WRITE FPDMA QUEUED (60h/61h): one command table per slot, the tag in the FIS's count field, PxSACT set before PxCI, completions found from PxSACT and PxCI, and the Set Device Bits FIS in the received-FIS area. Run the random test at depths 1 and 32 on AHCI and check the image on the host. Then log throughput against virtio-blk at both depths, labelled as emulated.</p>
+<p><b>Rubric</b> (10 points): depth-32 test passes on AHCI and on the host check (4); completion out of order handled (2); an error during queued commands recovered (the whole queue is aborted; resubmit) (2); every field you used marked with its source section after reading D1 and D2 (2).</p>
+
+<h2 id="F4-06-summary">Summary</h2>
+<ul>
+<li>An AHCI HBA is class 010601h with registers in BAR5: global registers, then 32 possible ports.</li>
+<li>Each port needs a command list and a received-FIS area; stop and start follow a fixed order (ST/CR, FRE/FR).</li>
+<li>A command is a 20-byte register FIS plus PRDs, in slot n, issued by PxCI bit n; errors appear in PxIS.TFES and PxTFD.</li>
+<li>IDENTIFY gives model, serial, firmware and capacity; ATA strings swap bytes in each word.</li>
+<li>Recovery from a command error: stop, clear errors, start; COMRESET if the device stays busy.</li>
+<li>Probing empty ports with a full COMRESET and a fixed timeout costs about a second each; reading the link state first costs nothing.</li>
+</ul>
+
+<h2 id="F4-06-sources">Sources</h2>
+<ol>
+<li id="F4-06-src-D1">Intel, "Serial ATA Advanced Host Controller Interface (AHCI)" specification (curriculum item 41; C5 reading: HBA memory registers, port registers, command list, received FIS, command table, "Software Manipulation of Port DMA Engines", initialization chapter). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-06-src-D2">INCITS T13, "ATA/ATAPI Command Set" (ACS) (curriculum item 41; C5 reading: IDENTIFY DEVICE, READ/WRITE DMA EXT, FPDMA QUEUED; status and error registers). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-06-src-D3">SATA-IO, "Serial ATA" specification: out-of-band signalling, FIS types, the SStatus/SControl registers. <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F4-06-src-D4">The Linux kernel source (curriculum item 40): <code>drivers/ata/ahci.c</code>, <code>drivers/ata/libahci.c</code>, <code>drivers/ata/libata-core.c</code>. <i>Title only — not opened during this build; the Source Researcher must confirm the version and the files (dossier gate G1 open).</i></li>
+<li id="F4-06-src-D5">Mark Russinovich et al., "Windows Internals", 7th edition, Part 1 (curriculum item 30): the I/O system and storage driver stack (port and miniport drivers). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F4-06-src-D6">This project's <code>DRIVERS.html</code>: List 1 (the test boot's driver table, row <code>amdsata</code>, and the note that init times alone do not explain a slow boot) and List 2 (<code>storahci</code>) (opened in this build; the project's own page).</li>
+<li id="F4-06-src-D7">This project's Systems Curriculum: milestone C5 (goal, reading, build, acceptance tests), section 4.3 (boot trace to milestones), and the safety box on storage drivers (opened in this build; the project's own page).</li>
+<li id="F4-06-src-D8">QEMU documentation: the <code>q35</code> machine's ICH9 AHCI controller, the <code>ide-hd</code> device's <code>model</code> and <code>serial</code> properties, trace events. <i>Title only — not opened during this build; the Source Researcher must confirm the version and pages (dossier gate G1 open).</i></li>
+<li id="F4-06-src-R1">R1 — lab run, step <code>build</code>: <code>university/labs/F4-06/build.out</code>, <code>build.log</code>.</li>
+<li id="F4-06-src-R2">R2 — lab run, step <code>ahci</code>: <code>ahci.out</code>, <code>ahci.log</code> (QEMU 8.2.2, q35, TCG; exit code 33 = pass).</li>
+<li id="F4-06-src-R3">R3 — lab run, step <code>image</code>: <code>image.out</code>, <code>image.log</code> (F4-05's <code>verify_image.py</code> on the SATA image).</li>
+<li id="F4-06-src-R4">R4 — lab run, step <code>ahci_trace</code>: <code>ahci_trace.out</code>, <code>ahci_trace.log</code> (QEMU trace events <code>ahci_mem_write_host</code>, <code>ahci_port_write</code>, <code>ahci_reset_port</code>).</li>
+<li id="F4-06-src-R5">R5 — lab run, step <code>boottrace</code>: <code>boottrace.out</code>, <code>boottrace.csv</code>, <code>boottrace.log</code> (two boots, healthy and <code>slowahci</code>; Listing 4).</li>
+</ol>
+
+<h2 id="F4-06-glossary">Glossary links</h2>
+<p><a href="#gl-ahci-advanced-host-controller-interface">AHCI (Advanced Host Controller Interface)</a> · <a href="#gl-hba-host-bus-adapter">HBA (host bus adapter)</a> · <a href="#gl-fis-frame-information-structure">FIS (frame information structure)</a> · <a href="#gl-command-list-and-command-slot">Command list and command slot</a> · <a href="#gl-prd-physical-region-descriptor">PRD (physical region descriptor)</a> · <a href="#gl-comreset">COMRESET</a> · <a href="#gl-identify-device">IDENTIFY DEVICE</a> · <a href="#gl-native-command-queuing-ncq">Native command queuing (NCQ)</a> · <a href="#gl-boot-trace">Boot trace</a> · <a href="#gl-write-1-to-clear-rw1c">Write-1-to-clear (RW1C)</a></p>
+
+<h2 id="F4-06-next">Next chapter</h2>
+<p>Next: <a href="#F4-07">F4-07 NVMe</a>. Previous: <a href="#F4-05">F4-05 virtio block and network</a>. Back to the course: <a href="#DR301">DR301</a>. Related: <a href="#F4-02">F4-02</a> (class codes), <a href="#F4-03">F4-03</a> (interrupts), <a href="#F1-50">F1-50</a> (storage queues from the hardware side). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackC">Track C</a> (milestone C5).</p>
+
+<h2 id="F4-06-answers">Answers to Check yourself</h2>
+<ol>
+<li>Class 01h, subclass 06h, programming interface 01h (010601h); registers in BAR5 (ABAR).</li>
+<li>Stop: clear ST, wait until CR is clear; clear FRE, wait until FR is clear. Start: (with CLB and FB set) set FRE, wait until PxTFD shows neither BSY nor DRQ, set ST.</li>
+<li>DET = 3 (device present, link established), SPD = 2 (Gen 2), IPM = 1 (active).</li>
+<li><code>27 80 35 00 89 67 45 40 23 01 00 00 10 00</code>: type, C bit, command 35h, features 0; LBA bits 7:0 = 89h, 15:8 = 67h, 23:16 = 45h; device 40h; LBA 31:24 = 23h, 39:32 = 01h, 47:40 = 00h; features (high) 0; count 16 = 10h, 00h.</li>
+<li>So that the full range up to the maximum fits in the field (a zero-length region is never needed); the count must be even, so bit 0 of the stored value is always 1 (count − 1 is odd).</li>
+<li>4000 test operations on AHCI and 2 reads in the error test (the failed one and the read of LBA 0) = 4002; the last one is IDENTIFY's completion status, still pending in PxIS when the driver enabled interrupts (R4's last lines). The virtio-blk operations do not interrupt (that driver polls with interrupts suppressed).</li>
+<li>Healthy: one implemented port, a register read, and no COMRESET if nothing is connected: almost nothing. Slow: one COMRESET and a one-second wait. The NVMe SSD is not behind the AHCI controller at all (F4-07).</li>
+<li>Firmware that booted from or initialised the controller has already brought up the links, so DET reflects reality. It is not enough after a hot-plug event, when the firmware did not initialise the controller, or when the link is in a power-saving state; then a reset (or a wake) is required.</li>
+<li>The interrupt handler had already read PxIS and cleared it by writing the bits back (write-1-to-clear) before the polling code read it; the error was seen through PxTFD's ERR bit instead.</li>
+</ol>
+<h3 id="F4-06-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li><code>ahci</code> dominates: a few milliseconds in the healthy boot and about 5000 ms more in the slow one; the next largest delta is a millisecond or two. It started a few milliseconds after the kernel's timer started, right after virtio-blk: it was not waiting for another driver; its own init is slow.</li>
+<li>About 5000 ms / 5 empty ports ≈ 1000 ms each. The kernel log says it directly: "port N: SSTS=0x000 no device (probe took 1002 ms)" for ports 1–5, while port 0 (the disk) answers in 0 ms.</li>
+<li><code>port_reset</code> (Listing 2, lines 54–66): a COMRESET and then a loop waiting up to <code>limit_ms</code> = 1000 for SSTS.DET = 3. With nothing connected no device ever answers, so the loop always ends by timeout. The slow boot calls it for every implemented port (line 161).</li>
+<li>It reads PxSSTS.DET first and resets only ports that already report a device (line 165). The firmware has already established the links, so an empty port reads DET = 0 and costs one register read.</li>
+<li>No. Init time in that table is the time of the driver's start routine; port detection may happen later or asynchronously in a storage port driver (for Windows, see D5; not verified), and the trace's phase times are needed to see time spent elsewhere. <code>DRIVERS.html</code> itself warns that driver init times alone do not explain a slow boot. You would need the phase durations and, ideally, the storage stack's own events (port reset and device arrival times).</li>
+<li>A boot-time budget test in QEMU with several empty AHCI ports (the q35 default has six), failing when the storage driver's init exceeds, say, 100 ms; and the per-port log line "probe took N ms", which made the cause obvious.</li>
+</ol>

@@ -1,0 +1,330 @@
+<!--meta
+id: F3-21
+title: Paging and the kernel address space
+course: OS302
+level: L3
+prereqs: F3-20; OS201 (F3-04); HW203
+time: 10–14 hours including the lab
+hardware: none for the lab (QEMU 8.2.2 with TCG; the QEMU monitor through QMP)
+maps: Curriculum Track B, milestone B4 (paging and the kernel address space); OS302 exam P (walk a page-table translation by hand from a QEMU monitor dump)
+analogy: F3 — the school (the map of lockers and the principal's sticky note)
+-->
+
+<h2 id="F3-21-hook">Story hook</h2>
+<p>Every student in the school has a locker number. Locker 12 in class A is not the same cupboard as locker 12 in class B: the school keeps a map from locker numbers to real cupboards, and each class has its own page in it. The principal's own staff lockers are on every page, in the same place, but marked "staff only". Some cupboards are marked "look, don't touch". Below the staff lockers there is a deliberately empty cupboard number with no cupboard behind it: anyone who walks past the end of the row bumps into it and an alarm rings.</p>
+<p>Looking a number up in the full map takes four steps through four binders, so the principal keeps a sticky note of the last few look-ups. Once, a cupboard was given to a new teacher, but the old note was still on the principal's desk. The old owner's last delivery went straight into the new teacher's cupboard. The map was right; the note was wrong.</p>
+<p>This chapter builds that map for the kernel: its own page tables, with permissions and guard pages, an API to map and unmap, and the discipline of clearing the sticky note, the TLB. It also teaches the exam skill of this course: walking a translation by hand from a QEMU monitor dump.</p>
+
+<h2 id="F3-21-able">What you will be able to do</h2>
+<ul>
+<li><b>Split</b> a 64-bit virtual address into its four table indices and offset, and walk the tables by hand from CR3 to the byte, using QEMU's monitor.</li>
+<li><b>Build</b> an address-space object with map, unmap, protect and translate over frames from F3-20.</li>
+<li><b>Give</b> each kernel section exactly the rights it needs: code read and execute, read-only data read-only and not executable, data and BSS writable and not executable.</li>
+<li><b>Explain</b> NX, write protection in kernel mode (CR0.WP), global pages and the PAT, and test that they work.</li>
+<li><b>Place</b> a kernel stack above an unmapped guard page and show the overflow is caught.</li>
+<li><b>Diagnose</b> a stale TLB entry that writes into memory the page tables no longer map.</li>
+</ul>
+
+<div class="co jargon" id="F3-21-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Page table</dt><dd><b>Simple words:</b> the table the CPU uses to turn the addresses a program uses into real memory addresses. <b>Analogy:</b> the map of lockers: locker number to real cupboard. <b>Precise:</b> in x86-64 4-level paging, a hierarchy of 4 KiB tables of 512 eight-byte entries (PML4, PDPT, PD, PT) rooted at CR3; each entry holds a physical address and permission bits. <sup class="src"><a href="#F3-21-src-D1">D1</a></sup></dd>
+<dt>PML4</dt><dd><b>Simple words:</b> the top-level page table. <b>Analogy:</b> the first binder of the locker map. <b>Precise:</b> the page-map level-4 table whose physical address is in CR3; indexed by virtual address bits 47–39. <sup class="src"><a href="#F3-21-src-D1">D1</a></sup> <sup class="src"><a href="#F3-21-src-R3">R3</a></sup></dd>
+<dt>Page-table entry (PTE)</dt><dd><b>Simple words:</b> one line of a page table: where the page is and what may be done with it. <b>Analogy:</b> one line of the locker map, with "staff only" and "look, don't touch" marks. <b>Precise:</b> a 64-bit entry: present, writable, user, write-through, cache-disable, accessed, dirty, page-size or PAT, global, the physical address bits, and NX in bit 63. <sup class="src"><a href="#F3-21-src-D1">D1</a></sup> <sup class="src"><a href="#F3-21-src-R1">R1</a></sup></dd>
+<dt>TLB (translation lookaside buffer)</dt><dd><b>Simple words:</b> the CPU's small cache of recent translations. <b>Analogy:</b> the principal's sticky note of recently looked-up lockers. <b>Precise:</b> a processor cache of virtual-to-physical translations and their rights; not kept coherent with the page tables by hardware, so software must invalidate entries it changes (<code>invlpg</code>, a CR3 write, or other mechanisms). <sup class="src"><a href="#F3-21-src-D1">D1</a></sup> <sup class="src"><a href="#F3-21-src-R4">R4</a></sup></dd>
+<dt>NX (no-execute)</dt><dd><b>Simple words:</b> a mark that says "this page holds data; never run it as code". <b>Analogy:</b> a "no experiments in this room" sign. <b>Precise:</b> bit 63 of a paging entry, honoured when EFER.NXE is set; an instruction fetch from such a page raises a page fault with the instruction-fetch bit set. <sup class="src"><a href="#F3-21-src-D1">D1</a></sup> <sup class="src"><a href="#F3-21-src-R2">R2</a></sup></dd>
+<dt>Guard page</dt><dd><b>Simple words:</b> an address deliberately left unmapped next to a stack or buffer, so running off the end faults. <b>Analogy:</b> the empty cupboard number at the end of the row that rings an alarm. <b>Precise:</b> an unmapped page adjacent to a region that grows; an access raises a page fault instead of corrupting the neighbouring memory. <sup class="src"><a href="#F3-21-src-R2">R2</a></sup></dd>
+<dt>Global page</dt><dd><b>Simple words:</b> a translation the CPU keeps even when it switches to another program's tables. <b>Analogy:</b> the staff lockers that are on every class's page. <b>Precise:</b> a leaf entry with the G bit set, while CR4.PGE is enabled; such TLB entries survive CR3 writes and are removed with <code>invlpg</code> or by toggling CR4.PGE. <sup class="src"><a href="#F3-21-src-D1">D1</a></sup></dd>
+<dt>PAT (page attribute table)</dt><dd><b>Simple words:</b> a table that lets each page choose how the CPU caches it. <b>Analogy:</b> a choice of delivery methods per cupboard: keep a copy on the desk, or always walk to the cupboard. <b>Precise:</b> an MSR with eight memory-type entries; the PAT, PCD and PWT bits of a leaf entry select one, giving write-back, write-through, write-combining, uncached and other types per page. <sup class="src"><a href="#F3-21-src-D1">D1</a></sup></dd>
+<dt>Virtual address space</dt><dd><b>Simple words:</b> all the addresses a program can use, whether or not memory is behind them. <b>Analogy:</b> all the locker numbers that could exist. <b>Precise:</b> with 4-level paging, 48-bit canonical addresses: a lower half 0–0x00007fffffffffff and an upper half 0xffff800000000000–0xffffffffffffffff. <sup class="src"><a href="#F3-21-src-D1">D1</a></sup></dd>
+</dl></div>
+<p>"Kernel" means the operating-system kernel here; F6 uses "kernel (GPU)" for code launched on a GPU, which is a different idea.</p>
+
+<h2 id="F3-21-pictures">The idea in pictures</h2>
+<p>Figure 1 is the page-table walk of the lab, with the real numbers: the walk target <code>0xffffffff80114008</code>, CR3 = <code>0x133000</code>, four entries read with the QEMU monitor, and the byte found at physical <code>0x114008</code>. Figure 2 is the kernel's virtual address layout that the monitor's <code>info mem</code> view confirmed.</p>
+<figure id="F3-21-fig1"><div class="svgbox">
+<svg viewBox="0 0 920 470" role="img" aria-labelledby="F3-21-f1t F3-21-f1d">
+<title id="F3-21-f1t">Figure 1: the four-level walk of virtual address 0xffffffff80114008</title>
+<desc id="F3-21-f1d">Top: the 64-bit virtual address 0xffffffff80114008 split into fields: bits 63 to 48, the sign extension, all ones; bits 47 to 39, PML4 index 511; bits 38 to 30, PDPT index 510; bits 29 to 21, PD index 0; bits 20 to 12, PT index 276; bits 11 to 0, offset 0x008. Below, five boxes left to right. CR3 holds 0x133000, the PML4. In the PML4, entry 511 at physical 0x133ff8 holds 0x134027: the PDPT is at 0x134000, flags present, writable, user, accessed. In the PDPT, entry 510 at 0x134ff0 holds 0x135027: the PD at 0x135000. In the PD, entry 0 at 0x135000 holds 0x136027: the PT at 0x136000. In the PT, entry 276 at 0x1368a0 holds 0x8000000000114163: frame 0x114000, present, writable, supervisor, accessed, dirty, global, no-execute. The frame plus the offset gives physical 0x114008, which holds 0x5452414e534c4154. Arrows connect each entry to the next table.</desc>
+<rect class="sv-bg" x="0" y="0" width="920" height="470"/>
+<text class="sv-tb" x="20" y="26">virtual address 0xffffffff80114008</text>
+<rect class="sv-box" x="20" y="40" width="170" height="54"/><text class="sv-t" x="30" y="62">bits 63–48</text><text class="sv-ts" x="30" y="82">sign: all ones</text>
+<rect class="sv-b1" x="190" y="40" width="140" height="54"/><text class="sv-t" x="200" y="62">47–39 PML4</text><text class="sv-tb" x="200" y="82">511</text>
+<rect class="sv-b2" x="330" y="40" width="140" height="54"/><text class="sv-t" x="340" y="62">38–30 PDPT</text><text class="sv-tb" x="340" y="82">510</text>
+<rect class="sv-b3" x="470" y="40" width="140" height="54"/><text class="sv-t" x="480" y="62">29–21 PD</text><text class="sv-tb" x="480" y="82">0</text>
+<rect class="sv-b4" x="610" y="40" width="140" height="54"/><text class="sv-t" x="620" y="62">20–12 PT</text><text class="sv-tb" x="620" y="82">276</text>
+<rect class="sv-b5" x="750" y="40" width="150" height="54"/><text class="sv-t" x="760" y="62">11–0 offset</text><text class="sv-tb" x="760" y="82">0x008</text>
+<rect class="sv-box" x="20" y="150" width="120" height="70" rx="6"/><text class="sv-tb" x="30" y="174">CR3</text><text class="sv-t" x="30" y="198">0x133000</text>
+<rect class="sv-b1" x="170" y="140" width="160" height="150" rx="6"/><text class="sv-tb" x="180" y="162">PML4 @ 0x133000</text><text class="sv-ts" x="180" y="190">[511] @ 0x133ff8</text><text class="sv-t" x="180" y="212">0x134027</text><text class="sv-ts" x="180" y="236">→ PDPT 0x134000</text><text class="sv-ts" x="180" y="256">P W U A</text>
+<rect class="sv-b2" x="350" y="140" width="160" height="150" rx="6"/><text class="sv-tb" x="360" y="162">PDPT @ 0x134000</text><text class="sv-ts" x="360" y="190">[510] @ 0x134ff0</text><text class="sv-t" x="360" y="212">0x135027</text><text class="sv-ts" x="360" y="236">→ PD 0x135000</text><text class="sv-ts" x="360" y="256">P W U A</text>
+<rect class="sv-b3" x="530" y="140" width="160" height="150" rx="6"/><text class="sv-tb" x="540" y="162">PD @ 0x135000</text><text class="sv-ts" x="540" y="190">[0] @ 0x135000</text><text class="sv-t" x="540" y="212">0x136027</text><text class="sv-ts" x="540" y="236">→ PT 0x136000</text><text class="sv-ts" x="540" y="256">P W U A, not 2 MiB</text>
+<rect class="sv-b4" x="710" y="140" width="190" height="150" rx="6"/><text class="sv-tb" x="720" y="162">PT @ 0x136000</text><text class="sv-ts" x="720" y="190">[276] @ 0x1368a0</text><text class="sv-t" x="720" y="212">0x8000000000114163</text><text class="sv-ts" x="720" y="236">→ frame 0x114000</text><text class="sv-ts" x="720" y="256">P W A D G NX, supervisor</text>
+<line class="sv-line" x1="140" y1="185" x2="164" y2="185"/><polygon class="sv-head" points="170,185 160,179 160,191"/>
+<line class="sv-line" x1="330" y1="215" x2="344" y2="215"/><polygon class="sv-head" points="350,215 340,209 340,221"/>
+<line class="sv-line" x1="510" y1="215" x2="524" y2="215"/><polygon class="sv-head" points="530,215 520,209 520,221"/>
+<line class="sv-line" x1="690" y1="215" x2="704" y2="215"/><polygon class="sv-head" points="710,215 700,209 700,221"/>
+<line class="sv-dash" x1="260" y1="94" x2="260" y2="140"/><line class="sv-dash" x1="400" y1="94" x2="430" y2="140"/><line class="sv-dash" x1="540" y1="94" x2="600" y2="140"/><line class="sv-dash" x1="680" y1="94" x2="780" y2="140"/>
+<rect class="sv-b5" x="560" y="340" width="340" height="80" rx="6"/><text class="sv-tb" x="572" y="364">physical 0x114000 + 0x008 = 0x114008</text><text class="sv-t" x="572" y="388">holds 0x5452414e534c4154</text><text class="sv-ts" x="572" y="408">(g_walk_target in .data)</text>
+<line class="sv-line" x1="805" y1="290" x2="805" y2="334"/><polygon class="sv-head" points="805,340 799,330 811,330"/>
+<line class="sv-dash" x1="825" y1="94" x2="880" y2="340"/>
+<text class="sv-ts" x="20" y="340">entry address = table base + 8 × index</text>
+<text class="sv-ts" x="20" y="360">next table = entry AND 0x000ffffffffff000</text>
+<text class="sv-ts" x="20" y="380">P present, W writable, U user allowed, A accessed,</text>
+<text class="sv-ts" x="20" y="400">D dirty, G global, NX no-execute (bit 63)</text>
+<text class="sv-ts" x="20" y="450">all numbers from the lab's monitor session (R3)</text>
+</svg></div><figcaption><b>Figure 1.</b> A four-level page-table walk, with the values QEMU's monitor printed in the lab (R3). Index fields and entry formats after the Intel SDM Vol. 3, "Paging" (4-level paging) <sup class="src"><a href="#F3-21-src-D1">D1</a></sup>; the entry decode is checked by R1.</figcaption></figure>
+
+<figure id="F3-21-fig2"><div class="svgbox">
+<svg viewBox="0 0 900 360" role="img" aria-labelledby="F3-21-f2t F3-21-f2d">
+<title id="F3-21-f2t">Figure 2: the kernel's virtual address layout after F3-21</title>
+<desc id="F3-21-f2d">A vertical bar of the 64-bit address space, not to scale, with the top at the top. From top: 0xffffffff80000000 plus physical: the kernel image, .text read and execute, .rodata read only and no-execute, .data and .bss read-write and no-execute, all global. 0xffffff0000000000: a guard page that is never mapped, then the 16 KiB kernel stack, read-write, no-execute. 0xffffe00000000000: the framebuffer window of F3-23. 0xffffe80000000000: device registers (MMIO) of F3-24 and F3-25, uncached. 0xffffd00000000000: large allocations of the heap in F3-22. 0xffffc00000000000: the region for the lab's random test mappings. 0xffff800000000000 plus physical: the direct map of RAM, read-write, no-execute, with reserved ranges below 4 GiB read only. Below a gap: the non-canonical hole. At the bottom: the lower half from 0 to 0x00007fffffffffff, empty in this course, reserved for user programs in OS303.</desc>
+<rect class="sv-bg" x="0" y="0" width="900" height="360"/>
+<rect class="sv-b1" x="40" y="20" width="300" height="40"/><text class="sv-t" x="50" y="44">kernel image</text>
+<text class="sv-ts" x="360" y="36">0xffffffff80000000 + phys: .text R X · .rodata R NX ·</text><text class="sv-ts" x="360" y="52">.data/.bss RW NX, all global</text>
+<rect class="sv-b2" x="40" y="66" width="300" height="30"/><text class="sv-t" x="50" y="86">kernel stack + guard page</text>
+<text class="sv-ts" x="360" y="86">0xffffff0000000000: guard (never mapped), stack 16 KiB above</text>
+<rect class="sv-b6" x="40" y="102" width="300" height="30"/><text class="sv-t" x="50" y="122">framebuffer (F3-23)</text><text class="sv-ts" x="360" y="122">0xffffe00000000000, write-combining via PAT</text>
+<rect class="sv-b7" x="40" y="138" width="300" height="30"/><text class="sv-t" x="50" y="158">MMIO window (F3-24, F3-25)</text><text class="sv-ts" x="360" y="158">0xffffe80000000000, uncached (PCD, PWT)</text>
+<rect class="sv-b5" x="40" y="174" width="300" height="30"/><text class="sv-t" x="50" y="194">heap large allocations (F3-22)</text><text class="sv-ts" x="360" y="194">0xffffd00000000000</text>
+<rect class="sv-box" x="40" y="210" width="300" height="30"/><text class="sv-t" x="50" y="230">test mappings (this lab)</text><text class="sv-ts" x="360" y="230">0xffffc00000000000</text>
+<rect class="sv-b3" x="40" y="246" width="300" height="34"/><text class="sv-t" x="50" y="268">direct map</text><text class="sv-ts" x="360" y="262">0xffff800000000000 + phys: RAM RW NX global;</text><text class="sv-ts" x="360" y="278">reserved ranges below 4 GiB read-only</text>
+<rect class="sv-box" x="40" y="286" width="300" height="20"/><text class="sv-ts" x="50" y="301">non-canonical hole</text>
+<rect class="sv-b4" x="40" y="310" width="300" height="34"/><text class="sv-t" x="50" y="332">lower half (user, OS303)</text><text class="sv-ts" x="360" y="332">0 – 0x00007fffffffffff: empty in OS302</text>
+</svg></div><figcaption><b>Figure 2.</b> The design note's layout table as a picture; not to scale. The kernel, stack, test and direct-map rows are confirmed by the monitor's <code>info mem</code> view in R3; the other windows are added by later chapters. Canonical-address rule after the Intel SDM <sup class="src"><a href="#F3-21-src-D1">D1</a></sup>.</figcaption></figure>
+
+<h2 id="F3-21-layer1">Layer 1 — the kid explanation</h2>
+<p>Programs do not use real memory addresses. They use made-up numbers, and the processor translates each one into a real address by looking it up in a map that the kernel wrote. The map also says what is allowed: some places may only be read, some may never be run as instructions, and some numbers lead nowhere on purpose, so a mistake is caught.</p>
+<p>The processor keeps a small notebook of translations it used recently, so it does not have to read the whole map every time. When the kernel changes the map, it must also tell the processor to forget the old notebook entry, or the processor will keep using it.</p>
+<div class="co analogy"><span class="lbl">Analogy</span><p>The map of lockers turns a locker number into a real cupboard, in four binders. Marks on each line say "staff only" or "look, don't touch". The principal's sticky note remembers recent look-ups; when a cupboard changes hands, the note must be torn off too.</p></div>
+
+<h2 id="F3-21-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F3-21-l2-split">Splitting an address</h3>
+<p>With 4-level paging a virtual address has 48 meaningful bits. The low 12 bits are the offset inside a 4 KiB page. The next four groups of 9 bits are indices into the four tables: bits 47–39 for the PML4, 38–30 for the PDPT, 29–21 for the PD and 20–12 for the PT. 9 bits select one of 512 entries, and 512 entries of 8 bytes fill exactly one 4 KiB page <sup class="src"><a href="#F3-21-src-D1">D1</a></sup>. Bits 63–48 must copy bit 47, which is what makes an address "canonical"; that rule splits the space into a lower and an upper half with a hole between them (F3-19's #GP test used an address in the hole).</p>
+<p>An entry in the PD can map a 2 MiB page directly (page-size bit set) instead of pointing to a PT; an entry in the PDPT can map 1 GiB the same way <sup class="src"><a href="#F3-21-src-D1">D1</a></sup>. The boot tables of F3-18 used only 2 MiB pages. The kernel's own tables use 4 KiB pages for its image (so each section can have its own rights) and 2 MiB pages for most of the direct map (fewer tables, fewer TLB entries).</p>
+<h3 id="F3-21-l2-rights">Rights</h3>
+<p>Each entry carries permission bits, and the effective right is the most restrictive along the walk: an address is writable only if every level allows writing, user-accessible only if every level allows user access, executable only if no level sets NX <sup class="src"><a href="#F3-21-src-D1">D1</a></sup>. This kernel keeps intermediate entries permissive (present, writable, user) and puts every restriction in the leaf, so one place decides. Two switches make the rights bite in kernel mode: EFER.NXE turns on the NX bit, and CR0.WP makes the CPU honour read-only pages even for ring-0 writes. Without WP, the kernel could write to its own <code>.rodata</code> unnoticed.</p>
+<h3 id="F3-21-l2-api">The address-space object</h3>
+<p><code>AddressSpace</code> owns one PML4 and offers <code>map</code> (one 4 KiB page), <code>map_2m</code>, <code>unmap</code> (clear the entry and invalidate the TLB entry), <code>protect</code> and <code>translate</code> (a software walk). Missing intermediate tables are allocated from the PMM and zeroed. The kernel builds its space once at boot, switches CR3 to it, and from then on the boot tables are no longer used. The address space for each user process arrives in OS303; it will share the kernel's upper half.</p>
+<h3 id="F3-21-l2-tlb">Why the TLB matters for correctness, not only speed</h3>
+<p>A walk costs up to four memory reads, so the CPU caches results in the TLB. The CPU does not watch the page tables for changes: if the kernel clears an entry and does nothing else, the old translation may stay in the TLB and keep working <sup class="src"><a href="#F3-21-src-D1">D1</a></sup>. So every change that removes or reduces rights must be followed by <code>invlpg</code> for that address (or a CR3 reload for non-global entries). On a multiprocessor, other CPUs' TLBs must be told too (a TLB shootdown, OS304). The forensic lab shows what one forgotten <code>invlpg</code> does.</p>
+
+<h2 id="F3-21-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F3-21-l3-build">Building the kernel space</h3>
+<p><code>build_kernel_space</code> in <code>paging.cc</code> does four things. First it enables the CPU features: EFER.NXE (bit 11), CR0.WP (bit 16), CR4.PGE (bit 7); R2 prints EFER <code>d00</code>, CR0 <code>80010011</code>, CR4 <code>a0</code> <sup class="src"><a href="#F3-21-src-R2">R2</a></sup>. Then it maps the kernel image section by section from the linker symbols of F3-18, with the least rights each needs, all global. Then it builds the direct map from the firmware's map: available RAM read-write and NX, using 2 MiB pages wherever a 2 MiB-aligned run fits and 4 KiB pages at the edges; reserved ranges below 4 GiB (ACPI tables, BIOS) read-only and NX, because later chapters read tables there; reserved ranges above 4 GiB not at all. Finally it switches CR3. For 128 MiB this costs 62 large pages, 1,024 small ones and 10 table pages <sup class="src"><a href="#F3-21-src-R2">R2</a></sup>.</p>
+<p>Two details came from failures in this build. The legacy BIOS area 0xE0000–0xFFFFF is where F3-23 and F3-24 search for the SMBIOS and ACPI entry points, but QEMU's map lists only 0xF0000–0xFFFFF as reserved; without an explicit read-only mapping, F3-23's SMBIOS scan page-faulted at <code>0xf0000</code> before the reserved range was mapped. And two map entries can share a partial page (available up to 0x9fbff, reserved from 0x9fc00): the second mapping attempt then hits an existing entry, so the code checks <code>translate</code> before mapping a 4 KiB edge page.</p>
+<h3 id="F3-21-l3-entry">The walk in code</h3>
+<p><code>AddressSpace::entry(virt, level, create)</code> walks from the PML4 down to the requested level, computing each index as <code>(virt &gt;&gt; (12 + 9 × (level − 1))) &amp; 511</code>, allocating and zeroing missing tables when asked, and refusing to descend through a 2 MiB leaf. <code>translate</code> is the same walk without allocation; at a 2 MiB leaf it keeps 21 offset bits instead of 12. The test of acceptance criterion 2 maps 1,000 random pages in a 4 TiB test region and checks the software walk against the CPU in two ways: <code>translate</code> must return the frame the test mapped, and a load through the mapping must read the value the test wrote through the direct map. Both agreed 1,000 times; the page-table count rose from 13 (10 at boot, 3 for the kernel stack) to 1,904, because random addresses rarely share tables <sup class="src"><a href="#F3-21-src-R2">R2</a></sup>.</p>
+<h3 id="F3-21-l3-tests">The four acceptance tests</h3>
+<ol>
+<li><b>Write to <code>.rodata</code></b>: page fault, error code 0x3 = present + write: "protection violation, write, supervisor mode" <sup class="src"><a href="#F3-21-src-R2">R2</a></sup>. Without CR0.WP the write would succeed.</li>
+<li><b>Execute from data</b>: a frame from the PMM gets the byte <code>0xC3</code> (<code>ret</code>) and is called through the direct map. Error code 0x11 = present + instruction fetch; RIP and CR2 both equal the page address <sup class="src"><a href="#F3-21-src-R2">R2</a></sup>. (The curriculum says "from the heap"; the heap arrives in F3-22 and uses the same NX direct map, so this is the same test.)</li>
+<li><b>Translate agrees with a manual walk</b> for 1,000 random addresses, as above; the "manual walk" by a person is the monitor session in Figure 1.</li>
+<li><b>Access after unmap faults</b>: the test writes through a fresh mapping, so its translation is certainly in the TLB, then unmaps and reads: error code 0x0, page not present. Only the <code>invlpg</code> in <code>unmap</code> makes that fault happen (the forensic lab removes it).</li>
+</ol>
+<h3 id="F3-21-l3-guard">The guard page, now with 4 KiB granularity</h3>
+<p>F3-19 had to sacrifice 2 MiB of the boot map for its guard. Now the kernel maps a 16 KiB stack at <code>0xffffff0000001000</code> and leaves <code>0xffffff0000000000</code> unmapped. The overflow variant recurses until RSP reaches <code>ffffff0000000f30</code> and CR2 reads <code>ffffff0000000f28</code>: inside the guard page; the double fault is reported on IST1 as in F3-19 <sup class="src"><a href="#F3-21-src-R5">R5</a></sup>. Every kernel thread in OS303 gets a stack built this way.</p>
+<h3 id="F3-21-l3-pat">Memory types and the PAT</h3>
+<p>Each leaf entry selects one of the eight PAT entries through three bits: PWT (bit 3), PCD (bit 4) and the PAT bit (bit 7 in a 4 KiB PTE, bit 12 in a large-page entry) <sup class="src"><a href="#F3-21-src-D1">D1</a></sup>. The MSR's reset value, printed in R2 as <code>0007040600070406</code>, holds one byte per entry, entry 0 in the low byte: 06 (write-back), 04 (write-through), 07 (uncached-minus), 00 (uncached), repeated. So ordinary pages (all three bits 0) are write-back; PCD + PWT selects entry 3, uncached, which F3-24 uses for device registers. Write-combining, which a framebuffer wants, is not among the reset entries; F3-23 rewrites entry 4 to write-combining (value 01) and selects it with the PAT bit alone. Different memory types for the same physical page through two mappings must be avoided; the direct map therefore does not cover device memory <sup class="src"><a href="#F3-21-src-D1">D1</a></sup>.</p>
+<h3 id="F3-21-l3-cost">What this design does not do</h3>
+<p>Page-table pages are never freed: unmapping leaves empty tables in place (the 1,891 tables added by test 3 stay allocated; R2's final statistics show it). A user-process address space must reclaim them on exit (OS303). There is no PCID (process-context identifiers would let TLB entries of several address spaces coexist), no 1 GiB pages, and no 5-level paging, which the curriculum lists for awareness <sup class="src"><a href="#F3-21-src-D1">D1</a></sup>.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>From memory, and confirmed only as far as the runs show: the bit positions EFER.NXE = 11, CR0.WP = 16, CR4.PGE = 7; the PAT MSR number 0x277 and its encoding (00 UC, 01 WC, 04 WT, 05 WP, 06 WB, 07 UC-); the PAT bit position 7 in a 4 KiB PTE and 12 in a 2 MiB entry; the rule that effective rights combine all levels; the behaviour of global entries on CR3 writes. Check them in the Intel SDM Vol. 3, "Paging" and "Memory Cache Control" (D1), and the AMD64 APM Vol. 2, "Page Translation and Protection" (D2). The runs confirm: QEMU 8.2.2 accepts the entries, faults with the decoded error codes, prints the PAT value above, and the monitor's walk agrees with the kernel's (R2, R3).</p></div>
+
+<h2 id="F3-21-hardware">How the hardware actually does it</h2>
+<p>The page walker is a hardware unit in each core. On a TLB miss it reads the PML4 entry from memory (through the caches), then the PDPT entry, the PD entry and the PT entry, checks rights at every level, and fills the TLB with the result. It also sets the accessed bit in each entry it uses and the dirty bit in the leaf on a write, which is why the lab's entries end in <code>…27</code> (accessed set) and the leaf in <code>…163</code> (accessed and dirty) <sup class="src"><a href="#F3-21-src-D1">D1</a></sup> <sup class="src"><a href="#F3-21-src-R3">R3</a></sup>. Processors also cache upper-level entries in paging-structure caches, which is another reason the SDM's invalidation rules must be followed exactly <sup class="src"><a href="#F3-21-src-D1">D1</a></sup>.</p>
+<p>QEMU's TCG emulates the walk and keeps its own software TLB per CPU. It behaves like real hardware in the way that matters here: a translation it has cached stays in use until <code>invlpg</code> or a CR3 write, as the forensic lab shows <sup class="src"><a href="#F3-21-src-R4">R4</a></sup>. How long a real CPU keeps an entry depends on the model and on what else runs; the bug may hide on one machine and appear on another, which is why it must be prevented by discipline rather than found by testing.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p>Untested on hardware. Real CPUs differ in TLB sizes and in which paging features they support (1 GiB pages, PCID, 5-level paging); query CPUID before using any of them. The stale-TLB behaviour on a particular real processor was not observed in this build.</p></div>
+
+<h2 id="F3-21-worked">Worked example</h2>
+<p>Exam P of this course: "walk a page-table translation by hand from a QEMU monitor dump". Here is the lab's dump (R3), solved the way the exam expects.</p>
+<ol>
+<li><b>Get CR3.</b> <code>info registers</code> shows <code>CR3=0000000000133000</code>. The PML4 is at physical 0x133000 (the low 12 bits of CR3 hold flags, all zero here).</li>
+<li><b>Split the address</b> <code>0xffffffff80114008</code>. In binary the bits 47–39 are all ones: PML4 index 511. Bits 38–30: 0x80114008 has bit 31 set and bit 30 clear, and bits 32–38 are ones, so the 9-bit field is 1 1111 1110 = 510. Bits 29–21: 0x80114008 &amp; 0x3FE00000 = 0, index 0. Bits 20–12: (0x114008 &gt;&gt; 12) &amp; 511 = 0x114 = 276. Offset: 0x008.</li>
+<li><b>PML4 entry</b> at 0x133000 + 8 × 511 = 0x133ff8: <code>xp /1gx 0x133ff8</code> → <code>0x0000000000134027</code>. Bit 0 set: present. Next table: 0x134000.</li>
+<li><b>PDPT entry</b> at 0x134000 + 8 × 510 = 0x134ff0 → <code>0x135027</code>. Bit 7 clear: not a 1 GiB page. Next: 0x135000.</li>
+<li><b>PD entry</b> at 0x135000 + 0 → <code>0x136027</code>. Bit 7 clear: not a 2 MiB page. Next: 0x136000.</li>
+<li><b>PT entry</b> at 0x136000 + 8 × 276 = 0x1368a0 → <code>0x8000000000114163</code>. Frame 0x114000; flags 0x163 = present (1), writable (2), accessed (0x20), dirty (0x40), global (0x100); bit 63 = NX; bit 2 clear = supervisor only.</li>
+<li><b>Physical address</b> 0x114000 + 0x008 = 0x114008. Check: <code>xp /1gx 0x114008</code> shows the kernel's value <code>0x5452414e534c4154</code>, and <code>gva2gpa</code> agrees: <code>gpa: 0x114008</code>.</li>
+</ol>
+<p>Note also that the result is consistent with the higher-half rule of F3-18: virtual <code>0xffffffff80114008</code> − <code>0xffffffff80000000</code> = physical 0x114008.</p>
+
+<h2 id="F3-21-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F3-21/</code>.</p>
+<p><b>Listing 1</b> — <code>paging.h</code></p>
+<pre class="listing" data-src="F3-21/paging.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–22</td><td>entry bits</td><td>Names for every flag the kernel uses, and the address mask.</td><td>Bit 7 has two meanings (PS in a PD, PAT in a PT): two names.</td></tr>
+<tr><td>22–32</td><td><code>split</code></td><td>The four indices and the offset.</td><td><code>constexpr</code>, tested on the host (R1).</td></tr>
+<tr><td>34–52</td><td><code>AddressSpace</code></td><td>The API: init, map, map_2m, unmap, protect, translate, activate.</td><td><code>unmap_no_flush</code> exists only for the forensic lab.</td></tr>
+<tr><td>54–56</td><td>kernel functions</td><td>CPU features, the kernel's space, the builder.</td><td>Every later chapter calls <code>build_kernel_space</code>.</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>paging.cc</code></p>
+<pre class="listing" data-src="F3-21/paging.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>24–35</td><td><code>init</code></td><td>One zeroed PML4 from the PMM.</td><td>The root of the address space.</td></tr>
+<tr><td>39–67</td><td><code>entry</code></td><td>Walks down, creating zeroed tables if asked; permissive intermediate entries.</td><td>Line 43: the index formula.</td></tr>
+<tr><td>69–87</td><td><code>map</code>, <code>map_2m</code></td><td>Refuse to overwrite a present entry.</td><td>An accidental double map is a bug, not an update.</td></tr>
+<tr><td>89–106</td><td><code>unmap_no_flush</code>, <code>unmap</code></td><td>Clear the entry; <code>unmap</code> adds <code>invlpg</code>.</td><td>Line 104: the line the forensic driver lacked.</td></tr>
+<tr><td>108–139</td><td><code>protect</code>, <code>translate</code></td><td>Change rights with invalidation; walk in software, 2 MiB aware.</td><td>Line 130: the offset bits depend on the leaf level.</td></tr>
+<tr><td>146–153</td><td><code>enable_cpu_features</code></td><td>NXE, WP, PGE; prints them and the PAT.</td><td>Rights mean nothing without these switches.</td></tr>
+<tr><td>160–221</td><td><code>build_kernel_space</code></td><td>Kernel sections, direct map, BIOS area, CR3 switch.</td><td>Lines 186–205: the rules for each range type.</td></tr>
+</tbody></table></div>
+<p><b>Listing 3</b> — <code>b4_main.cc</code></p>
+<pre class="listing" data-src="F3-21/b4_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>56–61</td><td><code>test_rodata_write</code></td><td>Writes to a <code>const</code> variable.</td><td>Acceptance test 1, first half.</td></tr>
+<tr><td>63–79</td><td><code>test_nx</code></td><td>Calls a data page holding <code>ret</code>.</td><td>Acceptance test 1, second half.</td></tr>
+<tr><td>81–117</td><td><code>test_translate</code></td><td>1,000 random mappings, software and CPU checks, then unmap.</td><td>Acceptance test 2.</td></tr>
+<tr><td>119–130</td><td><code>test_unmap_faults</code></td><td>Map, touch, unmap, read.</td><td>Acceptance test 3.</td></tr>
+<tr><td>132–145</td><td><code>print_layout</code></td><td>The layout table and the walk target.</td><td>Compared with <code>info mem</code> (acceptance test 4).</td></tr>
+<tr><td>167–198</td><td><code>stale_tlb_driver</code></td><td>Map, use, unmap, free, reuse, late write.</td><td>The forensic scenario.</td></tr>
+<tr><td>226–249</td><td><code>kmain</code></td><td>Builds the space, maps a guarded 16 KiB stack, switches to it.</td><td>From here on the boot stack is unused.</td></tr>
+</tbody></table></div>
+<p><b>Listing 4</b> — <code>qmp_walk.py</code> (the monitor session) and <code>pte_host.cpp</code></p>
+<pre class="listing" data-src="F3-21/qmp_walk.py"></pre>
+<pre class="listing" data-src="F3-21/pte_host.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>q 47–56</td><td>wait</td><td>Starts QEMU with QMP on a pipe; waits for the kernel's "waiting" line; reads the walk target.</td><td>The kernel halts with its tables in place.</td></tr>
+<tr><td>q 57–61</td><td>CR3, <code>info mem</code></td><td>Asks the monitor for registers and the mapping view.</td><td>Acceptance test 4 compares <code>info mem</code> with the layout.</td></tr>
+<tr><td>q 63–74</td><td>walk</td><td>For each level: index, entry address, <code>xp</code>, next table; then the data and <code>gva2gpa</code>.</td><td>Exactly the steps of the worked example.</td></tr>
+<tr><td>pte_host</td><td>cases, entry</td><td>Index split for four addresses; decode of the monitor's PT entry.</td><td>Checks <code>split</code> and the flag names on the host.</td></tr>
+</tbody></table></div>
+
+<h2 id="F3-21-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A locker map has one level; page tables have four, and the tables themselves are ordinary frames that the kernel must allocate, map and (in OS303) free.</li>
+<li>A sticky note that disagrees with the map is visibly wrong. A stale TLB entry gives no sign at all: the software walk (Figure 1) says "not mapped" while the CPU still writes through the old translation.</li>
+<li>"Look, don't touch" is a request; read-only pages are enforced by hardware, but only once CR0.WP is set for kernel code.</li>
+</ul>
+
+<h2 id="F3-21-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Restrictive intermediate entries</b>: a read-only PDPT entry silently makes a whole 1 GiB read-only. Keep restrictions in the leaves, or document them.</li>
+<li><b>Forgetting EFER.NXE</b> before setting bit 63: the CPU treats bit 63 as reserved and raises a page fault with the reserved-bit flag (0x8 in the error code).</li>
+<li><b>Mapping MMIO through the write-back direct map</b>: device registers cached; writes delayed or merged. Map devices separately and uncached (F3-24).</li>
+<li><b>Changing an entry without <code>invlpg</code></b>: works in some runs, fails in others (the forensic lab).</li>
+<li><b>Switching CR3 to tables that do not map the current code or stack</b>: immediate triple fault. Map the kernel image and the stack before <code>activate</code>.</li>
+<li><b>Debugging</b>: the monitor's <code>info mem</code> and <code>info tlb</code>, <code>xp</code> and <code>gva2gpa</code> (Listing 4), and <code>-d int</code> for the faults. In gdb, <code>monitor info mem</code> works through the gdb stub.</li>
+</ul>
+
+<div class="co transition" id="F3-21-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F3-20, frames handed out by a buddy allocator, reached through the boot direct map. <b>What carries over:</b> the higher-half layout and direct-map offset of F3-18, frames from the PMM (now also for page tables), the exception reports of F3-19 (every test here ends in one). <b>What changes:</b> the kernel owns its address space; rights are enforced per section; stacks have guard pages; TLB invalidation becomes part of every unmap. <b>What comes next:</b> F3-22 builds the kernel heap on top of frames and mappings, so that <code>new</code> and <code>delete</code> work in the kernel.</p></div>
+
+<h2 id="F3-21-check">Check yourself</h2>
+<ol>
+<li>Split <code>0xffff800000000000</code> and <code>0xffffff0000001000</code> into indices. Check with <code>pte_host.out</code>.</li>
+<li>Why does the PT entry of the walk end in <code>163</code> while the upper entries end in <code>027</code>?</li>
+<li>Explain in your own words why a cleared page-table entry is not enough to make an access fault.</li>
+<li>What error code do you predict for a user-mode read of a supervisor-only page that is present? Explain each bit.</li>
+<li>Which of these needs <code>invlpg</code> afterwards: (a) mapping a new page where nothing was mapped; (b) unmapping; (c) making a page read-only; (d) making a read-only page writable? Explain each.</li>
+<li>Apply to a new case: a kernel maps its framebuffer through the direct map with write-back caching. What could you see on the screen, and how does F3-23 avoid it?</li>
+<li>Predict-then-run: remove the CR0.WP line from <code>enable_cpu_features</code>. What does test 1 print now?</li>
+<li>From <code>info mem</code> in R3: why are <code>.text</code> and <code>.rodata</code> shown as one range <code>ffffffff8010d000-ffffffff80114000 -r-</code>, although their NX bits differ?</li>
+<li>How many page-table pages does it take to map one 4 KiB page at a random address in an otherwise empty region of the upper half, and why did test 3 need 1,891 for 1,000 pages?</li>
+</ol>
+
+<h2 id="F3-21-lab">Lab</h2>
+<p><b>Goal.</b> Milestone B4: the kernel builds and owns its page tables: higher-half kernel, a direct map of physical memory, guard pages, correct permissions; mapping and unmapping APIs with TLB invalidation.</p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2 with its monitor reached through QMP (<code>qmp_walk.py</code>, Python 3), g++ 13.3.0. Folder <code>university/labs/F3-21</code>; run <code>university/labs/run_lab.sh university/labs/F3-21</code> (about 15 seconds).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>QEMU first. A page-table mistake on a real machine can map device memory as cacheable or let a stray write reach firmware memory; never run unreviewed paging code on a machine whose data you need.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Read <code>b4.out</code> and match each test with its acceptance criterion.</li>
+<li>Read <code>walk.out</code> and redo every step of the walk on paper before reading the next line.</li>
+<li>Compare <code>info mem</code> in <code>walk.out</code> with the layout printed in <code>b4.out</code>; explain every difference.</li>
+<li>Read <code>guard.out</code>: confirm CR2 lies in the guard page.</li>
+<li>Change the walk target to a direct-map address in <code>b4_main.cc</code> and predict the walk (it ends at a 2 MiB page) before running.</li>
+</ol>
+<p><b>Expected observations.</b></p>
+<pre class="output" data-run="F3-21/pte_host"></pre>
+<pre class="output" data-run="F3-21/b4"></pre>
+<pre class="output" data-run="F3-21/walk"></pre>
+<pre class="output" data-run="F3-21/guard"></pre>
+<p><b>Verification</b> (the milestone's acceptance tests, verbatim):</p>
+<ul>
+<li>Writing to the kernel's read-only data section page-faults with a "write to read-only" decode; executing from the heap page-faults with an "instruction fetch" decode (NX works).</li>
+<li>Translate agrees with a manual page walk for 1,000 random mapped addresses.</li>
+<li>After unmapping a page, an access faults (proves the TLB was invalidated).</li>
+<li>The QEMU monitor's mapping view matches the layout table in the design note.</li>
+</ul>
+<p>In this build: tests 1, 2 and 4 of R2 fault with error codes 0x3, 0x11 and 0x0; test 3 agrees 1,000 of 1,000 times; R3's <code>info mem</code> shows the kernel sections, the 16 KiB stack above the unmapped guard, and the direct map with its read-only reserved ranges. <code>info mem</code> does not show the NX bit, so the execute rights are checked by test 2 instead.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>Triple fault right after the CR3 switch: the new tables do not map the code or the stack in use; print the layout before <code>activate</code>.</li>
+<li>Page fault with error bit 3 (reserved): NX used without EFER.NXE, or a physical address with bits above the CPU's limit.</li>
+<li>Test 1 does not fault: CR0.WP is not set.</li>
+<li><code>qmp_walk.py</code> waits forever: the kernel never printed "waiting for the QEMU monitor"; read the serial file it names.</li>
+</ul>
+<p><b>Extension.</b> Add <code>AddressSpace::destroy</code> that frees all page-table pages below a given level, and a test that the PMM's free count returns to its value before test 3.</p>
+
+<h2 id="F3-21-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Tomás maintains a driver that maps a buffer at a fixed kernel virtual address, uses it, then unmaps it and returns the frame. Since a "cleanup" of the unmap path, another subsystem reports corrupted data: words it initialised to <code>600d</code> change to values that look like the driver's. The page tables say the driver's buffer is not mapped any more.</p>
+<p><b>Evidence pack.</b> The driver's run (R4):</p>
+<pre class="output" data-run="F3-21/forensic_tlb"></pre>
+<p>The same run with one line of the driver changed back (R4):</p>
+<pre class="output" data-run="F3-21/forensic_fixed"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which frame did the driver use, which frame did the new owner get, and what did the new owner find?</li>
+<li>Hypotheses: the driver writes through a stale pointer into the direct map; the PMM handed the same frame out twice; the CPU used a cached translation. Which lines rule each in or out?</li>
+<li>Root cause: what does "software walk of the buffer: not mapped" prove, and why did the write still land?</li>
+<li>Fix: which line of <code>paging.cc</code> makes the second run fault instead?</li>
+<li>Prevention: how would you make it impossible to forget this in future code?</li>
+</ol>
+<p><b>Method hints.</b> Compare the frames. Then ask what the CPU uses for a translation it has used a moment before, and when it forgets it.</p>
+
+<h2 id="F3-21-project">Mini-project</h2>
+<p><b>The design note's memory layout, checked automatically.</b> Write a host script that reads <code>info mem</code> from a monitor session (extend <code>qmp_walk.py</code>) and a layout table in your design note (a simple text format), and reports every range that is in one but not the other, including rights. Run it on the lab kernel and on a kernel with one deliberate layout change.</p>
+<p><b>Rubric.</b> Script compares ranges and rights correctly (4). Real runs recorded for the matching and the deliberately broken layout (3). The design note's table is complete, including later chapters' windows (2). Limitations (no NX in <code>info mem</code>) stated (1).</p>
+
+<h2 id="F3-21-summary">Summary</h2>
+<ul>
+<li>A virtual address splits into four 9-bit indices and a 12-bit offset; each level's entry address is table base + 8 × index.</li>
+<li>Rights combine along the walk; keep restrictions in the leaves; NXE and WP make them apply to the kernel.</li>
+<li>The kernel image is mapped per section with the least rights; the direct map is NX; device memory stays out of it.</li>
+<li>Guard pages turn stack overflows into faults that the IST stack reports.</li>
+<li>The TLB is not coherent with the tables: every unmap or rights reduction needs <code>invlpg</code> (and later a shootdown).</li>
+<li>The QEMU monitor's <code>info registers</code>, <code>xp</code>, <code>info mem</code> and <code>gva2gpa</code> let you walk any translation by hand.</li>
+</ul>
+
+<h2 id="F3-21-sources">Sources</h2>
+<ol>
+<li id="F3-21-src-D1">Intel Corporation, "Intel 64 and IA-32 Architectures Software Developer's Manual", Volume 3 (tier 1; curriculum item 10; named in curriculum B4): "Paging" (4-level paging, entry formats, access rights, NX, global pages, PCIDs, TLB invalidation, 5-level paging) and "Memory Cache Control" (PAT, memory types). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-21-src-D2">AMD, "AMD64 Architecture Programmer's Manual", Volume 2: System Programming, "Page Translation and Protection" (tier 1; curriculum item 11). <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F3-21-src-D3">QEMU project, QEMU 8.2 documentation (tier 2): the monitor commands <code>info registers</code>, <code>info mem</code>, <code>xp</code>, <code>gva2gpa</code>, and QMP's <code>human-monitor-command</code>. <i>Title only — not opened during this build; the commands are cited from the run (R3).</i></li>
+<li id="F3-21-src-R1">R1 — lab run <code>university/labs/F3-21/pte_host.log</code>: host test of the address split and entry decode, g++ 13.3.0 with AddressSanitizer and UBSan, exit code 0.</li>
+<li id="F3-21-src-R2">R2 — lab run <code>b4.log</code>: the B4 test kernel on QEMU 8.2.2 (TCG), exit code 0 after the monitor session. Untested on hardware.</li>
+<li id="F3-21-src-R3">R3 — lab run <code>walk.log</code>: the monitor session through QMP (same QEMU run as R2).</li>
+<li id="F3-21-src-R4">R4 — forensic runs <code>forensic_tlb.log</code> and <code>forensic_fixed.log</code>, exit code 33 each.</li>
+<li id="F3-21-src-R5">R5 — lab run <code>guard.log</code>: the kernel-stack overflow variant, exit code 33.</li>
+</ol>
+
+<h2 id="F3-21-glossary">Glossary links</h2>
+<p><a href="#gl-page-table">Page table</a> · <a href="#gl-pml4">PML4</a> · <a href="#gl-page-table-entry-pte">Page-table entry</a> · <a href="#gl-tlb-translation-lookaside-buffer">TLB</a> · <a href="#gl-nx-no-execute">NX</a> · <a href="#gl-guard-page">Guard page</a> · <a href="#gl-global-page">Global page</a> · <a href="#gl-pat-page-attribute-table">PAT</a> · <a href="#gl-virtual-address-space">Virtual address space</a> · <a href="#gl-direct-map">Direct map</a></p>
+
+<h2 id="F3-21-next">Next chapter</h2>
+<p>Next: <a href="#F3-22">F3-22 The kernel heap and C++ allocation</a>. Previous: <a href="#F3-20">F3-20 The physical memory manager</a>. Back to the course: <a href="#OS302">OS302</a>. Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackB">Track B</a> (milestone B4).</p>
+
+<h2 id="F3-21-answers">Answers to Check yourself</h2>
+<ol>
+<li><code>0xffff800000000000</code>: PML4 256, PDPT 0, PD 0, PT 0, offset 0. <code>0xffffff0000001000</code>: PML4 510, PDPT 0, PD 0, PT 1, offset 0. Both lines are in <code>pte_host.out</code>.</li>
+<li>The upper entries are pointers to tables: present, writable, user (the permissive intermediate rule) and accessed: 0x27. The leaf adds dirty (0x40, the page was written), global (0x100), and lacks the user bit; NX sits in bit 63.</li>
+<li>Good answers say: the CPU may have the old translation in its TLB and keeps using it without reading the table again; only an invalidation (<code>invlpg</code>, a CR3 write for non-global entries) forces a new walk, which then finds the entry cleared and faults.</li>
+<li>0x5: bit 0 = 1 (present: a protection violation, not a missing page), bit 1 = 0 (read), bit 2 = 1 (user mode).</li>
+<li>(b) and (c) need it: the TLB may hold the old, more permissive translation. (a) does not: nothing could be cached for an unmapped page (a CPU does not cache "not present" in the TLB for 4-level paging, which you should confirm in D1). (d) is optional: the worst case is one spurious fault, which a kernel with a page-fault handler can treat as "retry" (OS303 does).</li>
+<li>Pixels arriving late or not at all, until the cache lines happen to be written back; partial frames. F3-23 maps the framebuffer separately with the write-combining type via the PAT, not through the direct map.</li>
+<li>Test 1 prints no exception: the write succeeds silently and "value still" shows <code>1</code>. Record the run to check.</li>
+<li><code>info mem</code> merges neighbouring pages whose user, read and write flags are equal; it does not print NX, so <code>.text</code> (R X) and <code>.rodata</code> (R NX) look the same to it.</li>
+<li>Up to three (a PDPT, a PD and a PT) below the existing PML4. Random addresses in a 4 TiB region rarely share a PD or PT, so most of the 1,000 mappings needed their own PD and PT and many their own PDPT: 1,904 − 13 = 1,891 new table pages (13 = 10 at boot plus 3 for the kernel stack).</li>
+</ol>
+<h3 id="F3-21-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> In each round the driver's buffer frame and the new owner's frame are the same, <code>0x13f000</code>: the PMM correctly reused the frame the driver had freed. The software walk says the buffer is not mapped. Yet the new owner's word reads <code>bad0001</code>, <code>bad0002</code>, <code>bad0003</code>: the driver's late write landed in it.</p>
+<p><b>Hypotheses.</b> A stale direct-map pointer would be possible, but the driver writes through <code>buf</code>, the unmapped address, as the code shows. The PMM did hand out the frame again, correctly, after the driver freed it; that is not a double allocation. A cached translation fits: the write used the old <code>buf → 0x13f000</code> translation.</p>
+<p><b>Root cause.</b> The "cleanup" replaced <code>unmap</code> with <code>unmap_no_flush</code>: the entry was cleared but the TLB entry remained. The software walk reads the tables (correct); the CPU uses the TLB (stale). QEMU's TCG keeps its software TLB entry until <code>invlpg</code> or a CR3 write, like a real TLB may.</p>
+<p><b>Fix.</b> Line 104 of <code>paging.cc</code>: <code>arch::invlpg(virt)</code> in <code>unmap</code>. With it, the late write page-faults (error code 0x2, CR2 = the buffer address) and the new owner keeps <code>600d</code> (second evidence file).</p>
+<p><b>Prevention.</b> Make invalidation part of the only public unmap and protect functions (remove <code>unmap_no_flush</code> from the API); on multiprocessors, batch invalidations with shootdowns in one function; keep the "access after unmap faults" test in the regression suite.</p>

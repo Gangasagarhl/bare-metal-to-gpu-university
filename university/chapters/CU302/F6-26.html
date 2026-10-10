@@ -1,0 +1,296 @@
+<!--meta
+id: F6-26
+title: Tensor cores with the WMMA API
+course: CU302
+level: L4
+prereqs: F6-25; F6-23; F6-21 (harness, row-major cuBLAS call); F6-15 (warp-level primitives)
+time: 10–16 hours including the lab and the forensic lab
+hardware: none for the coverage check, the fragment survey, the PTX/SASS reading and the forensic lab (nvcc 12.0, g++ 13.3 in the build container); running the WMMA kernel needs an NVIDIA GPU of compute capability 8.0 or newer for BF16 (the kernel's own guard), untested on hardware in this build
+maps: Curriculum E7 (FP16/BF16 inputs with FP32 accumulation on the matrix units; WMMA version first; tolerance justified from input rounding; disassembly shows the matrix instructions in the inner loop); 13.2 topics 6 and 7
+analogy: F6 — the great kitchen hall (registered: tensor / matrix cores = a machine that multiplies a whole small tray of numbers at once; big speed-up for the right shapes and types; only for specific sizes, layouts and number formats)
+-->
+
+<h2 id="F6-26-hook">Story hook</h2>
+<p>A new machine arrives in the great kitchen hall. You load it with a small square tray of amounts and a small square tray of weights, press one lever, and it adds every amount-times-weight combination into a third tray at once. One row of helpers operates it together: every helper of the row holds part of each tray, and the machine only starts when the whole row pulls the lever at the same moment.</p>
+<p>Esperanza, who runs the evening's table, is delighted, until she reads the label. The machine takes trays of exactly sixteen by sixteen. It accepts only the light measuring cups of <a href="#F6-25">F6-25</a> for the inputs, and it keeps its totals in the finely marked bowl. Which helper holds which part of the tray is "the machine's business": the manual says not to rely on it.</p>
+<p>And there is a warning sticker on the back: "In halls built before a certain year, this lever does nothing." Esperanza's colleague later finds out what that means the hard way — by bringing a recipe written for an old hall into a new one. This chapter puts the machine to work through NVIDIA's WMMA interface, proves from the compiler's output that it is really being used, and shows how a build flag can quietly take it away.</p>
+
+<h2 id="F6-26-able">What you will be able to do</h2>
+<ul>
+<li><b>Write</b> a mixed-precision GEMM (FP16 or BF16 inputs, FP32 accumulation) with <code>nvcuda::wmma</code> fragments, <code>load_matrix_sync</code>, <code>mma_sync</code> and <code>store_matrix_sync</code>.</li>
+<li><b>Explain</b> the warp-level contract of WMMA: all 32 threads participate, fragment contents are opaque, shapes and types are restricted.</li>
+<li><b>Prove</b> from PTX and SASS that the kernel uses tensor-core instructions in its inner loop, as milestone E7 requires.</li>
+<li><b>Test</b> the kernel with the tolerance derived in F6-25 and check its index arithmetic without a GPU.</li>
+<li><b>Diagnose</b> a build that contains no tensor-core instructions from <code>cuobjdump</code> evidence.</li>
+</ul>
+
+<div class="co jargon" id="F6-26-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Tensor core</dt><dd><b>Simple words:</b> a unit in the GPU that multiplies small matrices in one operation. <b>Analogy:</b> the tray machine. <b>Precise:</b> NVIDIA's name for the matrix-multiply-accumulate units of its GPUs, which compute D = A·B + C on small fixed-size tiles for specific input and accumulator types; reached from CUDA C++ through the WMMA API, PTX <code>wmma</code>/<code>mma</code> instructions or libraries. AMD calls its equivalent matrix cores (F7). <sup class="src"><a href="#F6-26-src-D1">D1</a></sup> <sup class="src"><a href="#F6-26-src-D2">D2</a></sup></dd>
+<dt>WMMA</dt><dd><b>Simple words:</b> NVIDIA's C++ interface for warp-wide matrix multiplies. <b>Analogy:</b> the lever and the instructions for the tray machine. <b>Precise:</b> warp matrix multiply-accumulate: the <code>nvcuda::wmma</code> namespace of <code>mma.h</code>, with class template <code>fragment</code> and the functions <code>fill_fragment</code>, <code>load_matrix_sync</code>, <code>mma_sync</code> and <code>store_matrix_sync</code> (all present in the CUDA 12.0 header read in this build). <sup class="src"><a href="#F6-26-src-H1">H1</a></sup> <sup class="src"><a href="#F6-26-src-D1">D1</a></sup></dd>
+<dt>Fragment</dt><dd><b>Simple words:</b> a piece of a small matrix spread over the registers of the 32 threads of a warp. <b>Analogy:</b> the part of each tray that each helper of the row holds. <b>Precise:</b> <code>wmma::fragment&lt;Use, m, n, k, T, Layout&gt;</code>, where Use is <code>matrix_a</code>, <code>matrix_b</code> or <code>accumulator</code>; each thread holds <code>num_elements</code> values whose mapping to matrix positions is not specified by the API. <sup class="src"><a href="#F6-26-src-H1">H1</a></sup> <sup class="src"><a href="#F6-26-src-D1">D1</a></sup></dd>
+<dt>Leading dimension (ldm)</dt><dd><b>Simple words:</b> how far apart, in elements, two consecutive rows (or columns) are in memory. <b>Analogy:</b> how many jars to skip on the shelf to get to the next row of the tray. <b>Precise:</b> the stride passed to <code>load_matrix_sync</code> and <code>store_matrix_sync</code>: for a row-major M × K matrix A, the leading dimension is K. <sup class="src"><a href="#F6-26-src-D1">D1</a></sup></dd>
+<dt>HMMA</dt><dd><b>Simple words:</b> the machine instruction that runs a half-precision-input matrix multiply on the tensor cores. <b>Analogy:</b> one pull of the lever. <b>Precise:</b> the SASS mnemonic seen in this build for <code>sm_80</code> and <code>sm_90</code>: <code>HMMA.16816.F32</code> (FP16 inputs, FP32 accumulate) and <code>HMMA.16816.F32.BF16</code>; each 16 × 16 × 16 <code>wmma.mma.sync</code> became two of them. <sup class="src"><a href="#F6-26-src-R3">R3</a></sup> <sup class="src"><a href="#F6-26-src-D3">D3</a></sup></dd>
+<dt>Compute capability / <code>-arch</code></dt><dd><b>Simple words:</b> the version number of a GPU's feature set, and the compiler option that chooses which one to build for. <b>Analogy:</b> the year the hall was built, and which hall the recipe is written for. <b>Precise:</b> <code>sm_XY</code> names the target; <code>__CUDA_ARCH__</code> is defined in device code to the target's value (800 for <code>sm_80</code>); a binary carries machine code (cubin) for the targets it was built for and PTX that the driver can compile later. <sup class="src"><a href="#F6-26-src-D1">D1</a></sup> <sup class="src"><a href="#F6-26-src-R5">R5</a></sup></dd>
+</dl></div>
+<p>Terms from earlier chapters: <a href="#gl-mixed-precision">mixed precision</a>, <a href="#gl-tolerance-test">tolerance</a> (F6-25); <a href="#gl-register-tiling">register tiling</a> (F6-23). "Warp" here is the NVIDIA term for 32 threads that execute together; AMD's wavefront is the similar group (F7).</p>
+
+<h2 id="F6-26-pictures">The idea in pictures</h2>
+<p>Figure 1 shows how Listing 1 divides C. A block of four warps computes a 64 × 64 tile; each warp computes a 32 × 32 tile, held as 2 × 2 accumulator fragments of 16 × 16; along K the warp loads two A fragments and two B fragments per step of 16 and issues four <code>mma_sync</code>.</p>
+<figure id="F6-26-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F6-26-f1t F6-26-f1d">
+<title id="F6-26-f1t">Figure 1: block, warp and fragment tiles of the WMMA kernel</title>
+<desc id="F6-26-f1d">Left: a 64 by 64 block tile of C divided into four 32 by 32 warp tiles labelled warp 0, warp 1, warp 2, warp 3 (warp 0 top left, warp 1 top right, warp 2 bottom left, warp 3 bottom right). Middle: the warp 0 tile enlarged, divided into four 16 by 16 accumulator fragments acc[0][0], acc[0][1], acc[1][0], acc[1][1]. Right: for one K step of 16, two A fragments a[0] and a[1] (16 by 16 each, from rows of A) and two B fragments b[0] and b[1] (from columns of B), with the text: 4 mma_sync per step: acc[i][j] += a[i] times b[j]; each loads straight from global memory in this first version. Not to scale.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="20" y="22">block tile of C: 64 × 64</text>
+<rect class="sv-box" x="20" y="34" width="200" height="200"/>
+<rect class="sv-b6" x="20" y="34" width="100" height="100"/><text class="sv-ts" x="40" y="88">warp 0</text>
+<rect class="sv-b1" x="120" y="34" width="100" height="100"/><text class="sv-ts" x="140" y="88">warp 1</text>
+<rect class="sv-b1" x="20" y="134" width="100" height="100"/><text class="sv-ts" x="40" y="188">warp 2</text>
+<rect class="sv-b1" x="120" y="134" width="100" height="100"/><text class="sv-ts" x="140" y="188">warp 3</text>
+<line class="sv-line" x1="222" y1="84" x2="262" y2="84"/><polygon class="sv-head" points="262,79 270,84 262,89"/>
+<text class="sv-tb" x="280" y="22">warp tile: 32 × 32</text>
+<rect class="sv-b6" x="280" y="34" width="80" height="80"/><text class="sv-ts" x="284" y="78">acc[0][0]</text>
+<rect class="sv-b6" x="360" y="34" width="80" height="80"/><text class="sv-ts" x="364" y="78">acc[0][1]</text>
+<rect class="sv-b6" x="280" y="114" width="80" height="80"/><text class="sv-ts" x="284" y="158">acc[1][0]</text>
+<rect class="sv-b6" x="360" y="114" width="80" height="80"/><text class="sv-ts" x="364" y="158">acc[1][1]</text>
+<text class="sv-ts" x="280" y="214">each acc: 16 × 16 FP32 fragment</text>
+<text class="sv-tb" x="480" y="22">one K step of 16</text>
+<rect class="sv-b2" x="480" y="60" width="40" height="40"/><text class="sv-ts" x="484" y="84">a[0]</text>
+<rect class="sv-b2" x="480" y="110" width="40" height="40"/><text class="sv-ts" x="484" y="134">a[1]</text>
+<rect class="sv-b3" x="540" y="34" width="40" height="40"/><text class="sv-ts" x="544" y="58">b[0]</text>
+<rect class="sv-b3" x="590" y="34" width="40" height="40"/><text class="sv-ts" x="594" y="58">b[1]</text>
+<text class="sv-ts" x="540" y="100">4 × mma_sync per step:</text>
+<text class="sv-ts" x="540" y="116">acc[i][j] += a[i] × b[j]</text>
+<text class="sv-ts" x="540" y="140">A, B: FP16 or BF16, row-major</text>
+<text class="sv-ts" x="540" y="156">loaded from global memory</text>
+<text class="sv-ts" x="540" y="172">(no shared memory yet)</text>
+<text class="sv-ts" x="20" y="262">Grid: ⌈N ÷ 64⌉ × ⌈M ÷ 64⌉ blocks of 128 threads; M, N, K must be multiples of 16 (the launcher checks).</text>
+<text class="sv-ts" x="20" y="282">Not to scale.</text>
+</svg></div><figcaption><b>Figure 1.</b> The tile hierarchy of Listing 1. Listing 3 checks on the CPU that this walk writes every element of C exactly once. <sup class="src"><a href="#F6-26-src-R2">R2</a></sup></figcaption></figure>
+<p>Figure 2 shows what a fragment is, using Listing 4's survey of the header: the 32 threads of a warp jointly hold a 16 × 16 tile, but how many values each holds — and which ones — is the library's business.</p>
+<figure id="F6-26-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 210" role="img" aria-labelledby="F6-26-f2t F6-26-f2d">
+<title id="F6-26-f2t">Figure 2: a fragment is spread over the 32 threads of a warp in an unspecified way</title>
+<desc id="F6-26-f2d">Left: a 16 by 16 tile drawn as a grid with a question mark over it. Right: 32 small boxes in a row labelled thread 0 to thread 31, each with a register strip. Text: per thread, from mma.h of CUDA 12.0: FP16 matrix_a 16 values (32 times 16 equals 512 slots for 256 elements), BF16 matrix_a 8 values (256 slots), FP32 accumulator 8 values (256), TF32 matrix_a of 16 by 8: 4 values (128). Below: the mapping from slots to matrix positions is not part of the API; use load_matrix_sync, store_matrix_sync and fill_fragment, or per-element operations that do not depend on position.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="210"/>
+<rect class="sv-box" x="20" y="30" width="128" height="128"/>
+<line class="sv-dash" x1="52" y1="30" x2="52" y2="158"/><line class="sv-dash" x1="84" y1="30" x2="84" y2="158"/><line class="sv-dash" x1="116" y1="30" x2="116" y2="158"/>
+<line class="sv-dash" x1="20" y1="62" x2="148" y2="62"/><line class="sv-dash" x1="20" y1="94" x2="148" y2="94"/><line class="sv-dash" x1="20" y1="126" x2="148" y2="126"/>
+<text class="sv-tb" x="76" y="100">?</text>
+<text class="sv-ts" x="20" y="176">16 × 16 tile</text>
+<line class="sv-line" x1="152" y1="94" x2="192" y2="94"/><polygon class="sv-head" points="192,89 200,94 192,99"/>
+<rect class="sv-b2" x="210" y="40" width="14" height="40"/><rect class="sv-b2" x="228" y="40" width="14" height="40"/><rect class="sv-b2" x="246" y="40" width="14" height="40"/><rect class="sv-b2" x="264" y="40" width="14" height="40"/>
+<text class="sv-ts" x="284" y="66">…</text>
+<rect class="sv-b2" x="300" y="40" width="14" height="40"/><rect class="sv-b2" x="318" y="40" width="14" height="40"/>
+<text class="sv-ts" x="208" y="98">thread 0 … thread 31</text>
+<text class="sv-t" x="360" y="40">values per thread (CUDA 12.0 mma.h):</text>
+<text class="sv-ts" x="360" y="62">FP16 matrix_a 16×16×16: 16  → 512 slots for 256 elements</text>
+<text class="sv-ts" x="360" y="80">BF16 matrix_a 16×16×16: 8  → 256 slots</text>
+<text class="sv-ts" x="360" y="98">FP32 accumulator 16×16×16: 8  → 256 slots</text>
+<text class="sv-ts" x="360" y="116">TF32 matrix_a 16×16×8: 4  → 128 slots</text>
+<text class="sv-ts" x="20" y="194">Which slot holds which matrix element is not part of the API: load, store and fill through the wmma functions.</text>
+</svg></div><figcaption><b>Figure 2.</b> Fragments are opaque. The per-thread counts are the header's compile-time <code>num_elements</code>, printed by Listing 4. <sup class="src"><a href="#F6-26-src-R6">R6</a></sup> <sup class="src"><a href="#F6-26-src-D1">D1</a></sup></figcaption></figure>
+
+<h2 id="F6-26-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Tensor core = the tray machine; fragment = the part of a tray each helper of the row holds; <code>mma_sync</code> = the whole row pulling the lever together; <code>load_matrix_sync</code> / <code>store_matrix_sync</code> = filling and emptying the trays in the machine's own order; <code>-arch</code> = which hall the recipe is written for.</p></div>
+<p>Until now, every helper multiplied numbers one pair at a time. The tray machine multiplies a whole small square of pairs and adds them all up in one go. It is much faster, but it is picky: exact tray sizes, light cups only for the inputs, a fine bowl for the totals.</p>
+<p>A whole row works the machine together. If one helper of the row is missing, the machine does not work properly, so the recipe must make sure the whole row is there.</p>
+<p>The trays are filled by the machine's own loading tool. Nobody needs to know which helper holds which number, and nobody should rely on it.</p>
+
+<h2 id="F6-26-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-26-l2-api">The four calls</h3>
+<p>The WMMA API declares, in <code>mma.h</code>: a class template <code>fragment&lt;Use, m, n, k, T, Layout&gt;</code>; <code>fill_fragment(frag, value)</code>; <code>load_matrix_sync(frag, pointer, ldm)</code> for A and B fragments (and an overload with a layout argument for accumulators); <code>mma_sync(d, a, b, c)</code>, computing d = a·b + c; and <code>store_matrix_sync(pointer, frag, ldm, layout)</code>. <sup class="src"><a href="#F6-26-src-H1">H1</a></sup> For 16-bit inputs the CUDA 12.0 header defines the shapes m × n × k = 16 × 16 × 16, 32 × 8 × 16 and 8 × 32 × 16, for both <code>__half</code> and <code>__nv_bfloat16</code> (the BF16 ones, and TF32 with 16 × 16 × 8, only when <code>__CUDA_ARCH__ &gt;= 800</code> or in host code), with <code>row_major</code> or <code>col_major</code> layouts for A and B. <sup class="src"><a href="#F6-26-src-H1">H1</a></sup> The suffix <code>_sync</code> means that all threads of the warp must call the function together with the same arguments; the functions are collective over the warp. <sup class="src"><a href="#F6-26-src-D1">D1</a></sup></p>
+<h3 id="F6-26-l2-kernel">The kernel</h3>
+<p>Listing 1 is the "WMMA version first" of E7. <sup class="src"><a href="#F6-26-src-C1">C1</a></sup> Warp <code>w</code> = <code>threadIdx.x / warpSize</code> of a 128-thread block takes the 32 × 32 sub-tile at row <code>(w / 2)·32</code>, column <code>(w % 2)·32</code> of the block's 64 × 64 tile. It zero-fills four FP32 accumulator fragments, then for each k in steps of 16 loads two A fragments (rows <i>r</i> and <i>r</i> + 16, row-major with leading dimension K) and two B fragments (columns <i>c</i> and <i>c</i> + 16, row-major with leading dimension N), and performs four <code>mma_sync</code>. At the end it stores the four accumulators to C as row-major with leading dimension N. All conditions in the kernel depend only on warp-uniform values (<code>warpRow</code>, <code>warpCol</code>, <code>k</code>), so either the whole warp calls a WMMA function or none of it does.</p>
+<p>The kernel requires M, N and K to be multiples of 16; the launcher refuses other shapes. Real libraries pad or use predicated loads for the edges; padding is the lab extension. Pointer arithmetic such as <code>A + r * K + k</code> with r, k and K multiples of 16 keeps every fragment pointer a multiple of 16 elements (32 bytes) from the base; the alignment rules for <code>load_matrix_sync</code> are stated in the Programming Guide (unverified box below).</p>
+<h3 id="F6-26-l2-test">The test</h3>
+<p>Listing 2 rounds random FP32 values in [−1, 1] to the input type on the host, keeps the FP32 originals for the FP64 reference, and judges each element of C against F6-25's bound [(2u<sub>in</sub> + u<sub>in</sub><sup>2</sup>)(1 + γ<sub>K</sub>) + γ<sub>K</sub>]Σ|ab|, with u<sub>in</sub> = 2<sup>−11</sup> for FP16 and 2<sup>−8</sup> for BF16 and FP32 accumulation. <sup class="src"><a href="#F6-26-src-R1">R1</a></sup> It then times the kernel at <i>n</i> = 1,024, 2,048 and 4,096 against <code>cublasGemmEx</code> with the same input type, FP32 output and FP32 compute, using F6-21's row-major trick. On this build it stops at the first runtime call, so the correctness of the index walk is checked separately by Listing 3 on the CPU: for six shapes, every element of C is written exactly once, no fragment load reaches outside A or B, and the number of <code>mma_sync</code> calls is M·N·K ÷ 4,096. <sup class="src"><a href="#F6-26-src-R2">R2</a></sup></p>
+
+<h2 id="F6-26-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F6-26-l3-ptx">From <code>mma_sync</code> to HMMA</h3>
+<p>The PTX for <code>sm_80</code> contains <code>wmma.mma.sync.aligned.row.row.m16n16k16.f32.f32</code> in the FP16 kernel and <code>wmma.mma.sync.aligned.row.row.m16n16k16.f32.bf16.bf16.f32</code> in the BF16 kernel: the instruction name carries the layouts (row, row), the shape and the types. <sup class="src"><a href="#F6-26-src-R3">R3</a></sup> <sup class="src"><a href="#F6-26-src-D2">D2</a></sup> The FP16 kernel's PTX has 12 of them and the BF16 kernel's 4: the compiler unrolled the K loop differently for the two types (these are static counts in the code, not executed counts). In the SASS for both <code>sm_80</code> and <code>sm_90</code>, each became two instructions: 24 <code>HMMA.16816.F32</code> and 8 <code>HMMA.16816.F32.BF16</code>. <sup class="src"><a href="#F6-26-src-R3">R3</a></sup> The "16816" reads naturally as an m16 n8 k16 operation, so one 16 × 16 × 16 product is two halves of 8 columns; that reading of the mnemonic is an inference, to be confirmed in the SASS reference (D3).</p>
+<p>E7 asks that "the disassembly shows the matrix instructions in the inner loop". <sup class="src"><a href="#F6-26-src-C1">C1</a></sup> The <code>sass_loop</code> step finds the main loop of the BF16 kernel (the backward branch <code>@P5 BRA 0x590</code> at 0x0ac0) and lists its loads and tensor-core instructions: 8 <code>HMMA.16816.F32.BF16</code> per iteration, preceded by 16 <code>LD.E</code> loads of 4 bytes each. <sup class="src"><a href="#F6-26-src-R4">R4</a></sup> That is the evidence E7 wants — and it also shows this first version's weakness.</p>
+<h3 id="F6-26-l3-weak">Why this first version is slow by design</h3>
+<p>Three things in the SASS loop deserve attention. The loads are <code>LD.E</code>, generic loads, not <code>LDG</code>: the compiler did not prove that the pointers point to global memory. They are 4 bytes each: two 16-bit elements per load, so a warp issues 16 load instructions per step of 16 in K for its four fragments. And they come straight from global memory: each A fragment is re-read by every warp and block that needs it, with no shared-memory reuse beyond what the warp tile gives (16 FLOP per byte read at the warp level, 32 per byte for the block, in F6-27's Listing 2). <sup class="src"><a href="#F6-26-src-R4">R4</a></sup> <sup class="src"><a href="#F6-26-src-R7">R7</a></sup> Everything F6-22 to F6-24 taught applies again: stage A and B tiles through shared memory with asynchronous copies, give each warp a larger tile of fragments, load fragments from shared memory with wide loads. Library kernels do all of this and more; <a href="#F6-27">F6-27</a> reads how CUTLASS organises it. The lab's measurements against cuBLAS will show how much this matters on your GPU.</p>
+<h3 id="F6-26-l3-guard">The architecture guard</h3>
+<p>BF16 fragments exist in <code>mma.h</code> only for <code>__CUDA_ARCH__ &gt;= 800</code>. <sup class="src"><a href="#F6-26-src-H1">H1</a></sup> Listing 1 therefore compiles its body only for those targets and otherwise executes <code>__trap()</code>, so that a wrong build fails loudly instead of writing nothing (the harness would then find NaN everywhere, because C is poisoned). The forensic lab shows why this guard matters: a build without <code>-arch</code> produced machine code for <code>sm_52</code> and PTX for <code>sm_52</code> only, and both contain the trap path. <sup class="src"><a href="#F6-26-src-R5">R5</a></sup> If the driver compiles that PTX for a newer GPU at load time, it compiles the code as written for <code>sm_52</code> — with <code>__CUDA_ARCH__</code> already fixed at 520 — so the trap remains. <sup class="src"><a href="#F6-26-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>(1) Alignment and leading-dimension requirements of <code>load_matrix_sync</code> and <code>store_matrix_sync</code> (pointer alignment in bytes; ldm a multiple of a number of elements that depends on the type): CUDA C++ Programming Guide, warp matrix functions. Listing 1 keeps every pointer at a multiple of 32 bytes from a <code>cudaMalloc</code> base and every ldm a multiple of 16, which is the most this build can state. (2) Which compute capabilities support which WMMA types (FP16 since 7.0, BF16 and TF32 since 8.0 per the header's own guards in this toolkit) and the throughput of each: Programming Guide and the architecture whitepaper of your GPU. (3) <code>cublasGemmEx</code> with <code>CUDA_R_16F</code>/<code>CUDA_R_16BF</code> inputs, <code>CUDA_R_32F</code> output and <code>CUBLAS_COMPUTE_32F</code> compiled and linked against CUDA 12.0's cuBLAS in this build; its semantics, and whether it uses tensor cores for these arguments, must be read in the cuBLAS documentation. (4) What the driver does with a trap at run time (the error code your program will see).</p></div>
+
+<h2 id="F6-26-hardware">How the hardware actually does it</h2>
+<p>A tensor-core instruction is issued by one warp and computes a small matrix product whose operands are spread over the registers of the warp's 32 threads; the hardware gathers them, multiplies, accumulates and scatters the result back into registers. <sup class="src"><a href="#F6-26-src-D1">D1</a></sup> <sup class="src"><a href="#F6-26-src-D2">D2</a></sup> In the SASS line <code>HMMA.16816.F32.BF16 R8, R44.reuse, R54, R8</code>, R8 is both the accumulator input and output, R44 holds A-fragment data and R54 B-fragment data, each naming the first of a group of consecutive registers; <code>.reuse</code> is an operand-reuse hint seen in this SASS. <sup class="src"><a href="#F6-26-src-R4">R4</a></sup> <sup class="src"><a href="#F6-26-src-D3">D3</a></sup> One <code>HMMA</code> replaces many <code>FFMA</code>: a 16 × 8 × 16 product is 2,048 multiply-adds, so if the reading of "16816" above is right, one instruction does the work that F6-23's kernel needed 2,048 FFMA instructions spread over a warp for (64 per thread). The arithmetic has moved from the FMA units to the tensor cores; the data movement has not changed, which is why staging through shared memory matters even more here than for SGEMM. Throughput per SM and per format is a product fact: your GPU's whitepaper.</p>
+
+<h2 id="F6-26-worked">Worked example</h2>
+<p><b>Task.</b> For M = 112, N = 208, K = 96 (one of the test shapes), compute the grid, the number of warps that do work, the number of <code>mma_sync</code> calls, and the number of <code>HMMA</code> instructions executed on <code>sm_80</code>; then the bound for a BF16 element with Σ|ab| = 24.</p>
+<ol>
+<li>Grid: ⌈208 ÷ 64⌉ × ⌈112 ÷ 64⌉ = 4 × 2 = 8 blocks, 32 warps.</li>
+<li>Warps with work: warp rows start at 0, 32, 64, 96 (all &lt; 112); warp columns at 0, 32, …, 224 — 224 ≥ 208, so the last column of warps returns. 4 × 7 = 28 warps work.</li>
+<li><code>mma_sync</code> calls: 112 × 208 × 96 ÷ (16 × 16 × 16) = 2,236,416 ÷ 4,096 = 546, as Listing 3 prints. <sup class="src"><a href="#F6-26-src-R2">R2</a></sup> (The warps on row 96 and column 192 have only one fragment row or column inside C, which is why the count is not 28 × 4 × 6.)</li>
+<li><code>HMMA</code> executed: 2 per <code>mma_sync</code> on <code>sm_80</code> (R3): 1,092.</li>
+<li>Bound factor for BF16, K = 96: 2u<sub>in</sub> + u<sub>in</sub><sup>2</sup> = 0.0078278; γ<sub>96</sub> = 96 × 2<sup>−24</sup> ÷ (1 − 96 × 2<sup>−24</sup>) = 5.722 × 10<sup>−6</sup>; factor ≈ 0.0078278 × 1.0000057 + 0.0000057 = 0.0078336. Tolerance for Σ|ab| = 24: 0.188.</li>
+</ol>
+
+<h2 id="F6-26-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>gemm_wmma.cuh</code>: the kernel.</p>
+<pre class="listing" data-src="F6-26/gemm_wmma.cuh"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>9–11</td><td><code>cuda_bf16.h</code>, <code>cuda_fp16.h</code>, <code>mma.h</code></td><td>Types and the WMMA API.</td><td>All names used below are declared in these CUDA 12.0 headers.</td></tr>
+<tr><td>13–15</td><td><code>WM, WN, WK = 16</code>; warp tile 32; block tile 64</td><td>The three tile levels.</td><td>Only the shapes listed in <code>mma.h</code> exist.</td></tr>
+<tr><td>20–22</td><td><code>#if __CUDA_ARCH__ &lt; 800 … __trap()</code></td><td>Guard for old targets.</td><td>A wrong build fails loudly (forensic lab).</td></tr>
+<tr><td>24–29</td><td><code>warp</code>, <code>warpRow</code>, <code>warpCol</code>, early return</td><td>Which 32 × 32 tile this warp owns; whole warps leave together.</td><td>WMMA calls must be made by all 32 threads; a per-thread condition would break that.</td></tr>
+<tr><td>30–35</td><td>accumulator fragments, <code>fill_fragment(…, 0.0f)</code></td><td>Four FP32 accumulators set to zero.</td><td>FP32 accumulation, as E7 requires.</td></tr>
+<tr><td>36–37</td><td><code>fragment&lt;matrix_a, …, T, row_major&gt; a[2]</code></td><td>Input fragments.</td><td>Type and layout are part of the type: a mismatch is a compile error.</td></tr>
+<tr><td>38</td><td><code>for (int k = 0; k &lt; K; k += WK)</code></td><td>Walk K in steps of 16.</td><td>K must be a multiple of 16.</td></tr>
+<tr><td>42, 48</td><td><code>load_matrix_sync(a[i], A + r * K + k, K)</code></td><td>Collective load of a 16 × 16 piece of A (ldm K) or B (ldm N).</td><td>The library chooses which thread holds what.</td></tr>
+<tr><td>54</td><td><code>mma_sync(acc[i][j], a[i], b[j], acc[i][j])</code></td><td>acc += a·b on the tensor cores.</td><td>Two <code>HMMA</code> each in the <code>sm_80</code> SASS.</td></tr>
+<tr><td>61–63</td><td><code>store_matrix_sync(C + r * N + c, acc[i][j], N, mem_row_major)</code></td><td>Writes a 16 × 16 FP32 tile.</td><td>Each element of C written once (Listing 3).</td></tr>
+</tbody></table></div>
+<p><b>Listing 2</b> — <code>wmma_gemm.cu</code>: E7's test and timing program.</p>
+<pre class="listing" data-src="F6-26/wmma_gemm.cu"></pre>
+<div class="tw"><table>
+<thead><tr><th>Part</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td><code>toFloat</code>, <code>fromFloat</code>, <code>unitRoundoff</code></td><td>specialisations for <code>__half</code> and <code>__nv_bfloat16</code></td><td>Conversions and u<sub>in</sub> per type.</td><td>One test template for both types.</td></tr>
+<tr><td><code>launchWmma</code> (lines 39–48)</td><td>multiple-of-16 check; grid; 128 threads</td><td>Refuses shapes the kernel cannot handle.</td><td>No silent partial results.</td></tr>
+<tr><td><code>testShape</code></td><td>FP32 originals kept; inputs rounded; NaN-poisoned C; F6-25 bound</td><td>Per-element test against FP64.</td><td>E7's tolerance "justified from FP16/BF16 input rounding".</td></tr>
+<tr><td><code>medianMs</code></td><td>warm-up, 20 runs, median; <code>cublasGemmEx</code></td><td>Times WMMA or cuBLAS.</td><td>Same protocol as E6 (F6-06).</td></tr>
+<tr><td><code>runType</code></td><td>five shapes; three sizes</td><td>Correctness then speed.</td><td>Speed runs use zero-filled inputs (lines 164–165); the lab asks you to repeat them with random data.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F6-26/wmma_gemm"></pre>
+<pre class="output" data-run="F6-26/build_sm80"></pre>
+<p><b>Listing 3</b> — <code>coverage.cpp</code>: the kernel's block → warp → fragment walk, replayed on the CPU.</p>
+<pre class="listing" data-src="F6-26/coverage.cpp"></pre>
+<pre class="output" data-run="F6-26/coverage"></pre>
+<p>Unlike the SGEMM kernels, the WMMA kernel cannot run on the university's emulator: its fragments are opaque, so an emulation would have to invent a layout. Listing 3 checks the part that is ours — the index arithmetic — and the GPU run checks the rest.</p>
+<p><b>Listing 4</b> — <code>fragments.cu</code>: values per thread in a fragment, read from the header (host code).</p>
+<pre class="listing" data-src="F6-26/fragments.cu"></pre>
+<pre class="output" data-run="F6-26/fragments"></pre>
+<p>The FP16 A fragment holds 16 values per thread, 512 slots for 256 elements: each element is held twice or the slots are padded — the header does not say, and the program cannot tell. The BF16 A fragment holds exactly 8. Two types of the same width, two different arrangements: never write code that depends on a fragment's internal order. <sup class="src"><a href="#F6-26-src-R6">R6</a></sup></p>
+<p>The compiler's view (<code>sm_80</code>, <code>sm_90</code>; compiled only): registers, PTX, SASS counts and the BF16 main loop. <sup class="src"><a href="#F6-26-src-R3">R3</a></sup> <sup class="src"><a href="#F6-26-src-R4">R4</a></sup></p>
+<pre class="output" data-run="F6-26/resources"></pre>
+<pre class="output" data-run="F6-26/ptx_wmma"></pre>
+<pre class="output" data-run="F6-26/sass_hmma"></pre>
+<pre class="listing" data-src="F6-26/sass_loop.py"></pre>
+<pre class="output" data-run="F6-26/sass_loop"></pre>
+
+<h2 id="F6-26-breaks">Where the analogy breaks</h2>
+<ul>
+<li>The tray machine in the story is one machine shared by the hall. Tensor cores are part of every SM, and each warp issues its own instructions to them; there is no queue for "the" machine.</li>
+<li>Helpers in the story load the trays by hand. Fragments live in the warp's registers; "loading the tray" is an ordinary load instruction (here 16 <code>LD.E</code> per step), so the machine is only as fast as the loads that feed it.</li>
+<li>The story's warning "in old halls the lever does nothing" suggests a harmless no-op. In Listing 1's default build the kernel traps; without the guard, a WMMA kernel for an unsupported target would not compile at all (the fragment types do not exist there), which is the better outcome.</li>
+</ul>
+
+<h2 id="F6-26-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>No <code>-arch</code>.</b> Symptom: the kernel traps (with Listing 1's guard) or fails to compile (without it). Find it: <code>cuobjdump -lelf</code> and <code>-lptx</code> on the binary, and a <code>grep HMMA</code> on its SASS (forensic lab). Fix: <code>-arch=sm_XY</code> for your GPU, or a <code>-gencode</code> list.</li>
+<li><b>Divergent WMMA calls.</b> Symptom: wrong results or a hang. Cause: a per-thread condition around <code>load_matrix_sync</code> or <code>mma_sync</code>. Fix: conditions on warp-uniform values only.</li>
+<li><b>Wrong layout tag.</b> Symptom: results look like A·B<sup>T</sup> or a transposed C. Cause: <code>col_major</code> fragment for row-major memory, or the wrong <code>mem_*_major</code> in the store. Find it: a non-symmetric test (M ≠ N, identity-like B).</li>
+<li><b>Wrong leading dimension.</b> Symptom: correct for square shapes only. Cause: ldm = M instead of K for A. Fix: ldm is the distance between consecutive rows of the stored matrix.</li>
+<li><b>Element-wise code that assumes a fragment order.</b> Symptom: works for FP16, wrong for BF16 (Listing 4 shows why). Fix: only position-independent operations on <code>frag.x[i]</code> (scaling, activation), or go through shared memory.</li>
+<li><b>Comparing FP16 results with the FP32 tolerance.</b> Symptom: "failures" everywhere. Fix: F6-25's bound with u<sub>in</sub>.</li>
+</ul>
+
+<div class="co transition" id="F6-26-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-23">F6-23</a> and <a href="#F6-24">F6-24</a> built FP32 GEMMs from FFMA instructions with register and shared-memory tiles; <a href="#F6-25">F6-25</a> derived tolerances for reduced-precision inputs. <b>What carries over:</b> the tile hierarchy (block, warp, now fragment), the harness protocol, the FP64 reference with a derived bound, and reading the SASS to prove what ran. <sup class="src"><a href="#F6-26-src-R3">R3</a></sup> <b>What changes:</b> the unit of work is a warp-wide 16 × 16 × 16 operation instead of a per-thread FMA; operands are opaque fragments; only specific shapes, types and targets exist, and a wrong <code>-arch</code> can remove the tensor cores from your binary. <sup class="src"><a href="#F6-26-src-H1">H1</a></sup> <sup class="src"><a href="#F6-26-src-R5">R5</a></sup> <b>What comes next:</b> <a href="#F6-27">F6-27</a> reads how CUTLASS and its layout algebra CuTe organise exactly these levels — threadblock, warp, instruction — together with staging, pipelining and swizzled layouts.</p></div>
+
+<h2 id="F6-26-check">Check yourself</h2>
+<ol>
+<li>Name the four WMMA functions Listing 1 uses and what each does.</li>
+<li>Explain in your own words why every condition around a WMMA call must have the same value in all 32 threads of a warp.</li>
+<li>Which statement is correct? (a) A fragment's element <code>x[0]</code> is always the top-left element of the tile. (b) The FP16 and BF16 A fragments of 16 × 16 × 16 hold the same number of values per thread. (c) <code>mma_sync</code> on <code>sm_80</code> became two <code>HMMA.16816</code> instructions in this build. (d) WMMA needs no particular <code>-arch</code>.</li>
+<li>Predict, then check in <code>sass_loop.out</code>: how many <code>HMMA</code> instructions per loop iteration does the BF16 kernel execute, and how many load instructions feed them?</li>
+<li>Apply it to a new case: M = N = K = 2,048. How many blocks, warps, <code>mma_sync</code> calls and <code>HMMA</code> instructions (on <code>sm_80</code>)?</li>
+<li>Why is the speed of this first WMMA kernel limited by loads rather than by the tensor cores? Give two pieces of evidence from the SASS loop.</li>
+<li>Why does Listing 1 trap instead of compiling an empty kernel for targets below <code>sm_80</code>?</li>
+<li>Why can the WMMA kernel not be tested on the university's CPU emulator, and what does Listing 3 test instead?</li>
+</ol>
+
+<h2 id="F6-26-lab">Lab</h2>
+<p><b>Goal.</b> Milestone E7, first part: "FP16/BF16 inputs with FP32 accumulation on the matrix units", "a WMMA/rocWMMA version first". Acceptance: "Error versus an FP64 reference within a tolerance justified from FP16/BF16 input rounding"; "Reaches X % of cuBLAS/hipBLASLt half-precision GEMM; the disassembly shows the matrix instructions in the inner loop." <sup class="src"><a href="#F6-26-src-C1">C1</a></sup></p>
+<p><b>Hardware and software needed.</b> Steps 1–3: none (this build: <code>Cuda compilation tools, release 12.0, V12.0.140</code>, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>). Steps 4–6: an NVIDIA GPU of compute capability 8.0 or newer (BF16), CUDA Toolkit and cuBLAS recorded in your dossier, or a cloud GPU instance. <b>Safety:</b> none beyond normal computer use.</p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-26</code>. Check <code>coverage.out</code> (every element once), <code>sass_hmma.out</code> and <code>sass_loop.out</code> (HMMA in the loop).</li>
+<li>Add the 32 × 8 × 16 shape as a variant (a warp tile of 64 × 16 from 2 × 2 fragments) and repeat the PTX/SASS reading. Which <code>wmma.mma</code> and <code>HMMA</code> appear?</li>
+<li>Add zero-padding on the host for shapes that are not multiples of 16 (copy into padded buffers), and extend the shape list of Listing 2 with 17 × 13 × 9 and 127 × 129 × 65.</li>
+<li>On a GPU: build Listing 2 with <code>-arch</code> for your GPU and <code>-DUSE_CUBLAS -lcublas</code>; run; record correctness (worst ratio of the bound per shape) and the speed table with the percentage of cuBLAS.</li>
+<li>Repeat the timing with random instead of zero-filled inputs and record any difference.</li>
+<li>Profile the WMMA kernel and cuBLAS at <i>n</i> = 4,096: tensor-core pipe utilisation, memory throughput, stall reasons. Explain the gap in three sentences.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: coverage correct for all six shapes; 24 and 8 <code>HMMA</code> in the two kernels for <code>sm_80</code> and <code>sm_90</code>; a main loop with 8 <code>HMMA</code> and 16 <code>LD.E</code>; GPU runs stop with <code>cudaErrorNoDevice</code>. On a GPU (untested here): all shapes within the bound; the WMMA kernel well below cuBLAS, with memory, not the tensor cores, as the limiter.</p>
+<p><b>Verification.</b> "ALL CHECKS PASSED" on your GPU; the SASS of your own build shows <code>HMMA</code> inside the loop; your E7 log records the bound, the worst ratio and the percentage of cuBLAS.</p>
+<p><b>Troubleshooting.</b> Compile errors about <code>fragment</code> for BF16 → target below <code>sm_80</code>. Kernel error at run time → check the build's architectures with <code>cuobjdump -lelf -lptx</code>. All elements fail with NaN → the kernel did not write C: a trap, a refused shape, or a launch error you did not check.</p>
+<p><b>Extension.</b> A TF32 variant: FP32 inputs, <code>precision::tf32</code> fragments of 16 × 16 × 8 and <code>wmma::__float_to_tf32</code> (both in the CUDA 12.0 <code>mma.h</code>); test with u<sub>in</sub> = 2<sup>−11</sup> and compare with the FP32 SGEMM of F6-24.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Listing 2 was built for the default target and for <code>sm_80</code> with cuBLAS; both runs stop with <code>cudaErrorNoDevice</code>. No tensor-core result and no time were produced in this build; correctness evidence is limited to the index walk (Listing 3) and the instruction-level reading of the binary.</p></div>
+
+<h2 id="F6-26-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Olumide's BF16 GEMM "works on my machine" but crashes on the team's new GPU server with a kernel error, and when he removes the <code>__trap()</code> guard to "fix" it, the build fails. His build script says <code>nvcc -std=c++17 -O2 wmma_gemm.cu</code>. The team lead asks for evidence before anybody touches the server's driver.</p>
+<p><b>Evidence pack.</b> What the binary from Olumide's build command contains, compared with a build with <code>-arch=sm_80</code> <sup class="src"><a href="#F6-26-src-R5">R5</a></sup>:</p>
+<pre class="output" data-run="F6-26/forensic_arch"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: which architectures do the two binaries contain machine code and PTX for, and how many <code>HMMA</code> and <code>BPT.TRAP</code> instructions does each contain?</li>
+<li>State two hypotheses for the crash (a driver problem on the server; a build that has no tensor-core code) and the evidence for each.</li>
+<li>Explain why the driver's compilation of the embedded PTX for the new GPU does not rescue the default build.</li>
+<li>Why did removing the guard make the build fail instead of fixing it?</li>
+<li>Propose the fix to the build script, and a CI check that would catch a binary without tensor-core instructions.</li>
+</ol>
+<p><b>Method hints.</b> Read the file names in the ELF and PTX lists; then connect the counts to the <code>#if</code> in lines 20–22 of Listing 1 and to the header's guards for BF16 fragments.</p>
+
+<h2 id="F6-26-project">Mini-project</h2>
+<p><b>E7, version 1, in MP3.</b> Add the WMMA kernel to your GEMM repository with: padding for any shape, both input types, the F6-25 tolerance with worst-ratio reporting, a CI job that builds for your target list and fails if the SASS of the BF16 kernel has no <code>HMMA</code> inside a loop (using a script like <code>sass_loop.py</code>), and, with GPU access, the E7 speed table against cuBLAS. <sup class="src"><a href="#F6-26-src-C1">C1</a></sup></p>
+<p><b>Rubric.</b> Correct for all shapes, including padded ones (3). Tolerance from F6-25 with worst ratio logged (2). CI checks for tensor-core instructions per target (2). Speed table with GPU, driver and toolkit printed by the tools (1). A written explanation of the gap to cuBLAS from profiler evidence (2).</p>
+
+<h2 id="F6-26-summary">Summary</h2>
+<ul>
+<li>WMMA exposes tensor cores as warp-wide operations on fragments: <code>fill_fragment</code>, <code>load_matrix_sync</code>, <code>mma_sync</code>, <code>store_matrix_sync</code>.</li>
+<li>Fragments are opaque: the header gives 16 values per thread for an FP16 A fragment and 8 for BF16; never depend on their order.</li>
+<li>In this build each 16 × 16 × 16 <code>mma_sync</code> became two <code>HMMA.16816</code> instructions on <code>sm_80</code> and <code>sm_90</code>; the BF16 main loop holds 8 <code>HMMA</code> fed by 16 <code>LD.E</code>.</li>
+<li>The test uses F6-25's bound; the index walk is verified on the CPU (every element once; M·N·K ÷ 4,096 <code>mma_sync</code>).</li>
+<li>A build without <code>-arch</code> contained only <code>sm_52</code> code and PTX with 0 <code>HMMA</code> and the trap; the driver's later compilation cannot add what the PTX does not contain.</li>
+<li>This first version loads fragments straight from global memory; staging and pipelining (F6-22 to F6-24, F6-27) are what libraries add.</li>
+</ul>
+
+<h2 id="F6-26-sources">Sources</h2>
+<ol>
+<li id="F6-26-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1): warp matrix functions (WMMA), their restrictions and alignment rules; compute capabilities; just-in-time compilation of PTX; <code>__CUDA_ARCH__</code>. <i>Title only — not opened during this build; the Source Researcher must confirm the version and sections (dossier gate G1 open).</i></li>
+<li id="F6-26-src-D2">D2 — NVIDIA, "Parallel Thread Execution ISA" (tier 1): <code>wmma.load</code>, <code>wmma.mma</code>, <code>wmma.store</code>, <code>mma</code>. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-26-src-D3">D3 — NVIDIA, "CUDA Binary Utilities" (tier 1): <code>cuobjdump</code> options <code>-sass</code>, <code>-lelf</code>, <code>-lptx</code>; SASS instruction reference (<code>HMMA</code>, <code>LD</code>, <code>BPT</code>). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-26-src-D4">D4 — NVIDIA, "cuBLAS" documentation (tier 1): <code>cublasGemmEx</code>, data types, compute types. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-26-src-H1">H1 — CUDA Toolkit 12.0 header <code>crt/mma.h</code> as installed in the build container, read during this build: the <code>nvcuda::wmma</code> declarations, fragment specialisations and shapes per type, the <code>__CUDA_ARCH__</code> guards (≥ 700 for the API, ≥ 800 for BF16 and TF32), <code>num_elements</code>. Vendor source code, tier 1 for what it declares.</li>
+<li id="F6-26-src-C1">C1 — Systems Curriculum (this project), milestone E7 (goal, build and acceptance tests quoted), local file <code>SYSTEMS_CURRICULUM.html</code>. A map, not a source (AH-4).</li>
+<li id="F6-26-src-R1">R1 — builds and runs of Listing 2 (<code>wmma_gemm.log</code>, <code>build_sm80.log</code>), <code>Cuda compilation tools, release 12.0, V12.0.140</code>; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+<li id="F6-26-src-R2">R2 — run of Listing 3 (<code>coverage.log</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with ASan and UBSan, exit code 0.</li>
+<li id="F6-26-src-R3">R3 — <code>ptxas -v</code>, PTX and SASS counts (<code>resources.log</code>, <code>ptx_wmma.log</code>, <code>sass_hmma.log</code>), <code>sm_80</code> and <code>sm_90</code>, compiled only.</li>
+<li id="F6-26-src-R4">R4 — SASS main loop of the BF16 kernel (<code>sass_loop.log</code>), <code>sm_80</code>, compiled only, extracted by <code>sass_loop.py</code>.</li>
+<li id="F6-26-src-R5">R5 — forensic comparison of two builds (<code>forensic_arch.log</code>), <code>cuobjdump -lelf</code>, <code>-lptx</code>, <code>-sass</code>, compiled only.</li>
+<li id="F6-26-src-R6">R6 — run of Listing 4 (<code>fragments.log</code>), nvcc 12.0, host code only, exit code 0.</li>
+<li id="F6-26-src-R7">R7 — run of F6-27 Listing 2 (<code>university/labs/F6-27/hierarchy.log</code>), g++, exit code 0.</li>
+</ol>
+
+<h2 id="F6-26-glossary">Glossary links</h2>
+<p><a href="#gl-tensor-core">Tensor core</a> · <a href="#gl-wmma">WMMA</a> · <a href="#gl-fragment-wmma">Fragment (WMMA)</a> · <a href="#gl-leading-dimension-ldm">Leading dimension (ldm)</a> · <a href="#gl-hmma">HMMA</a> · <a href="#gl-compute-capability-arch">Compute capability / -arch</a> · <a href="#gl-mixed-precision">Mixed precision</a> · <a href="#gl-tolerance-test">Tolerance (test)</a></p>
+
+<h2 id="F6-26-next">Next chapter</h2>
+<p><a href="#F6-27">F6-27 The CUTLASS and CuTe way: hierarchical tiles and layouts</a>. Previous: <a href="#F6-25">F6-25</a>. Back to the course: <a href="#CU302">CU302</a>.</p>
+
+<h2 id="F6-26-answers">Answers to Check yourself</h2>
+<ol>
+<li><code>fill_fragment</code> sets every value of a fragment (here the accumulators to 0); <code>load_matrix_sync</code> loads a 16 × 16 piece of A or B from memory with a leading dimension; <code>mma_sync</code> computes d = a·b + c; <code>store_matrix_sync</code> writes an accumulator to memory with a leading dimension and layout.</li>
+<li>The functions are collective: the warp's 32 threads together hold the fragment and together execute the operation. If some threads skip the call, the operation is incomplete and the results (or the program) are undefined.</li>
+<li>(c). (a) is false: the mapping is unspecified. (b) is false: 16 for FP16, 8 for BF16 (Listing 4). (d) is false: BF16 needs <code>sm_80</code> or newer in this toolkit's header, and the default build contained no tensor-core code.</li>
+<li>8 <code>HMMA.16816.F32.BF16</code> per iteration (4 <code>mma_sync</code> × 2), fed by 16 <code>LD.E</code> loads of 4 bytes.</li>
+<li>Blocks (2,048 ÷ 64)² = 1,024; warps 4,096; <code>mma_sync</code> 2,048³ ÷ 4,096 = 2,097,152; <code>HMMA</code> 4,194,304.</li>
+<li>Evidence: 16 load instructions per 8 <code>HMMA</code>, each loading only 4 bytes; generic <code>LD.E</code> loads straight from memory with no shared-memory reuse; F6-27's Listing 2 gives only 16 FLOP per byte at the warp level and 32 for the block. Each <code>HMMA</code> does 2,048 multiply-adds, so the loads, not the arithmetic, set the pace.</li>
+<li>Because a missing tensor-core path should fail loudly: a kernel that returns without writing would leave NaN in C (found by the test, but only if the test runs), while a trap stops the program at the first launch with an error you must check.</li>
+<li>The emulator would need to know which thread holds which fragment element, which the API leaves unspecified; inventing a layout would test our invention, not the kernel. Listing 3 tests our part: which tiles each warp loads and stores, and that every element of C is written exactly once.</li>
+</ol>
+<h3 id="F6-26-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>Default build: machine code for <code>sm_52</code> only and PTX for <code>sm_52</code> only; 0 <code>HMMA</code>, 2 <code>BPT.TRAP</code> (one per kernel instantiation). <code>-arch=sm_80</code> build: <code>sm_80</code> machine code and PTX; 32 <code>HMMA</code> (24 + 8), 0 traps.</li>
+<li>Driver problem: no evidence; the binary alone explains a trap. No tensor-core code: proven by 0 <code>HMMA</code> and 2 <code>BPT.TRAP</code> in the default build's SASS.</li>
+<li>The PTX in the default build was generated with <code>__CUDA_ARCH__</code> = 520, so it contains the trap branch of Listing 1 and no WMMA instructions. Compiling it for a newer GPU at load time translates that code faithfully; it cannot recover code the preprocessor removed.</li>
+<li>Without the guard, the device compilation for <code>sm_52</code> sees BF16 fragment types that <code>mma.h</code> does not declare below <code>__CUDA_ARCH__</code> 800 — a compile error, which is the honest outcome.</li>
+<li>Build with <code>-arch=sm_80</code> (or the server's architecture, or a <code>-gencode</code> list that includes it). CI: run <code>cuobjdump -sass</code> on the binary and fail if the WMMA kernels contain no <code>HMMA</code> (and list the architectures with <code>-lelf</code>).</li>
+</ol>
+<p>How the evidence was produced: <code>run.sh</code> step <code>forensic_arch</code> builds Listing 2 twice (with and without <code>-arch=sm_80</code>) and inspects both binaries with <code>cuobjdump</code>; compiled only, no GPU. The temporary file names in the ELF list differ between runs. Wrong answers: "the new GPU needs a driver update" (the binary has no code that could use any driver's tensor-core path); "BF16 is not supported by WMMA" (it is, for <code>sm_80</code>, as the second binary shows).</p>

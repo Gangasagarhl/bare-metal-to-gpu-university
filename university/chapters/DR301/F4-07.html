@@ -1,0 +1,330 @@
+<!--meta
+id: F4-07
+title: NVMe
+course: DR301
+level: L3
+prereqs: F4-01 to F4-06; OS302; HW205 (F1-50) recommended
+time: 9–12 hours including the lab and the course project
+hardware: none for the lab (QEMU 8.2.2 with TCG, q35 machine, QEMU's nvme device with two namespaces). A spare PC with an NVMe SSD you may erase is optional and untested in this build.
+maps: Curriculum Track C, milestone C6 (NVMe driver); the DR301 course project (root file system on NVMe in QEMU)
+analogy: F4 — the school and its visitors (pigeonholes with a numbered tray for orders and one for receipts, a bell on each, and a colour that changes every round)
+-->
+
+<h2 id="F4-07-hook">Story hook</h2>
+<p>After the old logistics company of F4-06, with its gates and forms inherited from another century, the school tries a new supplier built for speed. There is no access road and no form in a foreign language. There are pairs of trays: an order tray and a receipt tray. The school drops orders of exactly 64 bytes into the order tray and presses a bell with the tray's new count; the supplier puts 16-byte receipts into the receipt tray and the school presses another bell to say how far it has read. The school can set up one tray pair per teacher, so nobody waits for anybody.</p>
+<p>One detail is clever. Receipts are never wiped from the tray. Instead, in each round the supplier writes receipts in a different ink colour, so the school knows a receipt is new because its colour matches this round's colour. Forget about the colour and you will happily read last round's receipts as if they were new. This chapter builds an NVMe driver with admin and I/O queue pairs, PRP lists, Identify and namespaces, runs the random test with 1, 4 and 8 queue pairs, reads the course project's root file system from a second namespace, and shows exactly what happens to a driver that forgets the colour.</p>
+
+<h2 id="F4-07-able">What you will be able to do</h2>
+<ul>
+<li><b>Bring up</b> an NVMe controller: read CAP, disable, set up the admin queue pair, enable with the right entry sizes, wait for ready.</li>
+<li><b>Issue</b> admin commands: Identify Controller, the active namespace list, Identify Namespace, Set Features (number of queues), Create and Delete I/O queues.</li>
+<li><b>Submit and complete</b> I/O through submission queues, completion queues, doorbells and the phase tag.</li>
+<li><b>Describe</b> data with PRP entries and PRP lists for 1, 2 and more pages.</li>
+<li><b>Use</b> several I/O queue pairs and match completions to commands by command identifier.</li>
+<li><b>Read</b> a root file system from an NVMe namespace (the course project), and <b>diagnose</b> a driver that reads stale completions.</li>
+</ul>
+
+<div class="co jargon" id="F4-07-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>NVMe (NVM Express)</dt><dd><b>Simple words:</b> the standard way a computer talks to fast flash SSDs on PCI Express. <b>Analogy:</b> the new supplier's tray system. <b>Precise:</b> a host controller interface with memory-resident submission and completion queues, doorbell registers, and admin and I/O command sets; on PCI, class code 010802h with registers in BAR0. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-D2">D2</a></sup></dd>
+<dt>Submission queue (SQ)</dt><dd><b>Simple words:</b> a ring of commands the driver writes for the controller. <b>Analogy:</b> the order tray. <b>Precise:</b> a circular array of 64-byte entries in host memory; the driver owns the tail and advances it by writing the SQ tail doorbell; the controller consumes from the head. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup></dd>
+<dt>Completion queue (CQ)</dt><dd><b>Simple words:</b> a ring where the controller reports finished commands. <b>Analogy:</b> the receipt tray. <b>Precise:</b> a circular array of 16-byte entries (result, SQ head, SQ ID, command identifier, status with phase tag); the controller produces at the tail, the driver consumes at the head and reports it through the CQ head doorbell. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup></dd>
+<dt>Doorbell register</dt><dd><b>Simple words:</b> a register the driver writes to say "new orders up to here" or "I have read up to here". <b>Analogy:</b> the bells on the trays (not the faculty's doorbell analogy for interrupts, which ring the other way, from device to CPU). <b>Precise:</b> per queue, a tail doorbell for an SQ and a head doorbell for a CQ, at BAR0 offset 1000h + (2y or 2y + 1) × (4 &lt;&lt; CAP.DSTRD). <sup class="src"><a href="#F4-07-src-D2">D2</a></sup></dd>
+<dt>Phase tag</dt><dd><b>Simple words:</b> one bit in each completion that flips every time the controller goes round the queue. <b>Analogy:</b> this round's ink colour. <b>Precise:</b> bit 0 of the completion entry's status word; the controller writes the inverse of the previous value at that slot on each pass, starting from 1 on the first pass over a zeroed queue; an entry is new when its phase equals the phase the driver expects for the current pass. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup></dd>
+<dt>PRP (physical region page) entry</dt><dd><b>Simple words:</b> a pointer to one memory page of a command's data. <b>Analogy:</b> a shelf number on the order. <b>Precise:</b> a 64-bit physical address; a command carries PRP1 and PRP2; for data spanning more than two pages, PRP2 points to a page-aligned list of further PRP entries. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup></dd>
+<dt>Namespace</dt><dd><b>Simple words:</b> one "disk" inside an NVMe controller. <b>Analogy:</b> one of the supplier's warehouses. <b>Precise:</b> a quantity of non-volatile memory addressed by logical blocks, with its own size and LBA format, identified by a namespace ID (NSID) that every I/O command names. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup></dd>
+<dt>Command identifier (cid)</dt><dd><b>Simple words:</b> a number the driver puts on each command so it can recognise the answer. <b>Analogy:</b> the order number printed on the receipt. <b>Precise:</b> a 16-bit field in command dword 0, copied into the completion entry; unique among the commands outstanding on one SQ. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup></dd>
+</dl></div>
+
+<h2 id="F4-07-pictures">The idea in pictures</h2>
+<p>Figure 1 shows one queue pair and the four writes and reads that move a command through it. Figure 2 shows the phase tag over two passes, and what a driver that ignores it reads instead.</p>
+<figure id="F4-07-fig1"><div class="svgbox">
+<svg viewBox="0 0 880 290" role="img" aria-labelledby="F4-07-f1t F4-07-f1d">
+<title id="F4-07-f1t">Figure 1: a submission and completion queue pair</title>
+<desc id="F4-07-f1d">Left, the submission queue in host memory, a ring of 64-byte entries with the driver's tail and the controller's head. Right, the completion queue, a ring of 16-byte entries with the controller's tail and the driver's head. Below, BAR0 with the doorbells at 1000h: SQ y tail and CQ y head. Steps: 1, the driver writes a command (opcode, CID, NSID, PRP1, PRP2, starting LBA, block count) at the SQ tail; 2, it writes the new tail to the SQ tail doorbell; 3, the controller fetches the command, moves the data by DMA to or from the PRP pages, and writes a completion (CID, SQ head, status with phase bit) at the CQ tail; 4, the driver sees an entry whose phase equals the expected phase, processes it, advances its head and writes the CQ head doorbell.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="290"/>
+<text class="sv-tb" x="20" y="28">submission queue (64 B entries)</text>
+<rect class="sv-b1" x="20" y="40" width="60" height="40"/><rect class="sv-b1" x="80" y="40" width="60" height="40"/><rect class="sv-b3" x="140" y="40" width="60" height="40"/><rect class="sv-b8" x="200" y="40" width="60" height="40"/><rect class="sv-b8" x="260" y="40" width="60" height="40"/><rect class="sv-b8" x="320" y="40" width="60" height="40"/>
+<text class="sv-ts" x="146" y="64">new cmd</text>
+<text class="sv-ts" x="20" y="100">head (controller)</text><text class="sv-ts" x="200" y="100">tail (driver) after ①</text>
+<text class="sv-tb" x="480" y="28">completion queue (16 B entries)</text>
+<rect class="sv-b5" x="480" y="40" width="60" height="40"/><rect class="sv-b5" x="540" y="40" width="60" height="40"/><rect class="sv-b4" x="600" y="40" width="60" height="40"/><rect class="sv-b8" x="660" y="40" width="60" height="40"/><rect class="sv-b8" x="720" y="40" width="60" height="40"/><rect class="sv-b8" x="780" y="40" width="80" height="40"/>
+<text class="sv-ts" x="604" y="58">CID, SQ</text><text class="sv-ts" x="604" y="74">head, P=1</text>
+<text class="sv-ts" x="480" y="100">head (driver)</text><text class="sv-ts" x="660" y="100">tail (controller)</text>
+<rect class="sv-b7" x="20" y="200" width="840" height="56" rx="5"/><text class="sv-tb" x="30" y="222">BAR0</text><text class="sv-ts" x="30" y="242">CAP, VS, CC, CSTS, AQA, ASQ, ACQ</text>
+<rect class="sv-b2" x="330" y="210" width="230" height="36" rx="3"/><text class="sv-ts" x="338" y="233">1000h + 2y·stride: SQ y tail</text>
+<rect class="sv-b2" x="580" y="210" width="270" height="36" rx="3"/><text class="sv-ts" x="588" y="233">1000h + (2y+1)·stride: CQ y head</text>
+<line class="sv-line" x1="230" y1="84" x2="430" y2="206"/><polygon class="sv-head" points="420,198 426,208 432,198"/>
+<text class="sv-ts" x="260" y="150">② tail → doorbell</text>
+<line class="sv-dash" x1="380" y1="60" x2="596" y2="60"/><polygon class="sv-head" points="586,54 586,66 598,60"/>
+<text class="sv-ts" x="390" y="128">③ fetch, DMA, complete</text>
+<line class="sv-line" x1="540" y1="84" x2="700" y2="206"/><polygon class="sv-head" points="690,200 698,208 702,198"/>
+<text class="sv-ts" x="610" y="150">④ consume, head → doorbell</text>
+<text class="sv-ts" x="20" y="280">Offsets from the author's memory of D1/D2; confirmed by QEMU's behaviour and its trace (R2, R6).</text>
+</svg></div><figcaption><b>Figure 1.</b> An NVMe queue pair. Commands and completions live in host memory; the only register writes on the fast path are the two doorbells. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-D2">D2</a></sup></figcaption></figure>
+
+<figure id="F4-07-fig2"><div class="svgbox">
+<svg viewBox="0 0 880 250" role="img" aria-labelledby="F4-07-f2t F4-07-f2d">
+<title id="F4-07-f2t">Figure 2: the phase tag over two passes</title>
+<desc id="F4-07-f2d">A completion queue of 16 entries drawn three times. Start: all entries zero, phase 0; the driver expects phase 1. After pass 1: all 16 entries were written by the controller with phase 1; the driver consumed them and now expects phase 0 at entry 0. During pass 2: the controller has written entry 0 with phase 0 for command 17; entries 1 to 15 still hold pass-1 entries with phase 1. A correct driver sees entry 0's phase 0 equal to its expectation and takes it. A driver that always expects 1 skips the new entry 0 if it is already written, or, if it looks before the controller writes, reads the old pass-1 entries 0 to 15 as if they were new, advances its head past entries the controller never produced, and then waits forever for a phase-1 entry at a slot that now holds a phase-0 completion.</desc>
+<rect class="sv-bg" x="0" y="0" width="880" height="250"/>
+<text class="sv-tb" x="20" y="30">start</text>
+<rect class="sv-b8" x="140" y="16" width="640" height="24"/><text class="sv-ts" x="150" y="33">16 entries, all P = 0 (zeroed by the driver)</text><text class="sv-ts" x="790" y="33">expect 1</text>
+<text class="sv-tb" x="20" y="90">after pass 1</text>
+<rect class="sv-b5" x="140" y="76" width="640" height="24"/><text class="sv-ts" x="150" y="93">16 completions written, all P = 1; consumed</text><text class="sv-ts" x="790" y="93">expect 0</text>
+<text class="sv-tb" x="20" y="150">pass 2</text>
+<rect class="sv-b4" x="140" y="136" width="40" height="24"/><text class="sv-ts" x="144" y="153">P=0</text>
+<rect class="sv-b5" x="180" y="136" width="600" height="24"/><text class="sv-ts" x="190" y="153">entries 1–15: still pass 1, P = 1 (old)</text>
+<text class="sv-ts" x="140" y="186">correct driver: entry 0 has P = 0 = expected → new; entry 1 has P = 1 ≠ 0 → not yet</text>
+<text class="sv-ts" x="140" y="206">driver that always expects 1: old entries look new → stale CIDs; the real P = 0 entry is never taken</text>
+<text class="sv-ts" x="20" y="238">The lab's forensic build uses a 16-entry I/O queue so the wrap comes early (R7).</text>
+</svg></div><figcaption><b>Figure 2.</b> The phase tag lets the driver tell new completions from old ones without ever clearing the queue. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-R7">R7</a></sup></figcaption></figure>
+
+<h2 id="F4-07-layer1">Layer 1 — the kid explanation</h2>
+<p>A fast SSD and the computer share two lists in memory: one for jobs and one for "done" notes. The computer writes a job, rings a bell, and goes on with other work. The SSD does the job and writes a "done" note. The notes are never erased; instead the SSD writes them in a different colour each time it starts the list again from the top, so the computer can tell new notes from old ones. The computer can have many pairs of lists, one for each of its helpers.</p>
+
+<h2 id="F4-07-layer2">Layer 2 — the student explanation</h2>
+<p>An NVMe controller is PCI class 010802h with its registers in BAR0. CAP describes it (the maximum queue size, the doorbell stride, how long to wait for ready, the page sizes it supports). The driver disables the controller (CC.EN = 0, wait until CSTS.RDY = 0), writes the admin queues' sizes and addresses (AQA, ASQ, ACQ), enables it with the entry sizes it will use (64-byte commands, 16-byte completions), and waits for CSTS.RDY = 1. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-R2">R2</a></sup></p>
+<p>Everything else is commands. Admin commands go to queue 0: Identify (with a "CNS" value saying what to identify), Set Features, Create and Delete I/O queues. I/O commands go to the I/O queues: Read (02h), Write (01h), Flush (00h). Each command names a namespace, a starting LBA and a block count, and points at its data with PRP entries. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-D3">D3</a></sup></p>
+<p>Milestone C6 asks for "controller reset and enable sequence, queue memory, PRP lists, completion handling with MSI-X per queue (after C7, start polled), namespace block devices". This chapter's driver is polled, as the milestone allows until C7. Its acceptance tests compare Identify with QEMU's configuration, run the 1 GiB random test with 1, 4 and 8 queues, and ask for the root file system on NVMe, which is also this course's project. <sup class="src"><a href="#F4-07-src-D7">D7</a></sup></p>
+
+<h2 id="F4-07-layer3">Layer 3 — the engineer's depth</h2>
+<h3>Reset and enable</h3>
+<p>R2's CAP is <code>0x004018200f0107ff</code>. MQES (bits 15:0) = 7FFh: queues may hold up to 2048 entries (the field is zero-based). Bit 16 (CQR) = 1: queues must be physically contiguous. TO (bits 31:24) = 0Fh: wait up to 15 × 500 ms = 7500 ms for ready changes. DSTRD (bits 35:32) = 0: doorbells 4 bytes apart. CSS (bits 44:37): bit 0 set, the NVM command set. MPSMIN (bits 51:48) = 0 and MPSMAX (bits 55:52) = 4: pages from 4 KiB to 64 KiB. VS = 1.4.0. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-R2">R2</a></sup></p>
+<p>CC.EN = 0 resets the controller's queues; the driver must wait for CSTS.RDY to clear before touching AQA, ASQ and ACQ, and after setting EN it must wait for RDY to be set, watching CSTS.CFS (controller fatal status) and the timeout. CC also carries IOSQES = 6 and IOCQES = 4 (log2 of 64 and 16), the memory page size (0 = 4 KiB) and the command set (0 = NVM); a controller does not accept I/O queue creation unless IOSQES and IOCQES are set. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>All register offsets (CAP 0h, VS 8h, CC 14h, CSTS 1Ch, AQA 24h, ASQ 28h, ACQ 30h, doorbells from 1000h), the CAP and CC field positions, the command and completion layouts, the opcodes, CNS values, the Identify byte offsets (VID 0, SN 4–23, MN 24–63, FR 64–71, MDTS 77, NN 516; NSZE 0, FLBAS 26, LBAF from 128) and the feature ID 07h are from the author's memory of D1–D3, not from the documents; no second implementation was compared in the build container. They are confirmed by QEMU 8.2.2's NVMe model behaving as expected, by QEMU's trace naming the admin commands the driver sent (R6), and by the Identify values matching QEMU's configuration (R3). The rule that queue creation fails without IOSQES/IOCQES and the behaviour of the CQ head doorbell beyond posted entries are from memory only.</p></div>
+<h3>Admin commands and Identify</h3>
+<p>An admin command is a 64-byte entry: dword 0 holds the opcode (bits 7:0) and the CID (bits 31:16), then the NSID, PRP1 and PRP2, and command dwords 10–15. Identify with CNS = 1 returns the controller's 4 KiB data structure; CNS = 2 returns the list of active namespace IDs; CNS = 0 with an NSID returns that namespace's structure. R2: vendor <code>0x1b36</code>, serial "DR301NVME0001" and MDTS 5 (both from QEMU's command line), model "QEMU NVMe Ctrl", firmware "8.2.2". <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-R2">R2</a></sup></p>
+<p>One field is easy to misread: NN, "number of namespaces", is 256 in R2 although the controller has two. NN is the highest namespace ID the controller supports, not the count of namespaces in use; the active namespace list (CNS 2) gives the real ones: 1 and 2. The lab's first version printed "nn 256" as the namespace count; comparing with the configuration caught it. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-R3">R3</a></sup></p>
+<p>Identify Namespace gives NSZE (size in blocks) and the LBA formats: FLBAS bits 3:0 select one of the LBAF entries, whose bits 23:16 (LBADS) are log2 of the block size. R2: namespace 1 has 2097152 blocks of 512 bytes; namespace 2 (the root image, configured with <code>logical_block_size=4096</code>) has 512 blocks of 4096 bytes. <sup class="src"><a href="#F4-07-src-R2">R2</a></sup></p>
+<h3>I/O queues and doorbells</h3>
+<p>Set Features with feature 07h asks for a number of I/O queues (zero-based counts in dword 11); the answer in completion dword 0 says how many the controller allows: R2 asked for 8 pairs and was allowed 64. Create I/O Completion Queue comes before the SQ that uses it, with the queue ID and zero-based size in dword 10 and "physically contiguous" plus interrupt settings in dword 11 (here PC = 1, interrupts off: polled). Deleting is the other way round: SQs first, then their CQs. The trace in R6 shows exactly this order. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-R6">R6</a></sup></p>
+<p>The submission path: write the entry at the tail, advance the tail modulo the size, barrier, write the tail to the SQ's doorbell. The completion path: read the entry at the head; if its phase bit equals the expected phase, it is new: copy it, advance the head (flipping the expected phase on wrap-around), write the head to the CQ's doorbell so the controller can reuse the slot. The completion also reports the SQ head, which tells the driver how many SQ slots the controller has freed; the lab's driver never has more commands in flight than an SQ has entries, so it does not need to track it. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-D2">D2</a></sup></p>
+<h3>PRPs</h3>
+<p>PRP1 points to the first page of the data (it may have an offset; the lab keeps buffers page-aligned). If the data ends within the second page, PRP2 points to that page. If it needs more, PRP2 points to a PRP list: a page of 64-bit page addresses for the rest. The prp test in R2 covers all three cases (4, 8 and 64 KiB) and checks the data read back with a hash. MDTS = 5 limits one transfer to 2<sup>5</sup> × 4 KiB = 128 KiB with these page settings, so the lab's 64 KiB maximum is within it. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-R2">R2</a></sup></p>
+<h3>Several queues, and command identifiers</h3>
+<p>The random test sends slot <i>s</i> to I/O queue (<i>s</i> mod <i>n</i>) + 1 and polls all queues in turn. The CID encodes the slot in its low 5 bits and a sequence number above, so a completion names its slot and a stale completion (a CID no longer in flight) can be recognised. In a real kernel each CPU would own one queue pair and submit without locks; the curriculum's test asks for "1, 4 and 8 queues on 8 CPUs". This lab kernel has one CPU, so it exercises the controller's queue handling but not per-CPU submission (see the box in the lab section). <sup class="src"><a href="#F4-07-src-D7">D7</a></sup></p>
+<h3>Interrupts later</h3>
+<p>NVMe is designed for MSI-X with one vector per completion queue, so that each CPU's completions interrupt that CPU. This driver turns INTx off and polls, as C6 permits until C7 (MSI and MSI-X, DR302). <sup class="src"><a href="#F4-07-src-D7">D7</a></sup></p>
+
+<h2 id="F4-07-hardware">How the hardware actually does it</h2>
+<p>A real NVMe SSD has its controller on the drive, attached by PCI Express lanes; the queues are in host memory and the drive reads commands and writes completions by DMA, with the doorbell writes as its only signal from the CPU. Behind the controller, the drive's firmware (its flash translation layer) maps logical blocks to flash pages, does wear levelling and garbage collection, and decides when data written to its cache is durable, which is what Flush is for. The test machine's Windows driver list (<code>DRIVERS.html</code>, List 2) shows <code>stornvme</code>, Microsoft's NVMe driver, and <code>nvmedisk</code>, with "yes-on device" firmware. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup> <sup class="src"><a href="#F4-07-src-D8">D8</a></sup></p>
+<p>In the lab, QEMU's <code>nvme</code> device plays the controller and image files play the flash. R6 shows something a real machine does too: the firmware (here SeaBIOS) used the controller before the kernel, created its own queues and enabled it; the kernel's first job is to disable it and start clean. <sup class="src"><a href="#F4-07-src-R6">R6</a></sup></p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The description of SSD firmware (flash translation, wear levelling, garbage collection, cache and flush semantics) is general knowledge from memory, not from a source opened in this build. No physical NVMe device was used; queue counts, timeouts and transfer limits differ per drive and must be read from CAP and Identify.</p></div>
+
+<h2 id="F4-07-worked">Worked example</h2>
+<p><b>A read command.</b> Read 8 blocks (4 KiB) at LBA 8000 of namespace 1 into a page at 0x150000, CID 0x0123: dword 0 = <code>0x01230002</code> (CID in bits 31:16, opcode 02h); NSID = 1; PRP1 = <code>0x150000</code>, PRP2 = 0; dword 10 = 8000 = <code>0x1F40</code> (LBA bits 31:0), dword 11 = 0 (bits 63:32); dword 12 = 7 (block count, zero-based). <sup class="src"><a href="#F4-07-src-D3">D3</a></sup></p>
+<p><b>Doorbell addresses.</b> With DSTRD = 0 the stride is 4 bytes. Queue 0 (admin): SQ tail at 1000h, CQ head at 1004h. I/O queue 3: SQ tail at 1000h + 6 × 4 = 1018h, CQ head at 1000h + 7 × 4 = 101Ch. <sup class="src"><a href="#F4-07-src-D2">D2</a></sup></p>
+<p><b>A PRP list.</b> 64 KiB at buffer 0x200000 is 16 pages: PRP1 = 0x200000; PRP2 = the address of the list, whose 15 entries are 0x201000, 0x202000, …, 0x20F000. <sup class="src"><a href="#F4-07-src-D1">D1</a></sup></p>
+<p><b>Reading the CIDs in the trace.</b> R6's kernel part starts with CIDs 63, 95, 127: in binary 1 11111, 10 11111, 11 11111. The low 5 bits are 31 (the admin slot) and the sequence number above them counts 1, 2, 3. <sup class="src"><a href="#F4-07-src-R6">R6</a></sup></p>
+
+<h2 id="F4-07-code">Code walk-through</h2>
+<p>Files in <code>university/labs/F4-07/</code>. The kernel reuses F4-01 to F4-03 and F4-05's random test. <code>nvme.h</code> declares the driver's interface; <code>ustar.h</code> the root file system's.</p>
+<p><b>Listing 1</b> — <code>nvme_regs.h</code>, registers, entries, opcodes</p>
+<pre class="listing" data-src="F4-07/nvme_regs.h"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>10–11</td><td>offsets</td><td>Controller registers and the doorbell base.</td><td>From memory of D1/D2; see the unverified box.</td></tr>
+<tr><td>13–17</td><td>CAP fields</td><td>MQES, TO, DSTRD, CSS, MPSMIN as small functions.</td><td>Layer 3 decodes R2's CAP with them.</td></tr>
+<tr><td>19–22</td><td>CC, CSTS</td><td>EN, entry sizes, RDY, CFS.</td><td>The enable handshake.</td></tr>
+<tr><td>25–34</td><td><code>Sqe</code></td><td>The 64-byte command.</td><td><code>static_assert</code> on the size.</td></tr>
+<tr><td>36–44</td><td><code>Cqe</code></td><td>The 16-byte completion; status bit 0 = phase.</td><td>The bit the forensic build ignores.</td></tr>
+<tr><td>46–54</td><td><code>nop</code></td><td>Admin and NVM opcodes, CNS values, the queue-count feature.</td><td>R6 shows QEMU naming each opcode.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>nvme.cc</code>, the driver</p>
+<pre class="listing" data-src="F4-07/nvme.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–23</td><td>queue memory</td><td>Admin queues of 32 entries, up to 8 I/O pairs of 64 entries, page-aligned; Identify buffer; one PRP list; 32 slot buffers.</td><td>Static and physically contiguous (CAP.CQR = 1).</td></tr>
+<tr><td>25–30</td><td><code>Queue</code></td><td>Pointers, ID, size, tail, head, expected phase.</td><td>The driver's whole view of a queue pair.</td></tr>
+<tr><td>53–55</td><td>doorbells</td><td>SQ tail at 1000h + 2y × stride, CQ head at + (2y + 1) × stride.</td><td>Worked example.</td></tr>
+<tr><td>57–63</td><td><code>submit</code></td><td>Entry, tail, barrier, doorbell.</td><td>The controller may fetch as soon as the doorbell is written.</td></tr>
+<tr><td>68–83</td><td><code>poll</code></td><td>Phase check; copy; advance the head and flip the phase on wrap; ring the CQ doorbell.</td><td>Line 72 holds the forensic switch.</td></tr>
+<tr><td>85–90</td><td><code>next_cid</code></td><td>Sequence number above a 5-bit slot; never 0.</td><td>Lets <code>wait_any</code> recognise stale entries.</td></tr>
+<tr><td>93–126</td><td><code>wait_cid</code>, <code>admin</code></td><td>Synchronous admin commands with a 2 s limit.</td><td>Unexpected CIDs are counted, not silently accepted.</td></tr>
+<tr><td>135–158</td><td>create, delete</td><td>CQ before SQ; SQs before CQs on deletion; sizes zero-based.</td><td>R6 shows the same order.</td></tr>
+<tr><td>161–174</td><td><code>set_prps</code></td><td>One page, two pages, or a PRP list.</td><td>The three cases of the prp test.</td></tr>
+<tr><td>176–185</td><td><code>io_cmd</code></td><td>Opcode and CID, NSID, 64-bit LBA, zero-based block count.</td><td>Worked example.</td></tr>
+<tr><td>192–209</td><td>init: CAP</td><td>BAR0, bus mastering, INTx off; decode CAP; require 4 KiB pages and the NVM set.</td><td>R2's first line.</td></tr>
+<tr><td>211–231</td><td>init: reset, enable</td><td>Disable and wait; AQA, ASQ, ACQ; CC with entry sizes and EN; wait for RDY or CFS.</td><td>The controller was enabled by firmware first (R6).</td></tr>
+<tr><td>233–254</td><td>init: Identify</td><td>Controller fields; active namespace list; each namespace's size and block size.</td><td>Acceptance test 1.</td></tr>
+<tr><td>256–261</td><td>init: queues</td><td>Set Features (number of queues), then create the I/O queues.</td><td>R2: 8 asked, 64 allowed.</td></tr>
+<tr><td>276–300</td><td><code>rw</code>, <code>flush</code></td><td>Synchronous transfers on queue 1, with PRP lists.</td><td>Used by the prp test and the root file system.</td></tr>
+<tr><td>304–337</td><td><code>start</code>, <code>wait_any</code></td><td>Asynchronous 4 KiB requests spread over the queues; completion by CID; stale detection; 2 s limit.</td><td>The random test's interface.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>f407_main.cc</code>, the tests and the root</p>
+<pre class="listing" data-src="F4-07/f407_main.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>17–20</td><td><code>find</code></td><td>Class code 010802h.</td><td>Any vendor's NVMe controller.</td></tr>
+<tr><td>32–44</td><td>adapters</td><td>Block × 8 = LBA on namespace 1 (512-byte blocks); a timeout stops the run.</td><td>The forensic build ends here.</td></tr>
+<tr><td>47–66</td><td><code>prp_test</code></td><td>Write and read back 4, 8 and 64 KiB; compare hashes; zero the area again; flush.</td><td>The three PRP cases.</td></tr>
+<tr><td>68–83</td><td>root callbacks</td><td>Reads from namespace 2 in 4 KiB blocks; prints each file's size and hash, and the hostname.</td><td>The course project's evidence.</td></tr>
+<tr><td>85–119</td><td><code>tests</code></td><td>Init with one queue pair; print Identify; prp test; random test with 1, 4, 8 pairs (recreated each time); flush; walk the root.</td><td>All three C6 tests in one boot.</td></tr>
+<tr><td>121–128</td><td><code>forensic</code></td><td>The phase-ignoring build, 16-entry queues, 200 operations at depth 1.</td><td>R7.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>ustar.cc</code>, the read-only root file system</p>
+<pre class="listing" data-src="F4-07/ustar.cc"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>7–20</td><td>window</td><td>Reads the volume through a 64 KiB window, one NVMe command per window.</td><td>Large reads use the PRP-list path.</td></tr>
+<tr><td>22–27</td><td><code>octal</code></td><td>USTAR stores numbers as octal text.</td><td>Sizes and the checksum.</td></tr>
+<tr><td>30–55</td><td><code>walk</code></td><td>Header by header: end at a zero block; verify the checksum and the "ustar" magic; build the path from prefix and name; skip the data, rounded up to 512.</td><td>A corrupt image is refused, not misread.</td></tr>
+<tr><td>57–70</td><td><code>hash</code></td><td>FNV-1a of a file's data across windows.</td><td>Compared with the host's hashes (R5).</td></tr>
+<tr><td>72–81</td><td><code>read_file</code></td><td>Copies a small file.</td><td>Reads <code>etc/hostname</code>.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 5</b> — <code>mkroot.py</code>, the root image on the host</p>
+<pre class="listing" data-src="F4-07/mkroot.py"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>19–25</td><td>files</td><td>A hostname, a message, a placeholder init, and 1 MiB + 333 bytes of seeded random data.</td><td>The big file crosses many 64 KiB windows and ends mid-block.</td></tr>
+<tr><td>26–39</td><td>archive</td><td>Python's <code>tarfile</code> in USTAR format, fixed times and modes.</td><td>An independent writer for the kernel's reader.</td></tr>
+<tr><td>41</td><td>padding</td><td>To a whole MiB, so the namespace has whole 4 KiB blocks.</td><td>R2: 512 blocks of 4 KiB.</td></tr>
+<tr><td>43–44</td><td>expected output</td><td>The lines the kernel must print, with the same hash.</td><td>R5 compares them.</td></tr>
+</tbody></table></div>
+<p>The runs: build (R1), the C6 tests and the root (R2), Identify against the configuration (R3), the host's image check (R4), the root compared with the host (R5) and QEMU's trace of the admin commands (R6). The emulated milliseconds in R2 change from run to run.</p>
+<pre class="output" data-run="F4-07/build"></pre>
+<pre class="output" data-run="F4-07/nvme"></pre>
+<pre class="output" data-run="F4-07/identify"></pre>
+<pre class="output" data-run="F4-07/image"></pre>
+<pre class="output" data-run="F4-07/root"></pre>
+<pre class="output" data-run="F4-07/nvme_trace"></pre>
+
+<h2 id="F4-07-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Ink colours suggest many colours.</b> The phase is one bit: two "colours", alternating. Any scheme with more state would need more bits per entry.</li>
+<li><b>Trays per teacher, but one school building.</b> Queue pairs per CPU avoid locks in the driver, but the controller still serves all queues; how it arbitrates between them (round robin or weighted) is its business. The analogy suggests completely independent suppliers.</li>
+<li><b>The bell carries a number.</b> A doorbell write is not just "ring": it states the new tail or head index. Writing a wrong number (for example, a head beyond what the controller produced, as the forensic build does) is an error the analogy does not suggest.</li>
+</ul>
+
+<h2 id="F4-07-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Touching AQA/ASQ/ACQ while the controller is enabled.</b> Symptom: the admin queue is not where the controller thinks; the first command never completes. Disable and wait for RDY = 0 first.</li>
+<li><b>Sizes not zero-based.</b> Symptom: queue creation fails with an invalid-size status, or the queue is one entry larger than its memory.</li>
+<li><b>Ignoring the phase tag.</b> Symptom: stale completions, then a hang after the first wrap (forensic lab).</li>
+<li><b>Not zeroing a CQ before creating it.</b> Symptom: garbage with phase bit 1 is taken as the first completions.</li>
+<li><b>Reading NN as the namespace count.</b> Symptom: the driver probes 256 namespaces and fails on the first missing one.</li>
+<li><b>A PRP list that crosses a page.</b> Symptom: transfers above a certain size corrupt data. A list page holds 512 entries; longer lists chain with the last entry.</li>
+<li><b>Reusing a CID still in flight on the same SQ.</b> Symptom: completions credited to the wrong request.</li>
+</ul>
+
+<div class="co transition" id="F4-07-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F4-05's virtqueues and random test, F4-06's command structures and the habit of comparing with the device's configuration, F1-50 (HW205), where NVMe queues were introduced from the hardware side. <b>What carries over:</b> commands in memory, a write to start, completion matching, publication order, the host checks. <b>What changes:</b> no legacy protocol and no link to train; completions are recognised by a phase bit instead of an index the device publishes; queues are created by commands and can be many, one per CPU. <b>Next:</b> DR302 starts with milestone C7: MSI and MSI-X (so each queue can interrupt its own CPU) and the IOMMU (so devices reach only the memory you map for them). This is the last chapter of DR301; the course project below completes it.</p></div>
+
+<h2 id="F4-07-check">Check yourself</h2>
+<ol>
+<li>Decode CAP = <code>0x0000002028010fff</code>: maximum entries, ready timeout and doorbell stride.</li>
+<li>Why must the CQ be created before its SQ, and deleted after it?</li>
+<li>Compute the doorbell addresses of I/O queue 5's SQ and CQ with DSTRD = 2.</li>
+<li>A 12 KiB transfer starts at a page-aligned buffer. What are PRP1 and PRP2?</li>
+<li>Why does the driver flip its expected phase when its head wraps to 0, rather than when the controller wraps?</li>
+<li>What does NN = 256 tell you, and how do you find the namespaces in use?</li>
+<li>Apply to a new case: an SSD reports MDTS = 0 and MPSMIN = 0. What is the largest transfer, and what does your driver still have to limit?</li>
+<li>Why does the lab's CID put the slot in the low 5 bits and a sequence number above?</li>
+<li>Why is Flush part of a correct file-system driver even when every write completed successfully?</li>
+</ol>
+
+<h2 id="F4-07-lab">Lab</h2>
+<p><b>Goal.</b> Milestone C6: "Admin and I/O queue pairs, namespace discovery, reads and writes, one I/O queue per CPU." Build: "Controller reset and enable sequence, queue memory, PRP lists, completion handling with MSI-X per queue (after C7, start polled), namespace block devices." <sup class="src"><a href="#F4-07-src-D7">D7</a></sup></p>
+<p><b>Hardware and software needed.</b> No hardware. QEMU 8.2.2 (<code>q35</code>; <code>-device nvme,serial=DR301NVME0001,mdts=5</code> with two <code>nvme-ns</code> namespaces: a 1 GiB image as NSID 1 and the read-only root image with 4096-byte blocks as NSID 2), g++ 13.3, GNU ld 2.42, Python 3. Run <code>university/labs/run_lab.sh university/labs/F4-07</code> from the repository root (under a minute).</p>
+<div class="co safety"><span class="lbl">Safety</span><p>"Expect that a bad driver can corrupt disks (wrong LBA, wrong DMA address)... Disconnect disks you care about while testing storage drivers on real hardware." (curriculum safety box). NVMe adds a trap: the system disk of most modern PCs is an NVMe SSD, often the only one. Never boot a test kernel with write tests on a machine whose NVMe drive holds anything you want; the lab's namespace 1 is an image file the script deletes.</p></div>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run the lab. Decode CAP by hand; check every line of R3 against the QEMU command line in <code>nvme.log</code>.</li>
+<li>In R6, find the firmware's queue creation and the kernel's; explain the CIDs; find where the kernel deletes and recreates the queues for the 4- and 8-queue tests.</li>
+<li>Change the I/O queue depth to 8 and rerun. The random test keeps up to 32 requests in flight, spread over 1, 4 or 8 queues, and the driver does not check for a full SQ. Predict for each queue count whether the test passes, write the prediction down (remember how many entries a full ring can hold), then look.</li>
+<li>Add a check of the completion's SQ head and a refusal to submit when an SQ is full; test it with depth 8 and one queue.</li>
+<li>Read Identify Controller's other fields (for example the optional admin command support bits) and decide whether your controller supports a feature you would like to use; mark the field offsets as unverified until you have read D1.</li>
+</ol>
+<p><b>Expected observations.</b> R2: CAP as decoded in Layer 3; ready at once; Identify as configured; 2 active namespaces; the three PRP cases match; 4000 operations at depth 32 with 1, 4 and 8 queue pairs, 0 bad reads; the root's directories and four files with their hashes and the hostname; 0 stale completions; PASS. R3: every field matches. R4: 5905 distinct blocks, 0 differ. R5: identical. R6: the controller enabled twice (firmware, then kernel).</p>
+<p><b>Verification</b> (the milestone's acceptance tests, verbatim): "Identify Controller and Identify Namespace fields match QEMU's configured NVMe device." — R3. "1 GiB random I/O test passes with 1, 4 and 8 queues on 8 CPUs." — R2 and R4 with 1, 4 and 8 queues on one CPU; see the box. "Your root file system mounts from NVMe." — R2 and R5 for a read-only USTAR root read by the lab kernel; see the box and the course project. <sup class="src"><a href="#F4-07-src-D7">D7</a></sup></p>
+<div class="co unverified"><span class="lbl">Not tested in this build</span><p>Two parts of C6 are only partly met. (1) "on 8 CPUs": the lab kernel runs on one CPU; it creates and uses 1, 4 and 8 queue pairs, but per-CPU submission (each CPU owning a queue, no locks) needs your SMP kernel from OS302 and was not tested. (2) "mounts": the lab reads a USTAR archive from namespace 2 and checks every file against the host; it does not mount a writable file system through a VFS. The course project closes both gaps. Nothing here ran on a physical NVMe drive.</p></div>
+<p><b>Troubleshooting.</b> "no NVMe controller": the device is missing or the machine is <code>pc</code> with the controller on a bridge (use <code>q35</code>). Timeout after CC.EN = 1: CSTS.CFS set, or AQA/ASQ/ACQ written while enabled. Queue creation fails: IOSQES/IOCQES not in CC, or the size above MQES. Hang after exactly <i>n</i> commands on a queue of <i>n</i> entries: the phase tag.</p>
+<p><b>Extension.</b> Use the controller's SQ head reports to allow more requests in flight than slots, or add Write Zeroes and Dataset Management (deallocate) and check the image on the host. Mark every field as unverified until you have read D3.</p>
+
+<h2 id="F4-07-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Kofi's NVMe driver passed every test at his desk: Identify, the PRP test, a few hundred reads and writes. In the nightly test it hangs, always after the same number of requests per queue, with a log full of "STALE completion" warnings just before. Kofi says the controller must be returning completions twice.</p>
+<p><b>Evidence pack.</b> The driver built with the completion check that always expects phase 1, I/O queues of 16 entries, 200 operations at depth 1, and QEMU's count of completed commands (R7):</p>
+<pre class="output" data-run="F4-07/forensic"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: how many commands did the controller complete, how many stale completions did the driver see, and what did it wait for at the end?</li>
+<li>Decode the first stale line: CID 0x0100 is which slot and sequence number? Which command is slot 0 actually waiting for, and what does "SQ head 1" tell you about the entry's age?</li>
+<li>Why do the stale completions start exactly after 16 commands?</li>
+<li>Is the controller returning completions twice? Use QEMU's count to decide.</li>
+<li>Why does the run end in a timeout rather than in more stale completions?</li>
+<li>What did the driver tell the controller with each stale read, and why is that harmful on real hardware?</li>
+<li>Prevention: which test would have caught this at Kofi's desk?</li>
+</ol>
+<p><b>Method hints.</b> Write the CIDs in binary. Count the I/O commands. Draw the 16-entry completion queue for the first two passes (Figure 2).</p>
+
+<h2 id="F4-07-project">Mini-project and course project</h2>
+<p><b>Course project: the root file system on NVMe in QEMU.</b> The lab reads a read-only archive. The project makes it a real root: put the NVMe driver under your kernel's block-device interface (B14) as one block device per namespace, put an ext2 file system on namespace 2 (built on the host with <code>mke2fs</code>, or by your own mkfs), mount it as <code>/</code> through your VFS, and read <code>/etc/hostname</code> and run <code>/bin/init</code> from it when your kernel has user space. Then run the random test with 1, 4 and 8 queues with one queue pair per CPU on your SMP kernel (8 CPUs in QEMU), with each CPU submitting only to its own queue.</p>
+<p><b>Rubric</b> (20 points): the root mounts from NVMe and the host's file list and hashes match the kernel's (6); per-CPU queues on 8 CPUs, random test passes with 1, 4 and 8 queues, checked by the host (5); writes through the file system survive a reboot (Flush before shutdown) and the host's <code>e2fsck -n</code> is clean (4); the phase-tag, CID and PRP rules covered by host-side unit tests of your queue code (3); every register and field you used cited to a section of D1–D3 after reading them (2).</p>
+
+<h2 id="F4-07-summary">Summary</h2>
+<ul>
+<li>NVMe is class 010802h with registers in BAR0; CAP describes queue limits, timeout, doorbell stride and page sizes.</li>
+<li>Bring-up: disable and wait, admin queues in AQA/ASQ/ACQ, enable with entry sizes, wait for ready.</li>
+<li>Identify Controller, the active namespace list and Identify Namespace describe the device; NN is the highest namespace ID, not a count.</li>
+<li>I/O queues are created by admin commands, CQ before SQ; commands are 64 bytes, completions 16 bytes; doorbells carry indices.</li>
+<li>A completion is new when its phase bit equals the expected phase; the phase flips on every wrap.</li>
+<li>PRP1, PRP2 or a PRP list describe the data; MDTS limits a transfer.</li>
+<li>The course project's root file system can live on an NVMe namespace and be checked file by file against the host.</li>
+</ul>
+
+<h2 id="F4-07-sources">Sources</h2>
+<ol>
+<li id="F4-07-src-D1">NVM Express, Inc., "NVM Express Base Specification" (curriculum item 42; C6 reading: controller registers, admin commands Identify, Create I/O Completion Queue, Create I/O Submission Queue; queue mechanics, phase tag). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F4-07-src-D2">NVM Express, Inc., "NVMe PCIe Transport Specification" (curriculum item 42; C6 reading: doorbells). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F4-07-src-D3">NVM Express, Inc., "NVM Command Set Specification" (curriculum item 42; C6 reading: Read, Write, Flush). <i>Title only — not opened during this build; the Source Researcher must confirm the revision and section (dossier gate G1 open).</i></li>
+<li id="F4-07-src-D4">The Linux kernel source (curriculum item 40): <code>drivers/nvme/host/pci.c</code>, <code>drivers/nvme/host/core.c</code>. <i>Title only — not opened during this build; the Source Researcher must confirm the version and the files (dossier gate G1 open).</i></li>
+<li id="F4-07-src-D5">IEEE Std 1003.1 (POSIX), <code>pax</code> utility, "ustar Interchange Format". <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open). The lab does not rely on it: R5 checks the reader against Python's <code>tarfile</code>.</i></li>
+<li id="F4-07-src-D6">QEMU documentation: the <code>nvme</code> and <code>nvme-ns</code> devices (<code>serial</code>, <code>mdts</code>, <code>nsid</code>, <code>logical_block_size</code>) and the <code>pci_nvme_*</code> trace events. <i>Title only — not opened during this build; the Source Researcher must confirm the version and pages (dossier gate G1 open).</i></li>
+<li id="F4-07-src-D7">This project's Systems Curriculum: milestone C6 (goal, reading, build, acceptance tests) and the safety box on storage drivers (opened in this build; the project's own page).</li>
+<li id="F4-07-src-D8">This project's <code>DRIVERS.html</code>, List 2 (<code>stornvme</code>, <code>nvmedisk</code>) (opened in this build; the project's own page).</li>
+<li id="F4-07-src-R1">R1 — lab run, step <code>build</code>: <code>university/labs/F4-07/build.out</code>, <code>build.log</code>.</li>
+<li id="F4-07-src-R2">R2 — lab run, step <code>nvme</code>: <code>nvme.out</code>, <code>nvme.log</code> (QEMU 8.2.2, q35, TCG; exit code 33 = pass).</li>
+<li id="F4-07-src-R3">R3 — lab run, step <code>identify</code>: <code>identify.out</code>, <code>identify.log</code> (R2's Identify lines against the configuration).</li>
+<li id="F4-07-src-R4">R4 — lab run, step <code>image</code>: <code>image.out</code>, <code>image.log</code> (F4-05's <code>verify_image.py</code> on namespace 1, three seeds).</li>
+<li id="F4-07-src-R5">R5 — lab run, step <code>root</code>: <code>root.out</code>, <code>root.log</code> (Listing 5's expected lines against the kernel's).</li>
+<li id="F4-07-src-R6">R6 — lab run, step <code>nvme_trace</code>: <code>nvme_trace.out</code>, <code>nvme_trace.log</code> (QEMU trace events <code>pci_nvme_*</code>).</li>
+<li id="F4-07-src-R7">R7 — lab run, step <code>forensic</code>: <code>forensic.out</code>, <code>forensic.log</code> (<code>-append nophase</code>; exit code 3 expected).</li>
+</ol>
+
+<h2 id="F4-07-glossary">Glossary links</h2>
+<p><a href="#gl-nvme-nvm-express">NVMe (NVM Express)</a> · <a href="#gl-submission-queue-sq">Submission queue (SQ)</a> · <a href="#gl-completion-queue-cq">Completion queue (CQ)</a> · <a href="#gl-doorbell-register">Doorbell register</a> · <a href="#gl-phase-tag">Phase tag</a> · <a href="#gl-prp-physical-region-page-entry">PRP (physical region page) entry</a> · <a href="#gl-namespace">Namespace</a> · <a href="#gl-command-identifier-cid">Command identifier (cid)</a> · <a href="#gl-admin-queue-and-i-o-queues">Admin queue and I/O queues</a> · <a href="#gl-ustar">USTAR</a></p>
+
+<h2 id="F4-07-next">Next chapter</h2>
+<p>Previous: <a href="#F4-06">F4-06 AHCI SATA</a>. Back to the course: <a href="#DR301">DR301</a>. Next course: <a href="#DR302">DR302</a> (milestone C7: MSI, MSI-X and the IOMMU). Related: <a href="#F1-50">F1-50 NVMe and its queues</a>, <a href="#F4-05">F4-05</a> (virtqueues and the random test). Curriculum: <a href="../SYSTEMS_CURRICULUM.html#trackC">Track C</a> (milestone C6).</p>
+
+<h2 id="F4-07-answers">Answers to Check yourself</h2>
+<ol>
+<li>MQES = FFFh → 4096 entries; TO = 28h = 40 → 20000 ms; DSTRD = 0 → 4-byte stride (bits 35:32 of <code>0x00000020</code> in the high dword are 0; the 20h is bit 37, CSS bit 0, the NVM set).</li>
+<li>Creating an SQ names the CQ its completions go to, so the CQ must exist; deleting a CQ while an SQ still posts to it would leave completions with nowhere to go.</li>
+<li>Stride 4 &lt;&lt; 2 = 16 bytes. SQ 5 tail: 1000h + 10 × 16 = 10A0h; CQ 5 head: 1000h + 11 × 16 = 10B0h.</li>
+<li>Three pages: PRP1 = the buffer, PRP2 = the address of a PRP list holding buffer + 4 KiB and buffer + 8 KiB.</li>
+<li>Driver and controller go round the queue in lockstep entry by entry: the controller writes entry <i>i</i> of pass <i>k</i> with phase <i>k</i> mod 2 (inverted), and the driver reads entry <i>i</i> of the same pass; tracking its own head's wraps gives the driver exactly the phase of the pass it is reading, without seeing the controller's position.</li>
+<li>That namespace IDs go up to 256; Identify with CNS 2 (the active namespace list) gives the IDs in use, here 1 and 2.</li>
+<li>MDTS = 0 means no limit reported by the controller; the driver must still limit transfers to what its PRP lists and buffers can describe, and to what the namespace's size and the block layer allow.</li>
+<li>The slot index finds the request in one step, and the sequence number makes a CID different from the previous use of the same slot, so a stale completion for an old use of the slot is detected.</li>
+<li>A successful write may still sit in the drive's volatile cache; Flush makes the controller commit it to non-volatile media, which a file system needs before it records that the data is safe (for example before a journal commit or a clean unmount).</li>
+</ol>
+<h3 id="F4-07-forensic-key">Forensic lab answer key</h3>
+<ol>
+<li>QEMU completed 17 commands (17 <code>pci_nvme_rw_cb</code> lines); the driver counted 16 stale completions (only the first five are printed) and then waited 2000 ms for a completion that it never accepted.</li>
+<li>0x0100 = binary 1 00000 000: slot 0 (low 5 bits), sequence 8. Slot 0 is waiting for CID 0x0300 (sequence 24), the 17th I/O command. "SQ head 1" is the SQ head the controller reported when it completed the first I/O command: this is the pass-1 entry for the first command, read a second time.</li>
+<li>The I/O CQ has 16 entries. Commands 1–16 filled pass 1 with phase 1, and the driver consumed them correctly (it expected 1). Command 17 is the first of pass 2, where new entries have phase 0; the driver still expects 1 and the old entries all have phase 1.</li>
+<li>No: the controller completed 17 commands, one per command submitted. The driver read 16 old entries a second time.</li>
+<li>After reading all 16 old entries the driver is back at entry 0, which now holds the real completion of command 17 with phase 0; a driver that wants phase 1 never takes it, and no other entry changes, so it times out.</li>
+<li>Each stale read advanced the CQ head and wrote it to the CQ head doorbell, telling the controller that entries were consumed that it had not produced in this pass. The specification treats such a doorbell value as invalid (from memory, unverified); a real controller may report an error or behave unpredictably. QEMU tolerated it here (CSTS = <code>0x1</code>, no fatal status).</li>
+<li>Any test that runs more commands on a queue than it has entries: the chapter's random test (4000 operations on 64-entry queues) or simply a long sequential read. Kofi's desk tests stayed within one pass.</li>
+</ol>

@@ -1,0 +1,312 @@
+<!--meta
+id: F5-37
+title: Measuring with perftest
+course: DS401
+level: L4
+prereqs: F5-36; F5-35; F5-34; MA202 (median and percentile); HW301 (alpha–beta model)
+time: 10–14 hours including the lab, the forensic lab and the exam practice
+hardware: for the lab: g++ only (TCP loopback harness and the university's fabric model). For the perftest part: two hosts with RDMA adapters or Soft-RoCE, and the perftest package; the build container had neither (perftest not installed, no RDMA device): untested on hardware.
+maps: Curriculum Track F, section 14.1 row "Inter-node networks" (measure with perftest) and milestone F5 (measured latency and bandwidth between two nodes); reading-list item 81; course DS401 forensic lab "RDMA slower than TCP"
+analogy: F5 — friends in different towns (proposed mapping in NOTES.md: a latency test = timing one letter there and back, many times; a bandwidth test = timing a lorry-load of parcels; warm-up = the first deliveries while the courier learns the route, not counted)
+-->
+
+<h2 id="F5-37-hook">Story hook</h2>
+<p>Wei wants to know how fast the new courier is. On Monday he times one letter to Amara and back: 2 hours. On Tuesday the same trip takes 9 hours, because the courier was stuck behind a parade. On Wednesday he sends a whole lorry of parcels and divides the number of parcels by the time: 40 parcels per hour. Which number is "the speed of the courier"?</p>
+<p>None of them alone. One trip tells you almost nothing; many trips, sorted, tell you the usual time (the median) and the bad days (the tail). A single letter measures <i>delay</i>; a lorry-load measures <i>throughput</i>; they answer different questions. And if the courier was new on Monday and still learning the route, Monday should not count at all.</p>
+<p>The RDMA community's standard tool, the perftest suite, is built on exactly these rules. This chapter learns the rules on a harness we can run, then applies them to a case where an RDMA fabric was measured slower than TCP.</p>
+
+<h2 id="F5-37-able">What you will be able to do</h2>
+<ul>
+<li><b>Design</b> a latency and a bandwidth measurement with warm-up, enough iterations, fixed message sizes and percentile reporting.</li>
+<li><b>Run</b> a perftest-style harness and <b>interpret</b> its minimum, median, 99th percentile and maximum, and its message rate (the course goal "measure with perftest") <sup class="src"><a href="#F5-37-src-D4">D4</a></sup>.</li>
+<li><b>Fit</b> the alpha–beta model to latency medians and say when the fit is meaningless.</li>
+<li><b>Plan</b> a perftest run on RDMA hardware (what to fix, what to record) and <b>read</b> its output columns, knowing which flags this build could not check.</li>
+<li><b>Explain</b> an "RDMA slower than TCP" result from a configuration dump: path MTU and the missing lossless setting.</li>
+</ul>
+
+<div class="co jargon" id="F5-37-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>perftest</dt><dd><b>Simple words:</b> a set of small programs that measure how fast RDMA is between two machines. <b>Analogy:</b> the courier company's official stopwatch kit. <b>Precise:</b> an open-source benchmark suite distributed with or alongside rdma-core: one program per operation and metric (for example <code>ib_write_lat</code>, <code>ib_write_bw</code>, <code>ib_send_lat</code>, <code>ib_send_bw</code>, <code>ib_read_lat</code>, <code>ib_read_bw</code>), each run as a server on one host and a client on the other. <sup class="src"><a href="#F5-37-src-D1">D1</a></sup> <sup class="src"><a href="#F5-37-src-R4">R4</a></sup></dd>
+<dt>Latency test and bandwidth test</dt><dd><b>Simple words:</b> a latency test sends one message and waits for the answer, many times; a bandwidth test sends many messages without waiting and counts bytes per second. <b>Analogy:</b> one letter there and back, versus a lorry-load. <b>Precise:</b> a latency test is a ping-pong with one message in flight, reporting one-way latency as half the round-trip time; a bandwidth test keeps a window of messages in flight in one direction and reports bytes delivered divided by elapsed time, and the message rate. <sup class="src"><a href="#F5-37-src-D1">D1</a></sup> <sup class="src"><a href="#F5-37-src-R1">R1</a></sup></dd>
+<dt>Message rate</dt><dd><b>Simple words:</b> how many messages per second can be sent, whatever their size. <b>Analogy:</b> parcels per hour, not kilograms per hour. <b>Precise:</b> messages completed per second in a bandwidth test (bandwidth divided by message size); for small messages it, not bytes per second, is the limiting figure. <sup class="src"><a href="#F5-37-src-R1">R1</a></sup></dd>
+<dt>Goodput</dt><dd><b>Simple words:</b> the useful bytes delivered per second, not counting headers or bytes sent twice. <b>Analogy:</b> the letters that arrived the first time, not the envelopes or the repeats. <b>Precise:</b> application payload delivered once divided by time, or as a fraction of the bytes the link carried; it falls with per-packet header overhead (small path MTU) and with retransmission. <sup class="src"><a href="#F5-37-src-R2">R2</a></sup></dd>
+</dl>
+<p>Terms from earlier: <a href="#gl-median-and-percentile">median and percentile</a> and <a href="#gl-warm-up-run">warm-up run</a> (MA202); <a href="#gl-tail-latency">tail latency</a> (DS201: the slowest few percent, such as p99 or the maximum; for a step that waits for many messages, the tail sets the step time); <a href="#gl-alpha-beta-model">alpha–beta model</a> (HW301); <a href="#gl-path-mtu-rdma">path MTU</a>, <a href="#gl-lossless-traffic-class-and-priority-flow-control-pfc">lossless traffic class and PFC</a>, <a href="#gl-go-back-n">go-back-N</a> (<a href="#F5-35">F5-35</a>); <a href="#gl-queue-pair-qp">queue pair</a> (HW205).</p>
+</div>
+
+<h2 id="F5-37-pictures">The idea in pictures</h2>
+<p>Figure 1 is the protocol every test in this chapter follows.</p>
+<figure id="F5-37-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 250" role="img" aria-labelledby="F5-37-f1t F5-37-f1d">
+<title id="F5-37-f1t">Figure 1: the measurement protocol of a latency test and a bandwidth test</title>
+<desc id="F5-37-f1d">Top row, latency test: a connect and set-up block, then 200 warm-up round trips drawn grey and not timed, then 2000 timed round trips; each timed round trip is one message out and one back, and its time divided by two is recorded; the recorded samples are sorted into minimum, median, 99th percentile and maximum. Bottom row, bandwidth test: set-up, then a stream of many messages in one direction with several in flight, then one acknowledgement byte back; total bytes divided by total time gives megabytes per second; the test is repeated three times and the median of the three is reported. Message sizes are fixed per run and swept over a list.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="250"/>
+<text class="sv-tb" x="20" y="24">Latency test (one message in flight)</text>
+<rect class="sv-box" x="20" y="36" width="90" height="40" rx="4"/><text class="sv-ts" x="30" y="60">set-up</text>
+<rect class="sv-b8" x="120" y="36" width="140" height="40" rx="4"/><text class="sv-ts" x="130" y="54">200 warm-up</text><text class="sv-ts" x="130" y="69">not timed</text>
+<rect class="sv-b5" x="270" y="36" width="250" height="40" rx="4"/><text class="sv-ts" x="280" y="54">2000 timed round trips</text><text class="sv-ts" x="280" y="69">record RTT / 2 each</text>
+<line class="sv-line" x1="520" y1="56" x2="552" y2="56"/><polygon class="sv-head" points="552,51 560,56 552,61"/>
+<rect class="sv-b2" x="560" y="36" width="180" height="40" rx="4"/><text class="sv-ts" x="570" y="54">sort: min, median,</text><text class="sv-ts" x="570" y="69">p99, max</text>
+<line class="sv-line2" x1="290" y1="90" x2="330" y2="104"/><polygon class="sv-head" points="325,99 335,106 324,108"/><line class="sv-line2" x1="335" y1="112" x2="295" y2="124"/><polygon class="sv-head" points="300,119 290,126 302,128"/>
+<text class="sv-ts" x="345" y="112">ping, wait for pong, repeat</text>
+<text class="sv-tb" x="20" y="154">Bandwidth test (many messages in flight, one direction)</text>
+<rect class="sv-box" x="20" y="166" width="90" height="40" rx="4"/><text class="sv-ts" x="30" y="190">set-up</text>
+<rect class="sv-b5" x="120" y="166" width="400" height="40" rx="4"/><text class="sv-ts" x="130" y="184">stream N messages, then wait for 1 byte back</text><text class="sv-ts" x="130" y="199">MB/s = N x size / time</text>
+<line class="sv-line" x1="520" y1="186" x2="552" y2="186"/><polygon class="sv-head" points="552,181 560,186 552,191"/>
+<rect class="sv-b2" x="560" y="166" width="180" height="40" rx="4"/><text class="sv-ts" x="570" y="184">x 3 repetitions:</text><text class="sv-ts" x="570" y="199">min, median, max</text>
+<text class="sv-ts" x="20" y="236">Both tests: fixed message size per run, a list of sizes, everything else held constant and recorded.</text>
+</svg></div><figcaption><b>Figure 1.</b> The protocol of Listing 1 (lines 93–141 and 145–185), as run in R1. The same structure is described for the perftest programs in D1 (title only, pending verification) <sup class="src"><a href="#F5-37-src-D1">D1</a></sup> <sup class="src"><a href="#F5-37-src-R1">R1</a></sup>.</figcaption></figure>
+
+<p>Figure 2 plots the build's own latency measurements (R1, the <code>-O2</code> run): the minimum and the median one-way latency against message size, with the fitted alpha–beta line.</p>
+<figure id="F5-37-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 310" role="img" aria-labelledby="F5-37-f2t F5-37-f2d">
+<title id="F5-37-f2t">Figure 2: measured one-way latency over TCP loopback versus message size</title>
+<desc id="F5-37-f2d">A chart with message size from 0 to 65536 bytes on a linear horizontal axis and one-way latency from 0 to 32 microseconds on the vertical axis. Median points: 2 bytes 2.09, 64 bytes 15.81, 1024 bytes 15.23, 4096 bytes 17.35, 16384 bytes 21.01, 65536 bytes 29.87 microseconds. Minimum points: 1.65, 2.12, 1.79, 1.82, 6.35, 7.56 microseconds. A straight line, the least-squares fit of the medians, runs from 12.88 microseconds at size 0 to about 31 microseconds at 65536 bytes. The 2-byte median lies far below the line and the small-size medians are almost flat, showing that the fit's intercept is dominated by scheduling noise, not by a fixed per-message cost.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="310"/>
+<line class="sv-line" x1="60" y1="260" x2="680" y2="260"/><line class="sv-line" x1="60" y1="260" x2="60" y2="30"/>
+<text class="sv-ts" x="52" y="264">0</text><text class="sv-ts" x="40" y="194">10</text><text class="sv-ts" x="40" y="124">20</text><text class="sv-ts" x="40" y="54">30</text>
+<line class="sv-dash" x1="60" y1="190" x2="680" y2="190"/><line class="sv-dash" x1="60" y1="120" x2="680" y2="120"/><line class="sv-dash" x1="60" y1="50" x2="680" y2="50"/>
+<text class="sv-ts" x="56" y="278">0</text><text class="sv-ts" x="195" y="278">16384</text><text class="sv-ts" x="345" y="278">32768</text><text class="sv-ts" x="495" y="278">49152</text><text class="sv-ts" x="640" y="278">65536</text>
+<text class="sv-ts" x="300" y="300">message size (bytes)</text><text class="sv-ts" x="66" y="24">one-way latency (us)</text>
+<line class="sv-line2" x1="60" y1="169.8" x2="660" y2="42.9"/>
+<circle class="sv-dot1" cx="60" cy="245.4" r="5"/><circle class="sv-dot1" cx="60.6" cy="149.3" r="5"/><circle class="sv-dot1" cx="69.4" cy="153.4" r="5"/><circle class="sv-dot1" cx="97.5" cy="138.5" r="5"/><circle class="sv-dot1" cx="210" cy="112.9" r="5"/><circle class="sv-dot1" cx="660" cy="50.9" r="5"/>
+<circle class="sv-dot3" cx="60" cy="248.5" r="4"/><circle class="sv-dot3" cx="69.4" cy="247.5" r="4"/><circle class="sv-dot3" cx="97.5" cy="247.3" r="4"/><circle class="sv-dot3" cx="210" cy="215.6" r="4"/><circle class="sv-dot3" cx="660" cy="207.1" r="4"/>
+<circle class="sv-dot1" cx="470" cy="160" r="5"/><text class="sv-ts" x="482" y="164">median</text>
+<circle class="sv-dot3" cx="470" cy="180" r="4"/><text class="sv-ts" x="482" y="184">minimum</text>
+<line class="sv-line2" x1="462" y1="200" x2="478" y2="200"/><text class="sv-ts" x="482" y="204">fit of medians: 12.88 us + 0.2767 ns/byte</text>
+<text class="sv-ts" x="110" y="146">64 B median 15.81</text><text class="sv-ts" x="80" y="240">2 B median 2.09</text>
+</svg></div><figcaption><b>Figure 2.</b> Data from R1 (<code>bench_O2.out</code>), plotted by the author from the printed table; the fit line uses the printed alpha and 1/beta. The fit is honest arithmetic but a poor model of these points, as the worked example explains <sup class="src"><a href="#F5-37-src-R1">R1</a></sup>.</figcaption></figure>
+
+<p>Figure 3 is the result of the forensic lab's model: goodput of a long RDMA WRITE stream on two node pairs, as configured and with each setting fixed.</p>
+<figure id="F5-37-fig3"><div class="svgbox">
+<svg viewBox="0 0 760 240" role="img" aria-labelledby="F5-37-f3t F5-37-f3d">
+<title id="F5-37-f3t">Figure 3: modelled goodput per configuration</title>
+<desc id="F5-37-f3d">Horizontal bars, goodput as percent of the sender's fair share: pair A-B as configured (path MTU 4096, PFC on) 98.6 percent; pair C-D as configured (path MTU 1024, PFC off) 76.9 percent; C-D with path MTU 4096 and PFC still off 93.0 percent; C-D with PFC on and path MTU 1024 94.6 percent; C-D with both 98.6 percent. A note says these are outputs of the university's model, not measurements.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="240"/>
+<text class="sv-ts" x="20" y="44">A-B as configured</text><rect class="sv-b5" x="250" y="30" width="493" height="20"/><text class="sv-tm" x="680" y="44">98.6</text>
+<text class="sv-ts" x="20" y="78">C-D as configured</text><rect class="sv-b8" x="250" y="64" width="384.5" height="20"/><text class="sv-tm" x="640" y="78">76.9</text>
+<text class="sv-ts" x="20" y="112">C-D, path MTU 4096</text><rect class="sv-b3" x="250" y="98" width="465" height="20"/><text class="sv-tm" x="680" y="112">93.0</text>
+<text class="sv-ts" x="20" y="146">C-D, PFC on</text><rect class="sv-b3" x="250" y="132" width="473" height="20"/><text class="sv-tm" x="680" y="146">94.6</text>
+<text class="sv-ts" x="20" y="180">C-D, both</text><rect class="sv-b5" x="250" y="166" width="493" height="20"/><text class="sv-tm" x="680" y="180">98.6</text>
+<line class="sv-line" x1="250" y1="196" x2="750" y2="196"/><text class="sv-ts" x="246" y="212">0 %</text><text class="sv-ts" x="485" y="212">50 %</text><text class="sv-ts" x="725" y="212">100 %</text>
+<text class="sv-ts" x="20" y="232">Model output (R2), not a measurement. Bars scaled 5 px per percent.</text>
+</svg></div><figcaption><b>Figure 3.</b> Output of Listing 2 with the "whatif" argument on the lab's configuration dump <sup class="src"><a href="#F5-37-src-R2">R2</a></sup>. The model's mechanisms are stated in Layer 3; its loss probability is a chosen parameter, not a measured one.</figcaption></figure>
+
+<h2 id="F5-37-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Mapping (proposed): latency test = time one letter there and back, many times, and halve it; bandwidth test = time a lorry-load and divide; warm-up = the courier's first trips, not counted; the median = the usual trip; the 99th percentile = the parade days; goodput = letters that arrived the first time, not counting envelopes or repeats.</p></div>
+<p>To know how fast something is, you time it many times, throw away the first few, sort the times, and say "usually this, on a bad day that". You measure one letter and a lorry-load separately because they answer different questions. And you write down everything about the test (which courier, which road, what day) so someone else can repeat it.</p>
+
+<h2 id="F5-37-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F5-37-l2-rules">Seven rules of a network benchmark</h3>
+<ol>
+<li><b>One question per test.</b> Latency (one message in flight) and bandwidth (many in flight) are different experiments. A bandwidth test's per-message time is not a latency.</li>
+<li><b>Fixed message size per run, swept over a list.</b> Small messages show per-message cost; large messages show the bandwidth limit. Listing 1 uses 2 B to 64 KiB for latency and 64 B to 1 MiB for bandwidth.</li>
+<li><b>Warm up.</b> Listing 1 runs 200 untimed round trips before 2000 timed ones (lines 105–111).</li>
+<li><b>Report a distribution.</b> Minimum (the best the system can do), median (the usual), p99 and maximum (the tail) (<a href="#gl-median-and-percentile">MA202</a>). Never only a mean: one stall of 400 µs moves a mean of 2000 samples by 0.2 µs, invisible, while the maximum shows it.</li>
+<li><b>Repeat the whole run.</b> Listing 1 repeats each bandwidth test three times and prints the minimum, median and maximum of the three (lines 179–184). Two runs of the same program in this build (R1, sanitizer build and <code>-O2</code> build) differ, as the worked example shows.</li>
+<li><b>Hold everything else constant and record it.</b> Machine, CPU and core placement, kernel, driver and firmware versions, MTU, adapter settings, compiler and flags, the exact command. The run logs in this chapter (R1–R4) record what the build could record.</li>
+<li><b>Know what the clock measures.</b> Listing 1 measures round-trip time with a monotonic clock on one machine and halves it, which assumes the two directions are symmetric; it never compares clocks of two machines.</li>
+</ol>
+<h3 id="F5-37-l2-harness">The harness on TCP</h3>
+<p>Listing 1 applies these rules to a TCP connection over the loopback interface between two threads of one process, with Nagle's algorithm disabled (line 74). It has nothing to do with RDMA; it is here because it can run in the build container, and because its structure is that of the perftest programs. Its output (R1) contains two tables:</p>
+<pre class="output" data-run="F5-37/bench_O2"></pre>
+<p>Read it as an engineer: the 2-byte median is 2.09 µs but the 64-byte median is 15.81 µs, although 62 bytes more cannot cost 13 µs of copying (the bandwidth table shows over 2000 MB/s, about 0.03 µs for 62 bytes). Something other than message size changed between those two runs: most likely how the operating system scheduled the two threads on the 4 visible CPUs (whether the echo thread was sleeping or running when the ping arrived). The minimum column, 1.65 to 2.12 µs for all sizes up to 4 KiB, shows what the path can do when nothing gets in the way. This is why rule 4 matters: the median alone would have suggested a size effect that does not exist.</p>
+<h3 id="F5-37-l2-perftest">perftest on RDMA</h3>
+<p>The perftest programs apply the same protocol to RDMA operations: <code>ib_send_lat</code>/<code>ib_send_bw</code> for SEND/RECV, <code>ib_write_lat</code>/<code>ib_write_bw</code> for RDMA WRITE, <code>ib_read_lat</code>/<code>ib_read_bw</code> for RDMA READ, plus atomics. One host runs the program without a peer address (server); the other runs the same program with the server's address (client). They exchange queue-pair details out of band over TCP, exactly like Listing 1 of <a href="#F5-36">F5-36</a> <sup class="src"><a href="#F5-37-src-D1">D1</a></sup>. In this build the package is not installed and there is no RDMA device (R4), so nothing below was run.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware, flags not checked.</b> The perftest package was not installed in the build container (R4) and its documentation was not opened (D1, title only). The program names above are the ones the build looked for. The following flags are from the author's memory and must be checked with each program's <code>--help</code> before use: <code>-d &lt;device&gt;</code> (adapter), <code>-i &lt;port&gt;</code> (port), <code>-x &lt;gid index&gt;</code> (GID index, needed for RoCE), <code>-s &lt;bytes&gt;</code> (message size), <code>-a</code> (sweep all sizes), <code>-n &lt;iterations&gt;</code>, <code>-F</code> (do not fail on a CPU-frequency warning), <code>--report_gbits</code>, <code>-R</code> (connect with rdma-cm), <code>-q &lt;n&gt;</code> (number of QPs). Example pair, untested: on the server <code>ib_write_lat -d &lt;dev&gt; -x &lt;gid&gt; -s 64 -n 10000</code>, on the client the same with the server's address appended. The output columns (iteration count, minimum, maximum, typical, average, standard deviation and percentiles for latency; peak, average and message rate for bandwidth) are also from memory: read the header line your version prints.</p></div>
+<h3 id="F5-37-l2-what">What perftest numbers do and do not tell you</h3>
+<ul>
+<li>A latency test with one message in flight measures adapter, PCIe and wire latency plus polling; it says nothing about how a real application with many outstanding operations behaves.</li>
+<li>Results depend on settings that must be recorded: path MTU, message size, inline sends, which CPU core and which NUMA node the process runs on relative to the adapter (<a href="#F5-38">F5-38</a>), whether the CPU's frequency scaling is active, and the RoCE GID index (v1 or v2) <sup class="src"><a href="#F5-37-src-D2">D2</a></sup>.</li>
+<li>A perftest run between two hosts on an idle fabric shows the best case. The forensic lab of this chapter is about a fabric where incast makes the result much worse; a benchmark that never creates congestion would miss it.</li>
+<li>The no-hardware-numbers rule (AH-23): a perftest result is recorded with machine, adapter, firmware, driver, perftest version and command line, or it is not quoted.</li>
+</ul>
+
+<h2 id="F5-37-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F5-37-l3-alphabeta">The alpha–beta fit, and when it lies</h3>
+<p>The <a href="#gl-alpha-beta-model">alpha–beta model</a> says a message of n bytes takes t(n) = α + n/β: a fixed cost α plus n bytes at bandwidth β (HW301). Listing 1 fits it by least squares to the six medians (lines 160–172). The <code>-O2</code> run printed α = 12.88 µs and 1/β = 0.2767 ns/byte (β = 3614 MB/s); the sanitizer run printed α = 19.95 µs and 1/β = 0.2110 ns/byte (β = 4739 MB/s) <sup class="src"><a href="#F5-37-src-R1">R1</a></sup>. Three things are wrong with taking these at face value:</p>
+<ul>
+<li>The fitted α (12.88 µs) is six times the measured 2-byte median (2.09 µs). The intercept absorbs the scheduling noise of the 64 B to 4 KiB medians; it is not a per-message cost.</li>
+<li>The least-squares fit on linear sizes 2, 64, …, 65536 is dominated by the largest size: the 65536-byte point alone almost decides the slope.</li>
+<li>The two runs disagree by 55 % on α. A model parameter that changes that much between runs is not a property of the system.</li>
+</ul>
+<p>Better practice: fit minima or medians of many repeated runs; use sizes spaced evenly where you need the parameters (small sizes for α, large sizes for β); report the residuals; and check the fitted β against the separately measured bandwidth table (here 2868.6 MB/s median at 1 MiB, R1). On RDMA hardware the same method gives the α and β that collective-communication models need (<a href="#F5-38">F5-38</a> and DS402) <sup class="src"><a href="#F5-37-src-D2">D2</a></sup>.</p>
+<h3 id="F5-37-l3-bw">Bandwidth, message rate and the window</h3>
+<p>The bandwidth table shows the second limit: message rate. At 64 bytes the <code>-O2</code> run delivered 77.1 MB/s, which is 1.205 million messages per second; at 1 MiB it delivered 2868.6 MB/s but only 0.003 million messages per second (R1). For small messages the cost per message (here, a system call and a TCP segment) limits throughput; for large ones the cost per byte. RDMA adapters move the per-message cost into hardware, which is why message rate is one of their headline figures; perftest bandwidth programs report it alongside bytes per second <sup class="src"><a href="#F5-37-src-D1">D1</a></sup>.</p>
+<p>A bandwidth test needs enough messages in flight to cover the path's bandwidth-delay product: at rate B and round-trip time R, at least B × R bytes must be outstanding, or the sender waits for completions and the test measures latency instead. Listing 1 lets the TCP socket buffers provide the window; perftest programs have a parameter for the number of outstanding work requests (tx depth; not verified here) <sup class="src"><a href="#F5-37-src-D1">D1</a></sup>.</p>
+<h3 id="F5-37-l3-model">Why RoCE can be slower than TCP: the fabric model</h3>
+<p>RDMA is fast when its assumptions hold: large enough path MTU and a fabric that does not drop packets. Listing 2 is the university's <b>RoCE path model</b>: it reads a configuration dump (<code>fabric_model.in</code>) and predicts goodput for a long stream of RDMA WRITE packets with three mechanisms:</p>
+<ol>
+<li><b>Header overhead</b> per packet: 58 bytes (Ethernet 14 + IPv4 20 + UDP 8 + BTH 12 + ICRC 4, as counted in <a href="#F5-35">F5-35</a>, line 48). At path MTU 1024 the payload share is 1024 / 1082 = 94.6 %; at 4096 it is 98.6 %.</li>
+<li><b>Drops in a lossy class during incast</b>: when more than one sender converges (incast &gt; 1) and the QP's traffic is not in a lossless class with PFC, each packet is dropped with a fixed probability (0.002 in the dump, a chosen parameter) (lines 65–72).</li>
+<li><b>Go-back-N</b> recovery: after a drop, the responder discards the out-of-sequence packets that follow, and the requester resends everything from the lost PSN; the model counts a whole bandwidth-delay window (131072 bytes in flight) as resent per drop (lines 75–78). With PFC on, the same event is counted as a pause and nothing is lost (line 74).</li>
+</ol>
+<p>The result (R2): pair A-B (path MTU 4096, PFC on) 98.6 %; pair C-D (path MTU 1024, PFC off) 76.9 %, with 46238 packets resent after 379 NAKs. With smaller packets, more packets fit in the window (122 at MTU 1024 versus 32 at MTU 4096), so each drop costs more resends; the two misconfigurations multiply. TCP, by contrast, recovers from loss with selective acknowledgement and congestion control designed for lossy networks (DS201), which is how a TCP benchmark on the same hosts can beat a RoCE benchmark on a lossy fabric.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The model is a teaching model, not a simulator of any product. Not modelled: the throughput lost while PFC pauses a sender (counted, not charged), PFC side effects such as head-of-line blocking and pause storms, ECN-based congestion control in the adapter, retransmission timeouts, adapters that implement selective repeat instead of go-back-N, and the actual drop behaviour of any switch. The loss probability 0.002 and the in-flight bytes 131072 were chosen for the lab and were not measured anywhere. That go-back-N is the recovery of RC on RoCE, and that some adapters offer better recovery, is after D1 and D2 (pending verification).</p></div>
+
+<h2 id="F5-37-hardware">How the hardware actually does it</h2>
+<p>A perftest latency program on hardware, as described in D1 and D2 (pending verification): both sides register a buffer, connect an RC QP, and the client posts an operation and busy-polls the CQ (or, for RDMA WRITE latency, polls a byte in its own buffer that the server's WRITE changes). Timing comes from the CPU's cycle counter or a monotonic clock; per-iteration times are sorted for the percentiles <sup class="src"><a href="#F5-37-src-D1">D1</a></sup>. Small messages may be sent inline (data copied into the work request by the CPU, saving the adapter's DMA read), which lowers latency; the maximum inline size depends on the adapter <sup class="src"><a href="#F5-37-src-D2">D2</a></sup>.</p>
+<p>On the fabric, the switch decides what happens under congestion. With PFC enabled for a priority, a switch port whose buffer for that priority fills sends a pause frame upstream for that priority only; the upstream port stops sending that priority; nothing is dropped. Without it, the buffer overflows and packets are dropped, and RoCE's transport recovers end to end (<a href="#F5-35">F5-35</a>) <sup class="src"><a href="#F5-37-src-D3">D3</a></sup>. Both the switch and every host must agree which DSCP value or VLAN priority carries RoCE, and the switch must map it to the lossless priority: in the forensic dump, C-D's QPs use DSCP 26 and the switch's lossless DSCP is 26, but PFC on that class is off.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> No RDMA adapter, switch or perftest binary was available. The descriptions above (polling method of the WRITE latency test, inline sends, pause behaviour) are the chapter's reading of D1–D3 and must be checked against the perftest source and documentation, the adapter's manual and the switch's configuration guide for the versions in use. To test: two RoCE hosts on a switch with configurable PFC; run <code>ib_write_bw</code> with and without PFC on the RoCE priority while a third and fourth host send to the same receiver, and compare with the model.</p></div>
+
+<h2 id="F5-37-worked">Worked example</h2>
+<p><b>Two runs of the same harness disagree. Which numbers can you trust?</b> Listing 1 ran twice in this build: once as built by <code>run_lab.sh</code> (sanitizers, no optimisation) and once with <code>-O2</code> <sup class="src"><a href="#F5-37-src-R1">R1</a></sup>.</p>
+<pre class="output" data-run="F5-37/bench_tcp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Quantity</th><th>Sanitizer build</th><th><code>-O2</code> build</th><th>Reading</th></tr></thead>
+<tbody>
+<tr><td>2 B t_min</td><td>4.51 µs</td><td>1.65 µs</td><td>Real difference: sanitizers add work to every call.</td></tr>
+<tr><td>64 B t_median</td><td>20.05 µs</td><td>15.81 µs</td><td>Both dominated by scheduling; not a property of 64 bytes.</td></tr>
+<tr><td>2 B t_median</td><td>19.88 µs</td><td>2.09 µs</td><td>The <code>-O2</code> run's 2-byte test happened to keep both threads running.</td></tr>
+<tr><td>α (fit)</td><td>19.95 µs</td><td>12.88 µs</td><td>Unstable: do not quote.</td></tr>
+<tr><td>1 MiB BW_median</td><td>2856.9 MB/s</td><td>2868.6 MB/s</td><td>Stable within 0.5 %: large-message bandwidth is limited by copying, which both builds do in the C library.</td></tr>
+</tbody></table></div>
+<p>Conclusions: (1) measure the build you will deploy (<code>-O2</code>), never a debug build; (2) the minimum is the most repeatable latency figure here, and the median of small messages is not repeatable on a shared 4-CPU container; (3) large-message bandwidth is repeatable; (4) before quoting a median, pin the threads to cores and repeat the whole run several times (lab step 3).</p>
+<p><b>Goodput arithmetic for the forensic dump.</b> Pair C-D with PFC on (no losses): goodput = 1024 / (1024 + 58) = 94.6 %, which is the model's "what if: PFC on" line. Pair C-D as configured: 200000 packets delivered, 246238 sent; goodput = 200000 × 1024 / (246238 × 1082) = 204800000 / 266429516 = 76.9 % (R2).</p>
+
+<h2 id="F5-37-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>bench_tcp.cpp</code>: a perftest-style harness over TCP loopback.</p>
+<pre class="listing" data-src="F5-37/bench_tcp.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>26–49</td><td><code>sendAll</code>, <code>recvAll</code></td><td>Loop until all bytes are sent or received; <code>MSG_NOSIGNAL</code> avoids a signal on a closed socket.</td><td>A single <code>send</code> may transfer fewer bytes than asked.</td></tr>
+<tr><td>51–84</td><td><code>Pair</code></td><td>Listens on an ephemeral loopback port, connects, accepts, sets <code>TCP_NODELAY</code> on both ends; RAII closes both.</td><td>A fresh connection per test, Nagle off (<a href="#F5-34">F5-34</a>'s forensic lab).</td></tr>
+<tr><td>86–90</td><td><code>percentile</code></td><td>Sorts a copy and picks the element at q × (n − 1).</td><td>The nearest-rank style percentile (MA202): p99 of 2000 samples is the 1980th smallest.</td></tr>
+<tr><td>93–116</td><td><code>latencyTest</code></td><td>An echo thread; the client sends, waits for the echo, records RTT / 2 after the warm-up; shutting down the write side stops the echo thread.</td><td>Rules 1, 3 and 7.</td></tr>
+<tr><td>120–141</td><td><code>bandwidthTest</code></td><td>Streams <code>count</code> messages; the sink replies with one byte after the last; MB/s = size × count / time / 10⁶.</td><td>The final byte makes the time include delivery, not only handing data to the kernel.</td></tr>
+<tr><td>153–159</td><td>latency sweep</td><td>Six sizes; prints min, median, p99, max; keeps the medians.</td><td>Rule 2 and 4.</td></tr>
+<tr><td>160–172</td><td>alpha–beta fit</td><td>Ordinary least squares of median against size.</td><td>See Layer 3 for its weakness.</td></tr>
+<tr><td>176–185</td><td>bandwidth sweep</td><td>About 16 MiB per test (at least 200 messages), three repetitions, sorted; message rate from the median.</td><td>Rule 5.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>fabric_model.cpp</code>: the RoCE path model (forensic tool).</p>
+<pre class="listing" data-src="F5-37/fabric_model.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>20–46</td><td>structs</td><td>One pair's configuration (Ethernet MTU, path MTU, QP DSCP, the switch's lossless DSCP, PFC, ECN, incast senders); model parameters; a result.</td><td>The fields of the dump's columns.</td></tr>
+<tr><td>48</td><td><code>kHeaderBytes = 58</code></td><td>RoCE v2 over IPv4 header and trailer bytes per packet.</td><td>Counted from the frames of <a href="#F5-35">F5-35</a>.</td></tr>
+<tr><td>50–61</td><td><code>Lcg</code></td><td>A fixed-seed pseudo-random generator.</td><td>Same output every run: the evidence pack is reproducible.</td></tr>
+<tr><td>63–89</td><td><code>simulate</code></td><td>Lossless only if PFC is on <i>and</i> the QP's DSCP is the lossless one; window = ceil(in-flight bytes / packet size); per packet, a hit is a pause (lossless) or a drop with go-back-N (lossy); goodput = payload delivered / bytes carried.</td><td>The three mechanisms of Layer 3.</td></tr>
+<tr><td>101–130</td><td><code>main</code></td><td>Parses <code>pair</code> and <code>model</code> lines, ignores comments, prints one line per pair.</td><td>The dump format is the lab's own.</td></tr>
+<tr><td>131–146</td><td>whatif</td><td>For pair C-D: path MTU 4096; PFC on; both.</td><td>Separates the two causes.</td></tr>
+</tbody></table></div>
+<p>Whether perftest is available (R4):</p>
+<pre class="output" data-run="F5-37/perftest_check"></pre>
+
+<h2 id="F5-37-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A courier's round trip is the same distance both ways. A network path need not be symmetric; RTT / 2 is a convention, not a measurement of one direction.</li>
+<li>Timing a lorry-load ignores what happens to the letters. A bandwidth test of RDMA WRITE says nothing about whether the receiving program noticed the data.</li>
+<li>"Bad days" for a courier are rare and random. Tail latency in computers is often systematic (a timer interrupt every few milliseconds, a garbage collector, another tenant on the machine) and can be removed once found.</li>
+<li>Warm-up for a courier happens once. On a computer, "cold" can return: after a page is swapped out, after the CPU lowers its frequency when idle, after another program evicts the caches.</li>
+</ul>
+
+<h2 id="F5-37-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Mistake</th><th>Symptom</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Measuring a debug or sanitizer build</td><td>Latency several times higher</td><td>Record the compile command (R1 does)</td><td>Benchmark the release build.</td></tr>
+<tr><td>Reporting a mean only</td><td>A rare stall invisible, or a single outlier moving the result</td><td>Print min, median, p99, max</td><td>Report the distribution.</td></tr>
+<tr><td>No warm-up</td><td>First iterations much slower; p99 and max inflated</td><td>Plot latency against iteration number</td><td>Discard a warm-up phase.</td></tr>
+<tr><td>Too few messages in flight in a bandwidth test</td><td>Bandwidth grows with the window size</td><td>Double the window; if bandwidth rises, it was too small</td><td>Cover the bandwidth-delay product.</td></tr>
+<tr><td>Comparing runs with different settings</td><td>"RDMA slower than TCP", or two hosts that differ</td><td>Diff the configuration dumps (forensic lab)</td><td>Record and compare MTU, PFC, DSCP, GID index, versions.</td></tr>
+<tr><td>Process on the wrong NUMA node or core</td><td>Latency higher and more variable on one host</td><td>Check which node the adapter is attached to</td><td>Pin to a core near the adapter (<a href="#F5-38">F5-38</a>).</td></tr>
+<tr><td>Testing only on an idle fabric</td><td>Production much slower than the benchmark</td><td>Repeat under incast</td><td>Add a congestion test to the acceptance procedure.</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F5-37-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F5-36">F5-36</a> wrote a verbs ping-pong with a median; MA202 taught percentiles; HW301 the alpha–beta model; <a href="#F5-35">F5-35</a> path MTU, PFC and go-back-N. <b>What carries over:</b> the median and the alpha–beta model, the header bytes per packet, the incast capture's NAK-and-resend pattern <sup class="src"><a href="#F5-37-src-R2">R2</a></sup>. <b>What changes:</b> most dangerous first: a single number from one run is not a result, and two builds of the same harness gave a 55 % different α; configuration (MTU, lossless class) can make RDMA slower than TCP; benchmark tools need recorded versions and flags you check yourself <sup class="src"><a href="#F5-37-src-R1">R1</a></sup>. <b>What comes next:</b> <a href="#F5-38">F5-38</a> explains where the time goes on the host (system calls, copies, sleeping), measures kernel bypass and zero copy on shared memory, and sets the course project.</p></div>
+
+<h2 id="F5-37-check">Check yourself</h2>
+<ol>
+<li>Why does a latency test keep exactly one message in flight, and a bandwidth test many?</li>
+<li>Give three settings you must record with a perftest result, and why each changes the result.</li>
+<li>From R1 (<code>-O2</code>), what is the message rate at 64 bytes, and how is it computed from the bandwidth?</li>
+<li>Explain why the fitted α (12.88 µs) is not the per-message cost of this loopback path.</li>
+<li>Apply to a new case: a bandwidth test at 4 KiB gives 1.1 GB/s with 4 messages in flight and 3.0 GB/s with 64. What does that tell you about the first number?</li>
+<li>Compute the payload share of a RoCE v2 packet at path MTU 2048 with 58 bytes of headers.</li>
+<li>In the model, why does a drop cost more resent packets at path MTU 1024 than at 4096, for the same bytes in flight?</li>
+<li>Which line of Listing 2 decides whether a pair's traffic is lossless, and what two conditions does it require?</li>
+</ol>
+
+<h2 id="F5-37-lab">Lab</h2>
+<p><b>Goal.</b> Make the latency measurement of Listing 1 repeatable, and plan an RDMA measurement with perftest that someone else could repeat.</p>
+<p><b>Hardware and software needed.</b> Part A: Linux, g++ (the build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>), a machine with at least 2 CPUs. Part B (optional, untested in this build): two RDMA hosts or Soft-RoCE hosts with the perftest package. <b>Safety:</b> none beyond normal computer use; on a shared cluster, ask before running bandwidth tests that saturate links.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F5-37</code>; expect exit status 0 and the files <code>bench_tcp.out</code>, <code>bench_O2.out</code>, <code>fabric_model.out</code>, <code>fabric_whatif.out</code>, <code>perftest_check.out</code>.</li>
+<li>Run the <code>-O2</code> harness five times. For each size, tabulate the five minima and five medians. Which column is stable?</li>
+<li>Pin the two threads to different cores (<code>pthread_setaffinity_np</code>, or run the process under <code>taskset</code>) and repeat step 2. Then pin both to the same core. Explain the differences.</li>
+<li>Change the fit to use the minima instead of the medians, and only sizes up to 4096 for α. Compare the two fits.</li>
+<li>Part B: write a measurement plan for <code>ib_write_lat</code> and <code>ib_write_bw</code> between two hosts: what to fix (cores, MTU, GID index), what to record, how many repetitions; check every flag against <code>--help</code> and correct this chapter's unverified box where it is wrong.</li>
+</ol>
+<p><b>Expected observations.</b> Minima vary little between runs; medians of small sizes vary a lot without pinning and less with it; the fit on minima gives a smaller α. Exact numbers depend on the machine and are recorded, not predicted.</p>
+<p><b>Verification.</b> A table with five runs per size and a one-paragraph conclusion that says which figure you would quote and why. For Part B, a plan another student can execute without asking you questions.</p>
+<p><b>Troubleshooting.</b> "listen failed": the loopback interface is down or the process may not bind; "error: send: Broken pipe": the echo thread ended early (check it was not changed to stop after a fixed count); the harness takes over a minute: the machine is heavily loaded, and the lab's <code>bench_tcp.timeout</code> of 60 seconds may stop it.</p>
+
+<h2 id="F5-37-forensic">Forensic lab</h2>
+<p><b>Scenario — "RDMA slower than TCP" (the course's forensic lab).</b> A team moved its storage replication from TCP to RoCE on the lab fabric. Their benchmark of RDMA WRITE bandwidth between hosts C and D, while hosts A, B and two others also write to D, came out lower than their earlier TCP benchmark on the same hosts; between A and B, RoCE was faster than TCP. The ticket says "RoCE is slower than TCP on our network; revert?". The operators attached the configuration dump of both pairs and the output of the university's path model for it.</p>
+<p><b>Evidence pack.</b> The configuration dump (<code>fabric_model.in</code>, columns explained in its header lines):</p>
+<pre class="listing" data-src="F5-37/fabric_model.in"></pre>
+<p>The model's prediction for the pairs as configured:</p>
+<pre class="output" data-run="F5-37/fabric_model"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>List every difference between the A-B and C-D lines of the dump.</li>
+<li>Which differences can explain lower goodput on C-D, and by which mechanism each?</li>
+<li>Why is C-D's RoCE path MTU 1024 and not 4096? (Use <a href="#F5-35">F5-35</a>'s MTU table.)</li>
+<li>From the model's line for C-D, compute the goodput yourself, and say what the 46238 resent packets are.</li>
+<li>State a hypothesis, the evidence for it, and an experiment (on the model and on the real fabric) that separates the two causes.</li>
+<li>Write the recommendation for the ticket: revert or fix? What exactly should be changed, in which order, and how will you confirm it?</li>
+</ol>
+<p><b>Method hints.</b> Diff before you theorise. Then ask what each differing setting does to the bytes on the wire (headers per packet) and to losses (lossless or not).</p>
+
+<h2 id="F5-37-project">Mini-project</h2>
+<p><b>A benchmark report template and its first entry.</b> Write a one-page template for reporting a network measurement in this university (fields: question, tool and version, command lines, hosts, adapters, firmware, driver, MTU, lossless settings, core pinning, iterations, warm-up, repetitions, min/median/p99/max, message rate, raw output attached, known limitations). Fill it in for Listing 1 on your own machine. If you have RDMA hardware, fill a second copy for <code>ib_write_lat</code> and <code>ib_write_bw</code>. <b>Rubric:</b> completeness of the template 30 %; a filled entry that another student could reproduce 30 %; correct interpretation of the distribution and of the fit 25 %; honest list of limitations 15 %.</p>
+
+<h2 id="F5-37-summary">Summary</h2>
+<ul>
+<li>Latency (one message in flight, RTT / 2) and bandwidth (many in flight, bytes per second, message rate) are separate tests.</li>
+<li>Warm up, fix the size, sweep sizes, report min/median/p99/max, repeat whole runs, record everything, measure the release build.</li>
+<li>In this build the minimum latency was stable while small-message medians varied with scheduling; an alpha–beta fit of those medians gave an α of 12.88 µs in one run and 19.95 µs in another: not quotable.</li>
+<li>perftest applies the same protocol to RDMA operations; it was not installed here, and its flags are listed as unverified.</li>
+<li>RoCE needs a large enough path MTU and a lossless class: the model shows a pair with path MTU 1024 and PFC off at 76.9 % of fair-share goodput, versus 98.6 % when both are fixed.</li>
+</ul>
+
+<h2 id="F5-37-sources">Sources</h2>
+<ol>
+<li id="F5-37-src-D1">D1 — The perftest project (linux-rdma), README and the programs' <code>--help</code> output (tier 2): program names, server/client usage, flags, output columns, measurement method. <i>Title only — not installed and not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-37-src-D2">D2 — NVIDIA, "RDMA Aware Networks Programming User Manual" and the performance tuning guide of the adapter in use (tier 1 for vendor material): settings that affect results (inline, NUMA placement, MTU), RoCE recovery behaviour. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-37-src-D3">D3 — IEEE 802.1Q, its clauses on priority-based flow control (tier 1); InfiniBand Trade Association, InfiniBand Architecture Specification and RoCE v2 annex (curriculum item 81) for transport recovery. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-37-src-D4">D4 — Curriculum Track F, section 14.1 and milestone F5, and the DS401 course card (university internal). <i>Opened in this build.</i></li>
+<li id="F5-37-src-R1">R1 — <code>university/labs/F5-37/bench_tcp.log</code> (sanitizer build, by <code>run_lab.sh</code>) and <code>bench_O2.log</code> (<code>g++ -std=c++20 -O2</code>, by the lab's <code>run.sh</code>): Listing 1, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, Linux x86_64 cloud build container with 4 CPUs visible, exit code 0 each.</li>
+<li id="F5-37-src-R2">R2 — <code>university/labs/F5-37/fabric_model.log</code> and <code>fabric_whatif.log</code>: Listing 2 on <code>fabric_model.in</code>, same compiler, exit code 0 each. Model output, not a measurement.</li>
+<li id="F5-37-src-R3">R3 — <code>university/labs/F5-35/roce_packet.log</code>: the 58 header bytes and the MTU table used by the model (<a href="#F5-35">F5-35</a>).</li>
+<li id="F5-37-src-R4">R4 — <code>university/labs/F5-37/perftest_check.log</code>: the perftest programs and package are not installed in the build container, exit code 0.</li>
+</ol>
+
+<h2 id="F5-37-glossary">Glossary links</h2>
+<p><a href="#gl-perftest">perftest</a> · <a href="#gl-latency-test-and-bandwidth-test">Latency test and bandwidth test</a> · <a href="#gl-warm-up-run">Warm-up run</a> · <a href="#gl-tail-latency">Tail latency</a> · <a href="#gl-message-rate">Message rate</a> · <a href="#gl-goodput">Goodput</a> · <a href="#gl-median-and-percentile">Median and percentile</a> · <a href="#gl-alpha-beta-model">Alpha–beta model</a></p>
+
+<h2 id="F5-37-next">Next chapter</h2>
+<p>Next: <a href="#F5-38">F5-38 Kernel bypass and zero copy</a>. Previous: <a href="#F5-36">F5-36 Verbs, queue pairs and memory registration</a>. Back to the course: <a href="#DS401">DS401</a>.</p>
+
+<h2 id="F5-37-answers">Answers to Check yourself</h2>
+<ol>
+<li>With one message in flight, each timed interval contains exactly one message's journey, so it measures delay. With many in flight, the sender never waits for a reply, so the link stays busy and the total time measures throughput; one message's delay is hidden by overlap.</li>
+<li>Any three of: message size (per-message versus per-byte cost); path MTU (header overhead, F5-35); GID index / RoCE version (different encapsulation); core and NUMA placement (PCIe distance, cache); inline sends (avoids a DMA read); lossless settings (drops under congestion); tool and driver versions (different defaults).</li>
+<li>1.205 million messages per second: 77.1 MB/s divided by 64 bytes = 1.205 × 10⁶ messages/s (the table's last column).</li>
+<li>The 2-byte median was 2.09 µs and the minima of all sizes up to 4 KiB are 1.65–2.12 µs; the fit's intercept is pulled up by the 15–17 µs medians of 64 B to 4 KiB, which come from thread scheduling, and by the dominance of the largest size in a linear-size least-squares fit. The second run gave 19.95 µs: an unstable parameter.</li>
+<li>With 4 in flight the sender is waiting for completions: the test is latency-bound, and 1.1 GB/s is a property of the window, not of the path. Use at least the bandwidth-delay product in flight (here, at least 64 messages) before quoting bandwidth.</li>
+<li>2048 / (2048 + 58) = 2048 / 2106 = 97.2 %, the value in F5-35's MTU table.</li>
+<li>Go-back-N resends everything in flight after the lost packet. The same 131072 bytes in flight are 122 packets of 1082 bytes but only 32 packets of 4154 bytes; each drop therefore triggers about 122 resends at MTU 1024 and 32 at 4096 (R2: 46238 = 379 × 122; 12128 = 379 × 32).</li>
+<li>Line 65: <code>const bool lossless = c.pfc &amp;&amp; c.qpDscp == c.losslessDscp;</code> PFC must be on for the lossless class, and the QP's traffic must be marked with that class's DSCP.</li>
+</ol>
+<h3 id="F5-37-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation (the diff).</b> A-B: Ethernet MTU 9000, RoCE path MTU 4096, PFC on for the lossless class. C-D: Ethernet MTU 1500, path MTU 1024, PFC off. Same QP DSCP (26), same switch lossless DSCP (26), ECN off on both, incast 4 on both <sup class="src"><a href="#F5-37-src-R2">R2</a></sup>.</p>
+<p><b>Mechanisms.</b> (1) Path MTU 1024: 58 bytes of headers per 1024 bytes of payload, 94.6 % payload share versus 98.6 %. Path MTU 1024 is forced by Ethernet MTU 1500: the next RDMA MTU, 2048, needs an IP packet larger than 1500 bytes (F5-35's table: 1024 is the largest path MTU that fits Ethernet MTU 1500) <sup class="src"><a href="#F5-37-src-R3">R3</a></sup>. (2) PFC off: the RoCE traffic is marked for the lossless class (DSCP 26) but the class is not lossless, so during incast the switch drops; each drop triggers go-back-N. The model counts 379 NAKs and 46238 resent packets (379 × 122). Goodput = 200000 × 1024 / (246238 × 1082) = 76.9 %.</p>
+<p><b>Hypotheses.</b> H1: lossy class plus go-back-N under incast (strong: the C-D benchmark ran under incast, A-B with PFC does not lose; model: PFC on alone raises C-D to 94.6 %). H2: small path MTU (real but smaller: MTU 4096 alone gives 93.0 %, and it also reduces the go-back-N window). H3: "RoCE is inherently slower than TCP" (against: A-B is faster than TCP on the same fabric). H4: wrong DSCP marking (ruled out: QP DSCP equals the switch's lossless DSCP on both pairs).</p>
+<p><b>Separating experiment.</b> Model: the whatif lines (93.0 % MTU only, 94.6 % PFC only, 98.6 % both). Real fabric: rerun the C-D benchmark without the incast senders (if it then matches A-B apart from header overhead, losses are the cause); then enable PFC on the RoCE priority on C-D's switch ports and rerun under incast; then raise the Ethernet MTU on C, D and the switch ports and rerun. Watch the adapters' retransmission and out-of-sequence counters and the switch's drop and pause counters (counter names depend on the products, not verified).</p>
+<p><b>Recommendation.</b> Do not revert: fix the configuration. First enable PFC (and preferably ECN-based congestion control, D2) for the RoCE priority on C, D and their switch ports, matching A-B; then raise the Ethernet MTU to 9000 end to end so the path MTU can be 4096. Confirm with the same incast benchmark and with zero drops on the lossless priority. Add the configuration diff to the cluster's acceptance test.</p>
+<p><b>How the evidence was produced.</b> The dump is the lab's own file; the model output is Listing 2 run on it (R2). No real fabric was measured; the scenario's TCP comparison is narrative.</p>

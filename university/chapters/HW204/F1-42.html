@@ -1,0 +1,319 @@
+<!--meta
+id: F1-42
+title: Interrupts: the doorbell
+course: HW204
+level: L2
+prereqs: F1-41; HW202 (F1-24, F1-25); SP101
+time: 4–6 hours including the lab
+hardware: none for the simulator lab (g++ on any computer; the interrupt-count step needs Linux). The optional microcontroller step needs the reference kit's board (Raspberry Pi Pico 2 (RP2350), alternative ST NUCLEO-F446RE) and the Raspberry Pi Debug Probe as USB-to-UART bridge (build/KIT.md, ruling D1); it is untested on hardware in this build
+maps: Curriculum C2 (interrupt-driven UART; acceptance test "pasting 64 KiB through the serial port loses no bytes (checksum)") and H2 (interrupt-driven UART), as a simulated preview
+analogy: F1 — the restaurant building and its kitchen
+-->
+
+<h2 id="F1-42-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>Kofi is cooking alone tonight, and deliveries arrive at the back door. In the first hour he walks to the door every few minutes to check. Most trips are wasted: nobody is there. Worse, when the pans need him, he stays at the stove a little longer, and a courier who finds the door closed leaves the box on the step, where the next courier's box knocks it into the rain.</p>
+<p>At eight o'clock the owner fits a doorbell and a small shelf beside the door. Now Kofi cooks without walking anywhere. When the bell rings he finishes the stir he is doing, puts the box on the shelf, says "got it" to the courier, and goes back to exactly the pan he left. He unpacks the shelf when the cooking allows.</p>
+<p>That doorbell is an interrupt. The shelf is a ring buffer. This chapter shows, with a simulation you can run, why the boxes in the rain were not the courier's fault.</p>
+</div>
+
+<h2 id="F1-42-able">What you will be able to do</h2>
+<ul>
+<li>Explain polling and interrupts and when each one is the better choice.</li>
+<li>Trace the interrupt path from device to handler and back: request, controller, CPU entry, handler, acknowledge, return.</li>
+<li>State the rules for interrupt handlers: short, no blocking, acknowledge the device, share data safely.</li>
+<li>Size a ring buffer from the arrival rate and the longest time the main program is busy.</li>
+<li>Diagnose lost UART bytes from bench evidence, and fix them with an interrupt and a ring buffer (the course forensic lab, "The missing bytes").</li>
+</ul>
+
+<div class="co jargon" id="F1-42-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Polling</dt><dd><b>Simple words:</b> the program asks the device again and again "anything for me?". <b>Analogy:</b> walking to the back door every few minutes. <b>Precise:</b> software repeatedly reads a device status register and acts when a condition is true; simple and predictable, but it costs CPU time when nothing happens and reacts no faster than the polling period. <sup class="src"><a href="#F1-42-src-D2">D2</a></sup></dd>
+<dt>Interrupt</dt><dd><b>Simple words:</b> a signal from a device that makes the CPU stop what it is doing for a moment, run a special function, and then continue. <b>Analogy:</b> the doorbell. <b>Precise:</b> an asynchronous event, raised by hardware outside the instruction stream, that causes the processor to finish or abandon the current instruction, save enough state to resume, and transfer control to a handler; after the handler, the interrupted code resumes. <sup class="src"><a href="#F1-42-src-D3">D3</a></sup> <sup class="src"><a href="#F1-42-src-D2">D2</a></sup></dd>
+<dt>Interrupt request (IRQ)</dt><dd><b>Simple words:</b> the device's "please ring" signal. <b>Analogy:</b> the courier pressing the bell button. <b>Precise:</b> the signal (a wire level or edge, or a message on newer buses) that a device uses to request an interrupt; "IRQ number" also names the input line or interrupt number in an operating system. <sup class="src"><a href="#F1-42-src-D2">D2</a></sup> <sup class="src"><a href="#F1-42-src-R3">R3</a></sup></dd>
+<dt>Interrupt handler (ISR)</dt><dd><b>Simple words:</b> the small function that runs when the doorbell rings. <b>Analogy:</b> taking the box, saying "got it", going back to the pan. <b>Precise:</b> an interrupt service routine: code entered through the CPU's vector mechanism for one interrupt; it services the device (reads data, acknowledges the cause) and returns with a special return sequence that restores the interrupted state. <sup class="src"><a href="#F1-42-src-D3">D3</a></sup> <sup class="src"><a href="#F1-42-src-D4">D4</a></sup></dd>
+<dt>Interrupt vector</dt><dd><b>Simple words:</b> the number that says which handler to run. <b>Analogy:</b> the bell's room number on the panel in the kitchen. <b>Precise:</b> an index into a table of handler addresses (on x86 the IDT, on Cortex-M the vector table); the CPU reads the entry for the vector and jumps to it. <sup class="src"><a href="#F1-42-src-D4">D4</a></sup> <sup class="src"><a href="#F1-42-src-D5">D5</a></sup></dd>
+<dt>Acknowledge (an interrupt)</dt><dd><b>Simple words:</b> telling the device (and the controller) "I have seen it". <b>Analogy:</b> saying "got it" so the courier stops ringing. <b>Precise:</b> the handler's actions that remove the cause in the device (for example reading the data register, or writing a W1C status bit, <a href="#F1-41">F1-41</a>) and signal end-of-interrupt to the interrupt controller (<a href="#F1-43">F1-43</a>). <sup class="src"><a href="#F1-42-src-D2">D2</a></sup></dd>
+<dt>Overrun</dt><dd><b>Simple words:</b> a new byte arrived before software took the previous one, so a byte was lost. <b>Analogy:</b> the box knocked off the step into the rain. <b>Precise:</b> a receiver error: a received character could not be stored because the holding register or FIFO was full; UARTs report it in a status bit (the Linux header names the 16550's <code>UART_LSR_OE</code>). <sup class="src"><a href="#F1-42-src-D6">D6</a></sup> <sup class="src"><a href="#F1-42-src-L1">L1</a></sup></dd>
+<dt>Ring buffer</dt><dd><b>Simple words:</b> a fixed row of slots used in a circle: the writer adds at the head, the reader takes from the tail. <b>Analogy:</b> the shelf beside the door. <b>Precise:</b> a circular FIFO queue in an array with head and tail indices that wrap modulo its size; with one producer (the handler) and one consumer (the main program) it decouples arrival from processing. <sup class="src"><a href="#F1-42-src-D8">D8</a></sup> <sup class="src"><a href="#F1-42-src-R2">R2</a></sup></dd>
+<dt>Interrupt latency</dt><dd><b>Simple words:</b> how long it takes from the doorbell ringing to the handler starting. <b>Analogy:</b> finishing the stir before walking to the door. <b>Precise:</b> the time from the assertion of an interrupt request to the first instruction of its handler; it grows when interrupts are masked or a higher-priority handler is running. <sup class="src"><a href="#F1-42-src-D2">D2</a></sup></dd>
+</dl></div>
+
+<h2 id="F1-42-pictures">The idea in pictures</h2>
+<p>Figure 1 is the interrupt flow every interrupt follows, in five steps. Read it from the device on the left to the "return" arrow on the right.</p>
+<figure id="F1-42-fig1"><div class="svgbox">
+<svg viewBox="0 0 780 300" role="img" aria-labelledby="F1-42-f1t F1-42-f1d">
+<title id="F1-42-f1t">Interrupt flow: device, controller, CPU, handler, acknowledge</title>
+<desc id="F1-42-f1d">Five boxes from left to right connected by arrows. Box 1, device (UART): a byte arrives and the device raises its interrupt request. Box 2, interrupt controller: checks mask and priority and forwards the request with a vector number. Box 3, CPU: finishes the current instruction, saves state such as the program counter and flags, looks up the vector in its table. Box 4, handler: reads the data register, puts the byte in the ring buffer. Box 5, acknowledge: the device's cause is cleared and end-of-interrupt is sent to the controller. A long arrow at the bottom returns from box 5 to the interrupted program, labelled return: restore state and continue where it stopped. A dashed arrow from box 5 back to box 1 is labelled request cleared.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="300"/>
+<rect class="sv-b4" x="10" y="40" width="135" height="120" rx="6"/>
+<text class="sv-tb" x="77" y="62" text-anchor="middle">1 Device</text>
+<text class="sv-t" x="77" y="84" text-anchor="middle">UART: byte</text>
+<text class="sv-t" x="77" y="102" text-anchor="middle">arrives;</text>
+<text class="sv-t" x="77" y="120" text-anchor="middle">raises IRQ</text>
+<rect class="sv-b3" x="165" y="40" width="135" height="120" rx="6"/>
+<text class="sv-tb" x="232" y="62" text-anchor="middle">2 Controller</text>
+<text class="sv-t" x="232" y="84" text-anchor="middle">mask? priority?</text>
+<text class="sv-t" x="232" y="102" text-anchor="middle">forward with</text>
+<text class="sv-t" x="232" y="120" text-anchor="middle">a vector</text>
+<rect class="sv-b1" x="320" y="40" width="135" height="120" rx="6"/>
+<text class="sv-tb" x="387" y="62" text-anchor="middle">3 CPU</text>
+<text class="sv-t" x="387" y="84" text-anchor="middle">finish instruction;</text>
+<text class="sv-t" x="387" y="102" text-anchor="middle">save PC, flags;</text>
+<text class="sv-t" x="387" y="120" text-anchor="middle">look up vector</text>
+<rect class="sv-b5" x="475" y="40" width="135" height="120" rx="6"/>
+<text class="sv-tb" x="542" y="62" text-anchor="middle">4 Handler</text>
+<text class="sv-t" x="542" y="84" text-anchor="middle">read DATA;</text>
+<text class="sv-t" x="542" y="102" text-anchor="middle">push to ring</text>
+<text class="sv-t" x="542" y="120" text-anchor="middle">buffer</text>
+<rect class="sv-b6" x="630" y="40" width="140" height="120" rx="6"/>
+<text class="sv-tb" x="700" y="62" text-anchor="middle">5 Acknowledge</text>
+<text class="sv-t" x="700" y="84" text-anchor="middle">clear cause in</text>
+<text class="sv-t" x="700" y="102" text-anchor="middle">device; EOI to</text>
+<text class="sv-t" x="700" y="120" text-anchor="middle">controller</text>
+<line class="sv-line" x1="145" y1="100" x2="161" y2="100"/><polygon class="sv-head" points="159,95 159,105 166,100"/>
+<line class="sv-line" x1="300" y1="100" x2="316" y2="100"/><polygon class="sv-head" points="314,95 314,105 321,100"/>
+<line class="sv-line" x1="455" y1="100" x2="471" y2="100"/><polygon class="sv-head" points="469,95 469,105 476,100"/>
+<line class="sv-line" x1="610" y1="100" x2="626" y2="100"/><polygon class="sv-head" points="624,95 624,105 631,100"/>
+<line class="sv-dash" x1="700" y1="40" x2="700" y2="20"/><line class="sv-dash" x1="700" y1="20" x2="77" y2="20"/><line class="sv-dash" x1="77" y1="20" x2="77" y2="36"/>
+<polygon class="sv-head" points="72,33 82,33 77,40"/>
+<text class="sv-ts" x="390" y="15" text-anchor="middle">request cleared</text>
+<line class="sv-line2" x1="700" y1="160" x2="700" y2="220"/>
+<line class="sv-line2" x1="700" y1="220" x2="160" y2="220"/>
+<polygon class="sv-head" points="166,215 166,225 158,220"/>
+<rect class="sv-box" x="20" y="200" width="138" height="40" rx="6"/>
+<text class="sv-t" x="89" y="225" text-anchor="middle">main program</text>
+<text class="sv-ts" x="430" y="240" text-anchor="middle">return: restore saved state and continue exactly where it stopped</text>
+<text class="sv-ts" x="20" y="285">Solid arrows: the order of events (control flow). The data byte moves from the device to the ring buffer in step 4.</text>
+</svg></div><figcaption><b>Figure 1.</b> The interrupt flow: device → interrupt controller → CPU → handler → acknowledge, then return to the interrupted program <sup class="src"><a href="#F1-42-src-D3">D3</a></sup> <sup class="src"><a href="#F1-42-src-D2">D2</a></sup>. <a href="#F1-43">F1-43</a> opens box 2.</figcaption></figure>
+
+<p>Figure 2 shows, from the forensic run, why polling lost bytes: a byte arrives every 10 ticks, but one main-loop pass took 40 ticks.</p>
+<figure id="F1-42-fig2"><div class="svgbox">
+<svg viewBox="0 0 780 220" role="img" aria-labelledby="F1-42-f2t F1-42-f2d">
+<title id="F1-42-f2t">Byte arrivals versus polls in the forensic run</title>
+<desc id="F1-42-f2d">A time axis from tick 0 to tick 80. Top row: byte arrivals at ticks 0, 10, 20, 30, 40, 50, 60, 70 and 80. Middle row: polls by the main loop at 0, 4, 8, 12, 16, 20, 24, 28, then a long gap labelled "log flush: 40 ticks", then polls at 68, 72, 76. Bottom row: the byte at 30 is kept in the one-byte receiver; the bytes at 40, 50 and 60 find the receiver full and are lost (marked OVERRUN). With an interrupt, each arrival is handled at once and nothing is lost.</desc>
+<rect class="sv-bg" x="0" y="0" width="780" height="220"/>
+<line class="sv-line" x1="40" y1="170" x2="760" y2="170"/>
+<text class="sv-ts" x="40" y="188">0</text><text class="sv-ts" x="200" y="188">20</text><text class="sv-ts" x="360" y="188">40</text><text class="sv-ts" x="520" y="188">60</text><text class="sv-ts" x="680" y="188">80</text>
+<text class="sv-ts" x="740" y="205">ticks</text>
+<text class="sv-t" x="5" y="45">bytes</text>
+<circle class="sv-dot1" cx="40" cy="40" r="6"/><circle class="sv-dot1" cx="120" cy="40" r="6"/><circle class="sv-dot1" cx="200" cy="40" r="6"/><circle class="sv-dot1" cx="280" cy="40" r="6"/>
+<circle class="sv-dot2" cx="360" cy="40" r="6"/><circle class="sv-dot2" cx="440" cy="40" r="6"/><circle class="sv-dot2" cx="520" cy="40" r="6"/>
+<circle class="sv-dot1" cx="600" cy="40" r="6"/><circle class="sv-dot1" cx="680" cy="40" r="6"/>
+<text class="sv-tb" x="440" y="70" text-anchor="middle">OVERRUN: bytes at 40, 50, 60 lost</text>
+<text class="sv-t" x="5" y="115">polls</text>
+<rect class="sv-b5" x="38" y="105" width="4" height="20"/><rect class="sv-b5" x="70" y="105" width="4" height="20"/><rect class="sv-b5" x="102" y="105" width="4" height="20"/><rect class="sv-b5" x="134" y="105" width="4" height="20"/><rect class="sv-b5" x="166" y="105" width="4" height="20"/><rect class="sv-b5" x="198" y="105" width="4" height="20"/><rect class="sv-b5" x="230" y="105" width="4" height="20"/><rect class="sv-b5" x="262" y="105" width="4" height="20"/>
+<rect class="sv-b8" x="266" y="105" width="316" height="20"/>
+<text class="sv-t" x="424" y="120" text-anchor="middle">log flush: 40 ticks, no poll</text>
+<rect class="sv-b5" x="582" y="105" width="4" height="20"/><rect class="sv-b5" x="614" y="105" width="4" height="20"/><rect class="sv-b5" x="646" y="105" width="4" height="20"/>
+<text class="sv-ts" x="40" y="150">The three dots under the OVERRUN label (40, 50, 60) were lost. The receiver holds one byte.</text>
+</svg></div><figcaption><b>Figure 2.</b> The first overrun of the forensic run: polls at 0–28, then nothing until 68, while bytes keep arriving every 10 ticks. The lost bytes are marked by the OVERRUN label as well as by their shade <sup class="src"><a href="#F1-42-src-R4">R4</a></sup>.</figcaption></figure>
+
+<h2 id="F1-42-layer1">Layer 1 — the kid explanation</h2>
+<p>A computer must notice when something happens outside: a key is pressed, a byte arrives on a cable, a timer runs out. It can notice in two ways.</p>
+<p>The first way is <b>polling</b>. The program keeps asking the device "anything new?". It is easy to write. But most answers are "no", and while the program is busy with something else, it is not asking at all. If two bytes arrive while nobody asks, the device can keep only one. The other is lost.</p>
+<p>The second way is an <b>interrupt</b>. The device rings a doorbell. The CPU finishes the instruction it is on, remembers exactly where it was, and runs a tiny function called the <b>handler</b>. The handler takes the byte, puts it on a shelf called a <b>ring buffer</b>, and says "got it". Then the CPU goes back to its work as if nothing happened. Later the program takes the bytes from the shelf when it has time.</p>
+
+<h2 id="F1-42-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F1-42-l2-poll">Polling and its two costs</h3>
+<p>A polling loop reads a status register and acts when a bit is set (Listing 1 of <a href="#F1-41">F1-41</a>). Polling has two costs <sup class="src"><a href="#F1-42-src-D2">D2</a></sup>. First, wasted work: in Listing 1 of this chapter, with a main loop that polls every 4 ticks and a byte every 10 ticks, 98,303 polls found nothing (run R1). Second, a reaction time no better than the polling period: if the program is busy for longer than the device can buffer, data is lost. With a one-byte receiver and a byte every 10 ticks, polling every 4, 9 or 10 ticks passes the 64 KiB test; polling every 11 ticks loses 5,957 bytes and every 25 ticks loses 39,321 (run R1). The threshold is exactly the byte interval, because the receiver holds one byte.</p>
+<h3 id="F1-42-l2-irq">What happens on an interrupt</h3>
+<p>An interrupt is an asynchronous event: it is not caused by the instruction being executed <sup class="src"><a href="#F1-42-src-D3">D3</a></sup>. Figure 1 shows the path. The device raises its <b>interrupt request</b>. The interrupt controller decides whether to forward it and with which <b>vector</b> (<a href="#F1-43">F1-43</a>). The CPU, between instructions, saves the state needed to resume (at least the program counter and status flags), looks up the handler address for that vector and jumps there <sup class="src"><a href="#F1-42-src-D3">D3</a></sup> <sup class="src"><a href="#F1-42-src-D4">D4</a></sup> <sup class="src"><a href="#F1-42-src-D5">D5</a></sup>. The handler services the device and <b>acknowledges</b> it, then returns with the architecture's interrupt-return sequence, and the interrupted code continues as if nothing had happened <sup class="src"><a href="#F1-42-src-D3">D3</a></sup>. The CPU usually blocks further interrupts of the same or lower priority while a handler runs, which is one reason handlers must be short <sup class="src"><a href="#F1-42-src-D2">D2</a></sup>.</p>
+<h3 id="F1-42-l2-rules">Rules for handlers</h3>
+<ul>
+<li><b>Short.</b> Do the minimum: move the data, acknowledge, return. Long work goes to the main program <sup class="src"><a href="#F1-42-src-D8">D8</a></sup>.</li>
+<li><b>Never block.</b> No waiting for other devices, no locks the main program might hold, no memory allocation in time-critical code. A handler that waits can wait forever, because the code it waits for cannot run until the handler returns <sup class="src"><a href="#F1-42-src-D8">D8</a></sup>.</li>
+<li><b>Acknowledge the cause.</b> If the device's request is not cleared, a level-triggered line still asks, and the handler runs again at once, forever (<a href="#F1-43">F1-43</a> shows a missing EOI) <sup class="src"><a href="#F1-42-src-D2">D2</a></sup>.</li>
+<li><b>Share data carefully.</b> Data shared with the main program needs a design that tolerates the handler running between any two instructions of the main program: a single-producer single-consumer ring buffer with correctly ordered index updates, or short sections with interrupts disabled <sup class="src"><a href="#F1-42-src-D8">D8</a></sup>.</li>
+</ul>
+<h3 id="F1-42-l2-ring">The ring buffer</h3>
+<p>Listing 2 lets the handler move each byte from the UART into a ring buffer of 64 slots, and the main loop drains the buffer between its other jobs. With the same "field" workload that loses 28,911 bytes when polling (run R4), the interrupt version receives all 65,536 bytes with the right checksum; the buffer never held more than 4 bytes (high water 4, run R2). The buffer must be big enough: with only 2 slots, the same workload drops 19,274 bytes (run R2). The sizing rule is arrival rate × longest busy time, plus a margin: one byte per 10 ticks × 40 ticks = 4 bytes, which is exactly the high-water mark the run measured <sup class="src"><a href="#F1-42-src-W1">W1</a></sup> <sup class="src"><a href="#F1-42-src-R2">R2</a></sup>.</p>
+<h3 id="F1-42-l2-real">Interrupts on the build machine, for real</h3>
+<p>Linux counts every interrupt it handles and shows the counts in <code>/proc/interrupts</code>. Two snapshots one second apart on the build machine (run R3, output in the code walk-through) show interrupts from the network device's receive and send queues, from disk request queues, and "Local timer interrupts" on every CPU, each with its count per second. Each line names the controller and the delivery type: <code>PCI-MSIX</code> lines are message-signalled interrupts from PCI devices (<a href="#F1-43">F1-43</a>, <a href="#F1-45">F1-45</a>) <sup class="src"><a href="#F1-42-src-R3">R3</a></sup> <sup class="src"><a href="#F1-42-src-D7">D7</a></sup>. These are measurements of one virtual machine at one moment, not properties of any product.</p>
+
+<h2 id="F1-42-layer3">Layer 3 — the engineer's depth</h2>
+<p><b>Analogy first:</b> a real kitchen has several doorbells with different tones, a rule about which one may interrupt which, and a "do not disturb" switch.</p>
+<p><b>Masking and critical sections.</b> Every CPU can globally disable interrupt delivery for a short time (x86 clears the interrupt flag; Cortex-M sets a priority mask), and controllers can mask individual lines <sup class="src"><a href="#F1-42-src-D4">D4</a></sup> <sup class="src"><a href="#F1-42-src-D5">D5</a></sup>. Main-program code that must not be interrupted half-way (updating a shared index that is not a single atomic store, for example) runs with interrupts briefly disabled. Every such section adds to the worst-case interrupt latency, so they must be as short as the handlers.</p>
+<p><b>Entry and exit differ by architecture.</b> On x86 the vector indexes the interrupt descriptor table (IDT), and the handler ends with <code>iretq</code> in 64-bit mode; on Arm Cortex-M the hardware itself stacks a set of registers on entry, so a handler can be an ordinary C or C++ function listed in the vector table <sup class="src"><a href="#F1-42-src-D4">D4</a></sup> <sup class="src"><a href="#F1-42-src-D5">D5</a></sup>. The curriculum's B3 and H1/H2 milestones build these paths.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The exact set of registers saved automatically on interrupt entry, the stack used, and the return instruction are architecture details that neither this build nor the verification pass could check (the manuals' PDFs could not be opened): for x86-64, the Intel SDM Volume 3A chapter "Interrupt and Exception Handling"; for Cortex-M, the Armv7-M or Armv8-M Architecture Reference Manual sections on exception entry and return; for RISC-V, the privileged specification's trap handling (mepc, mcause, mret). Read the section for your target before writing an entry stub.</p></div>
+<p><b>Top half and bottom half.</b> Operating systems split interrupt work: a minimal handler that runs with the line blocked, and deferred work that runs later with interrupts enabled (Linux has several mechanisms for this) <sup class="src"><a href="#F1-42-src-D9">D9 ch. 10</a></sup>. The ring buffer of this chapter is the bare-metal form of the same idea: the handler only moves bytes; the main loop does the echo, the checksum and the log flush.</p>
+<p><b>When polling wins.</b> Polling is not wrong. When events arrive faster than the cost of an interrupt entry and exit, or when the CPU has nothing else to do, a tight polling loop has lower latency and overhead; high-rate network and storage drivers switch between interrupts and polling under load <sup class="src"><a href="#F1-42-src-D2">D2</a></sup>. The UART FIFO is a middle way: a 16550-compatible UART can collect several bytes and interrupt once per group <sup class="src"><a href="#F1-42-src-D6">D6</a></sup>; the Linux header defines <code>UART_FCR_ENABLE_FIFO</code> for that and <code>UART_IER_RDI</code> ("enable receiver data interrupt") for the receive interrupt <sup class="src"><a href="#F1-42-src-L1">L1</a></sup>.</p>
+
+<h2 id="F1-42-hardware">How the hardware actually does it</h2>
+<p>The interrupt request is a wire from the device to the interrupt controller (or, for PCI Express devices, a memory write of a special value to a special address, <a href="#F1-45">F1-45</a>) <sup class="src"><a href="#F1-42-src-D2">D2</a></sup>. Inside the CPU, the pipeline of <a href="#F1-26">F1-26</a> checks for pending, unmasked interrupts at instruction boundaries; when it takes one, it lets older instructions complete, discards younger ones, and redirects fetch to the handler <sup class="src"><a href="#F1-42-src-D2">D2</a></sup>. That is why an interrupt never splits one instruction in half from the program's point of view, and why the saved program counter points at the next instruction to execute. In the UART, a received byte sets "data ready"; if the receive interrupt is enabled, the same condition drives the interrupt request output, and reading the receive register clears it <sup class="src"><a href="#F1-42-src-D6">D6</a></sup>. Listing 2 models exactly that: <code>deliver()</code> sets data-ready and the handler empties the receiver.</p>
+
+<h2 id="F1-42-worked">Worked example</h2>
+<h3 id="F1-42-w1">Will polling keep up?</h3>
+<p>Byte interval: 10 ticks. Receiver capacity: 1 byte. A byte is lost when two bytes arrive between two polls, which happens when the gap between polls is longer than 10 ticks.</p>
+<ul>
+<li>Poll every 10 ticks: at most one byte between polls: no loss (R1: PASS).</li>
+<li>Poll every 11 ticks: sometimes two bytes arrive between polls: loss (R1: 5,957 lost).</li>
+<li>Field workload: passes of 4 ticks with a 40-tick pass every 8th time. In the 40-tick gap, 4 bytes arrive; the receiver keeps 1, so 3 are lost per long pass (Figure 2: 40, 50, 60) <sup class="src"><a href="#F1-42-src-R4">R4</a></sup>.</li>
+</ul>
+<h3 id="F1-42-w2">Size the ring buffer</h3>
+<p>Longest busy time of the main loop: 40 ticks. Bytes arriving meanwhile: 40 / 10 = 4. Plus one arriving at the boundary in the worst case: 5. A 64-slot buffer is far above this; a 2-slot buffer is below it, and run R2 confirms both: high water 4 with 64 slots, 19,274 drops with 2 <sup class="src"><a href="#F1-42-src-W1">W1</a></sup>.</p>
+
+<h2 id="F1-42-code">Code walk-through</h2>
+<p>Both listings use one model header: a sender that delivers one byte every <code>kGap</code> = 10 ticks, a receiver of <code>depth</code> 1 byte that counts overruns, and an order-sensitive checksum (two running sums modulo 65521), so a missing byte changes it.</p>
+<pre class="listing" data-src="F1-42/uart_model.h"></pre>
+<div class="tw"><table>
+<tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr>
+<tr><td>10–11</td><td><code>kGap</code>, <code>kTotal</code></td><td>One byte per 10 ticks; 64 KiB in total.</td><td>64 KiB with a checksum is the curriculum's C2 acceptance test.</td></tr>
+<tr><td>18–43</td><td><code>struct Uart</code></td><td><code>deliver()</code> stores a byte or counts an overrun; <code>read()</code> removes one byte.</td><td>A read with a side effect (<a href="#F1-41">F1-41</a>); overrun is the hardware's only record of loss.</td></tr>
+<tr><td>45–54</td><td><code>struct Checksum</code></td><td>Two running sums.</td><td>A plain sum would not notice reordering; this one also changes when a byte is missing.</td></tr>
+<tr><td>58–61</td><td><code>field_work</code></td><td>4 ticks per pass, 40 every 8th pass.</td><td>The forensic lab's load: mostly fast, sometimes slow.</td></tr>
+</table></div>
+<p><b>Listing 1</b> — <code>uart_poll.cpp</code>: echo by polling, at five constant loads.</p>
+<pre class="listing" data-src="F1-42/uart_poll.cpp"></pre>
+<p><b>Build command</b> (used by <code>run_lab.sh</code>): <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined uart_poll.cpp -o uart_poll</code></p>
+<pre class="output" data-run="F1-42/uart_poll"></pre>
+<div class="tw"><table>
+<tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr>
+<tr><td>24</td><td>tick loop</td><td>One iteration per tick until all bytes are sent and read.</td><td>Time is explicit, so the run is repeatable.</td></tr>
+<tr><td>25–32</td><td>arrival</td><td>Every 10 ticks the line delivers the next byte.</td><td>The sender does not wait for the receiver: a UART line has no "wait".</td></tr>
+<tr><td>33–42</td><td>poll</td><td>When the main loop reaches its poll, it empties the receiver, then is busy for <code>work</code> ticks.</td><td>Between polls nobody looks.</td></tr>
+<tr><td>56–61</td><td>table</td><td>Runs five loads and prints echoed, lost, empty polls, checksum.</td><td>The threshold at 10 ticks is visible in one table.</td></tr>
+</table></div>
+<p><b>Listing 2</b> — <code>uart_irq.cpp</code>: the same echo with a receive interrupt and a ring buffer.</p>
+<pre class="listing" data-src="F1-42/uart_irq.cpp"></pre>
+<pre class="output" data-run="F1-42/uart_irq"></pre>
+<div class="tw"><table>
+<tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr>
+<tr><td>11–44</td><td><code>struct Ring</code></td><td>Fixed array, head and tail that wrap modulo N, a count, a high-water mark, a drop counter.</td><td>No allocation in the handler; drops are counted, never silent.</td></tr>
+<tr><td>59–66</td><td>arrival + handler</td><td>Each arrival raises the interrupt; the handler empties the UART into the ring.</td><td>The handler runs at the arrival tick, whatever the main loop is doing.</td></tr>
+<tr><td>67–75</td><td>main loop</td><td>Drains the ring, then is busy (constant load or the field workload).</td><td>The slow work no longer decides whether bytes survive; the ring size does.</td></tr>
+<tr><td>89–93</td><td>five runs</td><td>Field load with 64 and 2 slots; heavy constant loads.</td><td>Shows the fix and the sizing limit.</td></tr>
+</table></div>
+<div class="co warning"><span class="lbl">Watch out</span><p>This model is single-threaded, so the handler can never interrupt <code>pop()</code> half-way. On real hardware it can. A real ring buffer shared between a handler and the main program must make the producer update only <code>head</code> and the consumer only <code>tail</code> (no shared <code>count</code>), with each index update a single, correctly ordered store, or protect the update by briefly disabling the interrupt <sup class="src"><a href="#F1-42-src-D8">D8</a></sup>. The mini-project asks you to rewrite <code>Ring</code> that way.</p></div>
+<p>The real interrupt counts of the build machine, from two snapshots of <code>/proc/interrupts</code> (<code>irq_delta.py</code>):</p>
+<pre class="output" data-run="F1-42/irq_delta"></pre>
+
+<h2 id="F1-42-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>A doorbell can wait while you finish the sauce; an unmasked interrupt cannot.</b> The CPU takes it at the next instruction boundary unless software masked it in advance <sup class="src"><a href="#F1-42-src-D2">D2</a></sup>.</li>
+<li><b>Kofi remembers where he was; the CPU must save it.</b> The "where I was" is a set of registers that hardware and the handler's entry code save and restore exactly; forgetting one corrupts the interrupted program in ways that look random <sup class="src"><a href="#F1-42-src-D3">D3</a></sup>.</li>
+<li><b>A doorbell rings once; a level-triggered request keeps ringing.</b> If the handler does not remove the cause, the CPU re-enters the handler immediately, and the main program never runs again (<a href="#F1-43">F1-43</a>) <sup class="src"><a href="#F1-42-src-D2">D2</a></sup>.</li>
+</ul>
+
+<h2 id="F1-42-mistakes">Common mistakes and debugging</h2>
+<ul>
+<li><b>Symptom:</b> bytes lost under load only (R4). <b>Cause:</b> polling period longer than the device can buffer. <b>Find it:</b> measure the main loop's longest pass and compare with byte interval × receiver depth; look for overrun flags. <b>Fix:</b> receive interrupt plus a ring buffer sized from the longest busy time.</li>
+<li><b>Symptom:</b> the system freezes as soon as the interrupt is enabled. <b>Cause:</b> the handler does not clear the device's request (or the controller's EOI), so it is re-entered forever. <b>Find it:</b> count handler entries; a counter that climbs while the main loop counter stands still. <b>Fix:</b> acknowledge in the device and the controller.</li>
+<li><b>Symptom:</b> rare corruption of data shared with a handler. <b>Cause:</b> a non-atomic update in the main program interrupted half-way. <b>Find it:</b> list every variable written by both sides. <b>Fix:</b> one writer per variable, or a short critical section with the interrupt masked.</li>
+<li><b>Symptom:</b> interrupts work, but other interrupts are now late. <b>Cause:</b> a long handler (printing, waiting) blocks lower-priority lines. <b>Fix:</b> move the work out of the handler.</li>
+<li><b>Symptom:</b> drops counted in the ring buffer (R2 with 2 slots). <b>Cause:</b> buffer smaller than arrival rate × longest busy time. <b>Fix:</b> size it from the measured worst case, and keep the drop counter visible.</li>
+</ul>
+
+<div class="co transition" id="F1-42-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F1-41">F1-41</a> controlled devices through registers and waited for them by polling; <a href="#F1-25">F1-25</a> and <a href="#F1-26">F1-26</a> showed how the CPU's control unit and pipeline fetch the next instruction. <b>What carries over:</b> status and data registers, W1C acknowledges, volatile accessors; the idea of the program counter <sup class="src"><a href="#F1-42-src-D2">D2</a></sup>. <b>What changes:</b> most dangerous first: your code can now be entered between any two instructions of the main program, so shared data needs a design; handlers must be short and must never block; control flow is no longer only what your source shows <sup class="src"><a href="#F1-42-src-D3">D3</a></sup> <sup class="src"><a href="#F1-42-src-D8">D8</a></sup>. <b>What comes next:</b> <a href="#F1-43">F1-43</a> opens the interrupt controller: many devices, one CPU, priorities, masks and the end-of-interrupt that a handler must not forget.</p></div>
+
+<h2 id="F1-42-check">Check yourself</h2>
+<ol>
+<li>Name two costs of polling.</li>
+<li>Put in order: handler runs; device raises request; CPU saves state; controller forwards with a vector; interrupted program continues; handler acknowledges.</li>
+<li>A UART has a 16-byte receive FIFO. Bytes arrive every 10 ticks. What is the longest time the main program may be busy, when polling, before bytes are lost? (a) 10 ticks (b) about 160 ticks (c) 16 ticks (d) unlimited</li>
+<li>Explain in your own words why an interrupt handler must never wait for something the main program does.</li>
+<li>Apply to a new case: a sensor sends a 6-byte message every 50 ticks, and the main loop's longest pass is 120 ticks. How many bytes must the ring buffer hold at least?</li>
+<li>Predict, then run: change <code>field_work</code> so the long pass is 100 ticks instead of 40, rerun Listing 2, and predict the high-water mark first.</li>
+<li>In run R3, which interrupt lines are delivered as messages (MSI-X), and which line is the local timer?</li>
+<li>Why does the overrun begin at tick 40 and not at tick 30 in Figure 2?</li>
+</ol>
+
+<h2 id="F1-42-lab">Lab</h2>
+<h3 id="F1-42-lab-goal">Goal</h3>
+<p>Build the UART echo twice, with polling and with an interrupt plus ring buffer, show where polling starts to lose bytes, and prove the interrupt version passes the 64 KiB checksum test under the same load.</p>
+<h3 id="F1-42-lab-need">Hardware and software needed</h3>
+<p>Simulator part: any computer with a C++20 compiler (the Lab Engineer used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>); Linux for the <code>/proc/interrupts</code> step. Optional board part: the reference kit's microcontroller board, the Raspberry Pi Pico 2 (RP2350) or its alternative the ST NUCLEO-F446RE, with the Raspberry Pi Debug Probe as the USB-to-UART bridge (3.3 V I/O; the NUCLEO's on-board ST-LINK provides its own), the board's vendor documentation and toolchain, and a terminal program (<code>university/build/KIT.md</code>, ruling D1); <b>untested on hardware</b> in this build and in the verification pass (no board was connected).</p>
+<h3 id="F1-42-lab-safety">Safety</h3>
+<div class="co safety"><span class="lbl">Safety</span><p>The simulator part needs none beyond normal computer use. For the optional board part: use a development board powered from USB only, at its own low voltage; learners below level L3 work with adult supervision; no mains-powered equipment; do not connect the board's UART pins to a PC serial port of a different voltage standard without the level converter the board's documentation names; flash only a board you are allowed to reflash.</p></div>
+<h3 id="F1-42-lab-steps">Steps</h3>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F1-42</code> and read <code>uart_poll.out</code>, <code>uart_irq.out</code>, <code>uart_field.out</code> and <code>irq_delta.out</code>.</li>
+<li>In <code>uart_poll.cpp</code>, add loads 12, 15 and 20 to the table. Before running, predict the lost bytes for 20 (hint: between two polls 20 ticks apart, two bytes arrive and one fits).</li>
+<li>Give the <code>Uart</code> a depth of 16 (a FIFO) and rerun the polling table. Find the new threshold.</li>
+<li>In <code>uart_irq.cpp</code>, add a counter of handler entries and a counter of main-loop passes, and print the CPU time spent in handlers if each entry costs 2 ticks.</li>
+<li>Run <code>run.sh</code> again twice and compare the per-second interrupt counts between runs.</li>
+<li>Optional, board (untested on hardware; to test it you need the kit board, its serial bridge, the vendor's UART example and a terminal program that can send a file): with your board's vendor examples, write a UART echo that polls the receive flag, then one that enables the receive interrupt and fills a ring buffer. Paste a 64 KiB file from the PC and compare checksums of what you sent and what came back.</li>
+</ol>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>Board step 6 was not performed in this build or in the verification pass. The reference kit (ruling D1) names the board and the serial bridge, but none was connected, so nothing here is a hardware observation. To test it you need: the Pico 2 or NUCLEO-F446RE, the Debug Probe (or the NUCLEO's ST-LINK) wired to the board's UART pins and ground, the vendor's toolchain and UART example, and a terminal program that can send a 64 KiB file. Register names, interrupt numbers, flag names and the flashing procedure come only from your board's reference manual and its vendor documentation (curriculum H2: "Drivers for the timer, UART and I2C written from the reference manual"). The paste test's pass condition (no lost bytes, equal checksums) is the curriculum's C2 acceptance test.</p></div>
+<h3 id="F1-42-lab-expect">Expected observations</h3>
+<p>From the Lab Engineer's runs: polling passes up to a 10-tick period and fails beyond it (R1); the interrupt version passes the field workload with a high-water mark of 4 and fails with a 2-slot ring (R2). Step 3: with 16 bytes of FIFO the threshold moves to about 16 × 10 ticks. Step 5: your counts differ from R3 and from each other; that is expected.</p>
+<h3 id="F1-42-lab-verify">Verification</h3>
+<p>The milestone acceptance test, verbatim from curriculum C2: "Pasting 64 KiB through the serial port loses no bytes (checksum)." In the simulator: the interrupt version prints PASS with the field workload and your heavier workloads.</p>
+<h3 id="F1-42-lab-trouble">Troubleshooting</h3>
+<ul>
+<li><b>The loop never ends:</b> your end condition waits for <code>u.data_ready()</code> but nothing reads the UART any more; keep the poll or drain running until all bytes are sent and read.</li>
+<li><b>PASS with bytes lost:</b> you compared byte counts, not checksums; a missing byte and a duplicated byte cancel in counts.</li>
+<li><b><code>run.sh</code> shows no MSI lines:</b> your machine's devices use other controllers; any line with a changing count is fine.</li>
+</ul>
+<h3 id="F1-42-lab-ext">Extension</h3>
+<p>Add a transmit path: the echo goes into a transmit ring buffer, and a "transmitter empty" interrupt sends one byte per 10 ticks. Show what happens when the receive rate is higher than the transmit rate.</p>
+
+<h2 id="F1-42-forensic">Forensic lab</h2>
+<h3 id="F1-42-for-scenario">Scenario</h3>
+<p>"The missing bytes." A customer reports that firmware updates sent over the serial console fail about half the time. Ana tests on the bench: when she types by hand, every character echoes. When she pastes a 64 KiB file, the checksum is wrong. The firmware polls the UART once per pass of its main loop; a recent change added a log that is flushed to flash every few passes. The UART on this board holds one received byte.</p>
+<h3 id="F1-42-for-evidence">Evidence pack</h3>
+<p>The bench tool's report for the shipped (polling) firmware, from the simulation <code>uart_field.cpp</code> (run R4):</p>
+<pre class="output" data-run="F1-42/uart_field"></pre>
+<h3 id="F1-42-for-questions">Questions</h3>
+<ol>
+<li>From BENCH 1–3, how many bytes were lost, and which pass length can lose them?</li>
+<li>State at least two hypotheses (for example: a wrong baud rate; a sender problem; polling too slowly) and say which evidence rules each out.</li>
+<li>Use BENCH 4 to prove when the first loss happened and why.</li>
+<li>Propose a fix and size it with numbers from the evidence.</li>
+<li>How will you verify the fix, and what test will stop this coming back?</li>
+</ol>
+<h3 id="F1-42-for-hints">Method hints</h3>
+<p>A wrong baud rate corrupts bytes; it does not make whole bytes disappear while the rest checksum-check in order. Compare the byte interval with each pass length. Then compare the time of the first overrun with the list of polls around it.</p>
+
+<h2 id="F1-42-project">Mini-project</h2>
+<p>Rewrite <code>Ring</code> as a single-producer, single-consumer buffer that is safe when the handler can interrupt the main program between any two instructions: the handler writes only <code>head</code>, the main program only <code>tail</code>, the indices are <code>std::atomic&lt;std::size_t&gt;</code> with release/acquire ordering, and "full" is <code>head - tail == N</code> with indices that wrap modulo 2<sup>k</sup>. Test it with two <code>std::thread</code>s (one producer, one consumer) and ThreadSanitizer.</p>
+<p><b>Rubric (10 points):</b> one writer per index (3); correct full and empty tests, including wrap-around (3); a ThreadSanitizer run with no report, output attached (2); a paragraph explaining why <code>count</code> was removed (2).</p>
+
+<h2 id="F1-42-summary">Summary</h2>
+<ul>
+<li>Polling is simple but wastes CPU time and reacts no faster than its period; data is lost when the period exceeds what the device can buffer.</li>
+<li>An interrupt makes the CPU save its state, run a handler through a vector, and return as if nothing happened.</li>
+<li>The flow is device → controller → CPU → handler → acknowledge → return.</li>
+<li>Handlers are short, never block, acknowledge the cause, and share data through a carefully designed structure.</li>
+<li>A ring buffer sized from arrival rate × longest busy time decouples arrival from processing: 0 bytes lost in R2.</li>
+<li>Real machines take hundreds of interrupts per second; Linux shows them in <code>/proc/interrupts</code> (R3).</li>
+</ul>
+
+<h2 id="F1-42-sources">Sources</h2>
+<ol>
+<li id="F1-42-src-W1"><b>W1</b> — Worked arithmetic in this chapter (polling thresholds, ring-buffer sizing). Checked against runs R1, R2 and R4.</li>
+<li id="F1-42-src-R1"><b>R1</b> — Lab run of Listing 1 (<code>uart_poll.cpp</code>): "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0", 2026-10-09, Linux x86_64 cloud build container, exit code 0. A simulation; untested on hardware.</li>
+<li id="F1-42-src-R2"><b>R2</b> — Lab run of Listing 2 (<code>uart_irq.cpp</code>), same toolchain and date, exit code 0. A simulation; untested on hardware.</li>
+<li id="F1-42-src-R3"><b>R3</b> — Two snapshots of <code>/proc/interrupts</code> one second apart on the build machine (Linux, 4 CPUs visible), compared by <code>irq_delta.py</code>; one measurement (AH-23).</li>
+<li id="F1-42-src-R4"><b>R4</b> — Forensic run of <code>uart_field.cpp</code>, same toolchain and date, exit code 0. A simulation.</li>
+<li id="F1-42-src-L1"><b>L1</b> — Linux UAPI header <code>linux/serial_reg.h</code> (linux-libc-dev 6.8.0-146.146), opened in this build: <code>UART_IER_RDI</code> 0x01 "Enable receiver data interrupt", <code>UART_FCR_ENABLE_FIFO</code> 0x01, <code>UART_LSR_OE</code> 0x02 "Overrun error indicator".</li>
+<li id="F1-42-src-C1"><b>C1</b> — Systems Curriculum (this project), milestones C2 and H2 (goals and acceptance tests quoted verbatim). A map, not a source (AH-4).</li>
+<li id="F1-42-src-D2"><b>D2</b> — David A. Patterson, John L. Hennessy, "Computer Organization and Design RISC-V Edition: The Hardware Software Interface", 2nd edition, Elsevier (Morgan Kaufmann), 2020, ISBN 9780128203316 (used for: polling versus interrupts, interrupt requests and priorities, acknowledging, precise interrupts in the pipeline, latency). <i>Verification pass 2026-10-10: the publisher's catalogue page was opened and confirms the edition; it lists the chapters without section titles, and the text was not opened, so no section is cited.</i></li>
+<li id="F1-42-src-D3"><b>D3</b> — Randal E. Bryant, David R. O'Hallaron, "Computer Systems: A Programmer's Perspective", 3rd edition, Pearson, 2015, ISBN 9780134092669 (used for: interrupts as asynchronous exceptions; saving state, handler, return to the next instruction). <i>Verification pass 2026-10-10: the book's home page was opened and confirms the edition; its table of contents and the exceptional-control-flow chapter could not be opened (lookup budget), so no section is cited.</i></li>
+<li id="F1-42-src-D4"><b>D4</b> — Intel, "Intel® 64 and IA-32 Architectures Software Developer Manuals", version 093 as shown on the vendor's download page, Volume 3A "System Programming Guide, Part 1" (used for: vectors and the IDT, the interrupt flag, interrupt return). <i>Verification pass 2026-10-10: the download page was opened (volumes and version confirmed); the volume PDFs and their chapters could not be opened (lookup budget exhausted), so no chapter section is cited.</i></li>
+<li id="F1-42-src-D5"><b>D5</b> — Arm, "Armv7-M Architecture Reference Manual" and "Armv8-M Architecture Reference Manual" (used for: the vector table, automatic stacking on exception entry, priority masking). <i>Verification pass 2026-10-10: not opened; the Arm documentation site redirected to a page without content, and the retry was refused by the lookup budget.</i></li>
+<li id="F1-42-src-D6"><b>D6</b> — Texas Instruments (formerly National Semiconductor), "PC16550D Universal Asynchronous Receiver/Transmitter with FIFOs" datasheet (used for: receive data ready, overrun, receive interrupt, FIFO). <i>Verification pass 2026-10-10: not opened; the vendor's PDF link returned an error and the retry was refused by the shared lookup budget. The register offsets and bit names used in this chapter come from the Linux header (opened).</i></li>
+<li id="F1-42-src-D7"><b>D7</b> — Linux kernel documentation, "The /proc Filesystem" (used for: the meaning of the columns of <code>/proc/interrupts</code>). <i>Verification pass 2026-10-10: not opened (lookup budget). The same point is made in D9, chapter 10, section "The /proc Interface": the display shows how many interrupts have been delivered to each CPU.</i></li>
+<li id="F1-42-src-D8"><b>D8</b> — Elecia White, "Making Embedded Systems" (O'Reilly) (used for: short handlers, no blocking, sharing data with handlers, circular buffers). <i>Verification pass 2026-10-10: not opened; the publisher's page was refused by the lookup budget, so the edition is not recorded.</i> (curriculum 17.2 reading)</li>
+<li id="F1-42-src-D9"><b>D9</b> — Jonathan Corbet, Alessandro Rubini, Greg Kroah-Hartman, "Linux Device Drivers, Third Edition" (O'Reilly; the free chapters published by LWN.net), chapter 10 "Interrupt Handling", sections "Top and Bottom Halves" (tasklets and workqueues), "Enabling and Disabling Interrupts" and "The /proc Interface" (used for: splitting interrupt work into a short handler that must not sleep and deferred work; "The first step usually consists of clearing a bit on the interface board") (curriculum item 39). <i>Verification pass 2026-10-10: chapter 10 opened.</i></li>
+</ol>
+
+<h2 id="F1-42-glossary">Glossary links</h2>
+<p><a href="#gl-polling">Polling</a> · <a href="#gl-interrupt">Interrupt</a> · <a href="#gl-interrupt-request-irq">Interrupt request (IRQ)</a> · <a href="#gl-interrupt-handler-isr">Interrupt handler (ISR)</a> · <a href="#gl-interrupt-vector">Interrupt vector</a> · <a href="#gl-acknowledge-an-interrupt">Acknowledge (an interrupt)</a> · <a href="#gl-overrun">Overrun</a> · <a href="#gl-ring-buffer">Ring buffer</a> · <a href="#gl-interrupt-latency">Interrupt latency</a></p>
+
+<h2 id="F1-42-next">Next chapter</h2>
+<p>Next: <a href="#F1-43">F1-43 Interrupt controllers</a>. Previous: <a href="#F1-41">F1-41 Memory-mapped I/O and port I/O</a>. Back to the course: <a href="#HW204">HW204 Buses, I/O, interrupts and DMA</a>.</p>
+
+<h2 id="F1-42-answers">Answers to Check yourself</h2>
+<ol>
+<li>Wasted CPU time on polls that find nothing (98,303 empty polls in R1 at a 4-tick period), and a reaction time no better than the polling period, which loses data when the program is busy too long.</li>
+<li>Device raises request → controller forwards with a vector → CPU saves state → handler runs → handler acknowledges → interrupted program continues.</li>
+<li>(b) about 160 ticks: the FIFO can absorb 16 bytes at one per 10 ticks. (a) is the one-byte case; (c) confuses bytes with ticks; (d) ignores that the FIFO fills.</li>
+<li>Any answer that says: while the handler runs, the main program cannot run (and often lower-priority interrupts are blocked), so whatever the handler waits for can never happen; the system deadlocks or misses deadlines.</li>
+<li>In 120 ticks at most three messages can start (at worst 120 / 50 rounded up = 3), so 18 bytes, plus margin; for example a 32-slot buffer.</li>
+<li>Prediction: 100 / 10 = 10 bytes arrive during the long pass, so a high-water mark of about 10 (and still PASS with 64 slots). Report your run's number.</li>
+<li>All <code>PCI-MSIX-…</code> lines (virtio network input and output, disk request queues, the RNG) are message-signalled; <code>LOC</code> is "Local timer interrupts".</li>
+<li>The byte at 30 arrived while the receiver was empty (the poll at 28 had emptied it) and was kept; the byte at 40 found the receiver still holding the byte from 30, because the next poll was not until 68.</li>
+</ol>
+<h3 id="F1-42-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation:</b> 65,536 sent, 36,625 received, checksum FAIL (BENCH 1); 28,911 overruns, the first at t = 40, 50, 60 (BENCH 2); pass lengths of 4 ticks (67,466 passes) and 40 ticks (9,638 passes) (BENCH 3); polls at 0…28 and then 68 (BENCH 4) (R4). <b>Hypotheses:</b> (1) wrong baud rate: ruled out, it would corrupt bytes rather than drop whole ones, and it would also affect hand typing; (2) the sender: ruled out, overruns are reported by the receiver, which means bytes arrived and could not be stored; (3) polling too slowly: confirmed. <b>Proof:</b> bytes arrive every 10 ticks; the UART holds one; a 40-tick pass leaves 4 arrivals for 1 slot, so 3 overruns per long pass; the first long pass runs from 28 to 68, exactly where the overruns at 40, 50, 60 are. Hand typing never puts two characters within 40 ticks. <b>Fix:</b> enable the receive interrupt and move bytes into a ring buffer in the handler; size: 40 / 10 = 4 bytes per long pass, plus margin, so 16 or more slots (Listing 2 uses 64). <b>Verification:</b> rerun the 64 KiB paste test: Listing 2 with the field workload prints 65,536 echoed, checksum 0x52668772, PASS, high water 4 (R2). <b>Prevention:</b> keep the 64 KiB paste test (curriculum C2) in the release checklist, run it with the logging feature enabled, and expose the overrun and ring-drop counters in the firmware's status output. <b>How the evidence was made:</b> <code>uart_field.cpp</code> with the field workload of <code>uart_model.h</code>; nothing was hand-edited. <b>Wrong answers:</b> "increase the baud rate" (more bytes per tick makes it worse); "flush the log less often" (reduces loss but does not remove it while any pass exceeds 10 ticks).</p>

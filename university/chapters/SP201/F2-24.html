@@ -1,0 +1,334 @@
+<!--meta
+id: F2-24
+title: Object representation: size, alignment, padding
+course: SP201
+level: L2
+prereqs: F2-23; F2-18 (bytes, sizeof, endianness); MA102 (binary and hexadecimal)
+time: 4–5 hours including the lab
+hardware: a computer running Linux (or WSL) with g++ 13 or clang++ 18; optional: aarch64 and riscv64 cross compilers with QEMU user mode (used in this build; real AArch64 or RISC-V hardware was not tested)
+maps: Curriculum 1.1 (object representation; misaligned access and strict aliasing as UB that bites kernels); preview of B3 (memory-mapped device registers laid out by struct) and B5 (allocators must return suitably aligned memory); P4 (CS:APP 3.9.3 data alignment)
+analogy: F2 — the restaurant building and its kitchen; registered mapping "main memory = the pantry" (guide 8.1); new mapping proposed in NOTES.md: "alignment = big crates may only start at shelf numbers that are a multiple of their size; padding = empty slots left so the next crate lines up"
+-->
+
+<h2 id="F2-24-hook">Story hook</h2>
+<div class="co analogy"><span class="lbl">Analogy</span>
+<p>The pantry shelves are numbered slots. Small jars fit anywhere. The big eight-slot crates of flour are different: the shelf frame has supports only at every eighth slot, so a crate must start at slot 0, 8, 16 and so on. Four-slot boxes of rice must start at a multiple of four.</p>
+<p>Wei packs an order kit in the order the recipe lists it: one jar of salt, a crate of flour, one jar of chili, a box of rice. The salt goes in slot 0; the flour cannot start at slot 1, so slots 1 to 7 stay empty and the flour takes 8 to 15. Chili in 16, three empty slots, rice in 20 to 23. The kit takes 24 slots and a third of them are air. Ana repacks the same four items, biggest first: flour 0 to 7, rice 8 to 11, salt 12, chili 13, two empty slots to round up. Sixteen slots. Same food, a third less shelf.</p>
+<p>The compiler packs every struct exactly like this. This chapter shows you how to read and predict the packing, why it exists, and how it trips up programs that send raw objects to other machines.</p>
+</div>
+
+<h2 id="F2-24-able">What you will be able to do</h2>
+<ul>
+<li><b>Predict</b> <code>sizeof</code>, <code>alignof</code> and member offsets of a simple struct, and check the prediction with <code>offsetof</code>.</li>
+<li><b>Explain</b> what alignment and padding are and why compilers insert padding.</li>
+<li><b>Reorder</b> members to reduce padding, and measure the saving.</li>
+<li><b>Lock down</b> a layout that other code depends on with <code>static_assert</code>, and check type properties (standard-layout, trivially copyable) with type traits.</li>
+<li><b>Read</b> bytes safely with <code>std::memcpy</code> instead of misaligned or type-punned pointers.</li>
+<li><b>Diagnose</b> a data-exchange bug caused by sending a struct's raw bytes (forensic lab), and fix it with explicit serialisation.</li>
+</ul>
+
+<div class="co jargon" id="F2-24-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Alignment</dt><dd><b>Simple words:</b> the rule that an object of some type must start at an address that is a multiple of a certain number. <b>Analogy:</b> crates may start only at slots that are a multiple of 8. <b>Precise:</b> an implementation-defined power of two, given by <code>alignof(T)</code>, such that every object of type <code>T</code> has an address that is a multiple of it; on the x86-64 build used here <code>alignof(int)</code> was 4 and <code>alignof(double)</code> 8. <sup class="src"><a href="#F2-24-src-D1">D1</a></sup> <sup class="src"><a href="#F2-24-src-R1">R1</a></sup></dd>
+<dt>Padding</dt><dd><b>Simple words:</b> unused bytes the compiler puts inside or at the end of a struct. <b>Analogy:</b> empty slots left so the next crate lines up. <b>Precise:</b> bytes of an object's representation that belong to no member; inserted so that each member meets its alignment and so that the size is a multiple of the struct's alignment (making arrays work); their values are unspecified unless the object was zero-initialised in a way that sets them. <sup class="src"><a href="#F2-24-src-D1">D1</a></sup> <sup class="src"><a href="#F2-24-src-D3">D3</a></sup></dd>
+<dt>alignof</dt><dd><b>Simple words:</b> the operator that tells you a type's alignment. <b>Analogy:</b> reading the "starts every N slots" label on a crate. <b>Precise:</b> <code>alignof(T)</code> yields a <code>std::size_t</code> constant, the alignment requirement of <code>T</code>; <code>alignas</code> requests a stricter one. <sup class="src"><a href="#F2-24-src-D1">D1</a></sup></dd>
+<dt>offsetof</dt><dd><b>Simple words:</b> a macro that tells you at which byte a member starts inside its struct. <b>Analogy:</b> "the rice starts at slot 20 of the kit". <b>Precise:</b> <code>offsetof(type, member)</code> from <code>&lt;cstddef&gt;</code>, a constant of type <code>std::size_t</code>; conditionally supported for types that are not standard-layout. <sup class="src"><a href="#F2-24-src-D1">D1</a></sup></dd>
+<dt>Standard-layout type</dt><dd><b>Simple words:</b> a struct simple enough that its layout follows the C rules. <b>Analogy:</b> a kit packed by the published packing rules, without hidden extras. <b>Precise:</b> a class type with, among other conditions, all non-static data members having the same access control, no virtual functions or virtual base classes, and members that are themselves standard-layout; tested with <code>std::is_standard_layout_v</code>. <sup class="src"><a href="#F2-24-src-D1">D1</a></sup></dd>
+<dt>Trivially copyable type</dt><dd><b>Simple words:</b> a type whose objects may be copied by copying their bytes. <b>Analogy:</b> a kit you can duplicate by photocopying the shelf. <b>Precise:</b> a type whose copy and move operations and destructor are trivial (or deleted, with at least one eligible); for such types, copying the bytes with <code>std::memcpy</code> into another object of the type gives that object the same value. Tested with <code>std::is_trivially_copyable_v</code>. <sup class="src"><a href="#F2-24-src-D1">D1</a></sup></dd>
+<dt>Strict aliasing</dt><dd><b>Simple words:</b> the rule that you may read an object only as its own type (or as raw bytes). <b>Analogy:</b> a flour crate must be opened as a flour crate, not as a box of rice. <b>Precise:</b> accessing an object through a glvalue of a type other than its dynamic type, a corresponding signed/unsigned type, or <code>char</code>/<code>unsigned char</code>/<code>std::byte</code> is undefined behaviour. <sup class="src"><a href="#F2-24-src-D1">D1</a></sup></dd>
+<dt>Serialisation</dt><dd><b>Simple words:</b> turning an object into a sequence of bytes in an agreed format, and back. <b>Analogy:</b> writing the kit's contents onto a delivery slip in an agreed order, instead of shipping the shelf. <b>Precise:</b> encoding of values into a defined external representation (field order, sizes, byte order, no padding) independent of the in-memory object representation; decoding is the reverse. <sup class="src"><a href="#F2-24-src-D3">D3</a></sup></dd>
+</dl></div>
+
+<h2 id="F2-24-pictures">The idea in pictures</h2>
+<p>Figure 1 shows the real byte map of the two structs of Listing 1, measured with <code>offsetof</code> on this build's x86-64 machine. Each cell is one byte; dashed cells are padding.</p>
+<figure id="F2-24-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 280" role="img" aria-labelledby="F2-24-f1t F2-24-f1d">
+<title id="F2-24-f1t">Byte maps of struct Loose (24 bytes) and struct Tidy (16 bytes)</title>
+<desc id="F2-24-f1d">Two rows of one-byte cells. Top row, Loose, 24 bytes: byte 0 size; bytes 1 to 7 padding; bytes 8 to 15 price; byte 16 spicy; bytes 17 to 19 padding; bytes 20 to 23 table. Bottom row, Tidy, 16 bytes: bytes 0 to 7 price; bytes 8 to 11 table; byte 12 size; byte 13 spicy; bytes 14 and 15 padding. Byte numbers 0, 8, 16 and 24 are marked above the rows.</desc>
+<text class="sv-tb" x="20" y="32">Loose: 24 bytes (10 of them padding)</text>
+<rect class="sv-b1" x="40" y="56" width="28" height="34"/>
+<text class="sv-tm" x="40" y="112">size</text>
+<rect class="sv-dash" x="68" y="56" width="28" height="34"/>
+<rect class="sv-dash" x="96" y="56" width="28" height="34"/>
+<rect class="sv-dash" x="124" y="56" width="28" height="34"/>
+<rect class="sv-dash" x="152" y="56" width="28" height="34"/>
+<rect class="sv-dash" x="180" y="56" width="28" height="34"/>
+<rect class="sv-dash" x="208" y="56" width="28" height="34"/>
+<rect class="sv-dash" x="236" y="56" width="28" height="34"/>
+<text class="sv-tm" x="142" y="112">padding</text>
+<rect class="sv-b2" x="264" y="56" width="28" height="34"/>
+<rect class="sv-b2" x="292" y="56" width="28" height="34"/>
+<rect class="sv-b2" x="320" y="56" width="28" height="34"/>
+<rect class="sv-b2" x="348" y="56" width="28" height="34"/>
+<rect class="sv-b2" x="376" y="56" width="28" height="34"/>
+<rect class="sv-b2" x="404" y="56" width="28" height="34"/>
+<rect class="sv-b2" x="432" y="56" width="28" height="34"/>
+<rect class="sv-b2" x="460" y="56" width="28" height="34"/>
+<text class="sv-tm" x="358" y="112">price</text>
+<rect class="sv-b3" x="488" y="56" width="28" height="34"/>
+<text class="sv-tm" x="484" y="128">spicy</text>
+<rect class="sv-dash" x="516" y="56" width="28" height="34"/>
+<rect class="sv-dash" x="544" y="56" width="28" height="34"/>
+<rect class="sv-dash" x="572" y="56" width="28" height="34"/>
+<text class="sv-tm" x="534" y="112">padding</text>
+<rect class="sv-b4" x="600" y="56" width="28" height="34"/>
+<rect class="sv-b4" x="628" y="56" width="28" height="34"/>
+<rect class="sv-b4" x="656" y="56" width="28" height="34"/>
+<rect class="sv-b4" x="684" y="56" width="28" height="34"/>
+<text class="sv-tm" x="638" y="112">table</text>
+<text class="sv-ts" x="36" y="51">0</text>
+<text class="sv-ts" x="260" y="51">8</text>
+<text class="sv-ts" x="484" y="51">16</text>
+<text class="sv-ts" x="708" y="51">24</text>
+<text class="sv-tb" x="20" y="162">Tidy: 16 bytes (2 of them padding)</text>
+<rect class="sv-b2" x="40" y="186" width="28" height="34"/>
+<rect class="sv-b2" x="68" y="186" width="28" height="34"/>
+<rect class="sv-b2" x="96" y="186" width="28" height="34"/>
+<rect class="sv-b2" x="124" y="186" width="28" height="34"/>
+<rect class="sv-b2" x="152" y="186" width="28" height="34"/>
+<rect class="sv-b2" x="180" y="186" width="28" height="34"/>
+<rect class="sv-b2" x="208" y="186" width="28" height="34"/>
+<rect class="sv-b2" x="236" y="186" width="28" height="34"/>
+<text class="sv-tm" x="134" y="242">price</text>
+<rect class="sv-b4" x="264" y="186" width="28" height="34"/>
+<rect class="sv-b4" x="292" y="186" width="28" height="34"/>
+<rect class="sv-b4" x="320" y="186" width="28" height="34"/>
+<rect class="sv-b4" x="348" y="186" width="28" height="34"/>
+<text class="sv-tm" x="302" y="242">table</text>
+<rect class="sv-b1" x="376" y="186" width="28" height="34"/>
+<text class="sv-tm" x="376" y="242">size</text>
+<rect class="sv-b3" x="404" y="186" width="28" height="34"/>
+<text class="sv-tm" x="400" y="258">spicy</text>
+<rect class="sv-dash" x="432" y="186" width="28" height="34"/>
+<rect class="sv-dash" x="460" y="186" width="28" height="34"/>
+<text class="sv-tm" x="436" y="242">padding</text>
+<text class="sv-ts" x="36" y="181">0</text>
+<text class="sv-ts" x="260" y="181">8</text>
+<text class="sv-ts" x="484" y="181">16</text>
+</svg></div><figcaption><b>Figure 1.</b> The same four members, two orders. Loose wastes 10 of 24 bytes on padding; Tidy wastes 2 of 16. The offsets are the measured values printed by Listing 1 (R1), identical in the AArch64 and RISC-V 64 runs under emulation (R6). Sources: D1, D3, R1, R6.</figcaption></figure>
+
+<h2 id="F2-24-layer1">Layer 1 — the kid explanation</h2>
+<p>Memory is a long row of numbered byte boxes (F2-18). A number like an <code>int</code> takes four boxes in a row, a <code>double</code> takes eight. The computer likes each value to start at a box number that "fits" it: an <code>int</code> at a multiple of 4, a <code>double</code> at a multiple of 8. That rule is called <b>alignment</b>.<sup class="src"><a href="#F2-24-src-D1">D1</a></sup></p>
+<p>When you put several values together in a <code>struct</code>, the compiler keeps the rule for each of them. If a <code>double</code> comes right after a one-byte <code>char</code>, it cannot start at box 1, so the compiler leaves boxes 1 to 7 empty. Those empty boxes are <b>padding</b>.<sup class="src"><a href="#F2-24-src-D3">D3</a></sup> Listing 1 measured it: the same four values took 24 boxes in one order and 16 in another.<sup class="src"><a href="#F2-24-src-R1">R1</a></sup></p>
+<p>Usually padding is invisible and harmless. It matters when you have millions of objects (wasted memory), and when you send an object's bytes to another program that does not know about the empty boxes.</p>
+
+<h2 id="F2-24-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F2-24-l2-rules">The layout rules, as the compiler applied them</h3>
+<p>For the structs in this chapter the compiler followed three rules, which you can check against every number in Listing 1 and the lab:<sup class="src"><a href="#F2-24-src-D3">D3</a></sup> <sup class="src"><a href="#F2-24-src-D7">D7</a></sup></p>
+<ol>
+<li>Members are placed in declaration order (C++ guarantees increasing addresses for members with the same access control).<sup class="src"><a href="#F2-24-src-D1">D1</a></sup></li>
+<li>Each member starts at the next offset that is a multiple of its alignment.</li>
+<li>The struct's alignment is the largest member alignment, and its size is rounded up to a multiple of that alignment, so that in an array every element's members are aligned too.</li>
+</ol>
+<p>Apply them to <code>Loose</code> (<code>char size; double price; char spicy; int table;</code>): <code>size</code> at 0; <code>price</code> needs a multiple of 8, so 8; <code>spicy</code> at 16; <code>table</code> needs a multiple of 4, so 20; it ends at 24, already a multiple of 8. Size 24. Listing 1 printed exactly "offsets: size 0, price 8, spicy 16, table 20" and "sizeof 24, alignof 8".<sup class="src"><a href="#F2-24-src-R1">R1</a></sup> Sorting members from largest alignment to smallest (<code>Tidy</code>) leaves padding only at the end: 16 bytes; 1000 objects took 24000 versus 16000 bytes.<sup class="src"><a href="#F2-24-src-R1">R1</a></sup></p>
+<h3 id="F2-24-l2-see">Seeing the padding</h3>
+<p>Listing 2 copies a <code>Loose</code> object's 24 bytes into an <code>unsigned char</code> array with <code>std::memcpy</code> and prints them. The object was value-initialised (<code>Loose order{};</code>), which zero-initialises it including padding, so the padding shows as <code>00</code>.<sup class="src"><a href="#F2-24-src-D1">D1</a></sup> <sup class="src"><a href="#F2-24-src-R2">R2</a></sup> Without that, the padding bytes have unspecified values, and two objects with equal members can differ byte by byte; that is why comparing structs with <code>memcmp</code> or hashing their raw bytes is unreliable.<sup class="src"><a href="#F2-24-src-D1">D1</a></sup> You can also read <code>price</code> (2.5) in bytes 8 to 15: <code>00 00 00 00 00 00 04 40</code>, the IEEE 754 encoding <code>0x4004000000000000</code> stored little-endian (F2-18, MA102).<sup class="src"><a href="#F2-24-src-R2">R2</a></sup></p>
+<h3 id="F2-24-l2-lock">Locking a layout</h3>
+<p>When other code depends on a layout (a file format, a device register block in curriculum B3, a message header), do not hope; assert. Listing 3 states <code>static_assert(sizeof(Header) == 8, ...)</code> and <code>static_assert(offsetof(Header, sequence) == 4, ...)</code>; if a later edit or a different compiler changes the layout, the build fails with your message.<sup class="src"><a href="#F2-24-src-D1">D1</a></sup> Listing 3 also checks two properties with type traits: <code>Header</code> is standard-layout and trivially copyable (safe to copy as bytes); <code>Named</code>, which holds a <code>std::string</code>, is not trivially copyable, because its bytes include a pointer to heap memory it owns (F2-22).<sup class="src"><a href="#F2-24-src-R3">R3</a></sup></p>
+<h3 id="F2-24-l2-memcpy">Reading bytes the right way</h3>
+<p>Data arriving from a file or network is a byte array. Casting <code>packet + 1</code> to <code>const std::uint32_t*</code> and dereferencing is undefined behaviour twice over: the address is misaligned for <code>uint32_t</code>, and no <code>uint32_t</code> object lives there (strict aliasing).<sup class="src"><a href="#F2-24-src-D1">D1</a></sup> Listing 4 shows UBSan reporting "load of misaligned address … which requires 4 byte alignment" at line 16, while the program still printed 42: on this x86-64 machine the misaligned load happened to work.<sup class="src"><a href="#F2-24-src-R4">R4</a></sup> The <code>std::memcpy</code> version at line 12 is well-defined at any address, and compilers typically turn a small fixed-size <code>memcpy</code> into a single load where the processor allows it.<sup class="src"><a href="#F2-24-src-D5">D5</a></sup></p>
+
+<h2 id="F2-24-layer3">Layer 3 — the engineer's depth</h2>
+<p><b>Who decides the layout.</b> The C++ standard fixes only the order of members and leaves sizes and alignments to the implementation; the platform's ABI document (for x86-64 Linux, the System V AMD64 psABI; for AArch64, the procedure call standard; for RISC-V, the RISC-V ELF psABI) pins them down so that separately compiled code agrees.<sup class="src"><a href="#F2-24-src-D1">D1</a></sup> <sup class="src"><a href="#F2-24-src-D7">D7</a></sup> In this build, Listing 1 and the lab program gave identical results when cross-compiled for AArch64 and RISC-V 64 and run under QEMU user-mode emulation; that shows what those compilers chose, not what real hardware does at run time, and no real AArch64 or RISC-V hardware was used.<sup class="src"><a href="#F2-24-src-R6">R6</a></sup></p>
+<pre class="output" data-run="F2-24/layout_aarch64"></pre>
+<pre class="output" data-run="F2-24/layout_riscv64"></pre>
+<p><b>Changing alignment.</b> <code>alignas(64)</code> on a struct raises its alignment, for example to give each thread's counter its own cache line (OS301/HW301's false sharing). The reverse, packing (<code>__attribute__((packed))</code> or <code>#pragma pack</code>), is a compiler extension, not standard C++; it removes padding but makes members misaligned, so taking a pointer or reference to such a member and using it is a classic source of faults on strict-alignment processors.<sup class="src"><a href="#F2-24-src-D5">D5</a></sup> Prefer explicit serialisation (forensic lab) to packed structs for external formats.</p>
+<p><b>Allocators and alignment.</b> <code>operator new</code> and <code>malloc</code> return memory aligned for any fundamental type (<code>alignof(std::max_align_t)</code>, typically 16 on x86-64 Linux); over-aligned types use the aligned forms of <code>new</code> since C++17.<sup class="src"><a href="#F2-24-src-D1">D1</a></sup> Your bump and free-list allocators in F2-25 must therefore take an alignment argument and round addresses up, exactly as the compiler rounds offsets here.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The values <code>alignof(std::max_align_t) == 16</code> on x86-64 Linux and the statement that some processors (older 32-bit ARM cores, some RISC-V implementations and many microcontrollers) trap or emulate slowly on misaligned loads were not measured in this build. Check by printing <code>alignof(std::max_align_t)</code> with the course command, and in the architecture reference manual of the processor you target (alignment fault behaviour), before relying on either.</p></div>
+
+<h2 id="F2-24-hardware">How the hardware actually does it</h2>
+<p>Processors fetch memory in fixed-size, aligned pieces (cache lines of, typically, 64 bytes; HW202). An aligned 8-byte value never straddles two pieces; a misaligned one can, which may cost two accesses or, for an access straddling two pages, two address translations.<sup class="src"><a href="#F2-24-src-D3">D3</a></sup> x86-64 handles ordinary misaligned loads in hardware, which is why Listing 4 printed 42; other architectures and some instructions (for example certain SIMD loads) require alignment and fault otherwise.<sup class="src"><a href="#F2-24-src-D3">D3</a></sup> <sup class="src"><a href="#F2-24-src-R4">R4</a></sup> Alignment rules let compilers emit single, fast instructions without checking addresses; padding is the price.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That the misaligned read in Listing 4 was executed as one ordinary load instruction (rather than split by the compiler) was not checked: the disassembly was not inspected, and the UBSan build adds its own code. Check with <code>objdump -d</code> on a build without sanitizers before using this listing as evidence about the processor.</p></div>
+
+<h2 id="F2-24-worked">Worked example</h2>
+<p>Predict <code>struct E { char c; double d; char c2; };</code> from the lab.</p>
+<ol>
+<li><code>c</code> at offset 0 (alignment 1).</li>
+<li><code>d</code> needs a multiple of 8: offset 8; bytes 1 to 7 are padding. It ends at 16.</li>
+<li><code>c2</code> at 16; it ends at 17.</li>
+<li>The struct's alignment is 8 (from <code>double</code>); round 17 up to 24. Bytes 17 to 23 are tail padding.</li>
+</ol>
+<p>Prediction: <code>sizeof 24</code>, <code>alignof 8</code>. The lab run printed "E 24 (align 8)".<sup class="src"><a href="#F2-24-src-R5">R5</a></sup> Reordered as <code>double d; char c; char c2;</code> it would need 16; verify that yourself in the lab extension.</p>
+
+<h2 id="F2-24-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>layout.cpp</code>: sizes, alignments and offsets.</p>
+<pre class="listing" data-src="F2-24/layout.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">4–10</td><td><code>struct Loose</code></td><td>Four members, small and large mixed.</td><td>Forces padding after <code>size</code> and after <code>spicy</code>.</td></tr>
+<tr><td class="n">12–18</td><td><code>struct Tidy</code></td><td>The same members, largest alignment first.</td><td>Padding only at the end.</td></tr>
+<tr><td class="n">20–24</td><td><code>template &lt;typename T&gt; void report</code></td><td>Prints <code>sizeof(T)</code> and <code>alignof(T)</code>.</td><td>One function for every type.</td></tr>
+<tr><td class="n">32–33</td><td><code>offsetof(Loose, price)</code> …</td><td>Prints where each member starts.</td><td>The measured byte map of Figure 1.</td></tr>
+<tr><td class="n">37–38</td><td><code>sizeof(Loose[1000])</code></td><td>Size of an array of 1000.</td><td>Padding multiplies: 8000 bytes saved.</td></tr>
+</tbody></table></div>
+<p><b>Build command</b>: <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined layout.cpp -o layout</code>, then <code>./layout</code>.</p>
+<pre class="output" data-run="F2-24/layout"></pre>
+<p><b>Listing 2</b> — <code>bytes_dump.cpp</code>: every byte of one object.</p>
+<pre class="listing" data-src="F2-24/bytes_dump.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">17</td><td><code>Loose order{};</code></td><td>Value-initialises: all zero, padding included.</td><td>Makes the padding bytes predictable for the dump.</td></tr>
+<tr><td class="n">22–23</td><td><code>std::memcpy(bytes, &amp;order, sizeof order);</code></td><td>Copies the object representation.</td><td>The defined way to look at bytes (F2-18).</td></tr>
+<tr><td class="n">24–27</td><td>loop printing hex, 8 per line</td><td>One row per 8 bytes.</td><td>Rows line up with the 8-byte alignment.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F2-24/bytes_dump"></pre>
+<p>Row 1: <code>4d</code> is <code>'M'</code>, then seven padding bytes. Row 2: the <code>double</code> 2.5. Row 3: <code>01</code> (spicy), three padding bytes, then 7 (table) little-endian.<sup class="src"><a href="#F2-24-src-R2">R2</a></sup></p>
+<p><b>Listing 3</b> — <code>traits.cpp</code>: asserting a layout and copying bytes safely.</p>
+<pre class="listing" data-src="F2-24/traits.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">14–15</td><td><code>static_assert(sizeof(Header) == 8, ...)</code></td><td>Checks the layout at compile time.</td><td>A layout change breaks the build, not a reader at run time.</td></tr>
+<tr><td class="n">26–28</td><td><code>std::is_trivially_copyable_v&lt;...&gt;</code></td><td>Asks the compiler about the types.</td><td>Only trivially copyable types may be copied as bytes.</td></tr>
+<tr><td class="n">32–34</td><td>two <code>std::memcpy</code> calls</td><td>Object to bytes and back.</td><td>A round trip that is well-defined for <code>Header</code>.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F2-24/traits"></pre>
+<p><b>Listing 4</b> — <code>misaligned.cpp</code>: a misaligned, type-punned read versus <code>memcpy</code>.</p>
+<pre class="listing" data-src="F2-24/misaligned.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Line</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td class="n">9</td><td><code>alignas(4) unsigned char packet[8]</code></td><td>A buffer whose start is 4-aligned.</td><td>So <code>packet + 1</code> is certainly misaligned for a 4-byte type.</td></tr>
+<tr><td class="n">12</td><td><code>std::memcpy(&amp;good, packet + 1, sizeof good);</code></td><td>Copies bytes 1 to 4 into a <code>uint32_t</code>.</td><td>Defined at any address: 0x0000002A = 42.</td></tr>
+<tr><td class="n">15–16</td><td><code>reinterpret_cast</code>, then <code>*p</code></td><td>Reads through a misaligned <code>uint32_t*</code>.</td><td>UB (alignment and aliasing); UBSan reports it.</td></tr>
+</tbody></table></div>
+<pre class="output" data-run="F2-24/misaligned"></pre>
+
+<h2 id="F2-24-breaks">Where the analogy breaks</h2>
+<ol>
+<li><b>Shelf supports are physical; alignment is a rule.</b> A crate cannot hang on a missing support. A misaligned value can often be read anyway (x86-64 did, R4); what breaks is the language contract, and the result may be a fault on another processor or a mis-optimisation on any.<sup class="src"><a href="#F2-24-src-D1">D1</a></sup></li>
+<li><b>Empty slots look empty.</b> Padding bytes are not "empty"; they hold whatever was there before, unless zeroed, and they are copied and sent along with the object.<sup class="src"><a href="#F2-24-src-D1">D1</a></sup></li>
+<li><b>Ana can reorder a kit freely.</b> Reordering members changes every offset; any file, message or device that depended on the old layout breaks. Only reorder types whose layout nothing outside the program sees.</li>
+</ol>
+
+<h2 id="F2-24-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>A struct is bigger than the sum of its members</td><td>Padding</td><td>Print <code>offsetof</code> for every member (Listing 1)</td><td>Normal; reorder by decreasing alignment if size matters</td></tr>
+<tr><td>Another program reads wrong values from your binary file or message</td><td>Raw struct bytes sent, padding and byte order included</td><td>Hex dump both sides (forensic lab)</td><td>Serialise field by field into a defined format</td></tr>
+<tr><td>"runtime error: load of misaligned address"</td><td>Pointer cast into a byte buffer</td><td>UBSan names the line (Listing 4)</td><td><code>std::memcpy</code> into a local, or <code>std::bit_cast</code> of a byte array</td></tr>
+<tr><td><code>memcmp</code> says two equal structs differ</td><td>Unspecified padding bytes</td><td>Dump both objects' bytes</td><td>Compare members (<code>operator==</code>, or <code>= default</code> in C++20)</td></tr>
+<tr><td><code>memcpy</code> of an object with a <code>std::string</code> crashes later (double free)</td><td>Type not trivially copyable; two objects now own one heap block</td><td><code>std::is_trivially_copyable_v</code> is false (Listing 3)</td><td>Copy with the copy constructor</td></tr>
+<tr><td>A layout silently changed after an edit</td><td>No check</td><td>—</td><td><code>static_assert</code> on size and offsets</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F2-24-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> F2-18 showed that objects are bytes in numbered boxes, with an object representation you can copy out; F2-23 showed which accesses the language forbids. <b>What carries over:</b> <code>sizeof</code>, byte order, <code>memcpy</code> as the safe way to look at bytes, and the sanitizers. <b>What changes:</b> you now see that a struct's bytes include padding chosen by the compiler under alignment rules from the platform ABI, so an object's in-memory form is not a data format; anything that crosses a program boundary needs an explicit layout.<sup class="src"><a href="#F2-24-src-D1">D1</a></sup> <sup class="src"><a href="#F2-24-src-D7">D7</a></sup> <b>What comes next:</b> F2-25 turns from single objects to sequences: arrays, spans and the bounds you must not cross, and you will use alignment again in the course project's allocators.</p></div>
+
+<h2 id="F2-24-check">Check yourself</h2>
+<ol>
+<li>What is the difference between <code>sizeof</code> and <code>alignof</code>? Give both for <code>double</code> on the build machine.</li>
+<li>Why is <code>Loose</code>'s size rounded up to a multiple of 8 even when the last member ends earlier? Give the array argument.</li>
+<li>Predict <code>sizeof</code> and <code>alignof</code> of <code>struct P { char a; std::uint16_t b; char c; };</code>, then of the reordered <code>{ std::uint16_t b; char a; char c; }</code>.</li>
+<li>Why does Listing 2 initialise <code>order</code> with <code>{}</code>? What could the padding bytes show otherwise?</li>
+<li>Name two reasons why <code>*reinterpret_cast&lt;const std::uint32_t*&gt;(packet + 1)</code> is undefined behaviour.</li>
+<li>Why is <code>Named</code> not trivially copyable, and what would go wrong if you copied it with <code>memcpy</code> and both copies were destroyed?</li>
+<li>Apply: a device's register block (curriculum B3) has a 32-bit control register at offset 0 and a 32-bit status register at offset 8. Write the struct and the <code>static_assert</code>s that guarantee it.</li>
+<li>A teammate wants to save disk space by adding <code>#pragma pack(1)</code> to every struct. What two risks do you point out?</li>
+</ol>
+
+<h2 id="F2-24-lab">Lab</h2>
+<h3 id="F2-24-lab-goal">Goal</h3>
+<p>Predict the size and alignment of seven structs by hand, then measure them, and explain every difference between your prediction and the measurement.</p>
+<h3 id="F2-24-lab-hw">Hardware and software needed</h3>
+<p>A Linux computer (or WSL) with g++; this build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> on x86-64. Optional: <code>aarch64-linux-gnu-g++</code>, <code>riscv64-linux-gnu-g++</code> and <code>qemu-user</code> to repeat the measurement for other architectures.</p>
+<h3 id="F2-24-lab-safety">Safety</h3>
+<p>None beyond normal computer use.</p>
+<h3 id="F2-24-lab-steps">Steps</h3>
+<ol>
+<li>Copy <code>layout_lab.cpp</code> from <code>university/labs/F2-24/</code>.</li>
+<li>For each struct A to G, draw its byte map on paper (as in Figure 1) and write your predicted <code>sizeof</code> into the comment.</li>
+<li>Build and run with the course command.</li>
+<li>For each mismatch, find the rule from layer 2 you missed.</li>
+<li>Optional: cross-compile and run with QEMU as in the lab's <code>run.sh</code>, and compare.</li>
+</ol>
+<pre class="listing" data-src="F2-24/layout_lab.cpp"></pre>
+<h3 id="F2-24-lab-expect">Expected observations</h3>
+<p>On the x86-64 build machine:</p>
+<pre class="output" data-run="F2-24/layout_lab"></pre>
+<p>The AArch64 and RISC-V 64 builds, run under QEMU (not on real hardware), printed the same values:</p>
+<pre class="output" data-run="F2-24/layout_lab_aarch64"></pre>
+<pre class="output" data-run="F2-24/layout_lab_riscv64"></pre>
+<h3 id="F2-24-lab-verify">Verification</h3>
+<p>(1) Your byte maps explain every printed number. (2) For struct G, you can say why an empty struct has size 1 (two distinct objects must have distinct addresses). (3) You add <code>static_assert</code>s matching the measured values and the program still builds.</p>
+<h3 id="F2-24-lab-trouble">Troubleshooting</h3>
+<ul>
+<li>You predicted A = 5 → you forgot that <code>int</code> must start at a multiple of 4 → padding bytes 1 to 3.</li>
+<li>You predicted B = 5 → you forgot tail padding → size rounds up to the alignment (4), so arrays of B stay aligned.</li>
+<li>You predicted G = 0 → objects need distinct addresses → <code>sizeof</code> of any complete object type is at least 1.<sup class="src"><a href="#F2-24-src-D1">D1</a></sup></li>
+</ul>
+<h3 id="F2-24-lab-ext">Extension</h3>
+<p>Reorder E to need 16 bytes and confirm. Then add <code>alignas(64)</code> to a struct holding one <code>int</code> and predict its <code>sizeof</code> before running.</p>
+
+<h2 id="F2-24-forensic">Forensic lab: "The record that would not fit"</h2>
+<p><b>Scenario.</b> The cold-room sensors report temperatures to the kitchen dashboard. The format document, agreed by both teams, says each record is 6 bytes: sensor id (1 byte), reading (4 bytes, lowest byte first), flags (1 byte). The sensor team's program sends a <code>SensorRecord</code> struct by copying its bytes. The dashboard shows sensor 3 reporting 3,892,314,112 with every alarm flag set. The sensor team says: "our struct has exactly those three fields, in that order, so the bug is on the dashboard."</p>
+<p><b>Evidence pack.</b> The sender's struct and its encoding, and the receiver's decoding, simulated in one program (<code>header_bug.cpp</code>), and its real output.</p>
+<pre class="listing" data-src="F2-24/header_bug.cpp"></pre>
+<pre class="output" data-run="F2-24/header_bug"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>How many bytes does the sender put on the wire, and how many does the format promise?</li>
+<li>Draw the byte map of <code>SensorRecord</code> from the hex dump. Where are the padding bytes?</li>
+<li>Which wire bytes does the receiver read as the reading? Compute their value by hand and compare with 3892314112.</li>
+<li>Why does the receiver see flags 3?</li>
+<li>Whose bug is it, and what are the two separate problems with sending raw struct bytes (one visible here, one that would appear with a different machine)?</li>
+<li>Propose a fix and a test that would have caught this before the dashboard did.</li>
+</ol>
+<p><b>Method hints.</b> Count bytes before reasoning about values. Use the layout rules: what alignment does <code>uint32_t</code> need? Read the receiver's code as the format document, byte by byte.</p>
+
+<h2 id="F2-24-project">Mini-project</h2>
+<p>Write a tiny binary "order log": a function <code>encode(const Order&amp;)</code> that writes an order (table number as 2 bytes, portions as 1 byte, price in cents as 4 bytes, all lowest byte first) into a <code>std::array&lt;unsigned char, 7&gt;</code>, and <code>decode</code> that reads it back. Use no struct-to-bytes copies. Test: encode/decode round trips for at least five orders including the maximum values; a test that the encoding of a fixed order equals a hard-coded byte sequence (a "golden" test); and a <code>static_assert</code> documenting that <code>sizeof(Order)</code> is <i>not</i> 7 on your machine. Rubric: correct encoding (2), tests including the golden test (2), one paragraph explaining why the golden test protects against the forensic lab's bug (1).</p>
+
+<h2 id="F2-24-summary">Summary</h2>
+<ul>
+<li>Every type has a size and an alignment; objects start at multiples of their alignment.</li>
+<li>The compiler inserts padding so members are aligned and so arrays work; the struct's size is a multiple of its alignment.</li>
+<li>Ordering members by decreasing alignment minimises padding; measured here, 24 bytes became 16.</li>
+<li>Padding bytes are part of the object representation and have unspecified values unless zeroed.</li>
+<li>Lock layouts that matter with <code>static_assert</code>; check copy-as-bytes safety with <code>std::is_trivially_copyable_v</code>.</li>
+<li>Read from byte buffers with <code>memcpy</code>, never through misaligned or type-punned pointers.</li>
+<li>An in-memory struct is not a file or wire format: serialise field by field.</li>
+</ul>
+
+<h2 id="F2-24-sources">Sources</h2>
+<ol>
+<li id="F2-24-src-D1">D1 — ISO/IEC 14882, the C++ standard (working draft for C++20), clauses on object representation, alignment (<code>alignof</code>, <code>alignas</code>), class member layout and standard-layout classes, trivially copyable types, <code>offsetof</code>, value-initialisation and zero-initialisation (including padding), type-based aliasing, and dynamic allocation alignment. Title only — not opened during this build; the Source Researcher must confirm the draft number and clauses (dossier gate G1 open).</li>
+<li id="F2-24-src-D3">D3 — Randal E. Bryant and David R. O'Hallaron, "Computer Systems: A Programmer's Perspective", section on data alignment in machine-level representation of programs (3.9.3 in the edition the curriculum names under P4). Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</li>
+<li id="F2-24-src-D5">D5 — GCC manual ("Using the GNU Compiler Collection"): type attributes (<code>packed</code>, <code>aligned</code>), <code>#pragma pack</code>, and the treatment of <code>memcpy</code> as a built-in. Title only — not opened during this build; the Source Researcher must confirm the sections (dossier gate G1 open).</li>
+<li id="F2-24-src-D7">D7 — "System V Application Binary Interface, AMD64 Architecture Processor Supplement" (sizes and alignment of fundamental types, aggregates); "Procedure Call Standard for the Arm 64-bit Architecture"; "RISC-V ELF psABI Specification". Title only — not opened during this build; the Source Researcher must confirm the versions and sections (dossier gate G1 open).</li>
+<li id="F2-24-src-S1">S1 — Systems Curriculum (this project), section 1.1 and milestones B3 and B5. Opened in this build (local file).</li>
+<li id="F2-24-src-R1">R1 — Lab run of Listing 1 (<code>layout.cpp</code>) in this build: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>-std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined</code>, 2026-10-09, Linux x86_64 build container, exit code 0.</li>
+<li id="F2-24-src-R2">R2 — Lab run of Listing 2 (<code>bytes_dump.cpp</code>), course flags, exit code 0.</li>
+<li id="F2-24-src-R3">R3 — Lab run of Listing 3 (<code>traits.cpp</code>), course flags, exit code 0.</li>
+<li id="F2-24-src-R4">R4 — Lab run of Listing 4 (<code>misaligned.cpp</code>), course flags, exit code 0 (UBSan reported and continued).</li>
+<li id="F2-24-src-R5">R5 — Lab run of <code>layout_lab.cpp</code>, course flags, exit code 0.</li>
+<li id="F2-24-src-R6">R6 — Cross builds of <code>layout.cpp</code> and <code>layout_lab.cpp</code> by the lab's <code>run.sh</code>: <code>aarch64-linux-gnu-g++</code> and <code>riscv64-linux-gnu-g++</code> 13.3.0, <code>-O0</code> without sanitizers, run under QEMU 8.2.2 user mode on the x86-64 build container; untested on real AArch64 or RISC-V hardware.</li>
+<li id="F2-24-src-R7">R7 — Forensic run of <code>header_bug.cpp</code> and of the fix <code>header_fixed.cpp</code>, course flags, exit code 0 each.</li>
+</ol>
+
+<h2 id="F2-24-glossary">Glossary links</h2>
+<p><a href="#gl-alignment">Alignment</a> · <a href="#gl-padding">Padding</a> · <a href="#gl-alignof">alignof</a> · <a href="#gl-offsetof">offsetof</a> · <a href="#gl-standard-layout-type">Standard-layout type</a> · <a href="#gl-trivially-copyable-type">Trivially copyable type</a> · <a href="#gl-strict-aliasing">Strict aliasing</a> · <a href="#gl-serialisation">Serialisation</a> · <a href="#gl-object-representation">Object representation</a> · <a href="#gl-endianness-byte-order">Endianness (byte order)</a></p>
+
+<h2 id="F2-24-next">Next chapter</h2>
+<p>Next: <a href="#F2-25">F2-25 Arrays, spans and bounds</a>. Before this: <a href="#F2-23">F2-23 Object lifetime and undefined behaviour</a>. Back to the course: <a href="#SP201">SP201 Memory and pointers</a>.</p>
+
+<h2 id="F2-24-answers">Answers to Check yourself</h2>
+<ol>
+<li><code>sizeof</code> is how many bytes an object occupies; <code>alignof</code> is the multiple its address must be. For <code>double</code>: 8 and 8 (R1).</li>
+<li>In an array, element <i>k</i> starts at <i>k</i> × <code>sizeof</code>. If <code>sizeof(Loose)</code> were 20, element 1 would start at 20 and its <code>price</code> at 28, not a multiple of 8. Rounding the size up to the alignment keeps every element aligned.</li>
+<li><code>{char, uint16_t, char}</code>: a at 0, b at 2, c at 4, ends at 5, rounded to alignment 2: size 6, align 2. Reordered <code>{uint16_t, char, char}</code>: 0, 2, 3, ends at 4: size 4, align 2. (Prediction by the rules; F in the lab, <code>{uint16_t, uint8_t}</code> = 4, is the closest measured case.)</li>
+<li>Value-initialisation zero-fills the whole object including padding, so the dump is predictable. Otherwise the padding bytes are unspecified; they may show old stack contents.</li>
+<li>The address is not a multiple of 4 (misaligned), and no <code>uint32_t</code> object exists there, so the access breaks the aliasing rule.</li>
+<li>Its copy constructor and destructor are non-trivial: <code>std::string</code> owns a heap buffer (for strings longer than its small-string capacity). A byte copy would make two objects point at one buffer, and destroying both would free it twice (double free, F2-21).</li>
+<li><code>struct Regs { std::uint32_t control; std::uint32_t reserved; std::uint32_t status; };</code> with <code>static_assert(offsetof(Regs, control) == 0)</code>, <code>static_assert(offsetof(Regs, status) == 8)</code> and <code>static_assert(sizeof(Regs) == 12)</code>. (Real device registers also need <code>volatile</code> access; curriculum B3.)</li>
+<li>(1) Misaligned members: pointers or references to them are unsafe, and access can fault or be slow on some processors. (2) It is a non-standard extension and changes every layout, breaking any code or file that depended on the old one; and it still does not fix byte order for data exchange.</li>
+</ol>
+<h3 id="F2-24-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> The sender puts 12 bytes on the wire (<code>sizeof(SensorRecord) = 12</code>); the format promises 6. Byte map: <code>03</code> (id) at 0; padding at 1 to 3 (<code>uint32_t</code> needs a multiple of 4); <code>e8 03 00 00</code> (1000 = 0x3E8, little-endian) at 4 to 7; <code>01</code> (flags) at 8; tail padding at 9 to 11 (size rounded to alignment 4). The receiver reads bytes 1 to 4 = <code>00 00 00 e8</code> lowest first: 0xE8000000 = 3,892,314,112, exactly the bad value; it reads flags from byte 5 = <code>03</code>, which is the second byte of the reading.<sup class="src"><a href="#F2-24-src-R7">R7</a></sup></p>
+<p><b>Hypotheses.</b> (H1, the sensor team's) the dashboard decodes wrongly — refuted: the receiver follows the agreed format exactly; with a correct 6-byte input it decodes correctly (see the fix). (H2) a transmission error — refuted: the bytes are deterministic and match the sender's own dump. (H3) the sender's raw struct bytes do not follow the format because of alignment padding — confirmed by the byte map.</p>
+<p><b>Conclusion.</b> The sender's bug. Problem 1 (visible): padding, which the format does not contain. Problem 2 (latent): byte order and type sizes are those of the sender's machine; on a big-endian sender the reading's bytes would be reversed even without padding. The in-memory representation is not a data format.</p>
+<p><b>Fix and prevention.</b> Encode field by field into exactly 6 bytes in the documented order and byte order, and decode the same way (<code>header_fixed.cpp</code>, below). Add a golden test: encoding <code>{3, 1000, 1}</code> must give exactly <code>03 e8 03 00 00 01</code>. The reference fix printed exactly that and decoded the original values.<sup class="src"><a href="#F2-24-src-R7">R7</a></sup></p>
+<pre class="listing" data-src="F2-24/header_fixed.cpp"></pre>
+<pre class="output" data-run="F2-24/header_fixed"></pre>

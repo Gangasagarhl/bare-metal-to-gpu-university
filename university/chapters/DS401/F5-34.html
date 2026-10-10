@@ -1,0 +1,325 @@
+<!--meta
+id: F5-34
+title: Why RDMA
+course: DS401
+level: L4
+prereqs: DS301 (F5-08, F5-09 RPC over TCP); HW205 (F1-52 NICs and descriptor rings, F1-53 RDMA-capable NICs preview); DS201 (F5-05 sockets, F5-07 measuring latency and throughput); OS201 (system calls)
+time: 10–14 hours including the lab and the forensic lab
+hardware: none for the lab: one Linux computer with g++ and strace (the build used g++ 13.3 and strace 6.8 in a cloud container with 4 CPUs visible). No RDMA NIC is needed or used in this chapter.
+maps: Curriculum Track F, section 14.1 row "Inter-node networks" and milestone F5 (concepts only); reading-list item 81 (InfiniBand Architecture Specification; pending verification); course DS401 goal "understand kernel bypass"
+analogy: F5 — friends in different towns (new mappings proposed in NOTES.md: the town post office = the kernel's network stack; a courier with the key to one shelf = an RDMA NIC writing into registered memory)
+-->
+
+<h2 id="F5-34-hook">Story hook</h2>
+<p>Wei and Amara live in different towns and keep a shared notebook: every evening Wei sends Amara the day's new lines. Each note goes through the post office. Wei walks to the counter and waits his turn. The clerk copies the note onto the office's own form, stamps it, sorts it and sends it. In Amara's town another clerk takes it out of the bag, copies it into an envelope, and knocks on Amara's door. Amara stops cooking, opens the door, reads the note and copies the lines into her notebook. The road between the towns is fast; most of the waiting happens at the counters and at the door.</p>
+<p>One day Amara gives a courier service a key that opens one shelf in her hall, and only that shelf. Now Wei hands his note to the courier at his own front door. The courier drives straight to Amara's house, checks the key against the shelf, and puts the note on it. Nobody copies the note on the way. Amara is not interrupted; she looks at the shelf when she wants to.</p>
+<p>The post office is the operating system's network stack. The courier with the key to one shelf is an <b>RDMA</b> network card. This chapter measures what the counters cost, and asks when a courier is worth its price.</p>
+
+<h2 id="F5-34-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> where the time and the CPU work go when a message travels through the kernel's TCP stack: system calls, copies, protocol processing, and waking a sleeping thread.</li>
+<li><b>Explain</b> the three ideas RDMA combines: the transport protocol runs in the network card, the application talks to the card without a system call (kernel bypass), and the card moves data straight to and from application memory (zero copy).</li>
+<li><b>Measure</b> the cost of the kernel path on your own machine with a ping-pong over TCP and a polled shared-memory mailbox, and count system calls with strace.</li>
+<li><b>Decide</b> when RDMA is worth its costs (memory registration, connection state, network configuration, programming effort) and when a tuned TCP path is enough.</li>
+<li><b>Diagnose</b> a "TCP is too slow, we need RDMA" complaint whose real cause is in the application's use of TCP.</li>
+</ul>
+
+<div class="co jargon" id="F5-34-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Kernel bypass</dt><dd><b>Simple words:</b> a program talks to the network card directly instead of asking the operating system for every message. <b>Analogy:</b> handing the note to the courier at your own door instead of queuing at the post-office counter. <b>Precise:</b> a design in which the operating system sets up access once (memory, queues, permissions) and the application then submits and completes data transfers by reading and writing queue memory and device registers mapped into its address space, with no system call on the data path. <sup class="src"><a href="#F5-34-src-D2">D2</a></sup> <sup class="src"><a href="#F5-34-src-D3">D3</a></sup></dd>
+<dt>Zero copy</dt><dd><b>Simple words:</b> the bytes go from your memory to the wire, and from the wire into the other program's memory, without being copied into another buffer on the way. <b>Analogy:</b> nobody copies Wei's note onto a form; the courier carries the original. <b>Precise:</b> a transfer in which the device reads the payload by DMA directly from the sender's application buffer and writes it by DMA directly into the receiver's application buffer, so the CPU makes no intermediate copy; the buffers must stay valid and resident until the transfer completes. <sup class="src"><a href="#F5-34-src-D2">D2</a></sup> <sup class="src"><a href="#F5-34-src-D1">D1</a></sup></dd>
+<dt>Transport offload</dt><dd><b>Simple words:</b> the network card itself does the work of a protocol like TCP: numbering packets, acknowledging, resending. <b>Analogy:</b> the courier service, not Wei, makes sure the note arrives and fetches a receipt. <b>Precise:</b> implementing the reliable transport (segmentation, sequence numbers, acknowledgements, retransmission, ordering) in the network adapter's hardware and firmware instead of in the host operating system; InfiniBand and RoCE define such a transport. <sup class="src"><a href="#F5-34-src-D1">D1</a></sup></dd>
+<dt>One-sided operation</dt><dd><b>Simple words:</b> an operation where only one computer's program takes part; the other computer's card does the work alone. <b>Analogy:</b> the note lands on Amara's shelf while Amara keeps cooking. <b>Precise:</b> an RDMA READ or RDMA WRITE (and atomic operations), which name a remote address and a remote key; the target adapter executes it against registered memory without the target application posting a request or receiving a completion. Two-sided operations (SEND matched with a posted RECEIVE) involve both programs. <sup class="src"><a href="#F5-34-src-D1">D1</a></sup> <sup class="src"><a href="#F5-34-src-D2">D2</a></sup></dd>
+<dt>System call cost</dt><dd><b>Simple words:</b> the time a program loses each time it asks the operating system to do something. <b>Analogy:</b> the wait at the counter, however short the road. <b>Precise:</b> the time and CPU work of entering the kernel, doing the requested work (here: copying bytes and running the protocol), and returning; plus, when a thread must wait, the cost of putting it to sleep and waking it up. Measured in this chapter as a difference between two paths, not as a property of any product. <sup class="src"><a href="#F5-34-src-R1">R1</a></sup> <sup class="src"><a href="#F5-34-src-R3">R3</a></sup></dd>
+<dt>Nagle's algorithm</dt><dd><b>Simple words:</b> a rule inside TCP that holds back a small piece of data while an earlier small piece is still waiting for its acknowledgement, so it can send them together. <b>Analogy:</b> the clerk keeps your second short note until the first one's receipt comes back, to save stamps. <b>Precise:</b> a sender-side TCP rule that delays sending a less-than-full segment while previously sent data is unacknowledged; combined with a receiver that delays its acknowledgements, a write-write-read pattern can stall for the delayed-ACK time; disabled per socket with the <code>TCP_NODELAY</code> option. <sup class="src"><a href="#F5-34-src-D4">D4</a></sup> <sup class="src"><a href="#F5-34-src-D5">D5</a></sup> <sup class="src"><a href="#F5-34-src-R4">R4</a></sup></dd>
+</dl>
+<p>Terms from earlier courses used here: <a href="#gl-rdma-remote-direct-memory-access">RDMA (remote direct memory access)</a>, <a href="#gl-queue-pair-qp">queue pair</a>, <a href="#gl-completion-queue-cq-rdma">completion queue</a> and <a href="#gl-infiniband-and-roce">InfiniBand and RoCE</a> (HW205, <a href="#F1-53">F1-53</a>); <a href="#gl-dma-direct-memory-access">DMA</a>, <a href="#gl-descriptor-ring">descriptor ring</a> and <a href="#gl-doorbell-register">doorbell register</a> (<a href="#F1-52">F1-52</a>); <a href="#gl-polling">polling</a> (HW204); <a href="#gl-median-and-percentile">median and percentile</a> (MA202). "Kernel" in this course means the operating-system kernel, not a GPU kernel.</p>
+</div>
+
+<h2 id="F5-34-pictures">The idea in pictures</h2>
+<p>Figure 1 puts the two journeys of the story side by side. On the left, a message sent with a TCP socket: two crossings into the kernel on each side, a copy at each end, the protocol run by the CPU, and a sleeping receiver that must be woken. On the right, an RDMA WRITE: the application tells the card about the work through memory and a doorbell, the card reads the application's buffer by DMA, the remote card checks the key and writes into the remote application's registered buffer, and the remote CPU does nothing.</p>
+<figure id="F5-34-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 400" role="img" aria-labelledby="F5-34-f1t F5-34-f1d">
+<title id="F5-34-f1t">Figure 1: the path of one message through TCP sockets and through an RDMA WRITE</title>
+<desc id="F5-34-f1d">Two panels. Left panel, TCP socket path, sender at the top and receiver at the bottom: the application buffer; a send system call enters the kernel; the kernel copies the bytes into a socket buffer (copy 1); the TCP/IP stack runs on the CPU; the NIC driver posts a descriptor; the NIC reads the kernel buffer by DMA and sends packets. At the receiver: the NIC writes the packets into kernel buffers by DMA and raises an interrupt; the kernel's TCP/IP stack runs on the receiver's CPU; the receiving thread, asleep in recv, is woken; the kernel copies the bytes into the application buffer (copy 2) and the system call returns. Right panel, RDMA WRITE path: once, at set-up, the kernel helps register the buffers and create the queues; then on the data path the sender application writes a work request into its send queue in its own memory and rings the doorbell, with no system call; the sender's NIC reads the application buffer by DMA and runs the transport; the receiver's NIC checks the remote key and the bounds and writes the data by DMA into the registered application buffer; the sender's NIC places a completion in the sender's completion queue; the receiver's CPU and application take no part.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="400"/>
+<text class="sv-tb" x="20" y="24">TCP socket (two-sided, through the kernel)</text>
+<text class="sv-tb" x="400" y="24">RDMA WRITE (one-sided, kernel bypassed)</text>
+<line class="sv-dash" x1="385" y1="10" x2="385" y2="390"/>
+<rect class="sv-b1" x="20" y="38" width="160" height="30" rx="5"/><text class="sv-t" x="30" y="58">app buffer (sender)</text>
+<rect class="sv-b3" x="20" y="78" width="345" height="30" rx="5"/><text class="sv-t" x="30" y="98">send() system call: copy 1 into socket buffer</text>
+<rect class="sv-b3" x="20" y="114" width="345" height="26" rx="5"/><text class="sv-t" x="30" y="132">TCP/IP on the sender's CPU; driver posts descriptor</text>
+<rect class="sv-b4" x="20" y="146" width="345" height="26" rx="5"/><text class="sv-t" x="30" y="164">NIC: DMA read of kernel buffer, packets out</text>
+<line class="sv-line2" x1="190" y1="172" x2="190" y2="196"/><polygon class="sv-head" points="185,190 190,198 195,190"/>
+<text class="sv-ts" x="200" y="190">network</text>
+<rect class="sv-b4" x="20" y="200" width="345" height="26" rx="5"/><text class="sv-t" x="30" y="218">NIC: DMA write into kernel buffer, interrupt</text>
+<rect class="sv-b3" x="20" y="232" width="345" height="26" rx="5"/><text class="sv-t" x="30" y="250">TCP/IP on the receiver's CPU</text>
+<rect class="sv-b8" x="20" y="264" width="345" height="26" rx="5"/><text class="sv-t" x="30" y="282">wake the thread sleeping in recv()</text>
+<rect class="sv-b3" x="20" y="296" width="345" height="30" rx="5"/><text class="sv-t" x="30" y="316">recv() returns: copy 2 into app buffer</text>
+<rect class="sv-b1" x="20" y="334" width="160" height="30" rx="5"/><text class="sv-t" x="30" y="354">app buffer (receiver)</text>
+<text class="sv-ts" x="20" y="384">CPU on both sides runs the protocol and the copies</text>
+<rect class="sv-box" x="400" y="38" width="340" height="40" rx="5"/><text class="sv-ts" x="410" y="54">set-up, once (with the kernel's help): register</text><text class="sv-ts" x="410" y="70">buffers, create queues, connect queue pairs</text>
+<rect class="sv-b1" x="400" y="88" width="340" height="30" rx="5"/><text class="sv-t" x="410" y="108">app writes a work request, rings doorbell</text>
+<rect class="sv-b4" x="400" y="126" width="340" height="40" rx="5"/><text class="sv-t" x="410" y="143">sender NIC: DMA read of the app buffer</text><text class="sv-ts" x="410" y="159">transport (sequence numbers, ACKs) in the NIC</text>
+<line class="sv-line2" x1="570" y1="166" x2="570" y2="196"/><polygon class="sv-head" points="565,190 570,198 575,190"/>
+<text class="sv-ts" x="580" y="188">network</text>
+<rect class="sv-b4" x="400" y="200" width="340" height="40" rx="5"/><text class="sv-t" x="410" y="217">receiver NIC: check remote key, bounds,</text><text class="sv-t" x="410" y="233">then DMA write into the registered buffer</text>
+<rect class="sv-b1" x="400" y="250" width="160" height="30" rx="5"/><text class="sv-t" x="410" y="270">app buffer (receiver)</text>
+<rect class="sv-b5" x="400" y="290" width="340" height="30" rx="5"/><text class="sv-t" x="410" y="310">completion entry at the SENDER only</text>
+<rect class="sv-b2" x="400" y="330" width="340" height="30" rx="5"/><text class="sv-t" x="410" y="350">receiver CPU and app: not involved</text>
+<text class="sv-ts" x="400" y="384">no system call and no copy on the data path</text>
+</svg></div><figcaption><b>Figure 1.</b> The kernel path of a socket message (left) and an RDMA WRITE (right); arrows show the data flow. Socket path after D4 and DS201 <a href="#F5-05">F5-05</a> (pending verification) <sup class="src"><a href="#F5-34-src-D4">D4</a></sup>; RDMA path after D1 and D2 (title only, pending verification) <sup class="src"><a href="#F5-34-src-D1">D1</a></sup> <sup class="src"><a href="#F5-34-src-D2">D2</a></sup>; the system-call counts of the left path are measured in R3 <sup class="src"><a href="#F5-34-src-R3">R3</a></sup>. Not to scale.</figcaption></figure>
+
+<p>Figure 2 shows what the lab measured on the build machine for a 64-byte echo: the fastest round trip through TCP on the loopback interface, and the fastest round trip through a polled shared-memory mailbox, which has no kernel on its path. The gap between the bars is the price of the kernel path on that machine.</p>
+<figure id="F5-34-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 210" role="img" aria-labelledby="F5-34-f2t F5-34-f2d">
+<title id="F5-34-f2t">Figure 2: measured minimum round-trip time of a 64-byte echo, TCP loopback versus shared-memory mailbox</title>
+<desc id="F5-34-f2d">Horizontal bar chart with a scale from 0 to 5 microseconds. TCP over loopback, minimum round trip 4.13 microseconds, four system calls per round trip. Shared-memory mailbox with polling, minimum round trip 0.48 microseconds, no system calls. The difference, 3.65 microseconds, is labelled as the kernel path. A note says the medians were very different: 35.40 microseconds for TCP and 0.64 for the mailbox, because a sleeping thread had to be woken.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="210"/>
+<line class="sv-line" x1="200" y1="40" x2="200" y2="140"/>
+<text class="sv-ts" x="196" y="158">0</text><text class="sv-ts" x="304" y="158">1</text><text class="sv-ts" x="412" y="158">2</text><text class="sv-ts" x="520" y="158">3</text><text class="sv-ts" x="628" y="158">4</text><text class="sv-ts" x="720" y="158">5 us</text>
+<line class="sv-dash" x1="308" y1="40" x2="308" y2="142"/><line class="sv-dash" x1="416" y1="40" x2="416" y2="142"/><line class="sv-dash" x1="524" y1="40" x2="524" y2="142"/><line class="sv-dash" x1="632" y1="40" x2="632" y2="142"/>
+<text class="sv-t" x="10" y="72">TCP loopback</text><text class="sv-ts" x="10" y="88">4 system calls</text>
+<rect class="sv-b3" x="200" y="56" width="446" height="34" rx="3"/><text class="sv-tb" x="560" y="78">4.13</text>
+<text class="sv-t" x="10" y="120">shared memory</text><text class="sv-ts" x="10" y="136">0 system calls</text>
+<rect class="sv-b5" x="200" y="104" width="52" height="34" rx="3"/><text class="sv-tb" x="258" y="126">0.48</text>
+<text class="sv-ts" x="300" y="126">difference 3.65 us = the kernel path (copies, protocol, wake-ups)</text>
+<text class="sv-ts" x="10" y="186">Minimum of 3,000 round trips, -O2 build. Medians: TCP 35.40 us, shared memory 0.64 us (a sleeping receiver had to be woken).</text>
+</svg></div><figcaption><b>Figure 2.</b> Minimum round-trip times printed by <code>paths_O2.out</code> <sup class="src"><a href="#F5-34-src-R2">R2</a></sup>; system-call counts from <code>syscalls_tcp.out</code> and <code>syscalls_shm.out</code> <sup class="src"><a href="#F5-34-src-R3">R3</a></sup>. Measured on one cloud container on one date; drawn to scale; not a property of any product.</figcaption></figure>
+
+<h2 id="F5-34-layer1">Layer 1 — the kid explanation</h2>
+<div class="co analogy"><span class="lbl">Analogy</span><p>Mapping, proposed for the F5 analogy registry (NOTES.md): the town post office = the operating system's network stack; queuing at the counter = a system call; copying the note onto the office's form = copying bytes into a kernel buffer; the knock on Amara's door = waking a sleeping program; the courier service = an RDMA network card; the key that opens only one shelf = a <i>remote key</i> for one registered memory region; checking the shelf = <a href="#gl-polling">polling</a>; the courier's receipt to Wei = a completion. The registered F5 warnings still hold: letters can be delayed, and the road can be cut.</p></div>
+<p>Sending a message through the operating system is safe and flexible: the post office checks everything, and any program can use it. But every message pays at the counter twice, once in each town, and is copied twice. For long letters, the road is the slow part. For short notes sent thousands of times a second, the counters are the slow part.</p>
+<p>RDMA moves the post-office work into the courier service, which is a special network card. After a careful set-up, the program hands work to the card directly, the card picks up the bytes from the program's own memory, and the other card puts them on the agreed shelf. Nothing is copied, nobody queues, and the other program is not interrupted. The price: someone has to hand out keys, keep the shelves reserved, and build roads where couriers never lose a parcel.</p>
+
+<h2 id="F5-34-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F5-34-l2-tcp">What happens to one TCP message</h3>
+<p>In DS201 (<a href="#F5-04">F5-04</a>, <a href="#F5-05">F5-05</a>) you used TCP through sockets. TCP runs in the operating-system kernel: the kernel keeps each connection's send and receive buffers, its sequence numbers and its timers <sup class="src"><a href="#F5-34-src-D4">D4</a></sup>. For one small request and its reply between two programs, the following work happens, all of it on CPUs:</p>
+<ol>
+<li><b>System call to send.</b> The sender calls <code>send</code>; the CPU enters the kernel <sup class="src"><a href="#F5-34-src-D5">D5</a></sup>.</li>
+<li><b>Copy 1.</b> The kernel copies the bytes from the application's buffer into kernel memory attached to the socket. The application may reuse its buffer as soon as <code>send</code> returns, which is only possible because of this copy <sup class="src"><a href="#F5-34-src-D4">D4</a></sup>.</li>
+<li><b>Protocol processing.</b> The kernel builds TCP and IP headers, keeps the data for possible retransmission, and hands a descriptor to the network driver, which rings the NIC's doorbell (<a href="#F1-52">F1-52</a>) <sup class="src"><a href="#F5-34-src-D4">D4</a></sup>.</li>
+<li><b>Receive side.</b> The receiving NIC writes the packet into a kernel buffer by DMA and raises an interrupt (or the kernel polls it); the kernel processes the IP and TCP headers and places the data in the socket's receive buffer <sup class="src"><a href="#F5-34-src-D4">D4</a></sup>.</li>
+<li><b>Wake-up.</b> The receiving thread is usually asleep inside <code>recv</code>. The kernel marks it runnable; the scheduler must run it on a CPU.</li>
+<li><b>Copy 2.</b> <code>recv</code> copies the bytes from the kernel buffer into the application's buffer and returns <sup class="src"><a href="#F5-34-src-D5">D5</a></sup>.</li>
+</ol>
+<p>The reply repeats all six steps in the other direction. The lab counts this: with both programs as threads of one process on the loopback interface, the TCP path made 12,800 <code>sendto</code> and 12,831 <code>recvfrom</code> system calls for 3,200 round trips at each of two sizes, that is, two system calls per message per side, four per round trip <sup class="src"><a href="#F5-34-src-R3">R3</a></sup>. The shared-memory path made none on its data path: its whole run, start-up included, made 97 system calls <sup class="src"><a href="#F5-34-src-R3">R3</a></sup>.</p>
+<h3 id="F5-34-l2-measure">What the lab measured</h3>
+<p>Listing 1 runs the same echo (send N bytes, receive the same N bytes back) over two paths between two threads: TCP over loopback with <code>TCP_NODELAY</code>, and a mailbox in shared memory that the threads poll with atomic sequence numbers. On the build machine, in the measurement build without sanitizers <sup class="src"><a href="#F5-34-src-R2">R2</a></sup>:</p>
+<div class="tw"><table>
+<thead><tr><th>Path, size</th><th>min (us)</th><th>median (us)</th><th>p99 (us)</th></tr></thead>
+<tbody>
+<tr><td>TCP, 64 B</td><td>4.13</td><td>35.40</td><td>79.36</td></tr>
+<tr><td>shared memory, 64 B</td><td>0.48</td><td>0.64</td><td>0.84</td></tr>
+<tr><td>TCP, 65,536 B</td><td>14.46</td><td>60.09</td><td>143.52</td></tr>
+<tr><td>shared memory, 65,536 B</td><td>15.68</td><td>19.01</td><td>40.14</td></tr>
+</tbody></table></div>
+<p>Three observations, each of which this course will return to. First, for small messages the fixed cost of the kernel path dominates: the best TCP round trip took more than eight times the best mailbox round trip. Second, the TCP <i>median</i> is much worse than its minimum: in most round trips at least one thread had gone to sleep in <code>recv</code> and had to be woken, while the polling threads never sleep. Third, for 64 KiB the mailbox is no longer clearly faster at its best: copying 64 KiB is now the expensive part, and the mailbox copies too (three <code>memcpy</code> calls per round trip). Removing the kernel does not remove copies; that needs zero copy, which is the subject of <a href="#F5-38">F5-38</a>.</p>
+<div class="co warning"><span class="lbl">Watch out</span><p>These are numbers from one cloud container with 4 visible CPUs that other jobs were sharing, on one date. They are evidence about the <i>difference between the paths</i> on that machine, not about TCP or shared memory in general, and not about any NIC. The sanitizer build of the same listing printed a TCP median of 30.54 us and a 64 KiB mailbox median of 26.43 us <sup class="src"><a href="#F5-34-src-R1">R1</a></sup>; your machine will print other numbers. <a href="#F5-37">F5-37</a> is about measuring this properly.</p></div>
+<h3 id="F5-34-l2-rdma">What RDMA changes</h3>
+<p>RDMA (remote direct memory access) combines three ideas, each of which removes one part of the kernel path <sup class="src"><a href="#F5-34-src-D1">D1</a></sup> <sup class="src"><a href="#F5-34-src-D2">D2</a></sup>:</p>
+<ul>
+<li><b>Transport offload.</b> The reliable transport (packet sequence numbers, acknowledgements, retransmission) is defined by the InfiniBand architecture and executed by the adapter, not by the host's kernel <sup class="src"><a href="#F5-34-src-D1">D1</a></sup>. Steps 3 and 4 move off the CPU.</li>
+<li><b>Kernel bypass.</b> After a set-up phase that does use the kernel (opening the device, registering memory, creating queues), the application submits work by writing work requests into queues and ringing a doorbell, and learns about finished work by reading a completion queue. The installed rdma-core header shows that <code>ibv_post_send</code>, <code>ibv_post_recv</code> and <code>ibv_poll_cq</code> are <code>static inline</code> functions that call the device's operations directly from the application <sup class="src"><a href="#F5-34-src-D3">D3</a></sup>; whether a particular provider makes a system call inside them is a property of that provider (see the unverified box below). Steps 1, 5 and the system-call part of 6 go away.</li>
+<li><b>Zero copy.</b> The adapter reads the payload by DMA from the application's registered buffer and the remote adapter writes it by DMA into the remote application's registered buffer <sup class="src"><a href="#F5-34-src-D2">D2</a></sup>. Copies 1 and 2 go away. The price is that the buffer must stay registered and resident (pinned) and must not be reused until the adapter reports completion.</li>
+</ul>
+<p>On top of these, RDMA offers <b>one-sided operations</b>: an RDMA WRITE or RDMA READ names a remote address and a remote key, and the remote adapter executes it without the remote application doing anything for that transfer <sup class="src"><a href="#F5-34-src-D1">D1</a></sup>. This is the courier putting the note on the shelf while Amara keeps cooking. The remote application only learns that data arrived if it looks (polls a flag in memory) or if the sender also sends a message that consumes a receive request (<a href="#F5-36">F5-36</a>).</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>That the data-path verbs of a given provider (for example a particular vendor's user-space driver, or the Soft-RoCE driver) execute without any system call, and exactly what the kernel does at set-up time, was not checked in this build: no RDMA device was available and the rdma-core documentation and provider sources were not opened. Check the rdma-core documentation and the provider's source for the rdma-core version recorded in the dossier (the build had the Ubuntu packages <code>libibverbs-dev</code> and <code>ibverbs-providers</code> version <code>50.0-2ubuntu0.2</code>, R2 of <a href="#F5-36">F5-36</a>), and trace a real run with strace on hardware.</p></div>
+
+<h2 id="F5-34-layer3">Layer 3 — the engineer's depth</h2>
+<h3 id="F5-34-l3-where">Where the benefit comes from, and how big it can be</h3>
+<p>Treat the time of one operation as a sum: <i>t = t<sub>host,send</sub> + t<sub>wire</sub> + t<sub>host,recv</sub> + t<sub>app</sub></i>. RDMA shrinks the host terms; it does nothing for the wire term (signals still travel at the speed the cable allows, and switches still forward) and nothing for the application's own work. The same Amdahl-style reasoning you used for parallel speed-up (SP203, HW301) bounds the gain: if the host network stack is 40 % of a request's time, removing all of it makes the request at most 1/0.6 ≈ 1.67 times faster. Measure the split before buying hardware. The lab's two paths are a crude but honest split: on the build machine, at least 3.65 us of a 4.13 us minimal TCP round trip was host path <sup class="src"><a href="#F5-34-src-R2">R2</a></sup>; for a service whose handler takes 500 us, removing that is invisible.</p>
+<p>The gain has three different faces, and a design should say which one it wants:</p>
+<ul>
+<li><b>Latency</b> for small messages: fewer and cheaper steps per message. This is where Figure 2's gap matters.</li>
+<li><b>CPU efficiency</b> for large transfers: with transport offload and zero copy, the CPUs at both ends spend almost nothing per byte, so they are free for the application. In the lab, the CPU copies 64 KiB several times per round trip; at high rates, those copies consume memory bandwidth and cores.</li>
+<li><b>Tail latency and jitter</b>: a busy-polling receiver never sleeps, so the "wake the thread" step (35.40 us median versus 4.13 us minimum for TCP in R2) disappears. This is mostly a property of polling, not of RDMA; it costs a CPU core that spins (<a href="#F5-38">F5-38</a> measures the trade-off).</li>
+</ul>
+<h3 id="F5-34-l3-costs">What RDMA costs</h3>
+<p>Every item below is a reason a team may stay with TCP. Each returns in a later chapter.</p>
+<ul>
+<li><b>Memory registration.</b> Buffers must be registered with the adapter before use; registration pins pages and fills the adapter's translation tables, and it is slow compared with a single transfer, so applications register large pools once and reuse them <sup class="src"><a href="#F5-34-src-D2">D2</a></sup> (<a href="#F5-36">F5-36</a>, <a href="#F5-38">F5-38</a>).</li>
+<li><b>Connection state.</b> A reliable connection is a queue pair at each end with its own state in the adapter; many-to-many communication among thousands of processes means many queue pairs <sup class="src"><a href="#F5-34-src-D1">D1</a></sup>. Datagram transports and shared receive queues exist to limit this (<a href="#F5-36">F5-36</a>).</li>
+<li><b>The network must cooperate.</b> InfiniBand is a separate fabric with its own switches and a subnet manager. RoCE runs on Ethernet but expects the network to be configured so that RDMA traffic is rarely dropped, because the adapter's recovery after a drop is expensive (<a href="#F5-35">F5-35</a>, and the course's forensic lab in <a href="#F5-37">F5-37</a>) <sup class="src"><a href="#F5-34-src-D1">D1</a></sup> <sup class="src"><a href="#F5-34-src-D2">D2</a></sup>.</li>
+<li><b>Security and isolation.</b> A remote key is a capability: whoever holds it and can reach the queue pair can write that memory region. Keys, protection domains and access flags must be designed, not copied from examples (<a href="#F5-36">F5-36</a>).</li>
+<li><b>Programming effort.</b> The application now manages buffers, queues, completions and flow control (a SEND that finds no posted receive at the target is an error condition, not a wait), the work the kernel did for you before.</li>
+<li><b>Observability.</b> Tools that watch the kernel (strace, socket statistics, packet capture on the host) see little of the data path; you need adapter counters and switch telemetry instead.</li>
+</ul>
+<h3 id="F5-34-l3-alternatives">Alternatives on the same spectrum</h3>
+<p>Kernel bypass and zero copy are not unique to RDMA. User-space packet-processing frameworks poll NIC rings from user space without a transport in hardware; the Linux kernel itself offers zero-copy send and receive paths for sockets in some cases; shared memory between processes on one machine (your mailbox) is the extreme case of both. Which one to use depends on whether the peer is on the same machine, whether you control the network, and whether you need a reliable transport in hardware. These alternatives are named here only as directions for reading; their interfaces were not opened in this build, and <a href="#F5-38">F5-38</a> compares the ideas with code you can run.</p>
+<h3 id="F5-34-l3-curriculum">Where this leads in the curriculum</h3>
+<p>Track F of the Systems Curriculum uses RDMA for the step from one machine to many: its milestone F5 ("Two nodes: RDMA and GPUDirect RDMA") runs all-reduce across two nodes over InfiniBand or RoCE and asks that "raw RDMA bandwidth measured with perftest is within 10 % of the NIC's line rate" <sup class="src"><a href="#F5-34-src-D6">D6</a></sup>. DS401 gives you the concepts and the measurement method; DG402 (F8) uses them with GPUs.</p>
+
+<h2 id="F5-34-hardware">How the hardware actually does it</h2>
+<p>An RDMA adapter is a PCIe device (<a href="#F1-45">F1-45</a>) built around the same structures as the NIC of <a href="#F1-52">F1-52</a>: queues of descriptors in host memory, doorbell registers that the host writes to say "new work", DMA engines that read and write host memory, and completion entries written back to host memory. Two differences make kernel bypass possible <sup class="src"><a href="#F5-34-src-D1">D1</a></sup> <sup class="src"><a href="#F5-34-src-D2">D2</a></sup>. First, the queues and a doorbell page belong to one application: the kernel maps them into that process's address space at set-up, so the process can post work with ordinary memory writes. Second, the adapter keeps its own table of registered memory regions with their keys, permissions and address translations, so it can check every access and translate application virtual addresses to physical pages without asking the CPU. The transport state of each connection (next packet sequence number, unacknowledged packets, retry counters) lives in the adapter too.</p>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> Nothing in this chapter ran on an RDMA adapter: the build container has none (no <code>/sys/class/infiniband</code>, and <code>ibv_get_device_list</code> returned 0 devices, R1 of <a href="#F5-36">F5-36</a>). The description of where queues, doorbells and translation tables live is the chapter's reading of the InfiniBand architecture's model of a channel adapter, written without opening the specification; how a specific adapter implements it (on-chip caches of translations, how many queue pairs it holds before performance drops, how its doorbells are mapped) is in that adapter's programming documentation, not checked here.</p></div>
+
+<h2 id="F5-34-worked">Worked example</h2>
+<p><b>How much does one trip through the kernel cost on the build machine, and what would removing it buy a key-value service?</b></p>
+<ol>
+<li><b>Per round trip.</b> Minimum TCP round trip 4.13 us, minimum mailbox round trip 0.48 us <sup class="src"><a href="#F5-34-src-R2">R2</a></sup>. Difference: 4.13 − 0.48 = 3.65 us. The minimum is the right statistic here: it is the round trip in which no thread had to be woken, so it isolates the system calls, copies and protocol work.</li>
+<li><b>Per system call.</b> strace counted 4 system calls per round trip on the TCP path (12,800 <code>sendto</code> for 3,200 round trips × 2 sizes × 2 sides = 12,800) <sup class="src"><a href="#F5-34-src-R3">R3</a></sup>. 3.65 us / 4 ≈ 0.91 us per send-or-receive, including its copy and its share of the protocol work. (strace itself slows each call down, so its timing columns are not used.)</li>
+<li><b>Per message rate.</b> A single thread that does nothing but these system calls could not exceed 1 / 3.65 us ≈ 274,000 round trips per second on this machine, before doing any useful work.</li>
+<li><b>For a service.</b> Suppose a key-value store answers a GET in 2 us of CPU work and the network round trip outside the hosts takes 3 us. Through TCP at the best case: 3.65 + 2 + 3 = 8.65 us. With the host path removed entirely: 2 + 3 = 5 us, a factor of 1.73. If the GET takes 200 us of work, the same change gives 206.65 / 203 ≈ 1.02: not worth a new network.</li>
+<li><b>The median view.</b> With the median instead of the minimum, the TCP path took 35.40 us against 0.64 us <sup class="src"><a href="#F5-34-src-R2">R2</a></sup>: almost all of the typical cost was waking sleeping threads. A TCP service that busy-polls its sockets would recover much of that without RDMA; a fair comparison changes one thing at a time.</li>
+</ol>
+<p>The "2 us" and "3 us" in step 4 are invented inputs for the exercise, not measurements; only the 3.65 us comes from the run.</p>
+
+<h2 id="F5-34-code">Code walk-through</h2>
+<p>Built and run by <code>university/labs/run_lab.sh university/labs/F5-34</code> with <code>g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address,undefined</code>; the lab's <code>run.sh</code> also builds it with <code>-O2</code> and no sanitizers (the measurement build) and runs it under <code>strace -f -c</code>. The socket functions and <code>TCP_NODELAY</code> are the POSIX and Linux interfaces of D5, used as in <a href="#F5-05">F5-05</a> and <a href="#F5-09">F5-09</a> <sup class="src"><a href="#F5-34-src-D5">D5</a></sup>.</p>
+<p><b>Listing 1</b> — <code>paths.cpp</code>: the same echo over TCP and over a polled shared-memory mailbox.</p>
+<pre class="listing" data-src="F5-34/paths.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>26–27</td><td><code>kWarmup</code>, <code>kIters</code></td><td>200 untimed round trips, then 3,000 timed ones.</td><td>The first round trips pay for page faults and cold caches; they are not the steady state (<a href="#F5-37">F5-37</a>).</td></tr>
+<tr><td>36–41</td><td><code>summarise</code></td><td>Sorts the samples and returns the minimum, median and 99th percentile.</td><td>One average would hide both the best case and the tail.</td></tr>
+<tr><td>43–59</td><td><code>class Fd</code></td><td>Owns a socket descriptor and closes it in the destructor.</td><td>RAII: no descriptor leaks on the error paths.</td></tr>
+<tr><td>61–87</td><td><code>sendAll</code>, <code>recvAll</code></td><td>Loop until all bytes are sent or received; <code>recvAll</code> returns false when the peer closes.</td><td>TCP is a byte stream: one call may move fewer bytes than asked (<a href="#F5-09">F5-09</a>).</td></tr>
+<tr><td>92–102</td><td>listener</td><td>Binds to 127.0.0.1 with port 0, then asks the kernel which port it chose.</td><td>No fixed port, so runs cannot collide.</td></tr>
+<tr><td>104–111</td><td>server thread</td><td>Accepts one connection, sets <code>TCP_NODELAY</code>, echoes every message.</td><td>Without <code>TCP_NODELAY</code>, small writes can wait for acknowledgements (the forensic lab).</td></tr>
+<tr><td>121–129</td><td>timed loop (TCP)</td><td>Sends <code>size</code> bytes, receives the echo, records the round trip after the warm-up.</td><td>Each iteration is two system calls on each side: R3 counts them.</td></tr>
+<tr><td>130</td><td>end of block</td><td>The client socket closes; the server's <code>recvAll</code> sees end of stream and its loop ends.</td><td>A clean shutdown, so <code>join</code> on line 131 returns.</td></tr>
+<tr><td>136–142</td><td><code>Mailbox</code></td><td>Two atomic sequence numbers and two byte buffers shared by both threads.</td><td>The "shelf": memory both sides can see, with a flag that says "new data".</td></tr>
+<tr><td>150–158</td><td>server thread (mailbox)</td><td>Spins until <code>requestSeq</code> reaches the next number (acquire), copies the request into the reply, publishes <code>replySeq</code> (release).</td><td>Release/acquire ordering (SP203) makes the copied bytes visible before the flag; no system call, no sleep.</td></tr>
+<tr><td>162–173</td><td>timed loop (mailbox)</td><td>Copies the message in, publishes the request number, spins on the reply number, copies the reply out.</td><td>Three <code>memcpy</code> per round trip: kernel bypass without zero copy, which is why 64 KiB is not faster here.</td></tr>
+<tr><td>186–199</td><td><code>main</code></td><td>Runs both paths for 64 and 65,536 bytes, or only one path when given <code>tcp</code> or <code>shm</code>.</td><td>The one-path modes let strace count each path's system calls separately.</td></tr>
+</tbody></table></div>
+<p><b>Run of Listing 1</b> (sanitizer build, as run by <code>run_lab.sh</code>):</p>
+<pre class="output" data-run="F5-34/paths"></pre>
+<p><b>Run of Listing 1</b> (measurement build: <code>-O2</code>, no sanitizers):</p>
+<pre class="output" data-run="F5-34/paths_O2"></pre>
+<p><b>System calls of the TCP path</b> (<code>strace -f -c ./paths tcp</code>; strace's own timing columns are inflated by tracing and are not used):</p>
+<pre class="output" data-run="F5-34/syscalls_tcp"></pre>
+<p><b>System calls of the shared-memory path</b> (<code>strace -f -c ./paths shm</code>): the whole run, including program start-up and thread creation.</p>
+<pre class="output" data-run="F5-34/syscalls_shm"></pre>
+
+<h2 id="F5-34-breaks">Where the analogy breaks</h2>
+<ul>
+<li>A courier who finds the shelf full or the key wrong can phone Wei. An RDMA WRITE that breaks the rules fails at the sender with an error completion, and the connection stops working until it is reset (<a href="#F5-36">F5-36</a>); there is no conversation.</li>
+<li>In the story Amara "notices the note when she looks". With RDMA she also has to know <i>when the whole note has arrived</i>: data written by a one-sided operation gives the target program no signal, so protocols write a flag last or send a separate message (<a href="#F1-53">F1-53</a>, <a href="#F5-36">F5-36</a>).</li>
+<li>Post offices in the story are slow because clerks are slow. The kernel is not slow at any one step; its cost is many small steps per message, each fast, plus the copies, and the cost depends on message size, CPU and load in ways the story cannot show. Measure it (Figure 2).</li>
+<li>Couriers can drive on any road. RoCE needs the Ethernet network to be configured for it, and InfiniBand needs its own network; the "road" is part of the design (<a href="#F5-35">F5-35</a>).</li>
+<li>Amara's key opens one shelf forever. Real remote keys are valid until the region is deregistered, and a stale key held by a peer is a real bug class (HW205's "stale key" forensic lab, <a href="#F1-53">F1-53</a>).</li>
+</ul>
+
+<h2 id="F5-34-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Small request-reply over TCP takes tens of milliseconds.</td><td>A write-write-read pattern with Nagle's algorithm on, against a receiver that delays acknowledgements.</td><td><code>strace -f -r</code> shows two small sends per request and a gap of tens of ms before the server's read completes (forensic lab).</td><td>One write per message (<code>writev</code>) or <code>TCP_NODELAY</code>.</td></tr>
+<tr><td>"RDMA is 10 times faster" in a benchmark, no gain in the product.</td><td>The benchmark measured only the network; the product spends its time elsewhere.</td><td>Split the request's time (worked example, step 4).</td><td>Measure the host-path share first; optimise what dominates.</td></tr>
+<tr><td>Median latency far above the minimum, on an idle machine.</td><td>Threads sleep in blocking calls and must be woken.</td><td>Compare min and median (R2); count context switches with <code>perf</code> or <code>/proc/&lt;pid&gt;/status</code>.</td><td>Busy-poll on a dedicated core, or accept the cost; do not blame the network.</td></tr>
+<tr><td>Results differ from run to run by large factors.</td><td>Shared machine, CPU frequency changes, threads migrating between cores.</td><td>Repeat runs; compare minima and medians; record the machine (<a href="#F5-37">F5-37</a>).</td><td>Pin threads, isolate cores, report distributions not single numbers.</td></tr>
+<tr><td>Timing a sanitizer build.</td><td>AddressSanitizer instruments every <code>memcpy</code>.</td><td>R1 versus R2: the 64 KiB mailbox median was 26.43 us with sanitizers and 19.01 us without.</td><td>Test correctness with sanitizers; measure with the build you ship.</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F5-34-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F5-09">F5-09</a> built an RPC library on TCP sockets, and HW205 (<a href="#F1-52">F1-52</a>, <a href="#F1-53">F1-53</a>) showed NIC descriptor rings and previewed RDMA with a model. <b>What carries over:</b> framing and request ids, the habit of treating a timeout as "outcome unknown", descriptor rings, doorbells and DMA, and measuring percentiles rather than averages <sup class="src"><a href="#F5-34-src-D4">D4</a></sup>. <b>What changes:</b> the kernel no longer does the transport, the copies or the waiting for you; most dangerous first: buffers handed to the adapter must not be touched or freed until it reports completion, one-sided writes give the target no signal, and the network itself must be configured for RDMA <sup class="src"><a href="#F5-34-src-D1">D1</a></sup> <sup class="src"><a href="#F5-34-src-D2">D2</a></sup>. <b>What comes next:</b> <a href="#F5-35">F5-35</a> opens the packets: InfiniBand's transport headers, and how RoCE carries them over Ethernet and IP.</p></div>
+
+<h2 id="F5-34-check">Check yourself</h2>
+<ol>
+<li>List the steps of a small TCP message from the sender's <code>send</code> to the receiver's <code>recv</code> returning. Mark each step that RDMA removes and say which of the three ideas removes it.</li>
+<li>Why does the kernel copy the bytes in <code>send</code>, instead of sending directly from the application's buffer? What does zero copy require from the application in exchange?</li>
+<li>In R2, the TCP path's 64-byte median (35.40 us) is far above its minimum (4.13 us), while the mailbox median (0.64 us) is close to its minimum (0.48 us). Explain the difference in your own words.</li>
+<li>Why is the 64 KiB mailbox round trip not faster than TCP at its minimum (15.68 us versus 14.46 us in R2), although the mailbox has no system calls?</li>
+<li>Apply to a new case: a storage service spends 80 us per request reading from an SSD and 6 us in the host network stack. What is the largest speed-up per request that RDMA could give? What could it still give the service?</li>
+<li>Which of these is a one-sided operation: (a) SEND; (b) RDMA WRITE; (c) RDMA READ; (d) a TCP <code>send</code>? What does the target program see for each?</li>
+<li>Predict, then run: change <code>kIters</code> to 300 and <code>kWarmup</code> to 0 in Listing 1. Which column changes most, and why?</li>
+<li>Name three costs of RDMA that a team must accept, and for each say which later chapter of DS401 deals with it.</li>
+</ol>
+
+<h2 id="F5-34-lab">Lab</h2>
+<p><b>Goal.</b> Measure the cost of the kernel path on your machine: build and run Listing 1, count its system calls, and write a one-page latency budget that separates system calls and copies, wake-ups, and copy cost for large messages.</p>
+<p><b>Hardware and software needed.</b> Any Linux computer with g++ (C++20) and strace; no RDMA hardware. The build used <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> and <code>strace -- version 6.8</code> in a cloud container with 4 visible CPUs. <b>Safety:</b> none beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>From the repository root run <code>university/labs/run_lab.sh university/labs/F5-34</code>. Expect exit status 0 and the files <code>paths.out</code>, <code>paths_O2.out</code>, <code>syscalls_tcp.out</code>, <code>syscalls_shm.out</code>.</li>
+<li>Read <code>syscalls_tcp.out</code>: check that <code>sendto</code> equals 2 sizes × 3,200 round trips × 2 sides. Explain the few extra <code>recvfrom</code> calls (hint: <code>recvAll</code> on line 108 sees the end of stream; and a large message may arrive in more than one piece).</li>
+<li>Run the measurement build three times (<code>g++ -std=c++20 -O2 university/labs/F5-34/paths.cpp -o paths -pthread</code>, then <code>./paths</code>). Record min, median and p99 of each run in a table. Which statistic is stable between runs?</li>
+<li>Add sizes 1,024 and 8,192 to line 192. Plot (by hand or with Python) the minimum round trip against size for both paths. Where do the curves cross on your machine?</li>
+<li>Pin the two threads to different CPUs (for example <code>taskset -c 0,1 ./paths</code>; this step was not run in the build) and compare medians.</li>
+<li>Write the latency budget: for 64 bytes, how much of the TCP round trip is (a) system calls and copies (from minima), (b) wake-ups (median minus minimum)? For 64 KiB, how much is copying (compare with the mailbox)?</li>
+</ol>
+<p><b>Expected observations.</b> From the build's run: 4 system calls per TCP round trip and none on the mailbox data path <sup class="src"><a href="#F5-34-src-R3">R3</a></sup>; a minimal 64-byte round trip of 4.13 us over TCP and 0.48 us through the mailbox; medians of 35.40 us and 0.64 us <sup class="src"><a href="#F5-34-src-R2">R2</a></sup>. Measured on that container; your numbers will differ, the pattern should not.</p>
+<p><b>Verification.</b> Your system-call counts match the formula of step 2 exactly; your budget's parts add up to the measured TCP median within 10 %; the sanitizer build reports no errors.</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>The program hangs → a thread waits for a message that never comes; check that both loops use the same number of iterations (lines 121 and 151).</li>
+<li><code>strace: ptrace(PTRACE_TRACEME, ...): Operation not permitted</code> → your container forbids tracing; run on a normal Linux machine or a virtual machine.</li>
+<li>The mailbox path takes seconds → the machine has one CPU, so the spinning threads take turns; polling needs at least two cores.</li>
+<li>Very large p99 values on the mailbox path → a polling thread was descheduled; this is exactly why bypass designs dedicate cores (<a href="#F5-38">F5-38</a>).</li>
+</ul>
+<p><b>Extension.</b> Move the mailbox into shared memory between two processes (<code>mmap</code> with <code>MAP_SHARED</code>) and compare with threads; <a href="#F5-38">F5-38</a>'s ring does this. Or replace the loopback TCP path with a TCP connection between two virtual machines and see how the wire term changes the budget.</p>
+
+<h2 id="F5-34-forensic">Forensic lab</h2>
+<p><b>Scenario — "we need RDMA: TCP takes 40 ms".</b> A team's internal service answers tiny requests: an 8-byte header followed by a 56-byte body, then an 8-byte reply. Their benchmark reports a median of about 44 ms per request on a single machine. A design document proposes moving the service to RDMA "because the kernel's TCP stack is too slow". You are asked to review the evidence first.</p>
+<p><b>Evidence pack.</b> (1) The team's benchmark output, produced by <code>nagle.cpp</code> in its default mode:</p>
+<pre class="output" data-run="F5-34/nagle"></pre>
+<p>(2) A system-call trace of three requests (<code>strace -f -r</code>; the second column is the time since the previous line, in seconds; process ids replaced by N). File descriptor 4 is the client's socket and 5 the server's.</p>
+<pre class="output" data-run="F5-34/nagle_trace"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>How many system calls does the client make per request, and with which sizes? Quote the lines.</li>
+<li>Find the long gaps in the trace. Which call is waiting, on which descriptor, and what does it receive when it finally returns?</li>
+<li>Compare with Figure 2 and R2 of this chapter. Is 44 ms plausibly "the cost of the kernel's TCP stack"? State at least two hypotheses for the gap.</li>
+<li>The first request was fast (0.277 ms). Which hypothesis explains why only the first one escapes the delay?</li>
+<li>Propose two different fixes that do not involve RDMA, and say how you would verify each.</li>
+<li>Write the two-sentence reply to the design document.</li>
+</ol>
+<p><b>Method hints.</b> Line up the client's two <code>sendto</code> calls with the server's <code>recvfrom</code> results: how many bytes did the server get each time? Then ask what TCP on the client might be waiting for before sending the second, smaller piece. The answer key is at the end of the page.</p>
+
+<h2 id="F5-34-project">Mini-project</h2>
+<p><b>A latency budget for a real service.</b> Choose a request-reply program you wrote earlier (the RPC library of <a href="#F5-09">F5-09</a> is a good candidate). Instrument it with timestamps at the client before send, at the server after receive, before reply, and at the client after receive, and run it over loopback and, if you can, between two machines. Produce a one-page budget: network and host path, server work, wake-ups, and a statement of what RDMA could and could not improve, with the arithmetic of the worked example. <b>Rubric:</b> correct measurement method (warm-up, percentiles, machine recorded) 30 %; budget parts that add up to the measured total 30 %; justified conclusion about RDMA 25 %; clarity 15 %.</p>
+
+<h2 id="F5-34-summary">Summary</h2>
+<ul>
+<li>A TCP message pays, on each side, system calls, a copy, protocol processing on the CPU and usually a thread wake-up; on the build machine this was at least 3.65 us per 64-byte round trip, and the median was dominated by wake-ups.</li>
+<li>RDMA combines transport offload, kernel bypass and zero copy, and adds one-sided operations that do not involve the target program.</li>
+<li>RDMA helps small-message latency, CPU cost per byte and jitter; it does nothing for the wire or the application's own work: apply Amdahl-style reasoning before deciding.</li>
+<li>Its costs are memory registration and pinning, connection state in the adapter, a network configured for it, key management, and more complex programs.</li>
+<li>Busy polling removes wake-ups but spends a core; removing the kernel does not remove copies.</li>
+<li>Measure the build you ship, on a recorded machine, with minima, medians and tails; one number is not a measurement.</li>
+<li>Before blaming TCP, check how the application uses it: a write-write-read pattern with Nagle's algorithm can cost tens of milliseconds.</li>
+</ul>
+
+<h2 id="F5-34-sources">Sources</h2>
+<ol>
+<li id="F5-34-src-D1">D1 — InfiniBand Trade Association, "InfiniBand Architecture Specification" (tier 1; curriculum reading-list item 81, with its RoCE v2 annex): the architecture overview (channel adapters, queue pairs, transport services, RDMA operations, memory registration and keys). <i>Title only — not opened during this build; the Source Researcher must confirm the release, volume and section titles (dossier gate G1 open).</i></li>
+<li id="F5-34-src-D2">D2 — NVIDIA, "RDMA Aware Networks Programming User Manual" (tier 1 for vendor material; listed in the curriculum's Track F reading): the RDMA architecture overview (kernel bypass, zero copy, transport offload, memory registration). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-34-src-D3">D3 — rdma-core project, header <code>infiniband/verbs.h</code> as installed by the Ubuntu package <code>libibverbs-dev</code> version <code>50.0-2ubuntu0.2</code> (tier 2: the project's own published interface). <i>Opened in this build (2026-10-09): the declarations and comments of <code>ibv_post_send</code>, <code>ibv_post_recv</code> and <code>ibv_poll_cq</code> (static inline functions calling the context's operations).</i></li>
+<li id="F5-34-src-D4">D4 — W. Richard Stevens et al., "TCP/IP Illustrated" (tier 3; edition to be recorded): TCP data flow (interactive data, Nagle's algorithm, delayed acknowledgements), TCP buffering in the kernel. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F5-34-src-D5">D5 — "The Open Group Base Specifications" (POSIX): <code>send</code>, <code>recv</code>, <code>socket</code>, <code>bind</code>, <code>listen</code>, <code>accept</code>, <code>connect</code>, <code>writev</code>; Linux manual pages <code>tcp(7)</code> (<code>TCP_NODELAY</code>) and <code>strace(1)</code> (tier 1 and 2). <i>Title only — not opened during this build; the identifiers compiled and ran in R1–R4 (dossier gate G1 open).</i></li>
+<li id="F5-34-src-D6">D6 — Systems Curriculum (this project), section 14 (Track F): 14.1 row "Inter-node networks", 14.2 hardware note, milestone F5 and its acceptance test quoted in Layer 3; reading-list item 81 — used as a map (AH-4).</li>
+<li id="F5-34-src-R1">R1 — <code>university/labs/F5-34/paths.log</code>: Listing 1, sanitizer build, <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, Linux x86_64 cloud build container, exit code 0.</li>
+<li id="F5-34-src-R2">R2 — <code>university/labs/F5-34/paths_O2.log</code>: Listing 1, <code>-O2</code> build without sanitizers, same toolchain and machine (4 CPUs visible), exit code 0.</li>
+<li id="F5-34-src-R3">R3 — <code>university/labs/F5-34/syscalls_tcp.log</code> and <code>syscalls_shm.log</code>: <code>strace -- version 6.8</code>, <code>strace -f -c</code> of the <code>-O2</code> build, one path each, exit code 0.</li>
+<li id="F5-34-src-R4">R4 — <code>university/labs/F5-34/nagle.log</code>, <code>nagle_trace.log</code>, <code>nagle_nodelay.log</code>, <code>nagle_onewrite.log</code>: the forensic evidence generator in its four modes, same toolchain, exit code 0 each.</li>
+</ol>
+
+<h2 id="F5-34-glossary">Glossary links</h2>
+<p><a href="#gl-kernel-bypass">Kernel bypass</a> · <a href="#gl-zero-copy">Zero copy</a> · <a href="#gl-transport-offload">Transport offload</a> · <a href="#gl-one-sided-operation">One-sided operation</a> · <a href="#gl-system-call-cost">System call cost</a> · <a href="#gl-nagle-s-algorithm">Nagle's algorithm</a> · <a href="#gl-rdma-remote-direct-memory-access">RDMA (remote direct memory access)</a> · <a href="#gl-queue-pair-qp">Queue pair (QP)</a> · <a href="#gl-completion-queue-cq-rdma">Completion queue (CQ, RDMA)</a> · <a href="#gl-infiniband-and-roce">InfiniBand and RoCE</a> · <a href="#gl-polling">Polling</a> · <a href="#gl-median-and-percentile">Median and percentile</a></p>
+
+<h2 id="F5-34-next">Next chapter</h2>
+<p>Next: <a href="#F5-35">F5-35 InfiniBand and RoCE</a>. Back to the course: <a href="#DS401">DS401</a>. Earlier: <a href="#F5-09">F5-09 Remote procedure calls</a>; <a href="#F1-53">F1-53 RDMA-capable NICs (preview)</a>.</p>
+
+<h2 id="F5-34-answers">Answers to Check yourself</h2>
+<ol>
+<li>send system call (removed by kernel bypass); copy into the socket buffer (zero copy); TCP/IP processing on the sender's CPU (transport offload); NIC DMA and wire (remain); receive interrupt and TCP/IP on the receiver's CPU (transport offload, and for a one-sided operation the receiver's CPU is not involved at all); waking the receiving thread (kernel bypass with polling, or no receiver at all for one-sided); copy into the application buffer (zero copy); the recv system call (kernel bypass).</li>
+<li>So that <code>send</code> can return at once and the application may reuse or free its buffer, while the kernel keeps a copy for possible retransmission. Zero copy requires the application to leave the buffer untouched, registered and resident until the adapter reports completion.</li>
+<li>The TCP threads block in <code>recv</code> and are put to sleep; in most round trips one of them had to be woken and scheduled, which costs far more than the system calls. The mailbox threads never sleep: they spin, so every round trip is close to the best case. (The difference is mostly polling versus blocking, not the network.)</li>
+<li>At 64 KiB the cost is dominated by copying bytes, and the mailbox copies too (three <code>memcpy</code> per round trip, line 155, 164, 168), while the kernel's copies are comparable. Removing system calls saves a fixed amount per message; it does not remove per-byte work. Zero copy would.</li>
+<li>At most (80 + 6) / 80 = 1.075, about 7.5 %. It could still free CPU time (no copies and protocol work per byte) and reduce jitter, which may matter more than the mean for this service.</li>
+<li>(b) and (c) are one-sided: the target program sees nothing (no completion, no interrupt); for an RDMA WRITE it can only notice changed memory. (a) SEND is two-sided: the target must have posted a receive and gets a completion. (d) is not RDMA; the target sees the data when its <code>recv</code> returns. Distractor: (c) "READ" sounds as if the target must answer; in RDMA the target's adapter answers, not its program.</li>
+<li>The p99 and the median of the first size change most: without warm-up, the timed set includes the first round trips with cold caches, page faults and connection start-up; with only 300 samples, the 99th percentile is decided by three samples. The minimum changes little.</li>
+<li>Memory registration and pinning (<a href="#F5-36">F5-36</a>, <a href="#F5-38">F5-38</a>); connection state and queue pairs (<a href="#F5-36">F5-36</a>); network configuration, MTU and lossless settings (<a href="#F5-35">F5-35</a>, <a href="#F5-37">F5-37</a>); measuring correctly (<a href="#F5-37">F5-37</a>); keys and access flags (<a href="#F5-36">F5-36</a>).</li>
+</ol>
+<h3 id="F5-34-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> Per request the client makes two <code>sendto</code> calls, 8 bytes ("REQ…") then 56 bytes, and one <code>recvfrom</code> of 8 bytes. In requests 2 and 3, the server's <code>recvfrom(5, …)</code> first returns only the 8 header bytes, and the next <code>recvfrom</code> that completes with the 56 body bytes resumes after 0.041713 s and 0.043288 s <sup class="src"><a href="#F5-34-src-R4">R4</a></sup>. The client's second <code>sendto</code> returned at once: the body was accepted by the client's kernel but not delivered for about 42 ms.</p>
+<p><b>Hypotheses.</b> (1) The kernel's TCP path is slow: ruled out, the same machine does a full 64-byte round trip in microseconds (R2), and request 1 took 0.277 ms. (2) The server is slow to process: ruled out, the server's call is blocked waiting for bytes, not working. (3) The client's TCP holds back the second small segment while the first is unacknowledged (Nagle's algorithm), and the server's TCP delays its acknowledgement of the header because it has no reply to piggy-back it on yet (delayed ACK); the body leaves only when the delayed ACK timer fires <sup class="src"><a href="#F5-34-src-D4">D4</a></sup>. This matches the gap and the configuration line <code>TCP_NODELAY=0</code>. (4) Request 1 escapes because no earlier data was unacknowledged when its body was written, or because the receiver acknowledged promptly at the start of the connection (the exact rule for the first segments is in D4 and the Linux <code>tcp(7)</code> page, not verified here).</p>
+<p><b>Root cause.</b> The client writes one logical message with two system calls, and the socket uses the default <code>TCP_NODELAY=0</code>: the write-write-read pattern meets Nagle's algorithm and delayed acknowledgements.</p>
+<p><b>Fix and verification.</b> Either send header and body in one call (<code>writev</code>, or build the message in one buffer), or set <code>TCP_NODELAY</code> on the client socket. Both were run <sup class="src"><a href="#F5-34-src-R4">R4</a></sup>:</p>
+<pre class="output" data-run="F5-34/nagle_nodelay"></pre>
+<pre class="output" data-run="F5-34/nagle_onewrite"></pre>
+<p>The median fell from 43.975 ms to 0.033 ms and 0.031 ms respectively. <b>Prevention.</b> A latency test in CI with an alert on the median; a code-review rule "one message, one write"; set <code>TCP_NODELAY</code> on request-reply sockets as <a href="#F5-09">F5-09</a>'s library and Listing 1 do.</p>
+<p><b>Reply to the design document.</b> "The 44 ms is a delay caused by how the client writes to TCP, not by the TCP stack; with one write per request the same service answers in about 31 us on the same machine. Re-measure the host-path share after this fix before considering RDMA."</p>
+<p><b>How the evidence was produced.</b> <code>nagle.cpp</code> in default mode (two <code>send</code> calls, default socket options) on loopback; the trace with <code>strace -f -r -e trace=sendto,recvfrom,writev,setsockopt,getsockopt ./nagle trace</code>; process ids replaced by N with <code>sed</code>; nothing else edited.</p>

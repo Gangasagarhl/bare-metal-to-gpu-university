@@ -1,0 +1,360 @@
+<!--meta
+id: F6-38
+title: Fused kernels: online softmax and layer norm
+course: CU401
+level: L4
+prereqs: F6-35, F6-36; F6-14 and F6-15 (reductions, warp shuffles); F6-25 (mixed precision and tolerances); MA302 (floating point)
+time: 10–14 hours including the lab
+hardware: Lab steps 4–6 need an NVIDIA GPU with a CUDA Toolkit and driver (record both) or a cloud GPU; the numerical study (steps 1–3), the PTX reading and the forensic lab need only g++ and nvcc (this build had no GPU)
+maps: Curriculum E12 (fused kernels: online softmax, layer norm); 13.2 topics 5 and 7; forensic lab "NaN after fusion" of the CU401 card
+analogy: F6 — the great kitchen hall
+-->
+
+<h2 id="F6-38-hook">Story hook</h2>
+<p>In the great kitchen hall, Amara's row of helpers prepares sauce in three steps: taste every pot to find the strongest, then dilute every pot by the strongest one, then share the sauce out in proportion. For a while each step was its own order. After every step the helpers carried all the pots back to the big pantry at the far end of the hall, and for the next step they carried them out again. The cooking itself took a moment; the walking took the afternoon.</p>
+<p>So Amara rewrote the recipe card: keep the pots at the station, do the three steps in a row, and walk to the pantry only with the finished sauce. That is a <b>fused kernel</b>. One problem remained: to dilute by the strongest pot, you must know the strongest pot before you start, which seemed to need one more walk along the row. Kenji, a helper with a good memory, showed a trick. He kept two numbers in his hands, "the strongest so far" and "my running tally, measured against the strongest so far". When a stronger pot appeared, he did not start again: he scaled his tally down once and carried on. That trick is the <b>online normaliser</b>.</p>
+<p>A month later the sauce came out as grey sludge on the busiest day of the year. Somebody had "simplified" Kenji's card and dropped the scaling step. On quiet days nobody noticed. This chapter's forensic lab is that day.</p>
+
+<h2 id="F6-38-able">What you will be able to do</h2>
+<ul>
+<li><b>Explain</b> why a chain of memory-bound kernels is limited by global-memory traffic, and count the bytes that fusion removes.</li>
+<li><b>Derive</b> the online normaliser for softmax and the merge rule for two partial states, and prove that the result equals the safe three-pass softmax.</li>
+<li><b>Implement</b> a fused row softmax and a fused layer norm with one warp per row, warp-shuffle merges and Welford statistics.</li>
+<li><b>Measure</b> numerical error against a double-precision reference, choose a tolerance and explain where FP32 overflow, underflow and cancellation come from.</li>
+<li><b>Diagnose</b> "NaN after fusion" from a per-chunk trace of the running maximum and normaliser.</li>
+</ul>
+
+<div class="co jargon" id="F6-38-jargon"><span class="lbl">Jargon box</span><dl class="gl">
+<dt>Kernel fusion</dt><dd><b>Simple words:</b> doing several steps of a calculation in one GPU program so the data between the steps never goes back to global memory. <b>Analogy:</b> keeping the pots at the station for all three recipe steps instead of walking to the pantry after each. <b>Precise:</b> combining operations that would be separate kernels (each reading its input from and writing its output to global memory) into one kernel whose intermediates stay in registers or shared memory; it removes the intermediate global-memory reads and writes and the extra launches. <sup class="src"><a href="#F6-38-src-D6">D6</a></sup> (Not the operating-system kernel of <a href="#OS301">OS301</a>.)</dd>
+<dt>Softmax</dt><dd><b>Simple words:</b> turns a list of scores into shares that are all positive and add up to one; bigger scores get much bigger shares. <b>Analogy:</b> sharing the sauce in proportion to each pot's strength, after a very strong "boost" of the differences. <b>Precise:</b> y<sub>i</sub> = e<sup>x<sub>i</sub></sup> / Σ<sub>j</sub> e<sup>x<sub>j</sub></sup>; it is unchanged when the same constant is subtracted from every x<sub>j</sub>, which is why implementations subtract the maximum. <sup class="src"><a href="#F6-38-src-D2">D2</a></sup></dd>
+<dt>Safe softmax</dt><dd><b>Simple words:</b> softmax computed after subtracting the largest score, so no exponential can become too big. <b>Analogy:</b> measuring every pot against the strongest one. <b>Precise:</b> y<sub>i</sub> = e<sup>x<sub>i</sub>−m</sup> / Σ<sub>j</sub> e<sup>x<sub>j</sub>−m</sup> with m = max<sub>j</sub> x<sub>j</sub>; every exponent is ≤ 0, so every term is in (0, 1]; three passes over the data (max, sum, write). <sup class="src"><a href="#F6-38-src-D2">D2</a></sup></dd>
+<dt>Online normaliser</dt><dd><b>Simple words:</b> finding the maximum and the sum in the same pass by fixing up the sum whenever the maximum grows. <b>Analogy:</b> Kenji's "strongest so far" and tally, scaled down once when a stronger pot appears. <b>Precise:</b> the state (m, d) is updated per element v by m′ = max(m, v), d′ = d·e<sup>m−m′</sup> + e<sup>v−m′</sup>; after the last element, d = Σ e<sup>x<sub>j</sub>−m</sup> exactly as in the safe softmax, so softmax needs two passes instead of three. <sup class="src"><a href="#F6-38-src-D2">D2</a></sup></dd>
+<dt>State merge (associative combine)</dt><dd><b>Simple words:</b> a rule for joining two partial answers into the answer for both parts. <b>Analogy:</b> two helpers who tasted different halves of the row compare notes. <b>Precise:</b> for softmax, (m<sub>a</sub>, d<sub>a</sub>) ⊕ (m<sub>b</sub>, d<sub>b</sub>) = (M, d<sub>a</sub>e<sup>m<sub>a</sub>−M</sup> + d<sub>b</sub>e<sup>m<sub>b</sub>−M</sup>) with M = max(m<sub>a</sub>, m<sub>b</sub>); because ⊕ is associative, a tree of shuffles can merge 32 lanes in five steps. <sup class="src"><a href="#F6-38-src-D2">D2</a></sup></dd>
+<dt>Layer norm</dt><dd><b>Simple words:</b> shifting and scaling each row of numbers so that it has average zero and spread one. <b>Analogy:</b> adjusting every pot so the row as a whole is "evenly seasoned". <b>Precise:</b> y<sub>i</sub> = γ<sub>i</sub>(x<sub>i</sub> − μ)/√(σ<sup>2</sup> + ε) + β<sub>i</sub>, with μ and σ<sup>2</sup> the mean and (population) variance of the row and γ, β learned per-feature parameters; this chapter's kernel computes the normalised part (γ = 1, β = 0). <sup class="src"><a href="#F6-38-src-D4">D4</a></sup></dd>
+<dt>Welford's algorithm</dt><dd><b>Simple words:</b> a way to keep a running mean and spread in one pass without the big cancellation of "sum of squares minus square of sum". <b>Analogy:</b> adjusting your idea of the average a little with each new pot. <b>Precise:</b> per element: n ← n + 1, δ = x − mean, mean ← mean + δ/n, M2 ← M2 + δ(x − mean); variance = M2/n; two states merge with δ = mean<sub>b</sub> − mean<sub>a</sub>, M2 = M2<sub>a</sub> + M2<sub>b</sub> + δ<sup>2</sup>n<sub>a</sub>n<sub>b</sub>/n. <sup class="src"><a href="#F6-38-src-D3">D3</a></sup></dd>
+<dt>Catastrophic cancellation</dt><dd><b>Simple words:</b> losing almost all correct digits when you subtract two nearly equal big numbers. <b>Analogy:</b> weighing a feather by weighing a truck with and without it. <b>Precise:</b> when a − b is computed from rounded a and b with a ≈ b, the absolute rounding errors of a and b remain while the result is small, so the relative error of the result can be large; E[x<sup>2</sup>] − E[x]<sup>2</sup> in FP32 is the classic case. <sup class="src"><a href="#F6-38-src-D5">D5</a></sup> (Taught in <a href="#MA302">MA302</a>.)</dd>
+</dl></div>
+
+<h2 id="F6-38-pictures">The idea in pictures</h2>
+<p>Figure 1 compares the unfused and the fused version of a row softmax: the boxes are kernels, the arrows are trips to and from global memory. Figure 2 shows the online normaliser as a state that each element updates, and the five-step shuffle tree that merges the 32 lane states of one warp.</p>
+<figure id="F6-38-fig1"><div class="svgbox">
+<svg viewBox="0 0 760 330" role="img" aria-labelledby="F6-38-f1t F6-38-f1d">
+<title id="F6-38-f1t">Figure 1: unfused softmax as three kernels versus one fused kernel</title>
+<desc id="F6-38-f1d">Top half, labelled unfused: a wide bar for global memory at the top. Below it three boxes in a row: kernel 1 row max, kernel 2 exp and sum, kernel 3 divide. Arrows show kernel 1 reading x from global memory and writing m; kernel 2 reading x and m and writing e and s; kernel 3 reading e and s and writing y. A note counts the traffic per row element: about four reads and two writes in this version. Bottom half, labelled fused: one box, the fused kernel, with a small region labelled registers holding m and d. It reads x twice, once for the online pass and once for the write pass, and writes y once: two reads and one write per element, and one launch instead of three.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="330"/>
+<text class="sv-tb" x="16" y="22">Unfused: three kernels, intermediates in global memory</text>
+<rect class="sv-b4" x="16" y="32" width="728" height="30" rx="6"/><text class="sv-t" x="28" y="52">global memory (the big pantry): x, m, e, s, y</text>
+<rect class="sv-b2" x="40" y="100" width="190" height="44" rx="6"/><text class="sv-t" x="54" y="127">kernel 1: row max m</text>
+<rect class="sv-b2" x="285" y="100" width="190" height="44" rx="6"/><text class="sv-t" x="298" y="127">kernel 2: e = exp(x − m), s</text>
+<rect class="sv-b2" x="530" y="100" width="190" height="44" rx="6"/><text class="sv-t" x="548" y="127">kernel 3: y = e / s</text>
+<line class="sv-line" x1="100" y1="62" x2="100" y2="98"/><polygon class="sv-head" points="95,92 105,92 100,100"/><text class="sv-ts" x="106" y="84">read x</text>
+<line class="sv-line" x1="180" y1="100" x2="180" y2="64"/><polygon class="sv-head" points="175,70 185,70 180,62"/><text class="sv-ts" x="186" y="84">write m</text>
+<line class="sv-line" x1="330" y1="62" x2="330" y2="98"/><polygon class="sv-head" points="325,92 335,92 330,100"/><text class="sv-ts" x="336" y="84">read x, m</text>
+<line class="sv-line" x1="430" y1="100" x2="430" y2="64"/><polygon class="sv-head" points="425,70 435,70 430,62"/><text class="sv-ts" x="436" y="84">write e, s</text>
+<line class="sv-line" x1="575" y1="62" x2="575" y2="98"/><polygon class="sv-head" points="570,92 580,92 575,100"/><text class="sv-ts" x="581" y="84">read e, s</text>
+<line class="sv-line" x1="680" y1="100" x2="680" y2="64"/><polygon class="sv-head" points="675,70 685,70 680,62"/><text class="sv-ts" x="686" y="84">write y</text>
+<text class="sv-ts" x="40" y="166">per element of a row: read x twice, read e once, write e and y: 3 reads + 2 writes (m and s are one value per row)</text>
+<line class="sv-dash" x1="16" y1="182" x2="744" y2="182"/>
+<text class="sv-tb" x="16" y="206">Fused: one kernel, intermediates in registers</text>
+<rect class="sv-b4" x="16" y="216" width="728" height="30" rx="6"/><text class="sv-t" x="28" y="236">global memory: x, y only</text>
+<rect class="sv-b5" x="200" y="282" width="360" height="40" rx="6"/><text class="sv-t" x="214" y="307">fused kernel: online pass, merge, write pass</text>
+<rect class="sv-b3" x="580" y="282" width="150" height="40" rx="6"/><text class="sv-ts" x="590" y="300">registers (hands):</text><text class="sv-tm" x="590" y="316">m, d per lane</text>
+<line class="sv-line" x1="260" y1="246" x2="260" y2="280"/><polygon class="sv-head" points="255,274 265,274 260,282"/><text class="sv-ts" x="266" y="266">read x (pass 1)</text>
+<line class="sv-line" x1="390" y1="246" x2="390" y2="280"/><polygon class="sv-head" points="385,274 395,274 390,282"/><text class="sv-ts" x="396" y="266">read x (pass 2)</text>
+<line class="sv-line" x1="520" y1="282" x2="520" y2="248"/><polygon class="sv-head" points="515,254 525,254 520,246"/><text class="sv-ts" x="456" y="276">write y</text>
+<text class="sv-ts" x="16" y="300">2 reads + 1 write</text><text class="sv-ts" x="16" y="316">per element; 1 launch</text>
+</svg></div><figcaption><b>Figure 1.</b> Data flow (arrows) between global memory and kernels for one row softmax. The unfused chain stores the exponentials <code>e</code> in global memory; the fused kernel keeps (m, d) in registers. The counts are per element and assume a row too long to stay in cache between kernels; caches can reduce the real traffic of the unfused chain, which is why you measure (Lab step 5). Not to scale. <sup class="src"><a href="#F6-38-src-D6">D6</a></sup> <sup class="src"><a href="#F6-38-src-D2">D2</a></sup></figcaption></figure>
+
+<figure id="F6-38-fig2"><div class="svgbox">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="F6-38-f2t F6-38-f2d">
+<title id="F6-38-f2t">Figure 2: the online normaliser and the warp merge tree</title>
+<desc id="F6-38-f2d">Left: three boxes in a row show the state after each element of x = 1, 3, 2: m = 1, d = 1; then m = 3, d = 1 times e to the minus 2 plus 1 = 1.135335; then m = 3, d = 1.135335 plus e to the minus 1 = 1.503215. An arrow labelled rescale points at the middle step, where the maximum grew. Right: eight small boxes labelled lane 0 to lane 7 hold lane states; lines combine them in pairs at distance 4, then 2, then 1 (butterfly pattern), so after three steps every lane holds the merged state. A note says a warp of 32 lanes needs five such steps, with offsets 16, 8, 4, 2, 1.</desc>
+<rect class="sv-bg" x="0" y="0" width="760" height="300"/>
+<text class="sv-tb" x="16" y="22">One lane: the state (m, d) after each element</text>
+<rect class="sv-b1" x="16" y="40" width="110" height="56" rx="6"/><text class="sv-tm" x="26" y="62">x = 1</text><text class="sv-tm" x="26" y="84">m=1 d=1</text>
+<rect class="sv-b6" x="150" y="40" width="150" height="56" rx="6"/><text class="sv-tm" x="160" y="62">x = 3 (new max)</text><text class="sv-tm" x="160" y="84">m=3 d=1.135335</text>
+<rect class="sv-b1" x="324" y="40" width="150" height="56" rx="6"/><text class="sv-tm" x="334" y="62">x = 2</text><text class="sv-tm" x="334" y="84">m=3 d=1.503215</text>
+<line class="sv-line" x1="126" y1="68" x2="148" y2="68"/><polygon class="sv-head" points="142,63 142,73 150,68"/>
+<line class="sv-line" x1="300" y1="68" x2="322" y2="68"/><polygon class="sv-head" points="316,63 316,73 324,68"/>
+<text class="sv-ts" x="150" y="114">rescale: d·e^(1−3) + e^(3−3)</text>
+<text class="sv-ts" x="324" y="114">no rescale: d·e^0 + e^(2−3)</text>
+<text class="sv-tm" x="16" y="146">m' = max(m, v)    d' = d · exp(m − m') + exp(v − m')</text>
+<text class="sv-tb" x="500" y="22">Merging lane states (butterfly)</text>
+<g>
+<rect class="sv-b2" x="500" y="40" width="26" height="22"/><rect class="sv-b2" x="530" y="40" width="26" height="22"/><rect class="sv-b2" x="560" y="40" width="26" height="22"/><rect class="sv-b2" x="590" y="40" width="26" height="22"/>
+<rect class="sv-b2" x="620" y="40" width="26" height="22"/><rect class="sv-b2" x="650" y="40" width="26" height="22"/><rect class="sv-b2" x="680" y="40" width="26" height="22"/><rect class="sv-b2" x="710" y="40" width="26" height="22"/>
+</g>
+<text class="sv-ts" x="503" y="56">L0</text><text class="sv-ts" x="533" y="56">L1</text><text class="sv-ts" x="563" y="56">L2</text><text class="sv-ts" x="593" y="56">L3</text><text class="sv-ts" x="623" y="56">L4</text><text class="sv-ts" x="653" y="56">L5</text><text class="sv-ts" x="683" y="56">L6</text><text class="sv-ts" x="713" y="56">L7</text>
+<line class="sv-dash" x1="513" y1="62" x2="633" y2="100"/><line class="sv-dash" x1="633" y1="62" x2="513" y2="100"/>
+<text class="sv-ts" x="740" y="90">4</text>
+<rect class="sv-b2" x="500" y="100" width="236" height="20"/><text class="sv-ts" x="506" y="115">after offset 4: Li holds Li ⊕ L(i xor 4)</text>
+<line class="sv-dash" x1="513" y1="120" x2="573" y2="150"/><line class="sv-dash" x1="573" y1="120" x2="513" y2="150"/>
+<text class="sv-ts" x="740" y="140">2</text>
+<rect class="sv-b2" x="500" y="150" width="236" height="20"/><text class="sv-ts" x="506" y="165">after offset 2: groups of 4 merged</text>
+<line class="sv-dash" x1="513" y1="170" x2="543" y2="200"/><line class="sv-dash" x1="543" y1="170" x2="513" y2="200"/>
+<text class="sv-ts" x="740" y="190">1</text>
+<rect class="sv-b5" x="500" y="200" width="236" height="20"/><text class="sv-ts" x="506" y="215">after offset 1: every lane has the row state</text>
+<text class="sv-ts" x="500" y="244">8 lanes drawn: 3 steps. A warp of 32 lanes:</text>
+<text class="sv-ts" x="500" y="260">5 steps, offsets 16, 8, 4, 2, 1 (Listing 4).</text>
+<text class="sv-ts" x="16" y="190">⊕ (merge): M = max(ma, mb),  d = da·exp(ma − M) + db·exp(mb − M)</text>
+<text class="sv-ts" x="16" y="210">Because ⊕ is associative, any grouping gives the same (m, d) up to rounding.</text>
+<text class="sv-ts" x="16" y="240">Numbers on the left: real output of the worked-example program (R2).</text>
+</svg></div><figcaption><b>Figure 2.</b> Left: the online normaliser on x = 1, 3, 2 (values from R2). Right: the butterfly merge with <code>__shfl_xor_sync</code>; after the last step every lane holds the same state, so every lane can do the write pass. The compiled kernel's PTX contains exactly these butterfly shuffles (<code>shfl.sync.bfly.b32</code>, R5). <sup class="src"><a href="#F6-38-src-D2">D2</a></sup> <sup class="src"><a href="#F6-38-src-H1">H1</a></sup></figcaption></figure>
+
+<h2 id="F6-38-layer1">Layer 1 — the kid explanation</h2>
+<p>Walking to the pantry takes much longer than stirring a pot. So if a recipe has three quick steps, do all three at your station before you walk. That is all fusion is: fewer trips.</p>
+<p>The hard part is a step that needs to know something about the whole row first, like "which pot is strongest?". Kenji's trick is to keep a running answer and fix it up when he learns more. When he finds a stronger pot, he scales his old tally once, and carries on. At the end, his tally is exactly what he would have got by walking along the row twice.</p>
+<p>And when two helpers have each tasted half the row, they can compare notes with the same fix-up rule. A whole row of 32 helpers can combine their notes in five rounds of whispering to a partner.</p>
+
+<h2 id="F6-38-layer2">Layer 2 — the student explanation</h2>
+<h3 id="F6-38-l2-why">Why memory-bound chains are worth fusing</h3>
+<p>One analogy sentence: every walk to the pantry costs the same whether you carry one pot or a full tray, and most deep-learning "glue" operations (softmax, normalisation, bias, activation) do only a few arithmetic operations per element they carry. Such operations have a low <b>arithmetic intensity</b> (operations per byte moved; <a href="#F6-21">F6-21</a>) and sit on the memory roof of the roofline model (<a href="#F6-33">F6-33</a>): their time is close to the bytes they move divided by the memory bandwidth you measured in <a href="#F6-09">F6-09</a>. <sup class="src"><a href="#F6-38-src-D6">D6</a></sup> <sup class="src"><a href="#F6-38-src-D7">D7</a></sup> Removing bytes therefore removes time almost one to one, and fusing a chain of such operations removes all intermediate writes and their re-reads. Figure 1 counts the softmax case: three reads and two writes per element unfused (x read twice, the exponentials written and re-read, y written), two reads and one write fused. That is a predicted 5/3 ≈ 1.7× less traffic for long rows, before caches; you will measure what your GPU actually does.</p>
+<h3 id="F6-38-l2-safe">From naive to safe softmax</h3>
+<p>The definition y<sub>i</sub> = e<sup>x<sub>i</sub></sup>/Σ e<sup>x<sub>j</sub></sup> fails in FP32 as soon as an input is large. The binary32 format of IEEE 754 has a largest finite value a little above 3.4 × 10<sup>38</sup>, and e<sup>x</sup> exceeds it just below x = 89; an overflowing operation returns infinity, and ∞/∞ or 0/0 is NaN. <sup class="src"><a href="#F6-38-src-D5">D5</a></sup> Listing 1 shows it on this build's CPU: <code>exp(88)</code> prints 1.65164e+38 and <code>exp(89)</code> prints inf (R1). Rows whose values are only near 88 already lose accuracy because the sum overflows (case <code>near_88</code>: error 0.00491), rows above it give NaN (<code>large</code>, <code>huge</code>), and very negative rows underflow every term to zero and give 0/0 = NaN (<code>negative</code>). Subtracting the row maximum m first changes nothing mathematically (the factor e<sup>−m</sup> cancels) and makes every exponent ≤ 0, so the largest term is exactly 1 and the sum is between 1 and n. <sup class="src"><a href="#F6-38-src-D2">D2</a></sup> The price is a third pass: max, then sum, then write.</p>
+<pre class="output" data-run="F6-38/softmax"></pre>
+<h3 id="F6-38-l2-online">The online normaliser</h3>
+<p>Milakov and Gimelshein's observation is that the maximum and the sum can be found in one pass if the sum is always kept relative to the current maximum. <sup class="src"><a href="#F6-38-src-D2">D2</a></sup> Keep a state (m, d) that means "d = Σ e<sup>x<sub>j</sub>−m</sup> over the elements seen so far, with m their maximum". Adding an element v:</p>
+<pre><code>m' = max(m, v)
+d' = d * exp(m - m') + exp(v - m')</code></pre>
+<p><b>Why it is exact.</b> By the invariant, d·e<sup>m−m′</sup> = Σ<sub>seen</sub> e<sup>x<sub>j</sub>−m</sup>·e<sup>m−m′</sup> = Σ<sub>seen</sub> e<sup>x<sub>j</sub>−m′</sup>, the old sum re-expressed against the new maximum; adding e<sup>v−m′</sup> restores the invariant with v included. By induction, after the last element d is exactly the safe-softmax denominator (in exact arithmetic; in floating point both are rounded sums of the same kind of terms). The start state is (−∞, 0): the first update computes 0·e<sup>−∞</sup> + e<sup>0</sup> = 1. Every exponent is still ≤ 0, so nothing overflows. Listing 1's <code>online</code> column has the same error as <code>safe</code> on every case while reading the input twice instead of three times (R1).</p>
+<p><b>Merging two states.</b> If one lane has (m<sub>a</sub>, d<sub>a</sub>) for its elements and another (m<sub>b</sub>, d<sub>b</sub>) for different elements, the state of the union is (M, d<sub>a</sub>e<sup>m<sub>a</sub>−M</sup> + d<sub>b</sub>e<sup>m<sub>b</sub>−M</sup>) with M = max(m<sub>a</sub>, m<sub>b</sub>), by the same re-expression argument. The update rule is the special case where one side is a single element (m<sub>b</sub> = v, d<sub>b</sub> = 1). The merge is commutative and associative (up to rounding), which is what a parallel reduction needs (<a href="#F6-14">F6-14</a>). <sup class="src"><a href="#F6-38-src-D2">D2</a></sup> One edge case matters: merging two empty states gives e<sup>−∞−(−∞)</sup> = e<sup>NaN</sup>, so Listing 4 returns early when M = −∞. <a href="#F6-39">F6-39</a> meets the same trap with masked attention scores.</p>
+<h3 id="F6-38-l2-ln">Layer norm and Welford</h3>
+<p>Layer normalisation normalises each row (one token's feature vector, in a transformer) by its own mean and variance. <sup class="src"><a href="#F6-38-src-D4">D4</a></sup> The tempting one-pass formula var = E[x<sup>2</sup>] − E[x]<sup>2</sup> subtracts two large, nearly equal numbers when the mean is large compared with the spread, and FP32 keeps only about seven significant decimal digits (24-bit significand). <sup class="src"><a href="#F6-38-src-D5">D5</a></sup> Listing 2 shows the damage on rows with a true variance of 10.0034: with an offset of 100 the one-pass result is 9.68; with 1,000 it is 7.31; with 10,000 it is 3760, which is not even close in size (R3). The two-pass method (mean first, then mean squared difference) is accurate but reads the row twice before the output pass. Welford's update keeps a running mean and M2 (the sum of squared differences from the current mean) in one pass and stays accurate: 10.0037 at offset 10,000. <sup class="src"><a href="#F6-38-src-D3">D3</a></sup> Like (m, d), Welford states merge: the last column ("Welford x2") merges the states of the two halves with the pairwise formula and agrees to about four digits. That merge is what the warp shuffles of Listing 4 do.</p>
+<pre class="output" data-run="F6-38/layernorm"></pre>
+
+<h2 id="F6-38-layer3">Layer 3 — the engineer's depth</h2>
+<p>One analogy sentence: a recipe card that keeps more pots in each helper's hands lets fewer helpers fit in the hall, so fusion trades memory traffic against registers. The engineering questions are which operations to fuse, how to map rows to threads, and how to keep the numbers honest.</p>
+<h3 id="F6-38-l3-mapping">Mapping rows to the hardware</h3>
+<ul>
+<li><b>One warp per row</b> (Listing 4) suits rows of a few hundred to a few thousand elements: each lane strides over the row, coalesced (<a href="#F6-08">F6-08</a>), and the merge is five shuffles with no shared memory and no <code>__syncthreads()</code>. Lanes that own fewer elements (here 1,500 = 46 × 32 + 28 columns, so four lanes own one element less) are harmless because their state is merged like any other.</li>
+<li><b>One block per row</b> suits long rows: each warp merges its lanes, then warps merge through shared memory (or <code>cub::BlockReduce</code> with a custom operator, <a href="#F6-35">F6-35</a>; or <code>cg::reduce</code>, <a href="#F6-36">F6-36</a>).</li>
+<li><b>Rows held in registers.</b> If a row fits in the warp's registers (cols/32 values per lane), pass 2 can reuse the values loaded in pass 1, making the kernel one read and one write per element. Listing 4 re-reads instead, to stay correct for any row length; the cost is visible in the PTX (R5: ten global loads after unrolling, for two loops).</li>
+<li><b>Several rows per warp</b> suit very short rows (a warp of 32 lanes on a row of 64 elements does only two elements per lane); use <code>tiled_partition</code> with tiles of 8 or 16 (<a href="#F6-36">F6-36</a>).</li>
+</ul>
+<h3 id="F6-38-l3-precision">Precision, intrinsics and tolerances</h3>
+<p>Listing 4 uses <code>__expf</code>, which the installed header documents as returning "an approximation" of e<sup>x</sup> with the accuracy of single-precision intrinsics. <sup class="src"><a href="#F6-38-src-H1">H1</a></sup> In the PTX for sm_80 it becomes <code>ex2.approx.f32</code> (25 occurrences after unrolling, R5): a base-2 hardware approximation, with the multiplication by log<sub>2</sub>e done before it. <sup class="src"><a href="#F6-38-src-D7">D7</a></sup> The division becomes <code>div.rn.f32</code>, a correctly rounded division. Whether <code>__expf</code> is accurate enough is a tolerance decision (<a href="#F6-25">F6-25</a>): softmax outputs are probabilities, so a combination of absolute and relative tolerance per element, plus the check "each row sums to 1 within n·ε", is a sensible start; justify the numbers from your own error measurements, as Listing 1 does on the CPU with <code>std::exp</code>. Mixed precision (FP16 or BF16 inputs) changes the picture: load in the low precision, but keep m, d, mean and M2 in FP32. Online softmax in BF16 accumulation would lose the small terms that make up most of d. <sup class="src"><a href="#F6-38-src-D5">D5</a></sup></p>
+<h3 id="F6-38-l3-what">What to fuse, and what not</h3>
+<ul>
+<li><b>Fuse</b> chains of element-wise and row-wise operations that are each memory-bound: bias + activation, residual add + layer norm, scale + mask + softmax. Each fused-away intermediate saves one write and one read of a full tensor.</li>
+<li><b>Fuse epilogues into GEMMs</b> (bias, activation, scaling applied to the accumulator before it is stored): cuBLASLt and CUTLASS expose this; the decision versus a separate kernel is <a href="#F6-35">F6-35</a>'s library question. <sup class="src"><a href="#F6-38-src-D8">D8</a></sup></li>
+<li><b>Do not fuse</b> when the fused kernel needs so many registers or so much shared memory that occupancy collapses and latency is no longer hidden (<a href="#F6-20">F6-20</a>), when one of the operations needs a grid-wide result before the next can start (a global sum across rows needs a second launch or a cooperative grid barrier, <a href="#F6-36">F6-36</a>), or when the unfused version is a library call you would have to beat (measure first).</li>
+<li><b>Recompute instead of store.</b> The second pass of Listing 4 recomputes e<sup>x−m</sup> instead of reading a stored value. Recomputation is cheap arithmetic traded for expensive traffic; <a href="#F6-39">F6-39</a> takes this to its conclusion with attention.</li>
+</ul>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p>The description of <code>ex2.approx</code> as a base-2 approximation, its accuracy, and the way <code>__expf</code> is lowered (multiply by log<sub>2</sub>e, then <code>ex2.approx</code>) are written from memory of the PTX ISA and the CUDA C++ Programming Guide's mathematical-functions appendix. Only the instruction names in R5 were observed in this build. Check both documents, for your toolkit version, before relying on the accuracy statement. The fusion examples for cuBLASLt and CUTLASS epilogues are named from the curriculum's reading list, not from their documentation.</p></div>
+
+<h2 id="F6-38-hardware">How the hardware actually does it</h2>
+<p>A row softmax kernel does a handful of floating-point operations per element and is dominated by the loads and stores that the SM sends to the memory system (<a href="#F1-59">F1-59</a>). The warp's 32 lanes load 32 consecutive floats per loop iteration, which the memory system serves as full cache-line transactions (<a href="#F6-08">F6-08</a>). The exponentials go to the special-function units: the instruction <code>ex2.approx.f32</code> in PTX is the special-function operation that the SASS of <a href="#F6-39">F6-39</a> shows as <code>MUFU.EX2</code> (R5 here; the SASS is in F6-39's lab). The shuffles (<code>shfl.sync.bfly.b32</code>) move register values between lanes of a warp without touching shared memory. <sup class="src"><a href="#F6-38-src-D1">D1</a></sup> <sup class="src"><a href="#F6-38-src-D7">D7</a></sup> The register report shows the cost of the fused state: 25 registers per thread for the softmax kernel and 28 for layer norm on sm_80 (R6), far below anything that would limit occupancy; the fused attention kernel of <a href="#F6-39">F6-39</a> is a very different story.</p>
+<pre class="output" data-run="F6-38/ptx_softmax"></pre>
+<pre class="output" data-run="F6-38/resources"></pre>
+
+<h2 id="F6-38-worked">Worked example</h2>
+<p>Online softmax of x = (1, 3, 2), by hand, then checked by a program.</p>
+<ol>
+<li><b>Start.</b> (m, d) = (−∞, 0).</li>
+<li><b>x = 1.</b> m′ = 1; d′ = 0·e<sup>−∞</sup> + e<sup>0</sup> = 1. State (1, 1).</li>
+<li><b>x = 3.</b> m′ = 3 (the maximum grew); d′ = 1·e<sup>1−3</sup> + e<sup>0</sup> = e<sup>−2</sup> + 1 = 0.135335 + 1 = 1.135335.</li>
+<li><b>x = 2.</b> m′ = 3; d′ = 1.135335·e<sup>0</sup> + e<sup>−1</sup> = 1.135335 + 0.367879 = 1.503214 (the program, with full precision, prints 1.503215).</li>
+<li><b>Check against safe softmax.</b> Σ e<sup>x<sub>j</sub>−3</sup> = e<sup>−2</sup> + e<sup>0</sup> + e<sup>−1</sup>: the same three terms, the same sum.</li>
+<li><b>Write pass.</b> y = (e<sup>−2</sup>, 1, e<sup>−1</sup>)/1.503215 = (0.090031, 0.665241, 0.244728); the three add up to 1.</li>
+<li><b>Merge instead.</b> Split as {1} and {3, 2}: states (1, 1) and (3, 1 + e<sup>−1</sup>) = (3, 1.367879). Merge: M = 3, d = 1·e<sup>−2</sup> + 1.367879·e<sup>0</sup> = 1.503215. Same answer, as associativity promises.</li>
+</ol>
+<pre class="listing" data-src="F6-38/worked.cpp"></pre>
+<pre class="output" data-run="F6-38/worked"></pre>
+<p><b>Traffic, for the lab's matrix.</b> 1,000 rows × 1,500 FP32 values = 1.5 × 10<sup>6</sup> elements = 6 MB per tensor (decimal megabytes). Unfused (Figure 1): 3 reads + 2 writes = 5 × 6 MB = 30 MB. Fused: 2 reads + 1 write = 18 MB. If your measured bandwidth (F6-09) is B GB/s, predict times of 30/B ms and 18/B ms; write your B and both predictions in the lab record before running.</p>
+
+<h2 id="F6-38-code">Code walk-through</h2>
+<p><b>Listing 1</b> — <code>softmax.cpp</code>: naive, safe and online softmax on the CPU, compared with a double-precision reference. Input <code>softmax.in</code> (case name, n, start, step; values repeat with period 7). Its output is shown in Layer 2 (R1).</p>
+<pre class="listing" data-src="F6-38/softmax.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>18–29</td><td><code>naiveSoftmax</code></td><td>Sum of e<sup>x</sup>, then divide.</td><td>Overflows above x ≈ 88 in FP32; underflows for very negative rows.</td></tr>
+<tr><td>31–46</td><td><code>safeSoftmax</code></td><td>Max pass, sum pass, write pass.</td><td>Correct for any finite input; three reads per element.</td></tr>
+<tr><td>48–62</td><td><code>onlineSoftmax</code></td><td>(m, d) updated per element; then the write pass.</td><td>Line 54 is the online normaliser; two reads per element.</td></tr>
+<tr><td>53–55</td><td><code>mNew</code>, <code>d = d * exp(m - mNew) + …</code></td><td>Rescale the old sum to the new maximum, add the new term.</td><td>Dropping the rescale is the forensic lab's bug.</td></tr>
+<tr><td>64–83</td><td><code>maxAbsError</code></td><td>Reference in double with max subtraction; largest absolute difference.</td><td>A NaN anywhere is reported as NaN, never hidden by <code>fmax</code>.</td></tr>
+<tr><td>103–104</td><td><code>exp(88.0f)</code>, <code>exp(89.0f)</code></td><td>Prints the FP32 overflow edge.</td><td>Evidence for the threshold, from this machine.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 2</b> — <code>layernorm.cpp</code>: the variance three ways (output in Layer 2, R3).</p>
+<pre class="listing" data-src="F6-38/layernorm.cpp"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>11–16</td><td><code>struct Welford</code></td><td>Mean, M2, count.</td><td>The state that a fused kernel keeps per lane.</td></tr>
+<tr><td>18–24</td><td><code>push</code></td><td>Welford update for one value.</td><td>Note <code>x - w.mean</code> uses the <i>new</i> mean.</td></tr>
+<tr><td>27–38</td><td><code>merge</code></td><td>Pairwise combination of two states.</td><td>The warp shuffle merge of Listing 4, lines 78–89.</td></tr>
+<tr><td>66–71</td><td>one-pass sums</td><td>E[x<sup>2</sup>] − E[x]<sup>2</sup>.</td><td>Catastrophic cancellation for large offsets.</td></tr>
+<tr><td>73–82</td><td>two-pass</td><td>Mean, then mean squared difference.</td><td>Accurate, but an extra read of the row.</td></tr>
+<tr><td>84–91</td><td>Welford, whole row and two halves merged</td><td>Same variance from one pass and from a merge.</td><td>Shows that the merge is safe to use in parallel.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 3</b> — <code>fused_trace.cpp</code>: a CPU model of the fused kernel's chunked loop with a per-chunk trace of m and d. Mode <code>online</code> is correct; mode <code>frozen</code> is the forensic lab's shipped bug. Correct run (R4):</p>
+<pre class="listing" data-src="F6-38/fused_trace.cpp"></pre>
+<pre class="output" data-run="F6-38/fused_trace"></pre>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>24–27</td><td>input ramp</td><td>Each chunk's values are <code>rampPerChunk</code> larger than the previous chunk's.</td><td>A growing row makes the maximum change at every chunk.</td></tr>
+<tr><td>34–37</td><td>chunk maximum</td><td>What one tile's reduction produces.</td><td>Printed so the trace shows when m should move.</td></tr>
+<tr><td>38–41</td><td><code>if (frozen &amp;&amp; c &gt; 0) mNew = m;</code></td><td>The bug: the normaliser stays at the first chunk's maximum.</td><td>Only active in the forensic mode.</td></tr>
+<tr><td>46–48</td><td><code>scale</code>, <code>d = d * scale + s</code></td><td>Chunk-level online update (merge of the old state with the chunk's state).</td><td>Exactly the merge rule with d<sub>b</sub> = s.</td></tr>
+<tr><td>52–60</td><td>write pass and checks</td><td>Counts NaN and infinite outputs and the sum.</td><td>The sum must be 1; the trace explains when it is not.</td></tr>
+</tbody></table></div>
+
+<p><b>Listing 4</b> — <code>softmax_fused.cu</code>: fused softmax and layer norm on the GPU, one warp per row.</p>
+<pre class="listing" data-src="F6-38/softmax_fused.cu"></pre>
+<p><b>Build command</b> (the one actually used): <code>nvcc -std=c++17 -O2 -lineinfo -Werror all-warnings softmax_fused.cu -o softmax_fused</code>, then <code>./softmax_fused</code>.</p>
+<pre class="output" data-run="F6-38/softmax_fused"></pre>
+<div class="co unverified"><span class="lbl">Not verified — check before relying on this</span><p><b>Untested on hardware.</b> The build is real and warning-free; the run stopped at the first allocation with <code>cudaErrorNoDevice</code> (R7). On a GPU the program should print a worst row-sum error near FP32 rounding and a worst row mean near zero; neither number has been observed in this build, and no timing exists.</p></div>
+<div class="tw"><table>
+<thead><tr><th>Lines</th><th>Code</th><th>What it does</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>23–31</td><td><code>mergeMaxSum</code></td><td>The ⊕ of Figure 2, with the empty-state guard.</td><td>Without line 26, two lanes with no elements produce NaN.</td></tr>
+<tr><td>35–39</td><td>row and lane</td><td>Warp number in the grid = row; lane = position in the warp.</td><td>The whole warp returns together, so later shuffles have all 32 lanes.</td></tr>
+<tr><td>43–48</td><td>pass 1</td><td>Each lane runs the online update over its strided elements.</td><td>Coalesced: lanes read consecutive floats.</td></tr>
+<tr><td>49–53</td><td>shuffle merge</td><td><code>__shfl_xor_sync</code> with offsets 16 … 1. <sup class="src"><a href="#F6-38-src-H1">H1</a></sup></td><td>After five steps every lane holds the row state (butterfly).</td></tr>
+<tr><td>55–57</td><td>pass 2</td><td>Recomputes e<sup>x−m</sup> and divides by d.</td><td>Recompute instead of storing the exponentials.</td></tr>
+<tr><td>71–77</td><td>Welford per lane</td><td>Listing 2's <code>push</code>.</td><td>One pass, no cancellation.</td></tr>
+<tr><td>78–89</td><td>Welford merge by shuffles</td><td>Listing 2's <code>merge</code>, three values per shuffle step.</td><td>Guards lanes with n = 0.</td></tr>
+<tr><td>90–94</td><td><code>rsqrtf</code>, output</td><td>Normalised output (γ = 1, β = 0).</td><td>ε keeps the division finite for constant rows.</td></tr>
+<tr><td>101–103</td><td>input values 100 … 124</td><td>Large on purpose.</td><td>A naive exp would overflow; the online version must not.</td></tr>
+<tr><td>111–113</td><td>256 threads = 8 rows per block</td><td>Grid rounded up in rows.</td><td>The row check in the kernel handles the last block.</td></tr>
+</tbody></table></div>
+
+<h2 id="F6-38-breaks">Where the analogy breaks</h2>
+<ul>
+<li><b>Helpers' hands are not unlimited; registers are counted.</b> "Keep everything at the station" sounds free, but each kept value is a register; more registers per thread means fewer warps fit on an SM (<a href="#F6-20">F6-20</a>). Fusion can make a kernel slower when it pushes occupancy too low or spills to local memory (F6-39's kernel shows a stack frame).</li>
+<li><b>Kenji's tally is exact; the GPU's is rounded.</b> In exact arithmetic the online normaliser equals the safe softmax; in FP32 the two orders of operations round differently and may differ in the last bits. The equality to test is "within a justified tolerance", not bit-identical.</li>
+<li><b>The pantry is not equally far for every trip.</b> Caches (L2) can keep an intermediate between two unfused kernels if it is small enough, so the real saving of fusion can be smaller than Figure 1's count. Measure.</li>
+</ul>
+
+<h2 id="F6-38-mistakes">Common mistakes and debugging</h2>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>How to find it</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>NaN rows only for large inputs (R1: <code>large</code>, <code>huge</code>)</td><td>No maximum subtracted</td><td>Test inputs above 88 and below −104 in FP32</td><td>Safe or online softmax</td></tr>
+<tr><td>NaN or zeros after "optimising" a working fused kernel (forensic lab)</td><td>Rescale of d skipped when m changes</td><td>Trace (m, d) per chunk; d grows by orders of magnitude</td><td>Restore d·e<sup>m−m′</sup></td></tr>
+<tr><td>NaN when a lane or a row has no elements</td><td>e<sup>−∞−(−∞)</sup> in the merge</td><td>Rows shorter than 32, fully masked rows</td><td>Guard the empty state (Listing 4, line 26)</td></tr>
+<tr><td>Layer norm output wrong for inputs with a large mean (R3)</td><td>E[x<sup>2</sup>] − E[x]<sup>2</sup> in FP32</td><td>Test rows with offset 10<sup>3</sup>–10<sup>4</sup></td><td>Welford or two-pass</td></tr>
+<tr><td>Hang or garbage in the shuffle loop</td><td>Some lanes returned early, the mask says all 32</td><td>A per-thread (not per-warp) early return</td><td>Return per warp, or compute the active mask</td></tr>
+<tr><td>Fused kernel slower than the unfused chain</td><td>Register pressure, spills, or the chain fitted in cache</td><td><code>-Xptxas -v</code> (R6), profiler</td><td>Smaller tiles, recompute, or keep the library</td></tr>
+</tbody></table></div>
+
+<div class="co transition" id="F6-38-transition"><span class="lbl">Transition box</span>
+<p><b>Where you came from:</b> <a href="#F6-14">F6-14</a> and <a href="#F6-15">F6-15</a> reduced sums with trees and warp shuffles; <a href="#F6-35">F6-35</a> compared such reductions with CUB; <a href="#F6-36">F6-36</a> named the groups that cooperate. <b>What carries over:</b> the reduction tree, shuffles inside a warp, coalesced strided loops, the error discipline of <a href="#F6-25">F6-25</a>. <sup class="src"><a href="#F6-38-src-D1">D1</a></sup> <b>What changes:</b> the value being reduced is no longer a number but a <i>state</i> with its own merge rule ((m, d) or (n, mean, M2)), and the rule must be both associative and numerically safe; the goal is fewer global-memory round trips, so the kernel is judged by bytes moved, not by arithmetic; a missing rescale produces NaN only for some inputs, so tests must include large, negative and growing rows. <sup class="src"><a href="#F6-38-src-D2">D2</a></sup> <sup class="src"><a href="#F6-38-src-D3">D3</a></sup> <b>What comes next:</b> <a href="#F6-39">F6-39</a> applies the online normaliser to attention, where the "row" is a row of a score matrix that is never stored at all.</p></div>
+
+<h2 id="F6-38-check">Check yourself</h2>
+<ol>
+<li>State the online normaliser update and the invariant that (m, d) satisfies after every step.</li>
+<li>Explain in your own words why subtracting the maximum does not change the softmax, and why it prevents overflow.</li>
+<li>Which statement is true? (a) The online softmax reads the input once in total. (b) Merging (m<sub>a</sub>, d<sub>a</sub>) and (m<sub>b</sub>, d<sub>b</sub>) requires knowing which elements each state saw. (c) The merge works in any order because it is associative. (d) <code>__expf</code> is exact in FP32.</li>
+<li>Compute by hand the online state after x = (4, 1, 4), then the softmax. Check the sum of the outputs.</li>
+<li>Predict, then run: Listing 1 with a case <code>mixed 1000 -50.0 25.0</code> (values −50 … 100). Which columns give NaN, and why?</li>
+<li>Apply to a new case: a row of 4,096 BF16 values. Which variables do you keep in which precision, and why?</li>
+<li>For 4,000 rows of 2,048 FP32 values, compute the bytes moved by the unfused chain and by the fused kernel (Figure 1's counts).</li>
+<li>Why does the one-pass variance fail at offset 10,000 while Welford does not? Use the number of significant digits of FP32 in your answer.</li>
+<li>In Listing 4, why must every lane of the warp reach the shuffle loop, and how does line 37 guarantee it?</li>
+</ol>
+
+<h2 id="F6-38-lab">Lab</h2>
+<p><b>Goal.</b> Milestone E12 (first part): "Kernels that fuse several operations to avoid memory round trips, as used in deep learning" — build an online-softmax kernel and a layer norm, prove numerical agreement with an unfused reference and measure the gain.</p>
+<p><b>Hardware and software needed.</b> Steps 1–3: <code>g++</code> and <code>nvcc</code> only (this build: <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code>, <code>Cuda compilation tools, release 12.0, V12.0.140</code>, no GPU). Steps 4–6: an NVIDIA GPU with a CUDA Toolkit and driver (record both) or a cloud GPU, plus your CU201 benchmark harness. Folder <code>university/labs/F6-38</code>.</p>
+<p><b>Safety.</b> None beyond normal computer use.</p>
+<p><b>Steps.</b></p>
+<ol>
+<li>Run <code>university/labs/run_lab.sh university/labs/F6-38</code>. Compare <code>softmax.out</code>, <code>layernorm.out</code> and <code>worked.out</code> with this chapter.</li>
+<li>Add three cases of your own to <code>softmax.in</code>: one all-equal row, one row with a single huge value, one row of length 1. Predict each column's result before running.</li>
+<li>Read <code>ptx_softmax.out</code> and <code>resources.out</code>. Compile Listing 4 with <code>-use_fast_math</code> and without <code>__expf</code> (use <code>expf</code>); compare the PTX instruction counts and the register reports.</li>
+<li>On a GPU: run <code>softmax_fused</code>. It must print a worst row-sum error below your tolerance (write the tolerance and its justification first).</li>
+<li>Write the unfused three-kernel version (max, exp-and-sum, divide) in your harness. Time both (median of 20 runs after warm-up, <a href="#F6-06">F6-06</a>) for 1,000 × 1,500 and 16,384 × 4,096. Compare with your predictions from the worked example.</li>
+<li>If your platform has a library softmax or layer norm (for example cuDNN, <a href="#F6-35">F6-35</a>), time it with the same harness and fill the table.</li>
+</ol>
+<p><b>Expected observations.</b> In this build: R1–R4 as shown; the online and safe columns agree to about 10<sup>−8</sup>; one-pass variance fails at large offsets. On a GPU: fused faster than unfused by a factor you predicted from bytes moved; your number, labelled "measured on &lt;GPU, driver, toolkit, date&gt;" (AH-23). Nothing in step 4–6 has been observed in this build.</p>
+<p><b>Verification.</b> The milestone's acceptance tests, verbatim: "Numerical agreement with an unfused reference; throughput reaches X % of the corresponding library implementation available on your platform (for example cuDNN's fused attention or the Composable Kernel attention examples)." Write X in your plan before step 5 (curriculum 13.4). Also: Compute Sanitizer reports no errors (<a href="#F6-05">F6-05</a>).</p>
+<p><b>Troubleshooting.</b></p>
+<ul>
+<li>NaN in a few rows only → a row whose values grow, with the rescale missing → run Listing 3 on that row's pattern.</li>
+<li>Row sums of 1 but wrong values → max taken over the wrong row (stride error) → print m per row and compare with the CPU.</li>
+<li>Fused kernel not faster → the unfused chain fitted in L2 at your size → repeat at a size several times larger than the L2 capacity from your device report (<a href="#F6-07">F6-07</a>).</li>
+</ul>
+<p><b>Extension.</b> Keep the row in registers when cols ≤ 32·K for a compile-time K and skip the second read; measure the gain. Then fuse "residual add + layer norm" and count the bytes saved.</p>
+
+<h2 id="F6-38-forensic">Forensic lab</h2>
+<p><b>Scenario.</b> Priya's team shipped a "faster" fused softmax. A reviewer had noticed that the rescale step <code>d * exp(m - mNew)</code> was "almost always 1" in their tests and replaced the chunk loop's normaliser update with a version that fixes m after the first chunk. All tests passed. In production, a model whose attention scores grow along the sequence started emitting NaN. The team's debug build logs, for one bad row, the running maximum and normaliser after each chunk of 256 values. The evidence below is a real run of Listing 3 in the shipped mode, on a row whose values grow by 15 per chunk (<code>forensic.in</code>), and on a flat row like those in the test suite (<code>forensic_flat.in</code>).</p>
+<p><b>Evidence pack.</b></p>
+<pre class="listing" data-src="F6-38/forensic.in"></pre>
+<pre class="output" data-run="F6-38/forensic"></pre>
+<pre class="listing" data-src="F6-38/forensic_flat.in"></pre>
+<pre class="output" data-run="F6-38/forensic_flat"></pre>
+<p><b>Questions.</b></p>
+<ol>
+<li>Observation: at which chunk does d first become infinite? What is m at that point, and what should it have been?</li>
+<li>Hypotheses: list at least two causes that could produce NaN (input already contains NaN; overflow in exp; division 0/0). Which lines of the evidence rule each in or out?</li>
+<li>Root cause: show with arithmetic why chunk 6 overflows (use the FP32 threshold printed by Listing 1) and why the flat run passed.</li>
+<li>Why are exactly 512 outputs NaN and not all 2,048?</li>
+<li>Fix and verification: what must line 40 of Listing 3 become, and which run in this chapter is the verification?</li>
+<li>Prevention: which test inputs and which runtime check would have caught this before release?</li>
+</ol>
+<p><b>Method hints.</b> Read the trace column by column. In a correct trace, which column should follow "chunk max"? Compare the growth of d with e<sup>15</sup>.</p>
+
+<h2 id="F6-38-project">Mini-project</h2>
+<p><b>Fused "scale, mask, softmax" for MP3.</b> Write one kernel that computes softmax(s·x + mask) per row, where the mask adds −∞ to chosen columns, with the online normaliser and the empty-state guard. Test: rows with no masked column, some masked columns, all columns masked (define and document the output), lengths 1, 31, 32, 33 and 4,096, and values up to ±10<sup>4</sup>. Report bytes moved and measured time against the unfused chain.</p>
+<p><b>Rubric.</b> Correctness on all listed cases with a justified tolerance (4). Fully masked rows handled and documented (2). Measurement protocol and labelled numbers (2). A short note on what fusion did not save and why (2).</p>
+
+<h2 id="F6-38-summary">Summary</h2>
+<ul>
+<li>Memory-bound chains spend their time on global-memory traffic; fusion removes intermediate writes and re-reads.</li>
+<li>Naive softmax overflows above x ≈ 88 in FP32 and gives NaN; subtracting the row maximum fixes it.</li>
+<li>The online normaliser (m, d) finds maximum and sum in one pass by rescaling d whenever m grows; it is exact in exact arithmetic.</li>
+<li>States merge with an associative rule, so warps merge them with five butterfly shuffles.</li>
+<li>Layer norm needs Welford (or two passes): E[x<sup>2</sup>] − E[x]<sup>2</sup> cancels catastrophically in FP32.</li>
+<li>Keep statistics in FP32 even with low-precision inputs; guard empty states.</li>
+<li>Fusion costs registers; verify with the compiler report and measure against the unfused chain and the library.</li>
+</ul>
+
+<h2 id="F6-38-sources">Sources</h2>
+<ol>
+<li id="F6-38-src-D1">D1 — NVIDIA, "CUDA C++ Programming Guide" (tier 1; the guide's registry records the title "CUDA Programming Guide", version 13.x): warp shuffle functions, mathematical functions and intrinsics, memory hierarchy. <i>Title only — not opened during this build; the Source Researcher must confirm the edition and section (dossier gate G1 open).</i></li>
+<li id="F6-38-src-D2">D2 — Maxim Milakov, Natalia Gimelshein, "Online normalizer calculation for softmax" (tier 5, paper; curriculum E12 reading): safe softmax, the online normaliser, its proof and parallel merge. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-38-src-D3">D3 — B. P. Welford, "Note on a method for calculating corrected sums of squares and products" (tier 5), and Tony F. Chan, Gene H. Golub, Randall J. LeVeque, "Algorithms for computing the sample variance: analysis and recommendations" (tier 5): the running update and the pairwise merge. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-38-src-D4">D4 — Jimmy Lei Ba, Jamie Ryan Kiros, Geoffrey E. Hinton, "Layer Normalization" (tier 5): definition of layer normalisation. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-38-src-D5">D5 — IEEE, "IEEE Standard for Floating-Point Arithmetic" (IEEE 754) (tier 1): binary32 format, overflow to infinity, invalid operations producing NaN; and the MA302 course material on cancellation. <i>Title only — not opened during this build (dossier gate G1 open).</i> The overflow edge itself is shown by R1.</li>
+<li id="F6-38-src-D6">D6 — Wen-mei Hwu, David Kirk, Izzat El Hajj, "Programming Massively Parallel Processors: A Hands-on Approach" (tier 3): memory-bound kernels, reductions, fusion. <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-38-src-D7">D7 — NVIDIA, "Parallel Thread Execution ISA" (tier 1): <code>ex2.approx</code>, <code>shfl.sync</code>; Samuel Williams, Andrew Waterman, David Patterson, "Roofline: An Insightful Visual Performance Model for Multicore Architectures" (tier 5). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-38-src-D8">D8 — NVIDIA, cuBLAS documentation (cuBLASLt epilogues) and CUTLASS (tier 2/4). <i>Title only — not opened during this build (dossier gate G1 open).</i></li>
+<li id="F6-38-src-H1">H1 — CUDA 12.0 headers as installed (Ubuntu package nvidia-cuda-dev 12.0.146~12.0.1-4build4), read in this build: <code>crt/device_functions.h</code> (<code>__expf</code>: "Returns an approximation to" e<sup>x</sup>, single-precision intrinsic accuracy note) and <code>sm_30_intrinsics.h</code> (<code>__shfl_xor_sync(unsigned mask, float var, int laneMask, int width=warpSize)</code>). Tier 1.</li>
+<li id="F6-38-src-R1">R1 — run of Listing 1 (<code>softmax.log</code>, input <code>softmax.in</code>), <code>g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code> with sanitizers, exit code 0.</li>
+<li id="F6-38-src-R2">R2 — run of the worked-example program (<code>worked.log</code>), same g++, exit code 0.</li>
+<li id="F6-38-src-R3">R3 — run of Listing 2 (<code>layernorm.log</code>), same g++, exit code 0.</li>
+<li id="F6-38-src-R4">R4 — runs of Listing 3: <code>fused_trace.log</code> (correct mode), <code>forensic.log</code> and <code>forensic_flat.log</code> (shipped mode), same g++, exit code 0.</li>
+<li id="F6-38-src-R5">R5 — PTX of <code>softmaxRows</code> for sm_80 (<code>ptx_softmax.log</code>), CUDA 12.0, compiled only.</li>
+<li id="F6-38-src-R6">R6 — ptxas register report for sm_80 (<code>resources.log</code>), CUDA 12.0, compiled only.</li>
+<li id="F6-38-src-R7">R7 — build and run of Listing 4 (<code>softmax_fused.log</code>), CUDA 12.0; untested on hardware, exit code 1 (<code>cudaErrorNoDevice</code>).</li>
+</ol>
+
+<h2 id="F6-38-glossary">Glossary links</h2>
+<p><a href="#gl-kernel-fusion">Kernel fusion</a> · <a href="#gl-softmax">Softmax</a> · <a href="#gl-safe-softmax">Safe softmax</a> · <a href="#gl-online-normaliser">Online normaliser</a> · <a href="#gl-state-merge-associative-combine">State merge</a> · <a href="#gl-layer-norm">Layer norm</a> · <a href="#gl-welford-s-algorithm">Welford's algorithm</a> · <a href="#gl-catastrophic-cancellation">Catastrophic cancellation</a> · <a href="#gl-kernel-gpu">Kernel (GPU)</a> · <a href="#gl-warp-wavefront">Warp / wavefront</a></p>
+
+<h2 id="F6-38-next">Next chapter</h2>
+<p>Next: <a href="#F6-39">F6-39 A tiled attention forward pass</a>. Previous: <a href="#F6-37">F6-37</a>. Back to the course: <a href="#CU401">CU401</a>.</p>
+
+<h2 id="F6-38-answers">Answers to Check yourself</h2>
+<ol>
+<li>m′ = max(m, v), d′ = d·e<sup>m−m′</sup> + e<sup>v−m′</sup>, starting from (−∞, 0). Invariant: m is the maximum of the elements seen and d = Σ<sub>seen</sub> e<sup>x<sub>j</sub>−m</sup>.</li>
+<li>e<sup>x<sub>i</sub>−m</sup>/Σe<sup>x<sub>j</sub>−m</sup> = e<sup>−m</sup>e<sup>x<sub>i</sub></sup>/(e<sup>−m</sup>Σe<sup>x<sub>j</sub></sup>): the factor cancels. With m the maximum, every exponent is ≤ 0, so every term is ≤ 1 and the sum is at most n: no overflow; and the largest term is exactly 1, so the sum is at least 1: no 0/0.</li>
+<li>(c). (a) is false: it reads twice (statistics pass, write pass). (b) is false: the state is all you need; that is the point of a merge rule. (d) is false: the header says it returns an approximation (H1).</li>
+<li>x = 4: (4, 1). x = 1: (4, 1 + e<sup>−3</sup>) = (4, 1.049787). x = 4: (4, 2.049787). Softmax: (1, e<sup>−3</sup>, 1)/2.049787 = (0.487856, 0.024289, 0.487856); sum 1.000001 from rounding to six places.</li>
+<li>Values reach 100, above 88: the naive column overflows (inf/inf → NaN); safe and online stay near 10<sup>−8</sup>. (Run it: add the line to <code>softmax.in</code>.)</li>
+<li>Load and store BF16; keep m, d (and, for layer norm, mean and M2) in FP32. BF16 has only 8 significant bits; summing 4,096 small terms into a BF16 d would lose most of them once d is much larger than each term.</li>
+<li>One tensor: 4,000 × 2,048 × 4 B = 32,768,000 B ≈ 32.8 MB. Unfused 5 × 32.8 = 163.8 MB; fused 3 × 32.8 = 98.3 MB.</li>
+<li>FP32 has a 24-bit significand, about 7 decimal digits. At offset 10<sup>4</sup>, x<sup>2</sup> ≈ 10<sup>8</sup>, and E[x<sup>2</sup>] and E[x]<sup>2</sup> agree in their first 7 digits, so the rounding errors of the sums (much larger than 10 after 4,096 additions) dominate the difference of about 10. Welford works with x − mean, numbers of size about 5, and never forms the large squares.</li>
+<li><code>__shfl_xor_sync</code> with the full mask requires all 32 lanes named in the mask to execute it; a lane that returned would leave the others waiting or reading undefined values. Line 37 compares <code>row</code>, which is the same for all 32 lanes of a warp, so the warp returns as a whole or not at all.</li>
+</ol>
+<h3 id="F6-38-forensic-key">Forensic lab answer key</h3>
+<p><b>Observation.</b> m stays 10.04 for all chunks while the chunk maximum grows 25.04, 40.04, …, 115.04. d grows by a factor of about e<sup>15</sup> ≈ 3.3 × 10<sup>6</sup> per chunk (250.9 → 8.2 × 10<sup>8</sup> → 2.7 × 10<sup>15</sup> …) and becomes inf at chunk 6. 512 outputs are NaN and the sum is NaN. In the correct run (R4) m follows the chunk maximum and d stays near 251.</p>
+<p><b>Hypotheses.</b> NaN already in the input would show as NaN in the chunk-max column (it does not). 0/0 needs d = 0 (d is never 0). Overflow in exp with a stale maximum explains the growth of d and the inf.</p>
+<p><b>Root cause.</b> With m frozen at 10.04, chunk 6 computes e<sup>x−10.04</sup> with x up to 100.04, an exponent of 90, above the FP32 limit of about 88.7 (R1: e<sup>89</sup> = inf). The flat run never has x − m above 0.04, so the missing rescale never matters: d simply accumulates the same sum as the correct version (2007.6 = 8 × 250.9), and the outputs sum to 1.</p>
+<p><b>Why 512.</b> With d = inf, outputs of chunks 0–5 are finite/inf = 0, and outputs of chunks 6–7 (2 × 256 = 512 values) have e<sup>x−m</sup> = inf, so inf/inf = NaN.</p>
+<p><b>Fix.</b> Delete the frozen branch: m′ = max(m, chunk max) and d = d·e<sup>m−m′</sup> + s. The verification run is <code>fused_trace.out</code> (R4): same input, 0 NaN, sum 1.</p>
+<p><b>Prevention.</b> Tests with rows whose maximum is in the last chunk, with growing rows, and with values above 88; a debug assertion that d is finite and that m equals the true maximum on sampled rows. <b>How the evidence was produced:</b> real runs of Listing 3 with the shipped mode <code>frozen</code> on a ramp and on a flat row; no GPU was involved.</p>
