@@ -87,3 +87,36 @@ All book sources (Nisan & Schocken; Harris & Harris; Petzold; Horowitz & Hill; I
 5. Glossary:
    - "XOR (exclusive OR)" is not duplicated in HW102/glossary.json. HW102 chapters link to MA102's existing `gl-xor-exclusive-or` entry.
    - HW102 has 44 other terms, with no slug clashes against other courses.
+
+## Owner rulings applied
+
+1. **Verilog/Icarus Verilog instead of the Nand2Tetris simulator** — decided by verifier, in the spirit of rulings A2 and C1: accepted. Icarus Verilog and Yosys are real tools, not stand-ins, and their options are now checked against their own documentation (D9, D6). Chapters F1-11, F1-12, F1-13 and F1-14 now say what the book D1 specifies (chip names such as Mux, DMux, Mux4Way16, HalfAdder, FullAdder; the Hack ALU's control bits zx, nx, zy, ny, f, no and flags zr, ng), checked in D1 chapters 1–2, and that the book's simulator was not installed or used.
+2. **Practical exam and project in Verilog form** — decided by verifier, with ruling B4 (exams are written in this pass by the exam writer from each chapter's "Check yourself") and B3 (default project rubric, guide 11.5): confirmed. The practical builds gates from NAND; the project is a tested 16-bit ALU with flags, in Verilog, simulated only (ruling B2: a course practical may pass without a hardware run when the record says why and the simulated evidence is complete).
+3. **Analogy mappings** (sink with taps, two kinds of tap, the pass/hatch, ticket-board lamps, runner's token, prep station with a dial, waiter's bell) — ruling A3: approved; registered by the integrator in "Analogy registry additions". Each chapter keeps its "Where the analogy breaks" list.
+4. **Curriculum milestone for HW102** — decided by verifier: no milestone is added. Milestones belong to the curriculum, which the units do not edit; the chapters keep "no curriculum milestone". The 4-bit ALU exhaustive test remains the course practical.
+5. **Glossary** — ruling A7: "XOR (exclusive OR)" keeps linking to MA102's canonical entry `gl-xor-exclusive-or`; HW102's 44 other terms have no clashes. The glossary `source` fields now name the verified tags; the "Transistor" and "Glitch (hazard)" definitions were corrected to match the chapters.
+6. **Length** — ruling A1: nothing trimmed for length.
+7. **Recorded runs** — ruling A5: all labs were re-run on 2026-10-10; only the date lines of the `.log` files changed, so the recorded files were restored.
+8. **Untested on hardware** — ruling C3: every chapter's lab now says what would be needed to test it on hardware (named chips or an FPGA board with datasheets, a low-voltage supply, a way to read outputs, adult supervision; for F1-15 an oscilloscope or logic analyser). Nothing is claimed as observed on hardware. Ruling C4: status "internally checked · hardware steps untested".
+9. **Rulings A8 (test keys), A10 (licence), D3, D4** — not applicable: HW102 labs contain no keys, no licence placeholder and no robot image. Ruling D1 (kit): `build/KIT.md` did not exist during this pass, so the hardware notes name no kit item.
+
+## Verification pass
+
+Done 2026-10-10 by the Fact-Checker agent (verification pass). Dossiers: `university/_dossiers/F1-09.dossier.html` … `F1-15.dossier.html`; QA records: `university/qa/F1-09.json` … `F1-15.json`.
+
+**Opened (shared source set, D-ids the same in every chapter):**
+- D1 Nisan & Schocken, "The Elements of Computing Systems": chapters 1 "Boolean Logic", 2 "Boolean Arithmetic", 3 "Sequential Logic" (free chapter PDFs on the nand2tetris website; chapter 1 labelled 1st edition there) and the Project 01–03 pages.
+- D2 Harris & Harris, "Digital Design and Computer Architecture, ARM Edition" (2015): table of contents and chapter summaries only (publisher preview); no claim rests on D2 alone.
+- D3 Petzold, "Code", 2nd edition: the author's companion website (chapters 6, 8, 14, 15).
+- D5 IEEE 1800-2023 (SystemVerilog, includes Verilog): catalogue page only; the text needs an IEEE sign-in and was not opened.
+- D6 Yosys: built-in help of the installed 0.33 and the 0.40 web page for `abc`.
+- D7 "CMOS VLSI Design 4th Ed." lecture slides on David Harris's Harvey Mudd pages: lectures 1, 2, 3, 4, 5, 11, 17. (New source.)
+- D8 Steve Ward, MIT "Computation Structures" course notes: chapters 3, 4, 6, 7, 11, 12, 14. (New source.)
+- D9 Icarus Verilog documentation: iverilog and vvp command-line flags. (New source; split from the old D5.)
+- D4 Horowitz & Hill, "The Art of Electronics", was not opened; its claims in F1-09 are now cited to D7, and D4 was removed from the Sources.
+
+**Corrected (main items):** the transistor definition ("three terminals" → gate controls the current between two other terminals; body terminal noted); the meaning of `vvp -n` (it makes `$stop`/Control-C a synonym for `$finish`, not "do not stop for input"); the relay sentence in F1-09 (no unsourced "smaller, faster, quieter"); "only NAND and NOR are complete" → "NAND and NOR are each complete" (F1-11); the memory/datapath sentence of F1-12; "static-1 hazard" naming removed (F1-15); F1-14's operation-set and flag-register sentences. Five former unverified boxes were resolved into notes from the opened sources (Yosys commands; D1 chip names, adders and ALU; Icarus options).
+
+**Left unverified (boxes):** Verilog standard semantics of `pmos`/`nmos`/`supply0`/`supply1`/`z`/`x`/`!==`/`!=` (F1-09; behaviour shown by runs only); the pMOS bubble symbol (F1-09); real transistor numbers (F1-09, by design); NAND-versus-NOR speed/size and the exact gate symbol shapes (F1-10); the trapezoid mux symbol (F1-12); real ISA flag registers and the borrow convention (F1-14); real gate delays (by design) and the description of static timing analysis tools (F1-15). The overflow rule "carry into the top bit XOR carry out" was not found in an opened source; it is supported by the exhaustive 4-bit run and the 200,007-vector 16-bit run (R3, R4) and by the worked argument.
+
+**Labs:** all re-run with `run_lab.sh`, exit code 0 for F1-09 … F1-15; expected-fail and demo listings behaved as recorded; output files identical, only log dates differed (restored per A5). All runs are simulation; untested on hardware.
