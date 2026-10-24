@@ -150,5 +150,62 @@ int main()
     std::printf("P: first address byte 0x3C -> 7-bit 0x%02X, %s; 0xB4 -> 0x%02X write; 0xB5 -> 0x%02X read; datasheet 'B4/B5' -> configure 0x%02X\n",
                 0x3C >> 1, (0x3C & 1) ? "read" : "write", 0xB4 >> 1, 0xB5 >> 1, 0xB4 >> 1);
     std::printf("P: capture 349 samples at 4 per bit = %.2f bit times; 3 x START + 1 repeated START, 3 x STOP, %d bytes x 9 clocks = %d clocks\n", 349 / 4.0, 9, 9 * 9);
+
+    // Addendum (exam pass of 2026-10-25): further numbers quoted in the keys.
+    std::printf("== Addendum ==\n");
+    {
+        const unsigned base = 24, len = 40, line = 16;
+        for (unsigned l = base / line; l <= (base + len - 1) / line; ++l) {
+            const unsigned lo = l * line, hi = lo + line - 1;
+            const bool shared = lo < base || hi > base + len - 1;
+            std::printf("M11: line %u = bytes %u-%u %s\n", l, lo, hi, shared ? "(shared with other data)" : "(buffer only)");
+        }
+        std::printf("M11: DMA break-even: PIO n ticks vs DMA 8 ticks -> DMA cheaper from n = %d\n", 8 + 1);
+    }
+    {
+        std::printf("M10: line 3 handler forgets EOI -> lines still served:");
+        for (int l = 0; l < 8; ++l) if (l < 3) std::printf(" %d", l);
+        std::printf("; lines blocked:");
+        for (int l = 0; l < 8; ++l) if (l >= 3) std::printf(" %d", l);
+        std::printf("\n");
+    }
+    {
+        // F7 after line 1's EOI: its new request (IRR bit 1) is still pending
+        std::printf("F7: after EOI of line 1 (ISR 0x00), IRR 0x1A IMR 0x08: candidates 0x%02X -> line 1 (vector %d) first, then line 4 (vector %d); line 3 stays masked\n",
+                    0x1Au & ~0x08u, 32 + 1, 32 + 4);
+    }
+    {
+        std::printf("F22: the first long gap: polls at 60 and 120; arrivals at");
+        int kept = 0;
+        for (int t = 70; t <= 120; t += 10) std::printf(" %d", t);
+        std::printf("; the 4-byte FIFO keeps");
+        for (int t = 70; t <= 120; t += 10) if (kept < 4) { std::printf(" %d", t); ++kept; }
+        std::printf("; lost 110 120 (arrival at 120 is processed before the poll at 120)\n");
+        std::printf("F22: ring needed >= %d bytes per long pass (+1 boundary = %d) -> 8 slots; received %d = 65536 - %d\n",
+                    60 / 10, 60 / 10 + 1, 65536 - 10922, 10922);
+        std::printf("F22: passes 81923 + 5461 = %d; long passes are 1 in %d\n", 81923 + 5461, (81923 + 5461) / 5461);
+    }
+    {
+        std::printf("P: address bytes in binary: 0x3C = ");
+        for (int b = 7; b >= 0; --b) std::printf("%d", (0x3C >> b) & 1);
+        std::printf(", 0xB4 = ");
+        for (int b = 7; b >= 0; --b) std::printf("%d", (0xB4 >> b) & 1);
+        std::printf(", 0xB5 = ");
+        for (int b = 7; b >= 0; --b) std::printf("%d", (0xB5 >> b) & 1);
+        std::printf("; data 0x2C = ");
+        for (int b = 7; b >= 0; --b) std::printf("%d", (0x2C >> b) & 1);
+        std::printf(", 0x8F = ");
+        for (int b = 7; b >= 0; --b) std::printf("%d", (0x8F >> b) & 1);
+        std::printf("\n");
+    }
+    {
+        std::printf("F12: 0x100000 bytes = %d KiB = %d MiB; 0x20000 bytes = %d KiB\n", 0x100000 / 1024, 0x100000 / 1048576, 0x20000 / 1024);
+        std::printf("F19: 16-bit ms counter wraps after %d ms; 2^31 ms wrap-safe limit = %.0f ms\n", 65536, std::pow(2.0, 31));
+        const unsigned wire = (0xB4u << 1) & 0xFFu;   // as probe()/read_reg() of the model would send it
+        std::printf("P: 0xB4 configured as a 7-bit address -> 0xB4 << 1 = 0x%03X, byte on the wire 0x%02X = 7-bit 0x%02X %s -> NACK (no target there)\n",
+                    0xB4u << 1, wire, wire >> 1, (wire & 1) ? "R" : "W");
+        std::printf("F23: UART line 1.91 ms of a 5.0 ms period = %.1f %%; I2C read 0.84 ms = %.1f %% of the period\n",
+                    22 * 10 / 115200.0 * 1e3 / 5.0 * 100, 0.84 / 5.0 * 100);
+    }
     return 0;
 }

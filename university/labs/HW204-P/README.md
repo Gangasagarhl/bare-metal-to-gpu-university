@@ -34,9 +34,14 @@ Reference solution and hidden evidence (Lab Engineer, not given to candidates):
 - `uart_model.h` (copied from F1-42), `uart_fifo_forensic.cpp` — evidence for the final exam's
   forensic question "The FIFO that was not enough"; `uart_fifo_fixed.cpp` — the fix and the
   wrong fixes under the same workload, for the key.
+- `i2c_events.cpp` — evidence for the key of the hand-decoding step: reads `i2c_decode.in` and
+  prints the sample number of every START and STOP and the nine bits (with their rising-SCL
+  samples) of every byte. Added in the exam pass of 2026-10-25.
 - `exam_checks.cpp` — recomputes every number quoted in the HW204 answer keys that is not
-  copied from a lab run.
-- `project_ref.cpp` — the course project (interrupt-driven sensor reader) in the course's
+  copied from a lab run (an "Addendum" section was added on 2026-10-25).
+- `project_ref.cpp` (with `project_ref.timeout` = 120 s: the ten-minute simulated run takes
+  about 22 s under the sanitizers on the 2026-10-25 machine, more than the runner's default 10 s)
+  — the course project (interrupt-driven sensor reader) in the course's
   simulators: timer calculation, I2C read on the model, ring buffer, UART output with sequence
   numbers over a ten-minute simulated run, and a decoded trace. The hardware version (Pico 2 /
   RP2350 or NUCLEO-F446RE, LSM6DSOX breakout, FX2 logic analyser, ruling D1) is UNTESTED ON
@@ -45,3 +50,11 @@ Reference solution and hidden evidence (Lab Engineer, not given to candidates):
 Every `.out` and `.log` file is written by `university/labs/run_lab.sh` (or by `run.sh` in its
 format). Nothing in this folder needs hardware. All addresses, register values, tick costs and
 clock frequencies are exercise values (ruling A4), not a real part's.
+
+Run history. First run 2026-10-10 with g++ 13.3.0 (the recorded `.out`/`.log` files). Re-run on
+2026-10-25 with g++ (Ubuntu 15.2.0-4ubuntu4) 15.2.0: runner exit code 0; every output identical to
+the recorded one except `poll_exam_O2.out`, where g++ 15.2 pads `wait_b` with a longer `nop`
+before the loop (the loop itself, `mov eax,DWORD PTR [rdi]` / `test al,0x1` / `je`, is the same,
+and `wait_a` is still a single load and `ret`). The recorded files are kept (ruling A5); the paper
+quotes the recorded g++ 13.3 disassembly with its log. `exam_checks.*` and `i2c_events.*` were
+recorded in the 2026-10-25 run (their logs name g++ 15.2).
