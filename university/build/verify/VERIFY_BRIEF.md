@@ -1,7 +1,7 @@
 # Verification pass brief (one unit: a course, a bridge or a mega project)
 
 You are the Source Researcher, Fact-Checker, Diagram reviewer, Editor and Accessibility reviewer
-for ONE unit of the university in the git repo at /home/user/bare-metal-to-gpu-university.
+for ONE unit of the university in the git repo at /home/raghavendra/bare-metal-to-gpu-university.
 Work only in that checkout. Do not commit or push. Never call any mcp__hearthbot__ tool.
 Touch only: your unit's chapter folder `university/chapters/<UNIT>/`, the lab folders of your
 unit's chapters `university/labs/<CHAPTER>/`, `university/_dossiers/<CHAPTER>.dossier.html` and
@@ -19,24 +19,19 @@ unit's chapters `university/labs/<CHAPTER>/`, `university/_dossiers/<CHAPTER>.do
 5. Your unit's `NOTES.md` (it lists the unverified claims and the open owner decisions).
 
 ## Web access
-The bash shell has NO general internet (only package indexes and GitHub). Load the web tools with
-ToolSearch "select:WebSearch,WebFetch" first.
-- **WebSearch** (mode "standard"; "extended" when the standard result is thin) works for every
-  topic. Its result quotes and summarises the pages it found, with their URLs. Use it to locate the
-  official document and to confirm what it says.
-- **WebFetch** reaches ONLY `github.com` and `raw.githubusercontent.com` in this session; the
-  environment's network policy denies every other host (the call fails with ENOTFOUND or 403).
-  Many standards and manuals have their source on GitHub (RISC-V ISA manual, the C++ draft
-  `cplusplus/draft`, Linux `Documentation/` via `torvalds/linux`, VIRTIO `oasis-tcs/virtio-spec`,
-  LLVM `llvm/llvm-project` docs, Zephyr, PX4, ArduPilot, ROS 2, Gazebo, CUDA samples, QEMU docs
-  source). Open those there and record the GitHub URL and the commit/tag you read.
-- Do not retry a denied host; do not pretend a document was opened.
+This session (2026-10-25, third pass) has full internet access through the `webfetch` tool:
+open official documents directly (vendor and standards sites, docs.kernel.org, GitHub,
+publisher pages). The bash shell may also reach the internet (curl), but prefer `webfetch`.
+- Do not retry a host that refuses (403/404) more than twice; record it as "not opened" with
+  the reason. Do not pretend a document was opened.
+- Paywalled standards and books: use the official table of contents, publisher page or a
+  freely published draft from the issuing body; say which in the dossier.
 Prefer tier-1 sources: the vendor's or project's own documentation, the standard's official page,
 the paper itself, the book publisher's page.
 
 **Honest recording (build-lead ruling for this pass, under owner ruling C1):**
 - A document you opened with WebFetch: "how accessed" = the URL opened; tier as usual.
-- A document you could not open but whose official page a WebSearch result quoted: "how accessed"
+- (Earlier passes only) A document whose official page a search result quoted: "how accessed"
   = "search excerpt of <URL> (WebSearch; document not opened: network policy)". A claim that the
   quoted official text confirms counts as confirmed; cite the section the excerpt names. Say in
   the claim's dossier F-row that the evidence is a search excerpt.
@@ -51,7 +46,7 @@ the paper itself, the book publisher's page.
    `<!--meta\nid: <CHAPTER>-dossier\nchapter: <CHAPTER>\n-->`. Contents, per AH-8..AH-14:
    a documents table with one row per source D-id the chapter cites (title exactly as printed,
    issuing body/authors, version or edition as shown or "no version shown", sections used, date
-   accessed 2026-10-10, how accessed = the URL opened, tier); a facts list (F-ids) keyed to the
+   accessed 2026-10-25, how accessed = the URL opened, tier); a facts list (F-ids) keyed to the
    chapter's tagged claims; a "not found" list; and the toolchain versions from
    `university/labs/TOOLCHAIN_VERSIONS.txt`. Lab-run sources (R-ids) are listed as local evidence.
 2. **Fact-check (G6).** Check every tagged technical claim and every "Not verified"/"unverified"
@@ -79,7 +74,7 @@ the paper itself, the book publisher's page.
 7. **QA record.** Write `university/qa/<CHAPTER>.json`:
    ```
    {"dossier": "approved — <n> documents opened, <m> facts, <k> not found",
-    "checker": "Fact-Checker agent (verification pass 2026-10-10)",
+    "checker": "Fact-Checker agent (verification pass 2026-10-25)",
     "factcheck": "done",
     "factcheck_note": "ok — <x> claims checked, <y> corrected, <z> left unverified",
     "diagrams": "ok — <short>", "edit": "ok — <short>", "accessibility": "ok — <short>",
