@@ -174,6 +174,39 @@ static void practical() {
                 wash - 1, bits, 3 + bits + 3);
 }
 
+// ---- F18: bit 25 of a free-running counter as a "slow clock" on a 50 MHz board (exercise value)
+static void bit25() {
+    const double f = 50e6;
+    const double half = static_cast<double>(1ull << 25) / f;   // bit 25 toggles every 2^25 cycles
+    std::printf("F18: 50 MHz, bit 25 toggles every 2^25 = %llu cycles = %.3f s; full period %.3f s (not 1 s)\n",
+                1ull << 25, half, 2.0 * half);
+}
+
+// ---- F19: the correct 010 detector and Mira's (S010 always returns to S0) on two bit strings
+static void seq010() {
+    enum { S0, SA, S01, S010 };
+    const char* names[] = {"S0", "SA", "S01", "S010"};
+    const std::vector<std::vector<int>> inputs = {{0, 1, 0, 1, 0}, {0, 1, 0, 0, 1, 0}};
+    for (const auto& bits : inputs) {
+        for (int bug = 0; bug <= 1; ++bug) {
+            int state = S0;
+            std::printf("F19c: %s on", bug ? "seq010_bug" : "seq010    ");
+            for (int b : bits) std::printf(" %d", b);
+            std::printf(":");
+            for (int in : bits) {
+                switch (state) {
+                case S0: state = in ? S0 : SA; break;
+                case SA: state = in ? S01 : SA; break;
+                case S01: state = in ? S0 : S010; break;
+                default: state = bug ? S0 : (in ? S01 : SA); break;
+                }
+                std::printf(" %s%s", names[state], state == S010 ? "(found)" : "");
+            }
+            std::printf("\n");
+        }
+    }
+}
+
 int main() {
     std::printf("HW201 exam key checks (all values are exercise values)\n");
     srLatch();
@@ -185,6 +218,8 @@ int main() {
     luts();
     assignments();
     boardBits();
+    bit25();
+    seq010();
     practical();
     return 0;
 }

@@ -71,6 +71,16 @@ check seq010 PASS
 step seq010_synth "seq010.v seq010_bug.v" "$YOSYS_VER" \
     "for m in seq010 seq010_bug; do yosys -q -p \"read_verilog \$m.v; synth -top \$m; tee -q -o /dev/stdout stat\" | grep -e '===' -e 'cells' -e 'DFF'; done"
 
+step seq010_fsm "seq010_bug.v" "$YOSYS_VER" \
+    "yosys -p 'read_verilog seq010_bug.v; synth -top seq010_bug' | grep -i -e 'encoding' -e 'one-hot' -e 'binary' | sort | uniq -c"
+
+# ------------------------------------------------ Final, question F10: the door chime (model answer)
+step chime "chime_tb.v chime.v" "$IVERILOG_VER" \
+    "iverilog -g2005 -Wall -o chime.vvp chime_tb.v chime.v && vvp -n chime.vvp"
+check chime PASS
+step chime_lint "chime.v" "$VERILATOR_VER" \
+    "verilator --lint-only -Wall chime.v && echo 'verilator: no warnings, exit code 0'"
+
 # ------------------------------------------------ Final, question F14: reading read_me.v
 step read_me_latch "read_me.v" "$YOSYS_VER" \
     "yosys -p 'read_verilog read_me.v; proc' | grep -c 'Latch inferred' | sed 's/^/Latch inferred lines: /'"

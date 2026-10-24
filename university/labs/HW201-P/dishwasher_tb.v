@@ -1,7 +1,7 @@
 // HW201 practical exam (P): the testbench handed to candidates together with
-// start/dishwasher.v. It drives the controller through three programmes (a clean run,
-// a run with the door opened four times, a run cut short by reset) and checks, at
-// every cycle, the rules of the word description in the paper. It never looks at the
+// start/dishwasher.v. It drives the controller through four programmes (a clean run,
+// a run with the door opened four times, a run cut short by reset, a final clean run)
+// and checks, at every cycle, the rules of the word description in the paper. It never looks at the
 // state encoding: any encoding and any number of states that behave as described pass.
 // Compile and run (the course command):
 //   iverilog -g2005 -Wall -o dishwasher.vvp dishwasher_tb.v dishwasher.v && vvp -n dishwasher.vvp

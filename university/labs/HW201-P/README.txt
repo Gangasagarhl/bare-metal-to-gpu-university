@@ -1,7 +1,9 @@
 HW201 practical exam (P), forensic evidence and project reference - lab folder
 =============================================================================
 
-Run: university/labs/run_lab.sh university/labs/HW201-P   (runner exit code 0 in this build)
+Run: university/labs/run_lab.sh university/labs/HW201-P   (runner exit code 0 on 2026-10-10; the steps chime, chime_lint and
+      seq010_fsm were added on 2026-10-25 and have not been run yet: Icarus Verilog, Verilator
+      and Yosys were not installed in that session)
 Paper: university/chapters/HW201/EXAMS.html, sections "Practical (P)", "Final" (forensic
 question) and "Course project".
 Marking points and reference outputs: university/_keys/HW201.keys.html.
@@ -28,6 +30,10 @@ Reference solution and hidden evidence (Lab Engineer, not given to candidates):
                          only once": the correct and the broken 010 detector, the testbench
                          with its shift-register check (seq010_bug.out is the evidence shown
                          in the paper; seq010.out and seq010_synth.out are the key)
+  seq010_fsm.out         the synthesis tool's own messages about the state encoding it chose
+                         for seq010_bug (key to forensic question F19d)
+  chime.v, chime_tb.v    model answer of final question F10 (the door chime FSM) and its
+                         property testbench (chime.out, chime_lint.out)
   read_me.v              the module read in final question F14; read_me_latch.out and
                          read_me_synth.out hold the synthesis tool's answer
   pc_branch.v, ram256x8.v, project_tb.v
@@ -39,6 +45,7 @@ Reference solution and hidden evidence (Lab Engineer, not given to candidates):
 
 Every .out and .log file is written by university/labs/run_lab.sh (exam_checks) or by run.sh
 in the same format. Toolchain as printed by the tools: Icarus Verilog 12.0, Verilator 5.020,
-Yosys 0.33, g++ 13.3.0. Nothing in this folder needs hardware: the practical is simulation
+Yosys 0.33 (recorded 2026-10-10); exam_checks.cpp re-run on 2026-10-24 with g++ 15.2.0
+(its log records the toolchain). Nothing in this folder needs hardware: the practical is simulation
 only, like the course's labs (the course has no hardware steps except the optional F1-22
 board lab, which is untested on hardware).
