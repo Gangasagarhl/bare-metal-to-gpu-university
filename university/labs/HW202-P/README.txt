@@ -14,6 +14,9 @@ folder is handed out:
   pipe_exam_start.in     the exam program "range.s": the difference between the largest and the
                          smallest of four readings (14 3 27 9), to be hand-traced through the
                          pipeline and then run through the completed model.
+  The start file includes ../F1-23/u16.h, the course's published ISA header (chapter material,
+  not exam material): candidates work in a folder next to the course's labs/F1-23, and may read
+  (not include) labs/F1-26/pipe.h and labs/F1-27/hazards.cpp, and use labs/F1-24/cpu.cpp in Part 3.
   As handed out the start file builds, prints wrong numbers and ends its self-check (the sum
   program of F1-23, whose numbers are printed in F1-27) with "self-check: 7 failures" (exit
   code 1): that is the expected starting state.
@@ -23,6 +26,8 @@ Reference solution and hidden evidence (Lab Engineer, not given to candidates):
                          range.s: 42 instructions, 101 cycles / 37 stalls without forwarding,
                          69 cycles / 5 stalls with forwarding, 18 branch cycles, output 24
   pipe_case2.in          the re-sit variant (six readings 5 40 12 8 33 1, output 39), run by run.sh
+  range_sched.s          the key's answer to Part 3 (the exam program scheduled for forwarding):
+                         range_sched_pipe.out 64 cycles, 0 data stalls; range_sched_cpu.out out: 24
   crosscheck_*.out       the course's own model (../F1-27/hazards.cpp) and the U16 computer
                          (../F1-24/cpu.cpp) on the exam program; crosscheck_diff.out shows that the
                          reference solution and the course model report identical totals
@@ -35,7 +40,8 @@ Reference solution and hidden evidence (Lab Engineer, not given to candidates):
                          with sll (opcode 12) running hand-encoded machine-code programs (Fibonacci,
                          5 x 8 by shifting) and the regression test (the sum program still gives 29)
   exam_checks.cpp        recomputes every number in the HW202 answer keys (encodings, traces, stage
-                         timings, pipeline cycle counts, predictor counts, Amdahl, interleavings)
+                         timings, pipeline cycle counts, predictor counts, Amdahl, interleavings,
+                         the forensic routines' stores and memory, the project's pipeline numbers)
 
 Every .out and .log file is written by university/labs/run_lab.sh (or run.sh in its format).
 Nothing in this folder needs hardware: the pipeline is the course's rule-based timing model of

@@ -3,7 +3,8 @@
 #  1. the practical's reference solution on the re-sit variant (pipe_case2.in);
 #  2. cross-check: the course's own pipeline model (F1-27 hazards.cpp) and the U16 computer
 #     (F1-24 cpu.cpp) on the exam program; the summary lines must agree with pipe_exam.out;
-#  3. the final exam's forensic evidence "The fast loop that lies": the clamp program as written,
+#  3. practical Part 3: the key's scheduled program range_sched.s (reference model and computer);
+#  4. the final exam's forensic evidence "The fast loop that lies": the clamp program as written,
 #     Ravi's reordered version and the fixed version, each through the pipeline model (forwarding
 #     diagram) and through the U16 computer (the outputs 236 / 85 / 236 are the key).
 set -u -o pipefail
@@ -30,6 +31,9 @@ step pipe_case2 "pipe_exam.cpp (run on pipe_case2.in, the re-sit variant)" "./pi
 step case2_cpu "pipe_case2.in (run with ../F1-24/cpu.cpp)" "./cpu < pipe_case2.in" ./.bin_cpu < pipe_case2.in
 step crosscheck_hazards "pipe_exam.in (run with ../F1-27/hazards.cpp, the course's model)" "./hazards 16 < pipe_exam.in" ./.bin_h 16 < pipe_exam.in
 step crosscheck_cpu "pipe_exam.in (run with ../F1-24/cpu.cpp)" "./cpu < pipe_exam.in" ./.bin_cpu < pipe_exam.in
+# Practical Part 3: the answer key's scheduled program through the reference solution and the computer.
+step range_sched_pipe "range_sched.s (run with pipe_exam.cpp, the reference solution)" "./pipe_exam 16 < range_sched.s" ./.bin_ref 16 < range_sched.s
+step range_sched_cpu "range_sched.s (run with ../F1-24/cpu.cpp)" "./cpu < range_sched.s" ./.bin_cpu < range_sched.s
 # The reference solution and the course model must report the same totals.
 {
     echo "reference solution (pipe_exam.out) versus the course model (crosscheck_hazards.out), summary lines:"

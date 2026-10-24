@@ -100,6 +100,9 @@ int main()
     std::printf("  offset = 4 - (11 + 1) = %d; 6-bit field = 0x%02X\n", 4 - 12, (4 - 12) & 0x3F);
     word("bne r3, r0, -8", u16::encodeI(u16::BNE, 3, 0, 4 - 12));
     std::printf("  taken target check: 11 + 1 + (%d) = %d\n", 4 - 12, 11 + 1 + (4 - 12));
+    std::printf("  extremes of the 6-bit offset at address a: -32 -> a + 1 - 32 = a - %d; +31 -> a + 1 + 31 = a + %d\n", 31, 32);
+    word("bne r3, r0, -32", u16::encodeI(u16::BNE, 3, 0, -32));
+    word("bne r3, r0, 31", u16::encodeI(u16::BNE, 3, 0, 31));
     std::printf("[M5] a word of the multiply program\n");
     word("decode 0x16C8", 0x16C8);
     std::printf("[M6] sw r5, 3(r2) with r2 = 20, r5 = 9 (machine trace)\n");
@@ -135,6 +138,14 @@ int main()
     word("lw r4, 0(r1)", u16::encodeI(u16::LW, 4, 1, 0));
     word("lw r5, 4(r1)", u16::encodeI(u16::LW, 5, 1, 4));
     word("lw r4, 8(r1)", u16::encodeI(u16::LW, 4, 1, 8));
+    {
+        std::uint16_t reg[8] = {0, 10, 0, 0, 0, 0, 0, 0};   // r1 = 10, every other register 0
+        for (const int imm : {0, 4, 8}) {
+            const u16::Fields f = u16::decode(u16::encodeI(u16::LW, 4, 1, imm));
+            std::printf("  lw rX, %d(r1) with r1 = 10: correct address %d, faulty address r1 + r%u = %d\n", imm, 10 + imm, f.rt,
+                        reg[f.rs] + reg[f.rt]);
+        }
+    }
     std::printf("[M13] ideal pipeline: 12 instructions -> %d cycles, CPI %.2f; multiply program of F1-24:\n", 12 + 4, 16.0 / 12);
     {
         const pipe::Result r = model("addi r1, r0, 6\naddi r2, r0, 7\naddi r3, r0, 0\nloop: add r3, r3, r1\naddi r2, r2, -1\nbne r2, r0, loop\nout r3\nhalt\n", false, false, false);
@@ -155,6 +166,7 @@ int main()
         }
         std::printf("  limit %.3f\n", static_cast<double>(single) / piped);
         const int piped6 = std::max({180, 120, 220, 150, 150, 100}) + r;
+        std::printf("  latency of one instruction: single-cycle %d du, five stages %d du, six stages %d du\n", single, 5 * piped, 6 * piped6);
         std::printf("  MEM split into 150 + 150 (six stages): period %d du; n = 200: %ld du (%d cycles), speed-up %.3f; limit %.3f\n",
                     piped6, (6 + 200 - 1) * static_cast<long>(piped6), 6 + 200 - 1, 200.0 * single / ((6 + 200 - 1) * piped6),
                     static_cast<double>(single) / piped6);
@@ -190,10 +202,13 @@ int main()
         totals("copy, as written, forwarding", model(orig, true, true, true));
         totals("copy, as written, no forwarding", model(orig, true, false, true));
         totals("copy, scheduled, forwarding", model(sched, true, true, true));
-        for (const auto* v : {&orig, &sched}) {
+        // a second accepted schedule: the counter update fills the bubble, the store keeps offset 10
+        const std::string sched2 = ".data 7 3 9 4 6\naddi r1, r0, 0\naddi r2, r0, 5\nloop: lw r4, 0(r1)\naddi r2, r2, -1\nsw r4, 10(r1)\naddi r1, r1, 1\nbne r2, r0, loop\nhalt\n";
+        totals("copy, scheduled (addi r2 moved), fwd", model(sched2, true, true, true));
+        for (const auto* v : {&orig, &sched, &sched2}) {
             const u16::Machine m = runText(*v);
             std::printf("  memory[10..14] after the run: %u %u %u %u %u (%s)\n", m.mem[10], m.mem[11], m.mem[12], m.mem[13], m.mem[14],
-                        v == &orig ? "as written" : "scheduled");
+                        v == &orig ? "as written" : v == &sched ? "scheduled, addi r1 moved, sw offset 9" : "scheduled, addi r2 moved");
         }
     }
     std::printf("[F8] 2-bit counter from state 3 on N N T T T N T T\n");
@@ -215,7 +230,14 @@ int main()
             const int miss = mispredictions(k, 0, o, &t);
             std::printf("  %-18s mispredictions %3d, cycles lost %3d, first 16: %s\n", names[k], miss, 2 * miss, t.substr(0, 16).c_str());
         }
-        std::printf("  loop body of 8 instructions: %d instructions; CPI from branches alone = 1 + lost/instructions\n", 20 * 8);
+        // each loop iteration is 8 instructions including the branch: 160 iterations = 1280 instructions
+        const int instr = 20 * 8 * 8;
+        std::printf("  iterations of 8 instructions (branch included): %d instructions\n", instr);
+        for (int k = 0; k < 4; ++k) {
+            const int miss = mispredictions(k, 0, o, nullptr);
+            std::printf("  %-18s CPI added by mispredictions = %d / %d = %.3f\n", names[k], 2 * miss, instr,
+                        static_cast<double>(2 * miss) / instr);
+        }
     }
     std::printf("[F11] bounds for the two-sum sequence C of F1-29 (latencies 3): dependence 3 + 4*3 + 3 = %d; issue 17/2 -> %d cycles\n", 3 + 12 + 3, (17 + 1) / 2);
     std::printf("[F13] Amdahl p = 0.8: N = 4 -> %.2f, N = 16 -> %.2f, limit %.1f\n", 1 / (0.2 + 0.8 / 4), 1 / (0.2 + 0.8 / 16), 1 / 0.2);
@@ -249,6 +271,46 @@ int main()
         totals("range.s scheduled, forwarding", model(sched, true, true, true));
         const u16::Machine m = runText(sched);
         std::printf("  output: %u, memory[4] = %u\n", m.output.empty() ? 999 : m.output[0], m.mem[4]);
+    }
+    std::printf("[F19] the clamp routines on the U16 machine: every store, then memory 0-5 after the run\n");
+    for (const char* name : {"forensic_orig.s", "forensic_fast.s", "forensic_fixed.s"}) {
+        std::ifstream f(name);
+        std::stringstream ss; ss << f.rdbuf();
+        std::istringstream in(ss.str());
+        u16::Machine m(u16::assemble(in));
+        std::string stores;
+        for (int i = 0; i < 100000 && !m.halted; ++i) {
+            const u16::Step st = m.step();
+            if (st.c.memWrite) {
+                stores += " [" + std::to_string(st.aluOut) + "]=" + std::to_string(st.b);
+            }
+        }
+        std::printf("  %-17s stores:%s; memory 0-5: %u %u %u %u %u %u; output %d\n", name, stores.c_str(), m.mem[0], m.mem[1],
+                    m.mem[2], m.mem[3], m.mem[4], m.mem[5], m.output.empty() ? -1 : static_cast<int>(m.output[0]));
+    }
+    {
+        // a second accepted fix: the counter update fills the bubble, the store keeps offset 0
+        std::ifstream f("forensic_orig.s");
+        std::stringstream ss; ss << f.rdbuf();
+        std::string src = ss.str();
+        const std::string a = "        slt  r5, r4, r6", b = "keep:   addi r1, r1, 1      ; next address\n        addi r2, r2, -1     ; one reading fewer\n";
+        const std::size_t pa = src.find(a), pb = src.find(b);
+        if (pa == std::string::npos || pb == std::string::npos) {
+            std::printf("  ALTERNATIVE FIX: source lines not found\n");
+        } else {
+            src.replace(pb, b.size(), "keep:   addi r1, r1, 1\n");
+            src.insert(pa, "        addi r2, r2, -1\n");
+            totals("clamp, addi r2 moved, forwarding", model(src, true, true, true));
+            const u16::Machine m = runText(src);
+            std::printf("  output %d\n", m.output.empty() ? -1 : static_cast<int>(m.output[0]));
+        }
+    }
+    std::printf("[Project] the reference Fibonacci program (project_ref.cpp) through the course model\n");
+    {
+        const std::string fib = "addi r1, r0, 0\naddi r2, r0, 1\naddi r3, r0, 8\nloop: out r1\nadd r4, r1, r2\n"
+                                "add r1, r2, r0\nadd r2, r4, r0\naddi r3, r3, -1\nbne r3, r0, loop\nhalt\n";
+        totals("fibonacci, no forwarding", model(fib, true, false, true));
+        totals("fibonacci, forwarding", model(fib, true, true, true));
     }
     return 0;
 }
