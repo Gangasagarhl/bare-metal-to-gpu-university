@@ -134,5 +134,24 @@ int main()
                 "n = 512: row = %u bytes = sets x line, so a column's lines share one set: %u lines in 12 ways\n",
                 8 * 2, 512 * 8, 512);
     std::printf("P: ratios of the measured times are computed by run.sh from transpose_time.out (transpose_time_ratios.out)\n");
+    std::printf("== Added in the exam pass of 2026-10-25 ==\n");
+    std::printf("M4: same-set spacing S x B = 256 x 32 = %u bytes (0x%X)\n", 256 * 32, 256 * 32);
+    split("M4 +0x2000", 0x2F4A7 + 0x2000, 256, 32);
+    std::printf("M8: n = 32 extra misses beyond compulsory: %llu; fully associative 16 ways leaves %llu extra: "
+                "the 3C rule calls them capacity misses\n",
+                static_cast<unsigned long long>(loopNest(8, 2, 32, false) - loopNest(8, 2, 32, true)),
+                static_cast<unsigned long long>(loopNest(1, 16, 32, false) - loopNest(1, 16, 32, true)));
+    std::printf("M9: 536800 - 524288 = %d reads that miss beyond one per matrix line\n", 536800 - 524288);
+    std::printf("M10: 16-byte lines, 8-byte single writes: write-back (5 + 4) x 16 = %d bytes; "
+                "write-through 2 x 16 + 5 x 8 = %d bytes\n", (5 + 4) * 16, 2 * 16 + 5 * 8);
+    std::printf("F20: AoS / SoA pass-1 misses = 4096 / 512 = %d; AoS data 4096 x 64 B = %u KiB = %.2f x the 48 KiB L1d; "
+                "SoA data 4096 x 8 B = %u KiB\n", 4096 / 512, 4096 * 64 / 1024, 4096.0 * 64 / 1024 / 48,
+                4096 * 8 / 1024);
+    std::printf("F20: 4194304 particles: AoS %u MiB, SoA masses %u MiB; stride table stride 1 / stride 8: "
+                "16 KiB 16.71 / 15.68 = %.2f x, 256 KiB 18.47 / 18.66 = %.2f x, 262144 KiB 6.26 / 1.42 = %.1f x\n",
+                4194304u / 1024 * 64 / 1024, 4194304u / 1024 * 8 / 1024, 16.71 / 15.68, 18.47 / 18.66, 6.26 / 1.42);
+    std::printf("P: model ratios: case 5 cols / rows = 262144 / 32768 = %.1f x; naive / blocked (tile 4) = "
+                "294912 / 98304 = %.1f x; re-sit tile 8: 294912 / 65536 = %.1f x; case 3: 288 / 108 = %.2f x\n",
+                262144.0 / 32768, 294912.0 / 98304, 294912.0 / 65536, 288.0 / 108);
     return 0;
 }
