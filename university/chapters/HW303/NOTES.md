@@ -86,7 +86,9 @@ Acceptance test, verbatim: "The UART prints a banner; a breakpoint in the reset 
 - **Image size and RAM use.** Reported by `llvm-size` and the map file against QEMU's STM32F100 model sizes (F1-74).
 - **Overall status: met in emulation only. Untested on hardware.**
 
-## Unverified boxes (per chapter: what to check, and where)
+## Unverified boxes (per chapter: what to check, and where) — as written by the authoring build
+
+This list is historical: the verification pass of 2026-10-25 resolved most items. The current state is in "Verification pass" at the end of this file.
 
 - **F1-73**
   - (1) How the RISC-V `virt` machine reaches 0x80000000 with `-bios none`. Check: QEMU RISC-V virt documentation; the RISC-V Privileged spec, reset section.
@@ -123,7 +125,7 @@ Acceptance test, verbatim: "The UART prints a banner; a breakpoint in the reset 
   - (1) Real datasheet contents (group/total current limits, tolerant pins, conditions, pull ranges, unused pins) and schematic-tool features. Check: the chosen chip's datasheet and reference manual GPIO chapter, and the board schematic and user guide.
   - (2) Untested-on-hardware box: U-BOARD-1 is fictional, and the currents are ideal-pin estimates.
 
-All book and specification sources are listed "title only — not opened during this build (dossier gate G1 open)". The Source Researcher must confirm editions and sections.
+In the authoring build all book and specification sources were listed "title only — not opened". The verification pass of 2026-10-25 opened the specifications and rewrote every Sources list (see "Verification pass").
 
 ## Fictional teaching parts (labelled in every chapter that uses them)
 
@@ -135,7 +137,7 @@ All book and specification sources are listed "title only — not opened during 
 - **U-BOARD-1.** A teaching board, defined by `F1-79/netcheck.in` (rev A) and `rev_b.net` (rev B, the forensic file).
 - **The F1-77 JTAG device.** Its IDCODE 0x0EDC0C01 and instruction codes are invented.
 
-## Analogy proposals (F1 restaurant world). Owner approval needed.
+## Analogy proposals (F1 restaurant world). Approved under owner ruling A3.
 
 These are proposed extensions of the F1 analogy world. They are used in the chapters but are not yet in the guide's analogy table.
 
@@ -154,7 +156,7 @@ These are proposed extensions of the F1 analogy world. They are used in the chap
 | Reference manual / datasheet / errata | the appliance's service manual / leaflet / "known issues" page | F1-78 |
 | Schematic / datasheet limits | the stand's wiring plan / the rating plates | F1-79 |
 
-## Decisions for the owner
+## Decisions for the owner (answered: see "Owner rulings applied")
 
 1. **The real lab microcontroller and board.**
    - Choose them, and supply or name the datasheet, reference manual, errata sheet, board schematic and user guide, with revisions.
@@ -177,3 +179,31 @@ These are proposed extensions of the F1 analogy world. They are used in the chap
    - the STM32F1 USART, RCC and GPIO;
    - SysTick;
    - the JTAG TAP table and SWD format.
+
+## Owner rulings applied
+
+1. **Real lab microcontroller and board** — ruling D1 (reference kit in `university/build/KIT.md`): the Raspberry Pi Pico 2 (RP2350) or the ST NUCLEO-F446RE. Every "untested on hardware" box now names these boards and says what is needed to test the step (ruling C3). The RP2350 datasheet is now a cited tier-1 source in all seven chapters. ST's RM0041/STM32F446 documents could not be opened (server refused), so ST-specific behaviour stays in unverified boxes.
+2. **GDB requirement** — no ruling covers it; decided by verifier: LLDB 18 through QEMU's GDB stub is accepted as the emulated evidence for the H1 breakpoint test (same GDB remote serial protocol; LLDB's "GDB to LLDB command map" lists the equivalent commands). The F1-77 note keeps saying that the GDB route was not run; when `gdb-multiarch` (or an Arm GDB) is installed, re-run the F1-77 session with GDB. The hardware run stays "untested on hardware" (C3); the catalogue shows "internally checked · hardware steps untested" (C4).
+3. **Debug probe** — ruling D1: the Raspberry Pi Debug Probe (CMSIS-DAP, SWD only) for the Pico 2, or the NUCLEO-F446RE's on-board ST-LINK. JTAG stays emulated/theoretical (KIT.md note). Probe software is cited from the OpenOCD User's Guide; the Raspberry Pi Debug Probe documentation page returned HTTP 403 and was not opened.
+4. **QEMU limits** (no CMSDK GPIO on mps2-an385; RCC/GPIO/timers unimplemented on stm32vldiscovery) — rulings B2 and C3: emulation plus the course's models is accepted; each limit is stated in the chapter (QEMU's own documentation now cited: MPS2 "Differences between QEMU and real hardware", STM32 "Missing devices") and each hardware step says what is needed to test it.
+5. **Analogy proposals** — ruling A3: approved; chapter metadata now says "extension approved under owner ruling A3".
+6. **Fictional teaching parts U-MCU-1 and U-BOARD-1** — ruling A2: approved; F1-75, F1-76, F1-78 and F1-79 now say that they are the course's own and name the real items they stand for (RP2350 / STM32F446RE; Pico 2 / NUCLEO-F446RE). Their numbers are exercise values (ruling A4); the 2 % baud-error threshold in F1-75 is now labelled "an exercise value".
+7. **Unverified register layouts** — ruling C1: CMSDK UART and timer checked against ARM DDI 0479B; MPS2 addresses and clock against AN385 (DAI 0385D); STM32F1 USART, RCC and GPIO offsets and bits against ST's own CMSIS/LL headers (the reference manual itself could not be opened); SysTick against the Armv7-M ARM (DDI 0403E.e); JTAG TAP and SWD format against ADIv5 (IHI 0031G). Only the IEEE 1149.1 text (sold; catalogue page read) and the CMSDK timer's RELOAD + 1 period and clock (QEMU model only) remain unverified.
+8. Other rulings checked: A1 (no trimming for length), A5 (recorded runs kept: host models re-run with identical output, recorded logs restored), A8 and A10 (no committed keys and no `LicenseRef-Uni-Lab` placeholder in the HW303 lab folders; nothing to change), C2 (new sources added only when opened), C4 (status follows the QA records).
+
+## Verification pass
+
+Third verification pass, 2026-10-25, with web access. Dossiers `university/_dossiers/F1-73..F1-79.dossier.html` and QA records `university/qa/F1-73..F1-79.json` written; the earlier interrupted WIP edits of F1-73 (commit 90c4f8f) were re-checked against freshly opened documents and completed.
+
+**Opened (all on 2026-10-25):** Arm DUI 0552A (Cortex-M3 Generic User Guide), DDI 0403E.e (Armv7-M ARM), DDI 0479B/C (CMSDK TRM), DAI 0385D (AN385), DDI 0337H (Cortex-M3 TRM), IHI 0031G (ADIv5) — all through Arm's documentation-service API and PDFs; Raspberry Pi RP2350 Datasheet (build 80d627281ed5, 01/10/2026); QEMU documentation (11.1.50 pages) and QEMU v8.2.2 source files; C++ working draft (eel.is, 2026-08-23) and N4861; RISC-V Privileged Architecture (library 20260120); GNU ld manual (2.47) and lld notes; Clang attribute and command-line references; GCC Common Attributes and Developer Options; GDB manual (remote protocol), LLDB remote/command-map pages, OpenOCD User's Guide; CMSIS-Core pages and Open-CMSIS-SVD; ST's `stm32f100xb.h` and `stm32f1xx_ll_gpio.h`; Zephyr "Threads"; TI SZZA036C and SCEA046B; OpenStax University Physics Vol. 3 §9.7; KiCad 9.0 Schematic Editor manual; IEEE 1149.1-2013 catalogue page.
+
+**Not opened:** STMicroelectronics RM0041/datasheets (server refused, curl and WebFetch), Elecia White "Making Embedded Systems" (O'Reilly, HTTP 403 twice), Raspberry Pi Debug Probe documentation (HTTP 403 twice), Analog Devices MT-101 (no response twice). Book catalogue pages only (text not read): Yiu (3rd ed., 2013), Harris and Harris ARM edition (2015), Horowitz and Hill (TOC page), CS:APP (front page). Their former claim tags were re-sourced to opened documents and the book entries were removed from the chapters' Sources lists.
+
+**Corrected (main items):** Cortex-M3 vs Armv7-M reset address of the vector table (VTOR reset rule); MCU program memory can be external flash (RP2350); SRAM-at-power-up claim replaced by the Armv7-M reset pseudocode; QEMU RISC-V `virt` reset path confirmed from QEMU source; C++20 forward-progress rule cited to N4861; "peripherals start with clocks off" made chip-specific; invented datasheet examples in F1-79 (VOH, typical pull-up) replaced with RP2350 values; Cortex-M3 breakpoint count (6 instruction comparators, Code region); watchpoints asynchronous; several "unverified" register boxes turned into sourced text. Per-chapter lists are in the QA records.
+
+**Left unverified (boxes):** F1-74 STM32F100 boot mode/SRAM size/peripheral list and flash wait states; F1-75 UART receiver tolerance, STM32 clock-enable reset values and wait states; F1-76 CMSDK timer period and clock on real MPS2, eye/inductance averaging; F1-77 IEEE 1149.1 text; F1-78 ST document split and timer buffering; F1-79 board-ID resistors, decoupling inductance, LED colour vs forward voltage, STM32 pin ratings. All "untested on hardware" boxes stay (ruling C3) and name the kit hardware needed.
+
+**Labs:** F1-78 and F1-79 re-run with `run_lab.sh` (container g++ is now 15.2.0): outputs identical, logs restored (A5). Host models of F1-75/76/77 re-run in a scratch copy: identical. QEMU/clang/LLDB/RISC-V steps of F1-73..F1-77: lab not re-run: toolchain missing (clang, ld.lld, llvm tools, qemu-system-arm/riscv64, lldb, riscv64-linux-gnu-g++ not installed at the end of the pass); recorded files kept.
+
+**Still open:** listing header comments in F1-73 `main.cc`, F1-74 `main.cc`, F1-75 `probe.cc`, F1-76 `blink.cc`, F1-77 `tap.cpp`, `app.cc`, `app_v2.cc` still say "unverified"/"pending verification" (a note under each listing explains); update them at the next re-run of those labs, once the QEMU/clang toolchain is installed. ST's documents should be opened when the vendor site is reachable.
+
