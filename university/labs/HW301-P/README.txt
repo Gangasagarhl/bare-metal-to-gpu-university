@@ -26,11 +26,20 @@ Reference solution and hidden evidence (Lab Engineer, not given to candidates):
                             nothing" (run.sh feeds them to the course's own models in ../F1-58,
                             ../F1-56 and ../F1-62; outputs forensic_occupancy/waves/copy.out are the
                             evidence shown in the paper, forensic_fix*.out the key's fix estimates)
+  kernel_map_variants.in    EX-1 variants quoted in the practical's key (bigblock with a 64-register cap or
+                            512/256-thread blocks, histogram with 4096 B shared, tiny with 32-thread
+                            blocks); run.sh runs the reference on it -> kernel_map_variants.out
+                            (added 2026-10-24; g++ 15.2.0)
+  final_f21.in / _fixed.in  the four passport lines of final question F21 and the key's rewrite, fed to
+                            ../F1-63/passport_check.cpp -> final_f21.out, final_f21_fixed.out
+                            (added 2026-10-24; run with g++ 15.2.0, see their .log files)
   project_passport_ref.txt  reference solution of the course project (hardware passport for the
                             gfx90a target, every DOC value read in the verification pass), checked
                             by ../F1-63/passport_check.cpp -> project_passport.out
 
 Every .out and .log file is written by university/labs/run_lab.sh (or run.sh in its format).
+Re-run on 2026-10-24 with g++ 15.2.0: runner exit code 0 and every older .out byte-identical to the
+recorded 2026-10-10 (g++ 13.3.0) files, so those .log files were kept as recorded (owner ruling A5).
 Nothing in this folder needs a GPU. Part B of the practical (the same mapping on a reference-kit
 GPU, with the device query and the compiler's resource report replacing the sheet) is untested on
 hardware: the build container has no GPU (owner rulings C3, D1).
