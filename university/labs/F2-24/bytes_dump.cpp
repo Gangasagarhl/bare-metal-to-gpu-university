@@ -14,7 +14,7 @@ struct Loose
 // Shows every byte of one object, including the padding bytes the program never set.
 int main()
 {
-    Loose order{};                       // value-initialised: members AND padding start as zero
+    Loose order{};                       // aggregate-initialised: every member starts at zero
     order.size = 'M';
     order.price = 2.5;
     order.spicy = 1;
