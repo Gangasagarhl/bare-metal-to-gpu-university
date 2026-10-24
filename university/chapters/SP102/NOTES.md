@@ -169,3 +169,99 @@ milestone. Two curriculum items are previewed explicitly and quoted as a map onl
 5. **Analogy register.** Please accept or reject the mappings above.
 6. **F2-17 lab step 5** (capture `limit` by reference in the factory) is offered as an
    optional exercise and was **not run**. The chapter says so.
+
+## Owner rulings applied
+
+Rulings from `university/OWNER_RULINGS.md`, applied in the verification pass of 2026-10-25.
+
+1. **Length (decision 1)** — ruling **A1**: the chapters' length (about 3,700–4,600 words of
+   prose each) is accepted as written. Nothing was trimmed for length; only wrong or unsourced
+   sentences were changed.
+2. **Exam P preview in F2-17 (decision 2)** — ruling **B4**: the course's practical is written
+   with the exams of this pass, with a reference solution that is actually run, and ruling **B7**
+   puts it in `labs/<C>-P/`. The F2-17 preview ("a short specification, write the class, defend
+   the invariant") matches the practical described by B4 and the course card; it stays as a preview.
+3. **Course project (decision 3)** — ruling **B3** (card weights fixed; default course-project
+   rubric is guide 11.5). Decided by verifier: the ring buffer stays the default project, built up
+   in F2-14 to F2-17; the matrix alternative allowed by the course card stays allowed.
+4. **C++23 content (decision 4)** — decided by verifier: keep `std::expected` (F2-16 Listing 5)
+   as Layer 3 material, built only by `run.sh` with `-std=c++23` and clearly labelled C++23. Its
+   description is now checked against the C++23 working draft N4950, 22.8 "Expected objects".
+5. **Analogy register (decision 5)** — ruling **A3**: all proposed F2 mappings (station, checklists,
+   pot on burner two, photocopy vs original card, recipe card with a blank, order rail, finger on
+   the spice shelf, procedure book, note / empty plate / alarm, sticky note) are approved and
+   registered; each chapter keeps its "Where the analogy breaks" section.
+6. **F2-17 lab step 5 not run (decision 6)** — decided by verifier: it stays an optional exercise.
+   The chapter already says "Step 5 was not run in this build"; it is not a listing presented as
+   tested (AH-26), so no change is needed.
+7. **Ruling A10 (licence)** — no `LicenseRef-Uni-Lab` placeholder exists in `labs/F2-09` …
+   `labs/F2-17`; nothing to change.
+8. **Ruling C1 / C2 (sources)** — every cited source was opened or recorded as not opened (see
+   below). New sources added under C2: the Linux kernel "Circular Buffers" document (F2-14 D6),
+   the libstdc++ 13.3.0 sources (tier 4), the Itanium C++ ABI and the x86-64 psABI, the Bash manual,
+   Stroustrup's paper "Exception Safety: Concepts and Techniques" (F2-16 D8).
+9. **Ruling C3 (untested on hardware)** — not applicable: no step in SP102 uses hardware beyond the
+   host computer; every QA record has an empty `hardware_untested` list.
+10. **Ruling A5 (recorded runs)** — the recorded `.out`/`.log` files are kept (see "Verification
+    pass" for why the labs could not be re-run with the recorded compiler).
+
+## Verification pass
+
+Date 2026-10-25 (third pass, full web access). Dossiers: `university/_dossiers/F2-09…F2-17.dossier.html`;
+QA records: `university/qa/F2-09…F2-17.json`. Every URL opened is listed in the dossiers as plain text.
+
+**Opened (tier and version as shown):**
+
+- ISO C++ working draft N4861 (C++20; HTML rendering of 2020-04-03), about 90 section pages, plus the
+  ISO catalogue page for ISO/IEC 14882:2020 (edition 6, withdrawn, replaced by 14882:2024); N4659
+  [dcl.init] (C++17) and N4950 [expected] (C++23) for two specific claims.
+- C++ Core Guidelines (page dated Jun 14, 2026), rules cited per chapter.
+- GCC 13.3.0 manual: 3.5, 3.8, 3.12, 3.17.
+- Linux man-pages 6.19: open(2), close(2), write(2), read(2), flock(2), getrlimit(2), _exit(2),
+  syscalls(2), syscall(2), stdin(3), abort(3), proc_pid_fd(5), proc(5), signal(7).
+- Itanium C++ ABI (3.1.2.1, 5.1.8) and its exception-handling chapter ($Revision: 1.22 $);
+  x86-64 psABI (LaTeX sources, 3.2.3); GNU Binutils "nm"; generic ABI "Section Groups".
+- libstdc++ sources at `releases/gcc-13.3.0`: stl_vector.h, vector.tcc, stl_iterator.h, stl_list.h,
+  stl_algo.h (also at 15.2.0), std_function.h.
+- AddressSanitizer wiki pages (AddressSanitizer, AddressSanitizerAlgorithm,
+  AddressSanitizerUseAfterReturn) and the Clang AddressSanitizer page; Linux kernel "Circular
+  Buffers"; Bash manual 3.7.5; Stroustrup "Exception Safety: Concepts and Techniques".
+- "A Tour of C++", Third edition: author's page, table of contents and the free sample chapter 12
+  only. No claim rests on the unopened chapters; every former D1 tag was re-anchored to the
+  standard or the Guidelines (F2-15 keeps D1 for the sample chapter's advice on vector and list).
+
+**Not opened:** Cormen et al., "Introduction to Algorithms" (MIT Press page: HTTP 403 twice; F2-14
+D3 kept as further reading, no claim rests on it); Arm developer documentation on caches (HTTP 403);
+Ubuntu wiki "ToolChain/CompilerFlags" (HTTP 404).
+
+**Main corrections** (details in each QA record):
+
+- F2-09: constructor definition made precise; `this`-passing box resolved (ABI first parameter, `rdi`).
+- F2-10: globals are not always constructed before `main` (implementation may defer); implicit
+  `noexcept` of destructors qualified; `_Unwind_Resume` box resolved.
+- F2-11: `flock` box resolved; "cannot be returned" made precise (`return f;`).
+- F2-12: vector-growth and AddressSanitizer boxes resolved (standard + libstdc++ source + ASan docs).
+- F2-13: `move_if_noexcept` box resolved; sink-parameter advice no longer misattributed to the Guidelines.
+- F2-14: template checking limited to dependent parts; ring-buffer definition neutral about head/tail
+  naming; W/COMDAT explanation corrected; CLRS replaced by the kernel document.
+- F2-15: cache claim re-sourced; "undefined" for a bad comparator softened to what the standard says;
+  iterator-layout box resolved; wrong "Listing 5" reference fixed; new note: libstdc++ 15.2.0 marks
+  `std::remove` `[[nodiscard]]` (13.3.0 does not).
+- F2-16: `[[nodiscard]]` warning is recommended practice, not required; `__cxa_*` and exit-code-134
+  boxes resolved; unsourced generalisations removed; stack protector stated as observed.
+- F2-17: explicit-capture advice labelled as the course's; `std::function` storage rule read from
+  libstdc++; lambda-numbering claim corrected (the ABI leaves TU-local closures to the compiler).
+
+**Left unverified (7 boxes):** F2-11 non-Linux file locking; F2-14 `% N` as a mask, COMDAT use by
+g++ 13.3; F2-16 cost of a throw and table size; F2-17 `std::function` inlining at -O2, g++ lambda
+numbering as shown by the demangler. (The 13-row table above is the state before this pass.)
+
+**Labs:** g++ 13.3.0 (the recorded toolchain) is not installed on the verification machine (only
+g++ 14 and 15.2.0), so the labs were not re-run with `run_lab.sh` in the repository and the recorded
+files are kept (QA records: "lab not re-run: toolchain missing"). For information, a scratch copy of
+all nine folders was built and run with g++ 15.2.0: every listing behaved as recorded (same exit codes,
+same expected compile failures, same sanitizer reports) except F2-15 `remove_bug.cpp`, which no longer
+compiles because libstdc++ 15 marks `std::remove` `[[nodiscard]]`; F2-15 now says so.
+
+**Glossary:** the `source` field of every entry now names the opened document and section; the
+definitions of Constructor, Ring buffer and [[nodiscard]] follow the corrected chapter text.
