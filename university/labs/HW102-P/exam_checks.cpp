@@ -99,7 +99,8 @@ int main() {
         int nb = !(b & b), t = !(a & nb), y = !(t & t);
         std::cout << "  " << a << " " << b << " |  " << nb << " " << t << " " << y << " | " << (a & !b) << "\n";
     }
-    std::cout << "  Yosys report '2 NAND + 3 NOT' counts as 2 + 3 = 5 NAND-equivalents\n\n";
+    std::cout << "  F1-11's Yosys XOR report (3 NAND + 2 NOT cells) counts as 3 + 2 = "
+              << 3 + 2 << " NAND-equivalents, against 4 for the hand-built XOR\n\n";
 
     // M9: buzzer = en AND s1 (station code 2 or 3)
     truthTable3("M9: buzz = 1 when en = 1 and s1 s0 is 10 or 11; simplifies to en AND s1",
@@ -190,7 +191,13 @@ int main() {
         std::cout << "  4-bit ripple adder of such full adders (cin = 0): 0011 + 0001 gives "
                   << bin4(rippleFaulty(3, 1) & 0xF) << " (" << rippleFaulty(3, 1) << ") instead of 0100 (4); "
                   << "0001 + 0010 gives " << bin4(rippleFaulty(1, 2) & 0xF) << " (right); "
-                  << wrong << " of 256 sums wrong\n\n";
+                  << wrong << " of 256 sums wrong\n";
+        int noShared = 0;
+        for (int a = 0; a < 16; ++a)
+            for (int b = 0; b < 16; ++b)
+                if ((a & b) == 0) ++noShared;
+        std::cout << "  with carry in 0 no carry is ever made, so the adder gives a XOR b; pairs with a AND b = 0: "
+                  << noShared << " (3^4); 256 - " << noShared << " = " << 256 - noShared << "\n\n";
     }
 
     // F12, F13 and the practical's named vectors
@@ -225,6 +232,73 @@ int main() {
               << 2 * 24 + 1 << " units; carry out at 2N = " << 2 * 24 << "; no-carry case 4 units; "
               << "N=16 -> " << 2 * 16 + 1 << "; N=8 -> " << 2 * 8 + 1 << "\n";
     std::cout << "  16-bit exhaustive test size: 2^16 * 2^16 * 8 = 2^35 = " << (1ULL << 35) << " vectors\n\n";
+
+    // F16 (continued): reading a 24-bit adder at a fixed moment
+    std::cout << "F16 reading at 40 units: worst case " << 2 * 24 + 1 << " > 40, so not always safe; "
+              << "a sum bit k fed by a carry from bit 0 settles at 2k + 1, so bits up to k = " << (40 - 1) / 2
+              << " are safe at 40 units\n\n";
+
+    // F18 (forensic): counts explained from the swapped-select model
+    {
+        int subset = 0, xorEqAdd = 0, xorEqSub = 0;
+        for (int a = 0; a < 16; ++a)
+            for (int b = 0; b < 16; ++b) {
+                if ((a | b) == a) ++subset;                    // b has no 1 outside a: a OR b == a
+                if ((a ^ b) == ((a + b) & 15)) ++xorEqAdd;     // no carry out of bits 0..2
+                if ((a ^ b) == ((a - b) & 15)) ++xorEqSub;     // no borrow out of bits 0..2
+            }
+        std::cout << "F18: op 011 (OR) shows PASS a and op 110 (PASS a) shows a OR b: right only when a OR b == a: "
+                  << subset << " pairs (3^4), wrong " << 256 - subset << "\n";
+        std::cout << "  op 100 (XOR) shows the sum a + b: right only when a + b == a XOR b (mod 16): " << xorEqAdd
+                  << " pairs, wrong " << 256 - xorEqAdd << "\n";
+        std::cout << "  op 001 (SUB) shows a XOR b with the subtraction's C and V: right only when a - b == a XOR b (mod 16): "
+                  << xorEqSub << " pairs, wrong " << 256 - xorEqSub << "\n";
+        std::cout << "  total " << 2 * (256 - subset) + (256 - xorEqAdd) + (256 - xorEqSub) << " of 2048\n\n";
+    }
+
+    // Practical Part B: carry in of the adder tied to 0
+    {
+        int wrongSub = 0;
+        for (int a = 0; a < 16; ++a)
+            for (int b = 0; b < 16; ++b)
+                if (((a + (~b & 15)) & 15) != ((a - b) & 15)) ++wrongSub;
+        std::cout << "P Part B: with carry in 0, SUB gives a + NOT b = a - b - 1: wrong y in " << wrongSub
+                  << " of 256 SUB pairs; plus the 3 named SUB vectors = " << wrongSub + 3 << " of 2056\n";
+        std::cout << "  3 - 9 -> " << bin4((3 + (~9 & 15)) & 15) << ", 8 - 8 -> " << bin4((8 + (~8 & 15)) & 15)
+                  << ", 0 - 1 -> " << bin4((0 + (~1 & 15)) & 15) << " (one less than 1010, 0000, 1111)\n";
+        std::cout << "  if b were not inverted but carry in were 1: 3 - 9 -> 3 + 9 + 1 = " << bin4((3 + 9 + 1) & 15)
+                  << " (" << 3 + 9 + 1 << "), not the observed 1001\n\n";
+    }
+
+    // Yosys reports converted (cell counts copied from yosys_alu4.out and yosys_alu16.out)
+    std::cout << "P Part C / project: CMOS NAND = 4 transistors, NOT = 2 (F1-10)\n";
+    std::cout << "  alu4 reference: 146 NAND + 79 NOT -> " << 146 + 79 << " NAND-equivalents, "
+              << 146 * 4 + 79 * 2 << " transistors\n";
+    std::cout << "  4-bit ripple adder (F1-14): 28 NAND + 20 NOT -> " << 28 + 20 << " NAND-equivalents; the ALU is "
+              << (146 + 79) * 100 / (28 + 20) << " % of it (integer percent)\n";
+    std::cout << "  alu_n N=16 reference: 566 NAND + 295 NOT -> " << 566 + 295 << " NAND-equivalents, "
+              << 566 * 4 + 295 * 2 << " transistors\n";
+    std::cout << "  result multiplexer by construction at 16 bits: 16 x 7 mux2 x 4 NAND = " << 16 * 7 * 4 << " NAND\n";
+    std::cout << "  alu4 split from yosys_alu4.out: 4 mux8 x 7 mux2 x (3 NAND + 1 NOT) = " << 4 * 7 * (3 + 1)
+              << " cells; 4 full_adder x (7 NAND + 5 NOT) = " << 4 * (7 + 5) << " cells; alu4 top level 34 NAND + 31 NOT = "
+              << 34 + 31 << " cells; sum " << 4 * 7 * 4 + 4 * 12 + 34 + 31 << "\n\n";
+
+    // Re-sit fault: carry flag not gated by arith; logic operations see the adder's a + b carry
+    {
+        int carries = 0;
+        for (int a = 0; a < 16; ++a)
+            for (int b = 0; b < 16; ++b)
+                if (a + b >= 16) ++carries;
+        std::cout << "P re-sit: pairs with a + b >= 16: " << carries << "; 6 logic opcodes x " << carries << " = "
+                  << 6 * carries << " wrong of 2056 (the named vectors are all correct)\n\n";
+    }
+
+    // Project timing, 1 unit per gate (alu_n_ref.v): a decomposition of the measured times
+    std::cout << "Project timing model: ADD FFFF+0 -> FFFF+1: input XOR 1 + adder 2N+1 = " << 2 * 16 + 1
+              << " + mux8 3 levels x 2 NAND = 6 + zero flag (group OR, last chain OR, NOT) 3 = " << 1 + 33 + 6 + 3 << "\n";
+    std::cout << "  ADD 0000+0 -> 0000+1: input XOR 1 + adder 4 + mux8 6 = " << 1 + 4 + 6
+              << " for y0, then zero flag: group OR 1 + four chain ORs 4 + NOT 1 = " << 1 + 4 + 6 + 1 + 4 + 1 << "\n";
+    std::cout << "  opcode change on s[2] only: top mux2 ns, t0, y = 3 NAND levels = " << 3 << "\n\n";
 
     // Practical and project counts by construction
     std::cout << "P/project counts by construction: mux8 = 7 mux2 = 28 NAND; 4 result bits -> 112 NAND in the result multiplexer;\n"

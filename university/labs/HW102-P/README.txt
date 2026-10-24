@@ -1,7 +1,11 @@
 HW102 practical exam (P) - lab folder
 =====================================
 
-Run: university/labs/run_lab.sh university/labs/HW102-P   (runner exit code 0 in this build)
+Run: university/labs/run_lab.sh university/labs/HW102-P   (runner exit code 0 on 2026-10-10)
+Second pass (2026-10-24): exam_checks.cpp was extended for the keys and re-run with run_lab.sh's
+own compile and format (g++ 15.2.0, exit code 0). Icarus Verilog and Yosys were not installed on
+the machine during that pass, so the HDL runs of run.sh were not repeated; their .out/.log files
+are the 2026-10-10 recordings. Re-run the whole folder once both tools are installed.
 Paper: university/chapters/HW102/EXAMS.html, section "Practical (P)".
 Marking points and reference outputs: university/_keys/HW102.keys.html.
 
